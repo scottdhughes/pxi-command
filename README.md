@@ -1,5 +1,10 @@
 # PXI /COMMAND
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+
 A real-time macro market strength index that aggregates 28 indicators across 7 categories to provide a single composite score (0-100) for market conditions.
 
 **Live:** [pxicommand.com](https://pxicommand.com)
