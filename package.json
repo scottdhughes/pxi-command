@@ -1,0 +1,39 @@
+{
+  "name": "pxi",
+  "version": "1.0.0",
+  "description": "PXI - Macro Market Strength Index",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/api/server.js",
+    "dev": "tsx src/index.ts",
+    "dev:server": "tsx src/api/server.ts",
+    "fetch": "tsx src/pipeline/fetch-all.ts",
+    "calculate": "tsx src/pipeline/calculate.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "refresh": "tsx src/pipeline/fetch-all.ts && tsx src/pipeline/calculate.ts",
+    "cron:daily": "tsx src/pipeline/cron.ts",
+    "cron:intraday": "tsx src/pipeline/cron.ts --intraday"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "2.8.5",
+    "date-fns": "^3.0.0",
+    "dotenv": "^16.3.1",
+    "express": "5.2.1",
+    "pg": "^8.11.3",
+    "yahoo-finance2": "^2.9.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.1.18",
+    "@types/cors": "2.8.19",
+    "@types/express": "5.0.6",
+    "@types/node": "^20.10.0",
+    "@types/pg": "^8.10.9",
+    "tsx": "^4.6.0",
+    "typescript": "^5.3.0"
+  }
+}
