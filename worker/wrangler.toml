@@ -17,3 +17,7 @@ index_name = "pxi-embeddings"
 # Workers AI
 [ai]
 binding = "AI"
+
+# Cron Triggers - Daily refresh at 6:00 AM UTC
+[triggers]
+crons = ["0 6 * * *"]

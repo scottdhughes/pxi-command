@@ -8,7 +8,10 @@ import { format, subYears } from 'date-fns';
 import axios from 'axios';
 import yahooFinance from 'yahoo-finance2';
 
-const WRITE_API_URL = process.env.WRITE_API_URL || 'https://pxi-api.novoamorx1.workers.dev/api/write';
+const WRITE_API_URL = process.env.WRITE_API_URL;
+if (!WRITE_API_URL) {
+  throw new Error('WRITE_API_URL environment variable is required');
+}
 const WRITE_API_KEY = process.env.WRITE_API_KEY;
 const FRED_API_KEY = process.env.FRED_API_KEY;
 

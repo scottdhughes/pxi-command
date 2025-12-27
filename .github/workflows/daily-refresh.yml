@@ -27,7 +27,7 @@ jobs:
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
-          WRITE_API_URL: https://pxi-api.novoamorx1.workers.dev/api/write
+          WRITE_API_URL: ${{ secrets.WRITE_API_URL }}
         run: npm run cron:daily
 
       - name: Log result

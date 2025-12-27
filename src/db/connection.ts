@@ -2,7 +2,10 @@
 // Collects writes in memory and batch-POSTs to Worker API
 // Compatible with the old pg-style query interface
 
-const WRITE_API_URL = process.env.WRITE_API_URL || 'https://pxi-api.novoamorx1.workers.dev/api/write';
+const WRITE_API_URL = process.env.WRITE_API_URL;
+if (!WRITE_API_URL) {
+  throw new Error('WRITE_API_URL environment variable is required');
+}
 const WRITE_API_KEY = process.env.WRITE_API_KEY;
 
 interface QueryResult<T = any> {
@@ -182,8 +185,11 @@ export const pool = {
 
 // Health check
 export async function healthCheck(): Promise<boolean> {
+  const apiUrl = process.env.WRITE_API_URL;
+  if (!apiUrl) return false;
   try {
-    const response = await fetch('https://pxi-api.novoamorx1.workers.dev/health');
+    const baseUrl = apiUrl.replace('/api/write', '');
+    const response = await fetch(`${baseUrl}/health`);
     return response.ok;
   } catch {
     return false;

@@ -41,7 +41,7 @@ Data Sources (FRED, Yahoo, etc.)
                       ▼
 ┌──────────────────────────────────────────────────┐
 │  Cloudflare Worker API                           │
-│  pxi-api.novoamorx1.workers.dev                  │
+│  <your-worker>.workers.dev                       │
 │  Endpoints:                                      │
 │    GET  /api/pxi      - Current score + history  │
 │    GET  /api/analyze  - AI regime analysis       │
@@ -92,7 +92,7 @@ npm run cron:daily
 cd frontend && npm run dev
 
 # Build frontend for production
-cd frontend && VITE_API_URL=https://pxi-api.novoamorx1.workers.dev npm run build
+cd frontend && VITE_API_URL=https://<your-worker>.workers.dev npm run build
 
 # Deploy Cloudflare Worker
 cd worker && npx wrangler deploy
@@ -193,10 +193,10 @@ npx wrangler d1 execute pxi-db --command "SELECT * FROM pxi_scores ORDER BY date
 
 ## URLs
 
-- **Production site:** https://pxicommand.com
-- **API endpoint:** https://pxi-api.novoamorx1.workers.dev/api/pxi
-- **AI analysis:** https://pxi-api.novoamorx1.workers.dev/api/analyze
-- **Similar periods:** https://pxi-api.novoamorx1.workers.dev/api/similar
-- **Health check:** https://pxi-api.novoamorx1.workers.dev/health
-- **GitHub repo:** https://github.com/scottdhughes/pxi-command
-- **Cloudflare dashboard:** https://dash.cloudflare.com
+After deployment, your API will be available at:
+- **API endpoint:** `https://<your-worker>.workers.dev/api/pxi`
+- **AI analysis:** `https://<your-worker>.workers.dev/api/analyze`
+- **Similar periods:** `https://<your-worker>.workers.dev/api/similar`
+- **Health check:** `https://<your-worker>.workers.dev/health`
+
+Configure your own domain and Pages site as needed.
