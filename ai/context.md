@@ -6,7 +6,7 @@
 
 - Aggregates 28 macro/market indicators into a single 0-100 "market strength" score
 - Fetches data daily from FRED, Yahoo Finance, DeFiLlama, Coinglass, CNN Fear & Greed
-- Stores data in **Cloudflare D1** (SQLite) - migrated from Neon PostgreSQL
+- Stores data in **Cloudflare D1** (SQLite) - no external database
 - Uses **Vectorize** for market regime embeddings (similarity search)
 - Uses **Workers AI** for regime analysis and text generation
 - Serves a read-only JSON API via Cloudflare Workers
@@ -20,12 +20,12 @@ Data Sources (FRED, Yahoo, etc.)
         ▼
 ┌──────────────────────────┐
 │  Node.js Fetchers        │  ← src/fetchers/*.ts
-│  (GitHub Actions cron)   │  ← Writes to Neon (legacy) + D1 sync
+│  (GitHub Actions cron)   │  ← Uses wrangler CLI to write to D1
 └──────────┬───────────────┘
            │
            ▼
 ┌──────────────────────────┐
-│  Cloudflare D1           │  ← SQLite database
+│  Cloudflare D1           │  ← SQLite database (no external DB)
 │  (pxi-db)                │  ← Tables: indicator_values, pxi_scores, category_scores
 └──────────┬───────────────┘
            │
@@ -47,7 +47,6 @@ Data Sources (FRED, Yahoo, etc.)
 │    GET  /api/analyze  - AI regime analysis       │
 │    GET  /api/similar  - Find similar periods     │
 │    POST /api/write    - Write data (auth req)    │
-│    POST /api/embed    - Generate embeddings      │
 └──────────────────────────────────────────────────┘
            │
            ▼
@@ -68,8 +67,7 @@ Data Sources (FRED, Yahoo, etc.)
 | `src/fetchers/alternative-sources.ts` | Calculated breadth indicators, CNN F&G |
 | `src/config/indicators.ts` | **Master list of all 28 indicators** - weights, sources, normalization |
 | `src/calculators/pxi.ts` | Normalizes values, calculates category & composite scores |
-| `src/db/connection.ts` | PostgreSQL connection pool (Neon - legacy) |
-| `scripts/sync-to-d1.ts` | Syncs calculated data from Neon to D1 |
+| `src/db/connection.ts` | **D1 client using wrangler CLI** (replaced pg) |
 | `worker/api.ts` | Cloudflare Worker API with D1, Vectorize, Workers AI |
 | `worker/schema.sql` | D1 database schema |
 | `frontend/src/App.tsx` | Single-page React dashboard |
@@ -81,10 +79,7 @@ Data Sources (FRED, Yahoo, etc.)
 npm install
 cd frontend && npm install && cd ..
 
-# Run database migrations (Neon - legacy)
-npm run migrate
-
-# Fetch all indicator data (takes ~5 min)
+# Fetch all indicator data (writes to D1 via wrangler)
 npm run fetch
 
 # Calculate PXI score from fetched data
@@ -92,9 +87,6 @@ npm run calculate
 
 # Run full daily pipeline (fetch + calculate)
 npm run cron:daily
-
-# Sync today's data to D1
-D1_WRITE_KEY=<key> npx tsx scripts/sync-to-d1.ts
 
 # Start frontend dev server (port 5173)
 cd frontend && npm run dev
@@ -108,7 +100,7 @@ cd worker && npx wrangler deploy
 # Deploy frontend to Cloudflare Pages
 npx wrangler pages deploy frontend/dist --project-name pxi-frontend
 
-# Execute D1 queries
+# Execute D1 queries directly
 npx wrangler d1 execute pxi-db --command "SELECT * FROM pxi_scores ORDER BY date DESC LIMIT 5" --remote
 ```
 
@@ -119,7 +111,6 @@ npx wrangler d1 execute pxi-db --command "SELECT * FROM pxi_scores ORDER BY date
 | `/api/pxi` | GET | No | Current PXI score, categories, sparkline |
 | `/api/analyze` | GET | No | AI-generated regime analysis |
 | `/api/similar` | GET | No | Find historically similar market regimes |
-| `/api/embed` | POST | No | Generate embeddings for all dates |
 | `/api/write` | POST | Yes | Write indicator/category/pxi data |
 | `/health` | GET | No | Health check with DB status |
 | `/og-image.svg` | GET | No | Dynamic OG image for social sharing |
@@ -128,7 +119,7 @@ npx wrangler d1 execute pxi-db --command "SELECT * FROM pxi_scores ORDER BY date
 
 - **TypeScript** everywhere (strict mode)
 - **ES Modules** - use `.js` extensions in imports (for Node ESM)
-- **No semicolons** in frontend, **semicolons** in backend (legacy inconsistency)
+- **No semicolons** in frontend, **semicolons** in backend
 - **Tailwind CSS** for styling - no separate CSS files
 - **Functional components** only in React
 - **No classes** - prefer functions and plain objects
@@ -156,7 +147,8 @@ npx wrangler d1 execute pxi-db --command "SELECT * FROM pxi_scores ORDER BY date
 
 - **Yahoo Finance rate limits** - Fetcher adds delays between requests
 - **FRED API** - Some series update weekly/monthly; missing data returns null
-- **D1 is SQLite** - No array types, no advanced PostgreSQL features
+- **D1 is SQLite** - No array types, no PostgreSQL features
+- **D1 client uses wrangler CLI** - Requires wrangler auth in environment
 - **Vectorize embeddings** - 768 dimensions using BGE model
 - **Workers AI rate limits** - Can't generate all embeddings in one request
 - **Wrangler v4** - Use `compatibility_flags = ["nodejs_compat"]`
@@ -173,18 +165,19 @@ npx wrangler d1 execute pxi-db --command "SELECT * FROM pxi_scores ORDER BY date
 | React | 19.x | Using new JSX transform |
 | Vite | 7.x | Frontend build tool |
 
+**Removed:** `pg`, `@types/pg` (no longer using PostgreSQL)
+
 ## Security Constraints
 
 - **No secrets in code** - All credentials via environment variables
 - **Secrets locations:**
-  - Local: `.env` file (gitignored)
-  - Worker: Cloudflare Worker secrets (`npx wrangler secret put KEY`)
-  - CI: GitHub Actions secrets
+  - Local: Wrangler OAuth (auto via `wrangler login`)
+  - CI: GitHub Actions secrets (`CLOUDFLARE_API_TOKEN`, `FRED_API_KEY`)
+  - Worker: Cloudflare Worker secrets (`WRITE_API_KEY`)
 - **Required secrets:**
-  - `D1_WRITE_KEY` - API key for write endpoint (GitHub Actions)
-  - `WRITE_API_KEY` - Same key in Worker secrets
-  - `PG_*` - Neon credentials (legacy, still used for fetching)
+  - `CLOUDFLARE_API_TOKEN` - For wrangler CLI in GitHub Actions
   - `FRED_API_KEY` - Free from FRED website
+  - `WRITE_API_KEY` - For /api/write endpoint (Worker secret)
 - **Write endpoint requires auth** - Bearer token in Authorization header
 - **Never commit `.env`**
 
