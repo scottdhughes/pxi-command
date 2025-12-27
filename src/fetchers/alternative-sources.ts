@@ -1,10 +1,11 @@
 import axios from 'axios';
+import yahooFinance from 'yahoo-finance2';
 import { format } from 'date-fns';
 import { query } from '../db/connection.js';
 import type { IndicatorValue } from '../types/indicators.js';
 
 // ============== Alternative Breadth Data ==============
-// Using free Yahoo Finance data to calculate breadth ourselves
+// Using yahoo-finance2 package to calculate breadth
 
 const SP500_SECTORS = [
   'XLK', // Technology
@@ -20,58 +21,68 @@ const SP500_SECTORS = [
   'XLC', // Communication
 ];
 
-// Major components for breadth approximation
-const BREADTH_TICKERS = [
-  'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B', 'UNH', 'JNJ',
-  'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'ABBV', 'MRK', 'PEP',
-  'KO', 'COST', 'AVGO', 'TMO', 'WMT', 'MCD', 'CSCO', 'ACN', 'ABT', 'DHR',
-  'NEE', 'LLY', 'VZ', 'ADBE', 'NKE', 'TXN', 'PM', 'WFC', 'RTX', 'BMY',
-  'COP', 'QCOM', 'UPS', 'MS', 'HON', 'ORCL', 'INTC', 'IBM', 'AMD', 'CAT',
-];
-
-interface YahooQuote {
-  symbol: string;
-  regularMarketPrice: number;
-  fiftyDayAverage: number;
-  twoHundredDayAverage: number;
-}
-
-export async function fetchBreadthFromYahoo(): Promise<{
-  above50dma: number;
-  above200dma: number;
-}> {
+// Calculate sector breadth - % of sectors with positive 20-day momentum
+export async function fetchSectorBreadth(): Promise<number> {
   try {
-    // Fetch quotes for breadth tickers
-    const symbols = BREADTH_TICKERS.join(',');
-    const response = await axios.get(
-      `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols}`,
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
-        },
-      }
-    );
+    let bullishSectors = 0;
 
-    const quotes = response.data?.quoteResponse?.result || [];
+    for (const symbol of SP500_SECTORS) {
+      try {
+        const quote = await yahooFinance.quote(symbol);
+        const price = quote.regularMarketPrice || 0;
+        const fiftyDayAvg = quote.fiftyDayAverage || price;
 
-    let above50 = 0;
-    let above200 = 0;
-    let total = 0;
-
-    for (const q of quotes as YahooQuote[]) {
-      if (q.regularMarketPrice && q.fiftyDayAverage && q.twoHundredDayAverage) {
-        total++;
-        if (q.regularMarketPrice > q.fiftyDayAverage) above50++;
-        if (q.regularMarketPrice > q.twoHundredDayAverage) above200++;
+        // Sector is bullish if above 50-day MA
+        if (price > fiftyDayAvg) {
+          bullishSectors++;
+        }
+      } catch (e) {
+        // Skip failed fetches
       }
     }
 
-    return {
-      above50dma: total > 0 ? (above50 / total) * 100 : 50,
-      above200dma: total > 0 ? (above200 / total) * 100 : 50,
-    };
+    // Return as percentage (0-100)
+    return (bullishSectors / SP500_SECTORS.length) * 100;
   } catch (err: any) {
-    console.error('Yahoo breadth fetch error:', err.message);
+    console.error('Sector breadth error:', err.message);
+    throw err;
+  }
+}
+
+// Calculate small cap relative strength (IWM/SPY)
+export async function fetchSmallCapStrength(): Promise<number> {
+  try {
+    const iwm = await yahooFinance.quote('IWM');
+    const spy = await yahooFinance.quote('SPY');
+
+    const iwmPrice = iwm.regularMarketPrice || 0;
+    const spyPrice = spy.regularMarketPrice || 0;
+
+    if (spyPrice === 0) return 0;
+
+    // Return ratio * 100 for easier percentile calc
+    return (iwmPrice / spyPrice) * 100;
+  } catch (err: any) {
+    console.error('Small cap strength error:', err.message);
+    throw err;
+  }
+}
+
+// Calculate mid cap relative strength (IJH/SPY)
+export async function fetchMidCapStrength(): Promise<number> {
+  try {
+    const ijh = await yahooFinance.quote('IJH');
+    const spy = await yahooFinance.quote('SPY');
+
+    const ijhPrice = ijh.regularMarketPrice || 0;
+    const spyPrice = spy.regularMarketPrice || 0;
+
+    if (spyPrice === 0) return 0;
+
+    // Return ratio * 100 for easier percentile calc
+    return (ijhPrice / spyPrice) * 100;
+  } catch (err: any) {
+    console.error('Mid cap strength error:', err.message);
     throw err;
   }
 }
@@ -180,50 +191,58 @@ export async function fetchAlternativeIndicators(): Promise<{
 
   console.log('\n📡 Fetching alternative data sources...\n');
 
-  // Breadth data
+  // Sector Breadth
   try {
-    console.log('  Calculating breadth from Yahoo quotes...');
-    const breadth = await fetchBreadthFromYahoo();
+    console.log('  Calculating sector breadth...');
+    const sectorBreadth = await fetchSectorBreadth();
 
     await query(
       `INSERT INTO indicator_values (indicator_id, date, value, source)
-       VALUES ('sp500_above_50dma', $1, $2, 'yahoo_calc')
+       VALUES ('sector_breadth', $1, $2, 'yahoo_calc')
        ON CONFLICT (indicator_id, date) DO UPDATE SET value = EXCLUDED.value`,
-      [today, breadth.above50dma]
+      [today, sectorBreadth]
     );
-    success.push('sp500_above_50dma');
-
-    await query(
-      `INSERT INTO indicator_values (indicator_id, date, value, source)
-       VALUES ('sp500_above_200dma', $1, $2, 'yahoo_calc')
-       ON CONFLICT (indicator_id, date) DO UPDATE SET value = EXCLUDED.value`,
-      [today, breadth.above200dma]
-    );
-    success.push('sp500_above_200dma');
-
-    console.log(`  ✓ breadth: 50DMA=${breadth.above50dma.toFixed(1)}%, 200DMA=${breadth.above200dma.toFixed(1)}%`);
+    success.push('sector_breadth');
+    console.log(`  ✓ sector_breadth: ${sectorBreadth.toFixed(1)}%`);
   } catch (err: any) {
-    console.error(`  ✗ breadth: ${err.message}`);
-    failed.push('breadth');
+    console.error(`  ✗ sector_breadth: ${err.message}`);
+    failed.push('sector_breadth');
   }
 
-  // Put/Call approximation
+  // Small Cap Strength
   try {
-    console.log('  Approximating put/call ratio...');
-    const pcRatio = await fetchPutCallFromYahoo();
-    if (pcRatio !== null) {
-      await query(
-        `INSERT INTO indicator_values (indicator_id, date, value, source)
-         VALUES ('put_call_ratio', $1, $2, 'yahoo_calc')
-         ON CONFLICT (indicator_id, date) DO UPDATE SET value = EXCLUDED.value`,
-        [today, pcRatio]
-      );
-      success.push('put_call_ratio');
-      console.log(`  ✓ put_call_ratio: ${pcRatio.toFixed(2)}`);
-    }
+    console.log('  Calculating small cap relative strength...');
+    const smallCapStrength = await fetchSmallCapStrength();
+
+    await query(
+      `INSERT INTO indicator_values (indicator_id, date, value, source)
+       VALUES ('small_cap_strength', $1, $2, 'yahoo_calc')
+       ON CONFLICT (indicator_id, date) DO UPDATE SET value = EXCLUDED.value`,
+      [today, smallCapStrength]
+    );
+    success.push('small_cap_strength');
+    console.log(`  ✓ small_cap_strength: ${smallCapStrength.toFixed(2)}`);
   } catch (err: any) {
-    console.error(`  ✗ put_call_ratio: ${err.message}`);
-    failed.push('put_call_ratio');
+    console.error(`  ✗ small_cap_strength: ${err.message}`);
+    failed.push('small_cap_strength');
+  }
+
+  // Mid Cap Strength
+  try {
+    console.log('  Calculating mid cap relative strength...');
+    const midCapStrength = await fetchMidCapStrength();
+
+    await query(
+      `INSERT INTO indicator_values (indicator_id, date, value, source)
+       VALUES ('midcap_strength', $1, $2, 'yahoo_calc')
+       ON CONFLICT (indicator_id, date) DO UPDATE SET value = EXCLUDED.value`,
+      [today, midCapStrength]
+    );
+    success.push('midcap_strength');
+    console.log(`  ✓ midcap_strength: ${midCapStrength.toFixed(2)}`);
+  } catch (err: any) {
+    console.error(`  ✗ midcap_strength: ${err.message}`);
+    failed.push('midcap_strength');
   }
 
   // Sentiment from Fear & Greed
@@ -243,25 +262,6 @@ export async function fetchAlternativeIndicators(): Promise<{
   } catch (err: any) {
     console.error(`  ✗ aaii_sentiment: ${err.message}`);
     failed.push('aaii_sentiment');
-  }
-
-  // Highs/Lows approximation
-  try {
-    console.log('  Approximating NYSE highs/lows...');
-    const highsLows = await fetchHighsLowsApprox();
-    if (highsLows !== null) {
-      await query(
-        `INSERT INTO indicator_values (indicator_id, date, value, source)
-         VALUES ('nyse_highs_lows', $1, $2, 'yahoo_calc')
-         ON CONFLICT (indicator_id, date) DO UPDATE SET value = EXCLUDED.value`,
-        [today, highsLows]
-      );
-      success.push('nyse_highs_lows');
-      console.log(`  ✓ nyse_highs_lows: ${highsLows}`);
-    }
-  } catch (err: any) {
-    console.error(`  ✗ nyse_highs_lows: ${err.message}`);
-    failed.push('nyse_highs_lows');
   }
 
   return { success, failed };
