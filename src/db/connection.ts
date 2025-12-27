@@ -53,18 +53,18 @@ export async function query<T = any>(
   sql: string,
   params?: any[]
 ): Promise<QueryResult<T>> {
+  const finalSql = buildSql(sql, params);
+
   try {
-    const finalSql = buildSql(sql, params);
-
-    // Escape for shell - use base64 to avoid escaping issues
-    const base64Sql = Buffer.from(finalSql).toString('base64');
-
+    // Pass SQL via environment variable to avoid shell escaping issues
+    // Use bash -c with single quotes so $D1_SQL is expanded from environment
     const result = execSync(
-      `echo "${base64Sql}" | base64 -d | npx wrangler d1 execute ${DB_NAME} --remote --json`,
+      `bash -c 'npx wrangler d1 execute ${DB_NAME} --remote --json --command "$D1_SQL"'`,
       {
         encoding: 'utf-8',
         maxBuffer: 50 * 1024 * 1024,
         stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, D1_SQL: finalSql },
       }
     );
 
@@ -77,8 +77,13 @@ export async function query<T = any>(
     };
   } catch (err: any) {
     // Check if it's just a non-SELECT query (no results expected)
-    if (err.message?.includes('results')) {
-      return { rows: [], rowCount: 0 };
+    if (err.stdout) {
+      try {
+        const parsed = JSON.parse(err.stdout);
+        if (parsed[0]?.success) {
+          return { rows: [], rowCount: 0 };
+        }
+      } catch {}
     }
     console.error('D1 query error:', err.message);
     console.error('SQL:', sql);
@@ -88,22 +93,9 @@ export async function query<T = any>(
 
 // Batch execute multiple SQL statements
 export async function batchExecute(statements: string[]): Promise<void> {
-  if (statements.length === 0) return;
-
-  const sql = statements.join('\n');
-  const base64Sql = Buffer.from(sql).toString('base64');
-
-  try {
-    execSync(
-      `echo "${base64Sql}" | base64 -d | npx wrangler d1 execute ${DB_NAME} --remote`,
-      {
-        encoding: 'utf-8',
-        stdio: 'inherit',
-      }
-    );
-  } catch (err: any) {
-    console.error('D1 batch execute error:', err.message);
-    throw err;
+  // Execute each statement individually
+  for (const stmt of statements) {
+    await query(stmt);
   }
 }
 
