@@ -14,7 +14,7 @@ export const pool = new Pool({
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
-  ssl: process.env.PG_SSL ? { rejectUnauthorized: false } : false,
+  ssl: process.env.PG_SSL ? { rejectUnauthorized: true } : false,
 });
 
 export async function query<T = any>(
