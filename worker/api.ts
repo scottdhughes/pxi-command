@@ -1,5 +1,7 @@
 // Cloudflare Worker API for PXI
-// Connects to Neon PostgreSQL
+// Connects to Neon PostgreSQL via serverless driver
+
+import { neon } from '@neondatabase/serverless';
 
 interface Env {
   DATABASE_URL: string;
@@ -19,29 +21,6 @@ interface CategoryRow {
   category: string;
   score: string;
   weight: string;
-}
-
-// Simple PostgreSQL query helper using fetch (Neon HTTP API)
-async function query(env: Env, sql: string, params: unknown[] = []) {
-  const url = env.DATABASE_URL.replace('postgresql://', 'https://').replace(/\/[^/]+$/, '/sql');
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Neon-Connection-String': env.DATABASE_URL,
-    },
-    body: JSON.stringify({
-      query: sql,
-      params,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Database error: ${response.statusText}`);
-  }
-
-  return response.json();
 }
 
 // CORS headers
@@ -70,79 +49,30 @@ export default {
     // Main PXI endpoint
     if (url.pathname === '/api/pxi') {
       try {
-        // Use Neon's serverless driver approach with fetch
-        const dbUrl = env.DATABASE_URL;
+        const sql = neon(env.DATABASE_URL);
 
-        // Parse connection string
-        const connMatch = dbUrl.match(/postgresql:\/\/([^:]+):([^@]+)@([^/]+)\/(.+)/);
-        if (!connMatch) {
-          throw new Error('Invalid DATABASE_URL');
-        }
-
-        const [, user, password, host, database] = connMatch;
-        const neonHost = host.replace('-pooler', '');
-
-        // Use Neon HTTP API
-        const apiUrl = `https://${neonHost}/sql`;
-
-        const pxiQuery = `
+        // Get latest PXI score
+        const pxiRows = await sql`
           SELECT date, score, label, status, delta_1d, delta_7d, delta_30d
           FROM pxi_scores ORDER BY date DESC LIMIT 1
-        `;
+        ` as PXIRow[];
 
-        const pxiRes = await fetch(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${password}`,
-          },
-          body: JSON.stringify({ query: pxiQuery }),
-        });
-
-        if (!pxiRes.ok) {
-          const text = await pxiRes.text();
-          throw new Error(`PXI query failed: ${text}`);
-        }
-
-        const pxiData = await pxiRes.json() as { rows: PXIRow[] };
-        const pxi = pxiData.rows[0];
+        const pxi = pxiRows[0];
 
         if (!pxi) {
           return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
         }
 
-        // Get categories
-        const catQuery = `
+        // Get categories for the same date
+        const catRows = await sql`
           SELECT category, score, weight
-          FROM category_scores WHERE date = '${pxi.date}'
-        `;
+          FROM category_scores WHERE date = ${pxi.date}
+        ` as CategoryRow[];
 
-        const catRes = await fetch(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${password}`,
-          },
-          body: JSON.stringify({ query: catQuery }),
-        });
-
-        const catData = await catRes.json() as { rows: CategoryRow[] };
-
-        // Get sparkline
-        const sparkQuery = `
+        // Get sparkline (last 30 days)
+        const sparkRows = await sql`
           SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 30
-        `;
-
-        const sparkRes = await fetch(apiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${password}`,
-          },
-          body: JSON.stringify({ query: sparkQuery }),
-        });
-
-        const sparkData = await sparkRes.json() as { rows: { date: string; score: string }[] };
+        ` as { date: string; score: string }[];
 
         const response = {
           date: pxi.date,
@@ -154,12 +84,12 @@ export default {
             d7: pxi.delta_7d ? parseFloat(pxi.delta_7d) : null,
             d30: pxi.delta_30d ? parseFloat(pxi.delta_30d) : null,
           },
-          categories: catData.rows.map((c: CategoryRow) => ({
+          categories: catRows.map((c: CategoryRow) => ({
             name: c.category,
             score: parseFloat(c.score),
             weight: parseFloat(c.weight),
           })),
-          sparkline: sparkData.rows.reverse().map((r: { date: string; score: string }) => ({
+          sparkline: sparkRows.reverse().map((r: { date: string; score: string }) => ({
             date: r.date,
             score: parseFloat(r.score),
           })),
