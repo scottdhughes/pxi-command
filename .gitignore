@@ -2,5 +2,10 @@ node_modules/
 dist/
 frontend/dist/
 .env
+.env.local
+.env*.local
 *.log
 .DS_Store
+.wrangler/
+*.pem
+*.key

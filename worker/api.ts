@@ -23,26 +23,83 @@ interface CategoryRow {
   weight: string;
 }
 
-// CORS headers
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-};
+// Allowed origins for CORS
+const ALLOWED_ORIGINS = [
+  'https://pxicommand.com',
+  'https://www.pxicommand.com',
+  'https://pxi-command.pages.dev',
+];
+
+// Rate limiting: simple in-memory store (resets on worker restart)
+const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT = 100; // requests per window
+const RATE_WINDOW = 60 * 1000; // 1 minute
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const record = rateLimitStore.get(ip);
+
+  if (!record || now > record.resetTime) {
+    rateLimitStore.set(ip, { count: 1, resetTime: now + RATE_WINDOW });
+    return true;
+  }
+
+  if (record.count >= RATE_LIMIT) {
+    return false;
+  }
+
+  record.count++;
+  return true;
+}
+
+// Security headers
+function getCorsHeaders(origin: string | null): Record<string, string> {
+  const allowedOrigin = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+
+  return {
+    'Access-Control-Allow-Origin': allowedOrigin,
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+  };
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const origin = request.headers.get('Origin');
+    const corsHeaders = getCorsHeaders(origin);
+
+    // Rate limiting
+    const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+    if (!checkRateLimit(clientIP)) {
+      return Response.json(
+        { error: 'Too many requests' },
+        { status: 429, headers: { ...corsHeaders, 'Retry-After': '60' } }
+      );
+    }
+
+    // Only allow GET and OPTIONS methods
+    if (request.method !== 'GET' && request.method !== 'OPTIONS') {
+      return Response.json(
+        { error: 'Method not allowed' },
+        { status: 405, headers: corsHeaders }
+      );
+    }
 
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Health check
+    // Health check (no cache, always fresh)
     if (url.pathname === '/health') {
       return Response.json({ status: 'healthy', timestamp: new Date().toISOString() }, {
-        headers: corsHeaders,
+        headers: { ...corsHeaders, 'Cache-Control': 'no-store' },
       });
     }
 
@@ -88,8 +145,9 @@ export default {
           },
         });
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Unknown error';
-        return new Response(`Error: ${message}`, { status: 500 });
+        // Log error internally but don't expose details to client
+        console.error('OG image error:', err instanceof Error ? err.message : err);
+        return new Response('Service unavailable', { status: 500, headers: corsHeaders });
       }
     }
 
@@ -142,13 +200,20 @@ export default {
           })),
         };
 
-        return Response.json(response, { headers: corsHeaders });
+        return Response.json(response, {
+          headers: {
+            ...corsHeaders,
+            'Cache-Control': 'public, max-age=60', // Cache for 1 minute
+          },
+        });
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Unknown error';
-        return Response.json({ error: message }, { status: 500, headers: corsHeaders });
+        // Log error internally but don't expose details to client
+        console.error('API error:', err instanceof Error ? err.message : err);
+        return Response.json({ error: 'Service unavailable' }, { status: 500, headers: corsHeaders });
       }
     }
 
+    // 404 for unknown routes
     return Response.json({ error: 'Not found' }, { status: 404, headers: corsHeaders });
   },
 };
