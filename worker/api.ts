@@ -1,26 +1,36 @@
 // Cloudflare Worker API for PXI
-// Connects to Neon PostgreSQL via serverless driver
-
-import { neon } from '@neondatabase/serverless';
+// Uses D1 (SQLite), Vectorize, and Workers AI
 
 interface Env {
-  DATABASE_URL: string;
+  DB: D1Database;
+  VECTORIZE: VectorizeIndex;
+  AI: Ai;
 }
 
 interface PXIRow {
   date: string;
-  score: string;
+  score: number;
   label: string;
   status: string;
-  delta_1d: string | null;
-  delta_7d: string | null;
-  delta_30d: string | null;
+  delta_1d: number | null;
+  delta_7d: number | null;
+  delta_30d: number | null;
 }
 
 interface CategoryRow {
   category: string;
-  score: string;
-  weight: string;
+  score: number;
+  weight: number;
+}
+
+interface SparklineRow {
+  date: string;
+  score: number;
+}
+
+interface IndicatorRow {
+  indicator_id: string;
+  value: number;
 }
 
 // Allowed origins for CORS
@@ -28,12 +38,13 @@ const ALLOWED_ORIGINS = [
   'https://pxicommand.com',
   'https://www.pxicommand.com',
   'https://pxi-command.pages.dev',
+  'https://pxi-frontend.pages.dev',
 ];
 
-// Rate limiting: simple in-memory store (resets on worker restart)
+// Rate limiting: simple in-memory store
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT = 100; // requests per window
-const RATE_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT = 100;
+const RATE_WINDOW = 60 * 1000;
 
 function checkRateLimit(ip: string): boolean {
   const now = Date.now();
@@ -52,13 +63,12 @@ function checkRateLimit(ip: string): boolean {
   return true;
 }
 
-// Security headers
 function getCorsHeaders(origin: string | null): Record<string, string> {
   const allowedOrigin = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
 
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Max-Age': '86400',
     'X-Content-Type-Options': 'nosniff',
@@ -83,8 +93,8 @@ export default {
       );
     }
 
-    // Only allow GET and OPTIONS methods
-    if (request.method !== 'GET' && request.method !== 'OPTIONS') {
+    // Only allow GET, POST, and OPTIONS
+    if (!['GET', 'POST', 'OPTIONS'].includes(request.method)) {
       return Response.json(
         { error: 'Method not allowed' },
         { status: 405, headers: corsHeaders }
@@ -96,27 +106,27 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Health check (no cache, always fresh)
-    if (url.pathname === '/health') {
-      return Response.json({ status: 'healthy', timestamp: new Date().toISOString() }, {
-        headers: { ...corsHeaders, 'Cache-Control': 'no-store' },
-      });
-    }
+    try {
+      // Health check
+      if (url.pathname === '/health') {
+        const result = await env.DB.prepare('SELECT 1 as ok').first();
+        return Response.json(
+          { status: 'healthy', db: result?.ok === 1, timestamp: new Date().toISOString() },
+          { headers: { ...corsHeaders, 'Cache-Control': 'no-store' } }
+        );
+      }
 
-    // OG Image endpoint for social sharing
-    if (url.pathname === '/og-image.svg') {
-      try {
-        const sql = neon(env.DATABASE_URL);
-        const rows = await sql`
-          SELECT score, label, status FROM pxi_scores ORDER BY date DESC LIMIT 1
-        ` as { score: string; label: string; status: string }[];
+      // OG Image endpoint
+      if (url.pathname === '/og-image.svg') {
+        const pxi = await env.DB.prepare(
+          'SELECT score, label, status FROM pxi_scores ORDER BY date DESC LIMIT 1'
+        ).first<{ score: number; label: string; status: string }>();
 
-        const pxi = rows[0];
         if (!pxi) {
-          return new Response('No data', { status: 404 });
+          return new Response('No data', { status: 404, headers: corsHeaders });
         }
 
-        const score = Math.round(parseFloat(pxi.score));
+        const score = Math.round(pxi.score);
         const label = pxi.label;
         const statusColors: Record<string, string> = {
           max_pamp: '#00a3ff',
@@ -144,76 +154,270 @@ export default {
             ...corsHeaders,
           },
         });
-      } catch (err: unknown) {
-        // Log error internally but don't expose details to client
-        console.error('OG image error:', err instanceof Error ? err.message : err);
-        return new Response('Service unavailable', { status: 500, headers: corsHeaders });
       }
-    }
 
-    // Main PXI endpoint
-    if (url.pathname === '/api/pxi') {
-      try {
-        const sql = neon(env.DATABASE_URL);
-
+      // Main PXI endpoint
+      if (url.pathname === '/api/pxi') {
         // Get latest PXI score
-        const pxiRows = await sql`
-          SELECT date, score, label, status, delta_1d, delta_7d, delta_30d
-          FROM pxi_scores ORDER BY date DESC LIMIT 1
-        ` as PXIRow[];
-
-        const pxi = pxiRows[0];
+        const pxi = await env.DB.prepare(
+          'SELECT date, score, label, status, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 1'
+        ).first<PXIRow>();
 
         if (!pxi) {
           return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
         }
 
         // Get categories for the same date
-        const catRows = await sql`
-          SELECT category, score, weight
-          FROM category_scores WHERE date = ${pxi.date}
-        ` as CategoryRow[];
+        const catResult = await env.DB.prepare(
+          'SELECT category, score, weight FROM category_scores WHERE date = ?'
+        ).bind(pxi.date).all<CategoryRow>();
 
         // Get sparkline (last 30 days)
-        const sparkRows = await sql`
-          SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 30
-        ` as { date: string; score: string }[];
+        const sparkResult = await env.DB.prepare(
+          'SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 30'
+        ).all<SparklineRow>();
 
         const response = {
           date: pxi.date,
-          score: parseFloat(pxi.score),
+          score: pxi.score,
           label: pxi.label,
           status: pxi.status,
           delta: {
-            d1: pxi.delta_1d ? parseFloat(pxi.delta_1d) : null,
-            d7: pxi.delta_7d ? parseFloat(pxi.delta_7d) : null,
-            d30: pxi.delta_30d ? parseFloat(pxi.delta_30d) : null,
+            d1: pxi.delta_1d,
+            d7: pxi.delta_7d,
+            d30: pxi.delta_30d,
           },
-          categories: catRows.map((c: CategoryRow) => ({
+          categories: (catResult.results || []).map((c) => ({
             name: c.category,
-            score: parseFloat(c.score),
-            weight: parseFloat(c.weight),
+            score: c.score,
+            weight: c.weight,
           })),
-          sparkline: sparkRows.reverse().map((r: { date: string; score: string }) => ({
+          sparkline: (sparkResult.results || []).reverse().map((r) => ({
             date: r.date,
-            score: parseFloat(r.score),
+            score: r.score,
           })),
         };
 
         return Response.json(response, {
           headers: {
             ...corsHeaders,
-            'Cache-Control': 'public, max-age=60', // Cache for 1 minute
+            'Cache-Control': 'public, max-age=60',
           },
         });
-      } catch (err: unknown) {
-        // Log error internally but don't expose details to client
-        console.error('API error:', err instanceof Error ? err.message : err);
-        return Response.json({ error: 'Service unavailable' }, { status: 500, headers: corsHeaders });
       }
-    }
 
-    // 404 for unknown routes
-    return Response.json({ error: 'Not found' }, { status: 404, headers: corsHeaders });
+      // AI: Find similar market regimes
+      if (url.pathname === '/api/similar' && request.method === 'GET') {
+        // Get today's indicator snapshot
+        const latestDate = await env.DB.prepare(
+          'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 1'
+        ).first<{ date: string }>();
+
+        if (!latestDate) {
+          return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
+        }
+
+        // Get indicator values for embedding
+        const indicators = await env.DB.prepare(`
+          SELECT indicator_id, value FROM indicator_values
+          WHERE date = ? ORDER BY indicator_id
+        `).bind(latestDate.date).all<IndicatorRow>();
+
+        if (!indicators.results || indicators.results.length === 0) {
+          return Response.json({ error: 'No indicators' }, { status: 404, headers: corsHeaders });
+        }
+
+        // Create text representation for embedding
+        const indicatorText = indicators.results
+          .map((i) => `${i.indicator_id}: ${i.value.toFixed(2)}`)
+          .join(', ');
+
+        // Generate embedding using Workers AI
+        const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+          text: indicatorText,
+        });
+
+        // Query Vectorize for similar days
+        const similar = await env.VECTORIZE.query(embedding.data[0], {
+          topK: 5,
+          returnMetadata: 'all',
+        });
+
+        // Get PXI scores for similar dates
+        const similarDates = similar.matches
+          .filter((m) => m.metadata?.date)
+          .map((m) => m.metadata!.date as string);
+
+        if (similarDates.length === 0) {
+          return Response.json({
+            current_date: latestDate.date,
+            similar_periods: [],
+            message: 'No historical embeddings yet. Run /api/embed to generate.',
+          }, { headers: corsHeaders });
+        }
+
+        const historicalScores = await env.DB.prepare(`
+          SELECT date, score, label, status FROM pxi_scores
+          WHERE date IN (${similarDates.map(() => '?').join(',')})
+        `).bind(...similarDates).all<PXIRow>();
+
+        return Response.json({
+          current_date: latestDate.date,
+          similar_periods: similar.matches.map((m, i) => ({
+            date: m.metadata?.date,
+            similarity: m.score,
+            pxi: historicalScores.results?.find((s) => s.date === m.metadata?.date),
+          })),
+        }, { headers: corsHeaders });
+      }
+
+      // AI: Generate embeddings for historical data
+      if (url.pathname === '/api/embed' && request.method === 'POST') {
+        const dates = await env.DB.prepare(
+          'SELECT DISTINCT date FROM indicator_values ORDER BY date'
+        ).all<{ date: string }>();
+
+        let embedded = 0;
+        const batchSize = 10;
+
+        for (let i = 0; i < (dates.results?.length || 0); i += batchSize) {
+          const batch = dates.results!.slice(i, i + batchSize);
+
+          for (const { date } of batch) {
+            const indicators = await env.DB.prepare(`
+              SELECT indicator_id, value FROM indicator_values
+              WHERE date = ? ORDER BY indicator_id
+            `).bind(date).all<IndicatorRow>();
+
+            if (!indicators.results || indicators.results.length < 10) continue;
+
+            const indicatorText = indicators.results
+              .map((ind) => `${ind.indicator_id}: ${ind.value.toFixed(2)}`)
+              .join(', ');
+
+            const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+              text: indicatorText,
+            });
+
+            await env.VECTORIZE.upsert([{
+              id: date,
+              values: embedding.data[0],
+              metadata: { date },
+            }]);
+
+            embedded++;
+          }
+        }
+
+        return Response.json({
+          success: true,
+          embedded_dates: embedded,
+        }, { headers: corsHeaders });
+      }
+
+      // Write endpoint for fetchers (requires API key)
+      if (url.pathname === '/api/write' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        const apiKey = authHeader?.replace('Bearer ', '');
+
+        // Simple API key check (set via wrangler secret)
+        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        const body = await request.json() as {
+          type: 'indicator' | 'category' | 'pxi';
+          data: any;
+        };
+
+        if (body.type === 'indicator') {
+          const { indicator_id, date, value, source } = body.data;
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO indicator_values (indicator_id, date, value, source)
+            VALUES (?, ?, ?, ?)
+          `).bind(indicator_id, date, value, source).run();
+        } else if (body.type === 'category') {
+          const { category, date, score, weight, weighted_score } = body.data;
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
+            VALUES (?, ?, ?, ?, ?)
+          `).bind(category, date, score, weight, weighted_score).run();
+        } else if (body.type === 'pxi') {
+          const { date, score, label, status, delta_1d, delta_7d, delta_30d } = body.data;
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).bind(date, score, label, status, delta_1d, delta_7d, delta_30d).run();
+
+          // Generate embedding for this date
+          const indicators = await env.DB.prepare(`
+            SELECT indicator_id, value FROM indicator_values
+            WHERE date = ? ORDER BY indicator_id
+          `).bind(date).all<IndicatorRow>();
+
+          if (indicators.results && indicators.results.length >= 10) {
+            const indicatorText = indicators.results
+              .map((i) => `${i.indicator_id}: ${i.value.toFixed(2)}`)
+              .join(', ');
+
+            const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+              text: indicatorText,
+            });
+
+            await env.VECTORIZE.upsert([{
+              id: date,
+              values: embedding.data[0],
+              metadata: { date, score },
+            }]);
+          }
+        }
+
+        return Response.json({ success: true }, { headers: corsHeaders });
+      }
+
+      // AI: Analyze current regime
+      if (url.pathname === '/api/analyze' && request.method === 'GET') {
+        // Get latest PXI and categories
+        const pxi = await env.DB.prepare(
+          'SELECT date, score, label, status FROM pxi_scores ORDER BY date DESC LIMIT 1'
+        ).first<PXIRow>();
+
+        const categories = await env.DB.prepare(
+          'SELECT category, score FROM category_scores WHERE date = ? ORDER BY score DESC'
+        ).bind(pxi?.date).all<CategoryRow>();
+
+        if (!pxi || !categories.results) {
+          return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
+        }
+
+        // Create analysis prompt
+        const prompt = `Analyze this market regime in 2-3 sentences. Be specific about what's driving conditions.
+
+PXI Score: ${pxi.score.toFixed(1)} (${pxi.label})
+Category Breakdown:
+${categories.results.map((c) => `- ${c.category}: ${c.score.toFixed(1)}/100`).join('\n')}
+
+Focus on: What's strong? What's weak? What does this suggest for risk appetite?`;
+
+        const analysis = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+          prompt,
+          max_tokens: 200,
+        });
+
+        return Response.json({
+          date: pxi.date,
+          score: pxi.score,
+          label: pxi.label,
+          status: pxi.status,
+          categories: categories.results,
+          analysis: (analysis as { response: string }).response,
+        }, { headers: corsHeaders });
+      }
+
+      return Response.json({ error: 'Not found' }, { status: 404, headers: corsHeaders });
+    } catch (err: unknown) {
+      console.error('API error:', err instanceof Error ? err.message : err);
+      return Response.json({ error: 'Service unavailable' }, { status: 500, headers: corsHeaders });
+    }
   },
 };

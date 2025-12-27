@@ -6,7 +6,9 @@
 
 - Aggregates 28 macro/market indicators into a single 0-100 "market strength" score
 - Fetches data daily from FRED, Yahoo Finance, DeFiLlama, Coinglass, CNN Fear & Greed
-- Stores historical values in Neon PostgreSQL (serverless)
+- Stores data in **Cloudflare D1** (SQLite) - migrated from Neon PostgreSQL
+- Uses **Vectorize** for market regime embeddings (similarity search)
+- Uses **Workers AI** for regime analysis and text generation
 - Serves a read-only JSON API via Cloudflare Workers
 - Displays score + sparkline + category breakdown on a minimal React frontend
 
@@ -18,21 +20,35 @@ Data Sources (FRED, Yahoo, etc.)
         ▼
 ┌──────────────────────────┐
 │  Node.js Fetchers        │  ← src/fetchers/*.ts
-│  (runs daily via cron)   │
+│  (GitHub Actions cron)   │  ← Writes to Neon (legacy) + D1 sync
 └──────────┬───────────────┘
            │
            ▼
 ┌──────────────────────────┐
-│  Neon PostgreSQL         │  ← Tables: indicator_values, pxi_scores, category_scores
-│  (serverless, us-east-1) │
+│  Cloudflare D1           │  ← SQLite database
+│  (pxi-db)                │  ← Tables: indicator_values, pxi_scores, category_scores
 └──────────┬───────────────┘
            │
-           ▼
-┌──────────────────────────┐
-│  Cloudflare Worker       │  ← worker/api.ts
-│  (Edge API)              │
-│  pxi-api.novoamorx1.workers.dev
-└──────────┬───────────────┘
+           ├──────────────────────────┐
+           ▼                          ▼
+┌──────────────────────────┐  ┌──────────────────┐
+│  Vectorize               │  │  Workers AI      │
+│  (pxi-embeddings)        │  │  (LLM + embed)   │
+│  768-dim cosine index    │  │  BGE + Llama 3.1 │
+└──────────────────────────┘  └──────────────────┘
+           │                          │
+           └──────────┬───────────────┘
+                      ▼
+┌──────────────────────────────────────────────────┐
+│  Cloudflare Worker API                           │
+│  pxi-api.novoamorx1.workers.dev                  │
+│  Endpoints:                                      │
+│    GET  /api/pxi      - Current score + history  │
+│    GET  /api/analyze  - AI regime analysis       │
+│    GET  /api/similar  - Find similar periods     │
+│    POST /api/write    - Write data (auth req)    │
+│    POST /api/embed    - Generate embeddings      │
+└──────────────────────────────────────────────────┘
            │
            ▼
 ┌──────────────────────────┐
@@ -52,8 +68,10 @@ Data Sources (FRED, Yahoo, etc.)
 | `src/fetchers/alternative-sources.ts` | Calculated breadth indicators, CNN F&G |
 | `src/config/indicators.ts` | **Master list of all 28 indicators** - weights, sources, normalization |
 | `src/calculators/pxi.ts` | Normalizes values, calculates category & composite scores |
-| `src/db/connection.ts` | PostgreSQL connection pool |
-| `worker/api.ts` | Cloudflare Worker API (read-only, rate-limited) |
+| `src/db/connection.ts` | PostgreSQL connection pool (Neon - legacy) |
+| `scripts/sync-to-d1.ts` | Syncs calculated data from Neon to D1 |
+| `worker/api.ts` | Cloudflare Worker API with D1, Vectorize, Workers AI |
+| `worker/schema.sql` | D1 database schema |
 | `frontend/src/App.tsx` | Single-page React dashboard |
 
 ## Local Dev Commands
@@ -63,7 +81,7 @@ Data Sources (FRED, Yahoo, etc.)
 npm install
 cd frontend && npm install && cd ..
 
-# Run database migrations
+# Run database migrations (Neon - legacy)
 npm run migrate
 
 # Fetch all indicator data (takes ~5 min)
@@ -74,6 +92,9 @@ npm run calculate
 
 # Run full daily pipeline (fetch + calculate)
 npm run cron:daily
+
+# Sync today's data to D1
+D1_WRITE_KEY=<key> npx tsx scripts/sync-to-d1.ts
 
 # Start frontend dev server (port 5173)
 cd frontend && npm run dev
@@ -86,17 +107,22 @@ cd worker && npx wrangler deploy
 
 # Deploy frontend to Cloudflare Pages
 npx wrangler pages deploy frontend/dist --project-name pxi-frontend
+
+# Execute D1 queries
+npx wrangler d1 execute pxi-db --command "SELECT * FROM pxi_scores ORDER BY date DESC LIMIT 5" --remote
 ```
 
-## Test Commands
+## API Endpoints
 
-```bash
-# No test suite yet - this is a known gap
-# To manually verify:
-npm run fetch    # Check for fetch errors in console
-npm run calculate # Should output new PXI score
-curl https://pxi-api.novoamorx1.workers.dev/api/pxi | jq .
-```
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/api/pxi` | GET | No | Current PXI score, categories, sparkline |
+| `/api/analyze` | GET | No | AI-generated regime analysis |
+| `/api/similar` | GET | No | Find historically similar market regimes |
+| `/api/embed` | POST | No | Generate embeddings for all dates |
+| `/api/write` | POST | Yes | Write indicator/category/pxi data |
+| `/health` | GET | No | Health check with DB status |
+| `/og-image.svg` | GET | No | Dynamic OG image for social sharing |
 
 ## Code Style & Conventions
 
@@ -107,7 +133,7 @@ curl https://pxi-api.novoamorx1.workers.dev/api/pxi | jq .
 - **Functional components** only in React
 - **No classes** - prefer functions and plain objects
 - Indicator IDs are `snake_case` (e.g., `fed_balance_sheet`)
-- All dates stored as `YYYY-MM-DD` strings in database
+- All dates stored as `YYYY-MM-DD` strings in D1
 
 ## Do Not Break (Invariants)
 
@@ -122,26 +148,28 @@ curl https://pxi-api.novoamorx1.workers.dev/api/pxi | jq .
 
 4. **CORS whitelist in `worker/api.ts`** - Only allows `pxicommand.com` origins
 
-5. **Rate limit: 100 req/min per IP** - Hardcoded in worker, don't remove
+5. **Rate limit: 100 req/min per IP** - Hardcoded in worker
+
+6. **D1 database ID** - `2254a52c-11b6-40a6-8881-ef6880f70d21` in wrangler.toml
 
 ## Known Sharp Edges / Gotchas
 
-- **Yahoo Finance rate limits** - Fetcher adds delays between requests; don't parallelize aggressively
-- **FRED API** - Some series update weekly/monthly; missing data returns null, not error
-- **Neon cold starts** - First query after idle can be slow (~500ms)
-- **Wrangler v4** - Use `compatibility_flags = ["nodejs_compat"]`, not deprecated `node_compat = true`
-- **Frontend build** - Must pass `VITE_API_URL` env var at build time, not runtime
-- **GitHub Actions cron** - Runs at 6:00 AM UTC daily; secrets stored in repo settings
-- **Coinglass/Farside scrapers** - Fragile; may break if sites change HTML structure
+- **Yahoo Finance rate limits** - Fetcher adds delays between requests
+- **FRED API** - Some series update weekly/monthly; missing data returns null
+- **D1 is SQLite** - No array types, no advanced PostgreSQL features
+- **Vectorize embeddings** - 768 dimensions using BGE model
+- **Workers AI rate limits** - Can't generate all embeddings in one request
+- **Wrangler v4** - Use `compatibility_flags = ["nodejs_compat"]`
+- **Frontend build** - Must pass `VITE_API_URL` env var at build time
+- **GitHub Actions cron** - Runs at 6:00 AM UTC daily
 
 ## Dependency Constraints
 
 | Package | Version | Notes |
 |---------|---------|-------|
 | Node.js | 20+ | Required for ESM + fetch |
-| `@neondatabase/serverless` | ^1.0.0 | Must use this for Worker, not `pg` |
-| `yahoo-finance2` | ^2.x | Handles Yahoo auth; don't use raw axios |
-| `wrangler` | 4.x | CLI for Cloudflare Workers/Pages |
+| `wrangler` | 4.x | CLI for Cloudflare Workers/Pages/D1 |
+| `yahoo-finance2` | ^2.x | Handles Yahoo auth |
 | React | 19.x | Using new JSX transform |
 | Vite | 7.x | Frontend build tool |
 
@@ -153,31 +181,29 @@ curl https://pxi-api.novoamorx1.workers.dev/api/pxi | jq .
   - Worker: Cloudflare Worker secrets (`npx wrangler secret put KEY`)
   - CI: GitHub Actions secrets
 - **Required secrets:**
-  - `DATABASE_URL` - Neon connection string (postgres://...)
-  - `PG_HOST`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD` - For local Node scripts
+  - `D1_WRITE_KEY` - API key for write endpoint (GitHub Actions)
+  - `WRITE_API_KEY` - Same key in Worker secrets
+  - `PG_*` - Neon credentials (legacy, still used for fetching)
   - `FRED_API_KEY` - Free from FRED website
-- **API is read-only** - No mutations exposed; safe to be public
-- **Never commit `.env`** - Verify with `git status` before pushing
+- **Write endpoint requires auth** - Bearer token in Authorization header
+- **Never commit `.env`**
 
-## Environment Variables
+## Cloudflare Resources
 
-```bash
-# .env (local development)
-PG_HOST=ep-xyz.us-east-1.aws.neon.tech
-PG_PORT=5432
-PG_DATABASE=pxi
-PG_USER=pxi_owner
-PG_PASSWORD=<secret>
-FRED_API_KEY=<secret>
-DATABASE_URL=postgres://pxi_owner:<password>@ep-xyz.us-east-1.aws.neon.tech/pxi?sslmode=require
-```
+| Resource | Name/ID | Binding |
+|----------|---------|---------|
+| D1 Database | pxi-db / `2254a52c-11b6-40a6-8881-ef6880f70d21` | `DB` |
+| Vectorize Index | pxi-embeddings | `VECTORIZE` |
+| Workers AI | - | `AI` |
+| Worker | pxi-api | - |
+| Pages | pxi-frontend | - |
 
 ## URLs
 
 - **Production site:** https://pxicommand.com
 - **API endpoint:** https://pxi-api.novoamorx1.workers.dev/api/pxi
+- **AI analysis:** https://pxi-api.novoamorx1.workers.dev/api/analyze
+- **Similar periods:** https://pxi-api.novoamorx1.workers.dev/api/similar
 - **Health check:** https://pxi-api.novoamorx1.workers.dev/health
-- **OG image:** https://pxi-api.novoamorx1.workers.dev/og-image.svg
 - **GitHub repo:** https://github.com/scottdhughes/pxi-command
-- **Cloudflare dashboard:** https://dash.cloudflare.com (Workers & Pages)
-- **Neon dashboard:** https://console.neon.tech
+- **Cloudflare dashboard:** https://dash.cloudflare.com

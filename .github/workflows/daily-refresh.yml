@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run daily refresh
+      - name: Fetch and calculate
         env:
           PG_HOST: ${{ secrets.PG_HOST }}
           PG_PORT: ${{ secrets.PG_PORT }}
@@ -32,8 +32,18 @@ jobs:
           PG_PASSWORD: ${{ secrets.PG_PASSWORD }}
           PG_SSL: require
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: npm run cron:daily
+
+      - name: Sync to D1
+        env:
+          PG_HOST: ${{ secrets.PG_HOST }}
+          PG_PORT: ${{ secrets.PG_PORT }}
+          PG_DATABASE: ${{ secrets.PG_DATABASE }}
+          PG_USER: ${{ secrets.PG_USER }}
+          PG_PASSWORD: ${{ secrets.PG_PASSWORD }}
+          PG_SSL: require
+          D1_WRITE_KEY: ${{ secrets.D1_WRITE_KEY }}
+        run: npx tsx scripts/sync-to-d1.ts
 
       - name: Log result
         if: always()
