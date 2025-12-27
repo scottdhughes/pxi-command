@@ -13,7 +13,8 @@
     "calculate": "tsx src/pipeline/calculate.ts",
     "migrate": "tsx src/db/migrate.ts",
     "refresh": "tsx src/pipeline/fetch-all.ts && tsx src/pipeline/calculate.ts",
-    "cron:daily": "tsx src/pipeline/cron.ts",
+    "cron:daily": "tsx src/pipeline/cron-fast.ts",
+    "cron:daily:slow": "tsx src/pipeline/cron.ts",
     "cron:intraday": "tsx src/pipeline/cron.ts --intraday"
   },
   "dependencies": {

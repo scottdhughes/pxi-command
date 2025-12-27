@@ -315,7 +315,7 @@ export default {
         }, { headers: corsHeaders });
       }
 
-      // Write endpoint for fetchers (requires API key)
+      // Write endpoint for fetchers (requires API key) - supports batch writes
       if (url.pathname === '/api/write' && request.method === 'POST') {
         const authHeader = request.headers.get('Authorization');
         const apiKey = authHeader?.replace('Bearer ', '');
@@ -326,53 +326,105 @@ export default {
         }
 
         const body = await request.json() as {
-          type: 'indicator' | 'category' | 'pxi';
-          data: any;
+          // Legacy single-record format
+          type?: 'indicator' | 'category' | 'pxi';
+          data?: any;
+          // New batch format
+          indicators?: { indicator_id: string; date: string; value: number; source: string }[];
+          categories?: { category: string; date: string; score: number; weight: number; weighted_score: number }[];
+          pxi?: { date: string; score: number; label: string; status: string; delta_1d: number | null; delta_7d: number | null; delta_30d: number | null };
         };
 
-        if (body.type === 'indicator') {
-          const { indicator_id, date, value, source } = body.data;
-          await env.DB.prepare(`
-            INSERT OR REPLACE INTO indicator_values (indicator_id, date, value, source)
-            VALUES (?, ?, ?, ?)
-          `).bind(indicator_id, date, value, source).run();
-        } else if (body.type === 'category') {
-          const { category, date, score, weight, weighted_score } = body.data;
-          await env.DB.prepare(`
-            INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-            VALUES (?, ?, ?, ?, ?)
-          `).bind(category, date, score, weight, weighted_score).run();
-        } else if (body.type === 'pxi') {
-          const { date, score, label, status, delta_1d, delta_7d, delta_30d } = body.data;
-          await env.DB.prepare(`
-            INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `).bind(date, score, label, status, delta_1d, delta_7d, delta_30d).run();
+        const stmts: D1PreparedStatement[] = [];
 
-          // Generate embedding for this date
-          const indicators = await env.DB.prepare(`
-            SELECT indicator_id, value FROM indicator_values
-            WHERE date = ? ORDER BY indicator_id
-          `).bind(date).all<IndicatorRow>();
-
-          if (indicators.results && indicators.results.length >= 10) {
-            const indicatorText = indicators.results
-              .map((i) => `${i.indicator_id}: ${i.value.toFixed(2)}`)
-              .join(', ');
-
-            const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-              text: indicatorText,
-            });
-
-            await env.VECTORIZE.upsert([{
-              id: date,
-              values: embedding.data[0],
-              metadata: { date, score },
-            }]);
+        // Handle legacy single-record format
+        if (body.type) {
+          if (body.type === 'indicator') {
+            const { indicator_id, date, value, source } = body.data;
+            stmts.push(env.DB.prepare(`
+              INSERT OR REPLACE INTO indicator_values (indicator_id, date, value, source)
+              VALUES (?, ?, ?, ?)
+            `).bind(indicator_id, date, value, source));
+          } else if (body.type === 'category') {
+            const { category, date, score, weight, weighted_score } = body.data;
+            stmts.push(env.DB.prepare(`
+              INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
+              VALUES (?, ?, ?, ?, ?)
+            `).bind(category, date, score, weight, weighted_score));
+          } else if (body.type === 'pxi') {
+            const { date, score, label, status, delta_1d, delta_7d, delta_30d } = body.data;
+            stmts.push(env.DB.prepare(`
+              INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).bind(date, score, label, status, delta_1d, delta_7d, delta_30d));
           }
         }
 
-        return Response.json({ success: true }, { headers: corsHeaders });
+        // Handle batch indicator values
+        for (const ind of body.indicators || []) {
+          stmts.push(env.DB.prepare(`
+            INSERT OR REPLACE INTO indicator_values (indicator_id, date, value, source)
+            VALUES (?, ?, ?, ?)
+          `).bind(ind.indicator_id, ind.date, ind.value, ind.source));
+        }
+
+        // Handle batch category scores
+        for (const cat of body.categories || []) {
+          stmts.push(env.DB.prepare(`
+            INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
+            VALUES (?, ?, ?, ?, ?)
+          `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score));
+        }
+
+        // Handle PXI score
+        if (body.pxi) {
+          const p = body.pxi;
+          stmts.push(env.DB.prepare(`
+            INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).bind(p.date, p.score, p.label, p.status, p.delta_1d, p.delta_7d, p.delta_30d));
+        }
+
+        // Execute in batches (D1 batch limit is ~100 statements)
+        const BATCH_SIZE = 100;
+        let totalWritten = 0;
+
+        for (let i = 0; i < stmts.length; i += BATCH_SIZE) {
+          const batch = stmts.slice(i, i + BATCH_SIZE);
+          await env.DB.batch(batch);
+          totalWritten += batch.length;
+        }
+
+        // Generate embedding if we have PXI data
+        if (body.pxi) {
+          const indicators = await env.DB.prepare(`
+            SELECT indicator_id, value FROM indicator_values
+            WHERE date = ? ORDER BY indicator_id
+          `).bind(body.pxi.date).all<IndicatorRow>();
+
+          if (indicators.results && indicators.results.length >= 10) {
+            try {
+              const indicatorText = indicators.results
+                .map((i) => `${i.indicator_id}: ${i.value.toFixed(2)}`)
+                .join(', ');
+
+              const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+                text: indicatorText,
+              });
+
+              await env.VECTORIZE.upsert([{
+                id: body.pxi.date,
+                values: embedding.data[0],
+                metadata: { date: body.pxi.date, score: body.pxi.score },
+              }]);
+            } catch (e) {
+              // Embedding generation is best-effort, don't fail the whole write
+              console.error('Embedding generation failed:', e);
+            }
+          }
+        }
+
+        return Response.json({ success: true, written: totalWritten }, { headers: corsHeaders });
       }
 
       // AI: Analyze current regime

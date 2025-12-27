@@ -23,11 +23,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Fetch and calculate (writes to D1)
+      - name: Fetch and write to D1 via Worker API
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: 461aad8037e6c7bda5bac789d1393a75
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+          WRITE_API_URL: https://pxi-api.novoamorx1.workers.dev/api/write
         run: npm run cron:daily
 
       - name: Log result
