@@ -28,11 +28,13 @@ function Sparkline({ data }: { data: { score: number }[] }) {
   const max = Math.max(...data.map(d => d.score))
   const range = max - min || 1
 
-  const padding = 2
+  const width = 240
+  const height = 48
+  const padding = 4
 
   const points = data.map((d, i) => {
-    const x = padding + (i / (data.length - 1)) * (100 - padding * 2)
-    const y = padding + (100 - padding * 2) - ((d.score - min) / range) * (100 - padding * 2)
+    const x = padding + (i / (data.length - 1)) * (width - padding * 2)
+    const y = padding + (height - padding * 2) - ((d.score - min) / range) * (height - padding * 2)
     return `${x},${y}`
   }).join(' ')
 
@@ -41,7 +43,11 @@ function Sparkline({ data }: { data: { score: number }[] }) {
   const isUp = lastPoint.score >= firstPoint.score
 
   return (
-    <svg viewBox="0 0 100 20" className="w-48 sm:w-60 h-10 sm:h-12 opacity-70">
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className="w-48 sm:w-60 h-10 sm:h-12 opacity-70"
+      preserveAspectRatio="none"
+    >
       <defs>
         <linearGradient id="lineGradient" x1="0%" y1="0%" x2="100%" y2="0%">
           <stop offset="0%" stopColor="#949ba5" stopOpacity="0.3" />
@@ -51,7 +57,7 @@ function Sparkline({ data }: { data: { score: number }[] }) {
       <polyline
         fill="none"
         stroke="url(#lineGradient)"
-        strokeWidth="0.8"
+        strokeWidth="1.5"
         strokeLinecap="round"
         strokeLinejoin="round"
         points={points}
