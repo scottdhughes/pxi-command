@@ -46,6 +46,53 @@ export default {
       });
     }
 
+    // OG Image endpoint for social sharing
+    if (url.pathname === '/og-image.svg') {
+      try {
+        const sql = neon(env.DATABASE_URL);
+        const rows = await sql`
+          SELECT score, label, status FROM pxi_scores ORDER BY date DESC LIMIT 1
+        ` as { score: string; label: string; status: string }[];
+
+        const pxi = rows[0];
+        if (!pxi) {
+          return new Response('No data', { status: 404 });
+        }
+
+        const score = Math.round(parseFloat(pxi.score));
+        const label = pxi.label;
+        const statusColors: Record<string, string> = {
+          max_pamp: '#00a3ff',
+          pamping: '#00a3ff',
+          neutral: '#949ba5',
+          soft: '#949ba5',
+          dumping: '#949ba5',
+        };
+        const color = statusColors[pxi.status] || '#949ba5';
+        const isLight = pxi.status === 'neutral' || pxi.status === 'soft';
+
+        const svg = `<svg width="1200" height="630" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="630" fill="#000000"/>
+  <text x="600" y="340" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-weight="300" font-size="220" fill="#f3f3f3">${score}</text>
+  <rect x="475" y="400" width="250" height="44" rx="4" fill="${color}" fill-opacity="${isLight ? '0.2' : '1'}"/>
+  <text x="600" y="432" text-anchor="middle" font-family="monospace" font-weight="500" font-size="16" fill="${isLight ? '#f3f3f3' : '#000000'}" letter-spacing="2">${label}</text>
+  <text x="600" y="100" text-anchor="middle" font-family="monospace" font-weight="500" font-size="18" fill="#949ba5" letter-spacing="4">PXI/COMMAND</text>
+  <text x="600" y="580" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" fill="#949ba5" opacity="0.5">MACRO MARKET STRENGTH INDEX</text>
+</svg>`;
+
+        return new Response(svg, {
+          headers: {
+            'Content-Type': 'image/svg+xml',
+            'Cache-Control': 'public, max-age=300',
+            ...corsHeaders,
+          },
+        });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        return new Response(`Error: ${message}`, { status: 500 });
+      }
+    }
+
     // Main PXI endpoint
     if (url.pathname === '/api/pxi') {
       try {
