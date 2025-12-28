@@ -1165,12 +1165,17 @@ export default {
         const cutoffDate = formatDate(thirtyDaysAgo);
 
         const similar = await env.VECTORIZE.query(embedding.data[0], {
-          topK: 10,
-          filter: { date: { $lt: cutoffDate } },
+          topK: 50, // Get more and filter manually
           returnMetadata: 'all',
         });
 
-        if (!similar.matches || similar.matches.length === 0) {
+        // Filter out recent dates manually (limit to 5 to avoid timeout)
+        const filteredMatches = (similar.matches || []).filter(m => {
+          const matchDate = (m.metadata as any)?.date || m.id;
+          return matchDate < cutoffDate;
+        }).slice(0, 5);
+
+        if (filteredMatches.length === 0) {
           return Response.json({
             error: 'No similar historical periods found',
             hint: 'Run /api/backfill to populate historical embeddings'
@@ -1180,27 +1185,34 @@ export default {
         // For each similar period, look at what happened next
         const outcomes: { date: string; similarity: number; score: number; d7_change: number | null; d30_change: number | null }[] = [];
 
-        for (const match of similar.matches) {
+        for (const match of filteredMatches) {
           const histDate = match.id;
           const histScore = (match.metadata as any)?.score || 0;
 
           // Get PXI 7 and 30 days after this date
+          // Calculate date 35 days after
+          const histDateObj = new Date(histDate);
+          histDateObj.setDate(histDateObj.getDate() + 35);
+          const endDate = formatDate(histDateObj);
+
           const futureScores = await env.DB.prepare(`
-            SELECT date, score,
-              julianday(date) - julianday(?) as days_after
-            FROM pxi_scores
-            WHERE date > ? AND date <= date(?, '+35 days')
-            ORDER BY date
-          `).bind(histDate, histDate, histDate).all<{ date: string; score: number; days_after: number }>();
+            SELECT date, score FROM pxi_scores
+            WHERE date > ? AND date <= ?
+            ORDER BY date LIMIT 35
+          `).bind(histDate, endDate).all<{ date: string; score: number }>();
+
+          // Calculate days after manually
+          const histDateMs = new Date(histDate).getTime();
 
           let d7_change: number | null = null;
           let d30_change: number | null = null;
 
           for (const fs of futureScores.results || []) {
-            if (fs.days_after >= 5 && fs.days_after <= 10 && d7_change === null) {
+            const daysAfter = Math.round((new Date(fs.date).getTime() - histDateMs) / (1000 * 60 * 60 * 24));
+            if (daysAfter >= 5 && daysAfter <= 10 && d7_change === null) {
               d7_change = fs.score - histScore;
             }
-            if (fs.days_after >= 25 && fs.days_after <= 35 && d30_change === null) {
+            if (daysAfter >= 25 && daysAfter <= 35 && d30_change === null) {
               d30_change = fs.score - histScore;
             }
           }
@@ -1243,7 +1255,7 @@ export default {
         // Get current PXI
         const currentPxi = await env.DB.prepare(
           'SELECT score, label FROM pxi_scores WHERE date = ?'
-        ).first<{ score: number; label: string }>(latestDate.date);
+        ).bind(latestDate.date).first<{ score: number; label: string }>();
 
         return Response.json({
           current: {
