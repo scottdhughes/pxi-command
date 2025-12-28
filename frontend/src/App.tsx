@@ -21,6 +21,35 @@ interface PXIData {
   }[]
 }
 
+interface PredictionData {
+  current: {
+    date: string
+    score: number
+    label: string
+  }
+  prediction: {
+    d7: {
+      expected_change: number
+      direction: 'UP' | 'DOWN'
+      confidence: number
+      based_on: number
+    } | null
+    d30: {
+      expected_change: number
+      direction: 'UP' | 'DOWN'
+      confidence: number
+      based_on: number
+    } | null
+  }
+  similar_periods: {
+    date: string
+    similarity: string
+    pxi_then: string
+    d7_change: string | null
+    d30_change: string | null
+  }[]
+}
+
 function Sparkline({ data }: { data: { score: number }[] }) {
   if (data.length === 0) return null
 
@@ -106,8 +135,63 @@ function CategoryBar({ name, score }: { name: string; score: number }) {
   )
 }
 
+function PredictionCard({ prediction }: { prediction: PredictionData }) {
+  const d7 = prediction.prediction.d7
+  const d30 = prediction.prediction.d30
+
+  if (!d7 && !d30) return null
+
+  return (
+    <div className="w-full mt-6 sm:mt-10">
+      <div className="text-[10px] sm:text-[11px] text-[#949ba5]/50 uppercase tracking-widest mb-4 text-center">
+        Forecast
+      </div>
+      <div className="flex justify-center gap-6 sm:gap-10">
+        {d7 && (
+          <div className="text-center">
+            <div className={`text-2xl sm:text-3xl font-light ${
+              d7.direction === 'UP' ? 'text-[#00a3ff]' : 'text-[#949ba5]'
+            }`}>
+              {d7.direction === 'UP' ? '+' : ''}{d7.expected_change.toFixed(1)}
+            </div>
+            <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mt-1">
+              7d
+            </div>
+            <div className="text-[9px] text-[#949ba5]/30 mt-0.5">
+              {Math.round(d7.confidence * 100)}% conf
+            </div>
+          </div>
+        )}
+        {d30 && (
+          <div className="text-center">
+            <div className={`text-2xl sm:text-3xl font-light ${
+              d30.direction === 'UP' ? 'text-[#00a3ff]' : 'text-[#949ba5]'
+            }`}>
+              {d30.direction === 'UP' ? '+' : ''}{d30.expected_change.toFixed(1)}
+            </div>
+            <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mt-1">
+              30d
+            </div>
+            <div className="text-[9px] text-[#949ba5]/30 mt-0.5">
+              {Math.round(d30.confidence * 100)}% conf
+            </div>
+          </div>
+        )}
+      </div>
+      {prediction.similar_periods.length > 0 && (
+        <div className="mt-4 text-center">
+          <div className="text-[9px] text-[#949ba5]/30">
+            Based on {prediction.similar_periods.length} similar periods
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function App() {
   const [data, setData] = useState<PXIData | null>(null)
+  const [prediction, setPrediction] = useState<PredictionData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -115,10 +199,25 @@ function App() {
     const fetchData = async () => {
       try {
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
-        const res = await fetch(`${apiUrl}/api/pxi`)
-        if (!res.ok) throw new Error('Failed to fetch')
-        const json = await res.json()
-        setData(json)
+
+        // Fetch PXI data and predictions in parallel
+        const [pxiRes, predRes] = await Promise.all([
+          fetch(`${apiUrl}/api/pxi`),
+          fetch(`${apiUrl}/api/predict`).catch(() => null)
+        ])
+
+        if (!pxiRes.ok) throw new Error('Failed to fetch')
+        const pxiJson = await pxiRes.json()
+        setData(pxiJson)
+
+        // Predictions are optional - don't fail if unavailable
+        if (predRes?.ok) {
+          const predJson = await predRes.json()
+          if (!predJson.error) {
+            setPrediction(predJson)
+          }
+        }
+
         setError(null)
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Unknown error'
@@ -217,6 +316,9 @@ function App() {
               <CategoryBar key={cat.name} name={cat.name} score={cat.score} />
             ))}
         </div>
+
+        {/* Predictions */}
+        {prediction && <PredictionCard prediction={prediction} />}
       </main>
 
       {/* Footer */}
