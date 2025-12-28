@@ -586,6 +586,175 @@ async function handleScheduled(env: Env): Promise<void> {
     }
 
     console.log(`✅ PXI refresh complete: ${result.pxi.score.toFixed(1)} (${result.pxi.label})`);
+
+    // Generate and store prediction for tracking
+    try {
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      const cutoffDate = formatDate(thirtyDaysAgo);
+
+      // Get embedding for today (just created above)
+      const todayEmbedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+        text: indicators
+          .filter(i => i.date === today)
+          .map(i => `${i.indicator_id}: ${i.value.toFixed(2)}`)
+          .join(', '),
+      });
+
+      const similar = await env.VECTORIZE.query(todayEmbedding.data[0], {
+        topK: 50,
+        returnMetadata: 'all',
+      });
+
+      const filteredMatches = (similar.matches || []).filter(m => {
+        const matchDate = (m.metadata as { date?: string })?.date || m.id;
+        return matchDate < cutoffDate;
+      }).slice(0, 5);
+
+      if (filteredMatches.length > 0) {
+        // Calculate predictions from similar periods
+        const outcomes: { d7: number | null; d30: number | null; weight: number }[] = [];
+
+        for (const match of filteredMatches) {
+          const histDate = (match.metadata as { date?: string })?.date || match.id;
+          const histScore = (match.metadata as { score?: number })?.score;
+          if (!histScore) continue;
+
+          const endDate = new Date(histDate);
+          endDate.setDate(endDate.getDate() + 35);
+          const endDateStr = formatDate(endDate);
+
+          const futureScores = await env.DB.prepare(`
+            SELECT date, score FROM pxi_scores WHERE date > ? AND date <= ? ORDER BY date LIMIT 35
+          `).bind(histDate, endDateStr).all<{ date: string; score: number }>();
+
+          const histDateMs = new Date(histDate).getTime();
+          let d7_change: number | null = null;
+          let d30_change: number | null = null;
+
+          for (const fs of futureScores.results || []) {
+            const daysAfter = Math.round((new Date(fs.date).getTime() - histDateMs) / (1000 * 60 * 60 * 24));
+            if (daysAfter >= 5 && daysAfter <= 10 && d7_change === null) {
+              d7_change = fs.score - histScore;
+            }
+            if (daysAfter >= 25 && daysAfter <= 35 && d30_change === null) {
+              d30_change = fs.score - histScore;
+            }
+          }
+
+          outcomes.push({ d7: d7_change, d30: d30_change, weight: match.score });
+        }
+
+        // Calculate weighted predictions
+        const validD7 = outcomes.filter(o => o.d7 !== null);
+        const validD30 = outcomes.filter(o => o.d30 !== null);
+
+        const d7_prediction = validD7.length > 0
+          ? validD7.reduce((sum, o) => sum + o.d7! * o.weight, 0) / validD7.reduce((sum, o) => sum + o.weight, 0)
+          : null;
+        const d30_prediction = validD30.length > 0
+          ? validD30.reduce((sum, o) => sum + o.d30! * o.weight, 0) / validD30.reduce((sum, o) => sum + o.weight, 0)
+          : null;
+
+        // Calculate confidence
+        const d7_directions = validD7.map(o => o.d7! > 0 ? 1 : -1);
+        const d7_confidence = d7_directions.length > 0
+          ? Math.abs(d7_directions.reduce((a, b) => a + b, 0)) / d7_directions.length
+          : 0;
+        const d30_directions = validD30.map(o => o.d30! > 0 ? 1 : -1);
+        const d30_confidence = d30_directions.length > 0
+          ? Math.abs(d30_directions.reduce((a, b) => a + b, 0)) / d30_directions.length
+          : 0;
+
+        // Calculate target dates
+        const target7d = new Date();
+        target7d.setDate(target7d.getDate() + 7);
+        const target30d = new Date();
+        target30d.setDate(target30d.getDate() + 30);
+
+        await env.DB.prepare(`
+          INSERT OR REPLACE INTO prediction_log
+          (prediction_date, target_date_7d, target_date_30d, current_score, predicted_change_7d, predicted_change_30d, confidence_7d, confidence_30d, similar_periods)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          today,
+          d7_prediction !== null ? formatDate(target7d) : null,
+          d30_prediction !== null ? formatDate(target30d) : null,
+          result.pxi.score,
+          d7_prediction,
+          d30_prediction,
+          d7_confidence,
+          d30_confidence,
+          JSON.stringify(filteredMatches.slice(0, 5).map(m => m.id))
+        ).run();
+
+        console.log(`📈 Logged prediction: 7d=${d7_prediction?.toFixed(1) || 'N/A'}, 30d=${d30_prediction?.toFixed(1) || 'N/A'}`);
+      }
+    } catch (predErr) {
+      console.error('Prediction logging failed:', predErr);
+    }
+
+    // Evaluate past predictions
+    try {
+      const pendingPredictions = await env.DB.prepare(`
+        SELECT id, prediction_date, target_date_7d, target_date_30d, current_score,
+               predicted_change_7d, predicted_change_30d, actual_change_7d, actual_change_30d
+        FROM prediction_log
+        WHERE evaluated_at IS NULL
+      `).all<{
+        id: number;
+        prediction_date: string;
+        target_date_7d: string | null;
+        target_date_30d: string | null;
+        current_score: number;
+        predicted_change_7d: number | null;
+        predicted_change_30d: number | null;
+        actual_change_7d: number | null;
+        actual_change_30d: number | null;
+      }>();
+
+      let evaluated = 0;
+      for (const pred of pendingPredictions.results || []) {
+        let needsUpdate = false;
+        let actual7d = pred.actual_change_7d;
+        let actual30d = pred.actual_change_30d;
+
+        if (pred.target_date_7d && pred.target_date_7d <= today && actual7d === null) {
+          const score7d = await env.DB.prepare(
+            'SELECT score FROM pxi_scores WHERE date = ?'
+          ).bind(pred.target_date_7d).first<{ score: number }>();
+          if (score7d) {
+            actual7d = score7d.score - pred.current_score;
+            needsUpdate = true;
+          }
+        }
+
+        if (pred.target_date_30d && pred.target_date_30d <= today && actual30d === null) {
+          const score30d = await env.DB.prepare(
+            'SELECT score FROM pxi_scores WHERE date = ?'
+          ).bind(pred.target_date_30d).first<{ score: number }>();
+          if (score30d) {
+            actual30d = score30d.score - pred.current_score;
+            needsUpdate = true;
+          }
+        }
+
+        if (needsUpdate) {
+          const fullyEvaluated = (actual7d !== null || pred.predicted_change_7d === null) &&
+                                 (actual30d !== null || pred.predicted_change_30d === null);
+          await env.DB.prepare(`
+            UPDATE prediction_log SET actual_change_7d = ?, actual_change_30d = ?, evaluated_at = ? WHERE id = ?
+          `).bind(actual7d, actual30d, fullyEvaluated ? new Date().toISOString() : null, pred.id).run();
+          evaluated++;
+        }
+      }
+
+      if (evaluated > 0) {
+        console.log(`✅ Evaluated ${evaluated} past predictions`);
+      }
+    } catch (evalErr) {
+      console.error('Prediction evaluation failed:', evalErr);
+    }
   } else {
     console.log('⚠️ Could not calculate PXI - insufficient data');
   }
@@ -1025,6 +1194,79 @@ export default {
               metadata: { date: targetDate, score: result.pxi.score, label: result.pxi.label },
             }]);
             embedded = true;
+
+            // Generate and store prediction for tracking
+            try {
+              const thirtyDaysAgo = new Date();
+              thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+              const cutoffDate = formatDate(thirtyDaysAgo);
+
+              const similar = await env.VECTORIZE.query(embedding.data[0], {
+                topK: 50,
+                returnMetadata: 'all',
+              });
+
+              const filteredMatches = (similar.matches || []).filter(m => {
+                const matchDate = (m.metadata as any)?.date || m.id;
+                return matchDate < cutoffDate;
+              }).slice(0, 5);
+
+              if (filteredMatches.length > 0) {
+                // Calculate predictions from similar periods
+                const outcomes: { d7: number | null; d30: number | null }[] = [];
+                for (const match of filteredMatches) {
+                  const histDate = match.id;
+                  const histScore = (match.metadata as any)?.score || 0;
+                  const histDateObj = new Date(histDate);
+                  histDateObj.setDate(histDateObj.getDate() + 35);
+                  const endDate = formatDate(histDateObj);
+
+                  const futureScores = await env.DB.prepare(`
+                    SELECT date, score FROM pxi_scores WHERE date > ? AND date <= ? ORDER BY date LIMIT 35
+                  `).bind(histDate, endDate).all<{ date: string; score: number }>();
+
+                  const histDateMs = new Date(histDate).getTime();
+                  let d7 = null, d30 = null;
+                  for (const fs of futureScores.results || []) {
+                    const daysAfter = Math.round((new Date(fs.date).getTime() - histDateMs) / (1000 * 60 * 60 * 24));
+                    if (daysAfter >= 5 && daysAfter <= 10 && d7 === null) d7 = fs.score - histScore;
+                    if (daysAfter >= 25 && daysAfter <= 35 && d30 === null) d30 = fs.score - histScore;
+                  }
+                  outcomes.push({ d7, d30 });
+                }
+
+                const valid7 = outcomes.filter(o => o.d7 !== null);
+                const valid30 = outcomes.filter(o => o.d30 !== null);
+                const pred7 = valid7.length > 0 ? valid7.reduce((s, o) => s + o.d7!, 0) / valid7.length : null;
+                const pred30 = valid30.length > 0 ? valid30.reduce((s, o) => s + o.d30!, 0) / valid30.length : null;
+                const conf7 = valid7.length > 0 ? Math.abs(valid7.filter(o => o.d7! > 0).length - valid7.filter(o => o.d7! < 0).length) / valid7.length : null;
+                const conf30 = valid30.length > 0 ? Math.abs(valid30.filter(o => o.d30! > 0).length - valid30.filter(o => o.d30! < 0).length) / valid30.length : null;
+
+                // Calculate target dates
+                const targetDate7d = new Date(targetDate);
+                targetDate7d.setDate(targetDate7d.getDate() + 7);
+                const targetDate30d = new Date(targetDate);
+                targetDate30d.setDate(targetDate30d.getDate() + 30);
+
+                await env.DB.prepare(`
+                  INSERT OR REPLACE INTO prediction_log
+                  (prediction_date, target_date_7d, target_date_30d, current_score, predicted_change_7d, predicted_change_30d, confidence_7d, confidence_30d, similar_periods)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `).bind(
+                  targetDate,
+                  formatDate(targetDate7d),
+                  formatDate(targetDate30d),
+                  result.pxi.score,
+                  pred7,
+                  pred30,
+                  conf7,
+                  conf30,
+                  JSON.stringify(filteredMatches.map(m => m.id))
+                ).run();
+              }
+            } catch (predErr) {
+              console.error('Prediction logging failed:', predErr);
+            }
           }
         } catch (e) {
           console.error('Embedding generation failed:', e);
@@ -1254,15 +1496,50 @@ export default {
           });
         }
 
-        // Calculate weighted predictions
+        // Load model params for accuracy weighting
+        const modelParams = await env.DB.prepare(
+          'SELECT param_key, param_value FROM model_params'
+        ).all<{ param_key: string; param_value: number }>();
+        const params: Record<string, number> = {};
+        for (const p of modelParams.results || []) {
+          params[p.param_key] = p.param_value;
+        }
+        const accuracyWeight = params['accuracy_weight'] || 0.3;
+        const minPredictions = params['min_predictions_for_weight'] || 3;
+
+        // Look up historical accuracy for each period
+        const periodDates = outcomes.map(o => o.date);
+        const accuracyScores: Record<string, number> = {};
+        if (periodDates.length > 0) {
+          const placeholders = periodDates.map(() => '?').join(',');
+          const accuracyResults = await env.DB.prepare(`
+            SELECT period_date, accuracy_score, times_used
+            FROM period_accuracy
+            WHERE period_date IN (${placeholders})
+          `).bind(...periodDates).all<{ period_date: string; accuracy_score: number; times_used: number }>();
+          for (const a of accuracyResults.results || []) {
+            // Only use accuracy weight if period has been used enough times
+            if (a.times_used >= minPredictions) {
+              accuracyScores[a.period_date] = a.accuracy_score;
+            }
+          }
+        }
+
+        // Calculate weighted predictions (combining similarity + accuracy)
         const validD7 = outcomes.filter(o => o.d7_change !== null);
         const validD30 = outcomes.filter(o => o.d30_change !== null);
+
+        const getWeight = (o: typeof outcomes[0]) => {
+          const accScore = accuracyScores[o.date] ?? 0.5; // Default to 0.5 if no history
+          // Blend similarity and accuracy: (1-w)*similarity + w*accuracy
+          return (1 - accuracyWeight) * o.similarity + accuracyWeight * accScore;
+        };
 
         const weightedAvg = (items: typeof outcomes, key: 'd7_change' | 'd30_change') => {
           const valid = items.filter(i => i[key] !== null);
           if (valid.length === 0) return null;
-          const totalWeight = valid.reduce((sum, i) => sum + i.similarity, 0);
-          const weightedSum = valid.reduce((sum, i) => sum + (i[key]! * i.similarity), 0);
+          const totalWeight = valid.reduce((sum, i) => sum + getWeight(i), 0);
+          const weightedSum = valid.reduce((sum, i) => sum + (i[key]! * getWeight(i)), 0);
           return weightedSum / totalWeight;
         };
 
@@ -1351,6 +1628,383 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           status: pxi.status,
           categories: categories.results,
           analysis: (analysis as { response: string }).response,
+        }, { headers: corsHeaders });
+      }
+
+      // Evaluate past predictions against actual results
+      if (url.pathname === '/api/evaluate' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader || authHeader !== `Bearer ${env.WRITE_API_KEY}`) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        // Get all predictions that haven't been evaluated yet
+        const pendingPredictions = await env.DB.prepare(`
+          SELECT id, prediction_date, target_date_7d, target_date_30d, current_score,
+                 predicted_change_7d, predicted_change_30d, actual_change_7d, actual_change_30d
+          FROM prediction_log
+          WHERE evaluated_at IS NULL
+          ORDER BY prediction_date ASC
+        `).all<{
+          id: number;
+          prediction_date: string;
+          target_date_7d: string | null;
+          target_date_30d: string | null;
+          current_score: number;
+          predicted_change_7d: number | null;
+          predicted_change_30d: number | null;
+          actual_change_7d: number | null;
+          actual_change_30d: number | null;
+        }>();
+
+        const today = new Date().toISOString().split('T')[0];
+        let evaluated = 0;
+
+        for (const pred of pendingPredictions.results || []) {
+          let needsUpdate = false;
+          let actual7d = pred.actual_change_7d;
+          let actual30d = pred.actual_change_30d;
+
+          // Check if we can evaluate 7d prediction
+          if (pred.target_date_7d && pred.target_date_7d <= today && actual7d === null) {
+            const score7d = await env.DB.prepare(
+              'SELECT score FROM pxi_scores WHERE date = ?'
+            ).bind(pred.target_date_7d).first<{ score: number }>();
+
+            if (score7d) {
+              actual7d = score7d.score - pred.current_score;
+              needsUpdate = true;
+            }
+          }
+
+          // Check if we can evaluate 30d prediction
+          if (pred.target_date_30d && pred.target_date_30d <= today && actual30d === null) {
+            const score30d = await env.DB.prepare(
+              'SELECT score FROM pxi_scores WHERE date = ?'
+            ).bind(pred.target_date_30d).first<{ score: number }>();
+
+            if (score30d) {
+              actual30d = score30d.score - pred.current_score;
+              needsUpdate = true;
+            }
+          }
+
+          // Update if we have new actual values
+          if (needsUpdate) {
+            const fullyEvaluated = (actual7d !== null || pred.predicted_change_7d === null) &&
+                                   (actual30d !== null || pred.predicted_change_30d === null);
+
+            await env.DB.prepare(`
+              UPDATE prediction_log
+              SET actual_change_7d = ?, actual_change_30d = ?, evaluated_at = ?
+              WHERE id = ?
+            `).bind(
+              actual7d,
+              actual30d,
+              fullyEvaluated ? new Date().toISOString() : null,
+              pred.id
+            ).run();
+            evaluated++;
+          }
+        }
+
+        return Response.json({
+          success: true,
+          pending: pendingPredictions.results?.length || 0,
+          evaluated,
+        }, { headers: corsHeaders });
+      }
+
+      // Get prediction accuracy metrics
+      if (url.pathname === '/api/accuracy' && request.method === 'GET') {
+        // Get all evaluated predictions
+        const predictions = await env.DB.prepare(`
+          SELECT prediction_date, predicted_change_7d, predicted_change_30d,
+                 actual_change_7d, actual_change_30d, confidence_7d, confidence_30d
+          FROM prediction_log
+          WHERE actual_change_7d IS NOT NULL OR actual_change_30d IS NOT NULL
+          ORDER BY prediction_date DESC
+          LIMIT 100
+        `).all<{
+          prediction_date: string;
+          predicted_change_7d: number | null;
+          predicted_change_30d: number | null;
+          actual_change_7d: number | null;
+          actual_change_30d: number | null;
+          confidence_7d: number | null;
+          confidence_30d: number | null;
+        }>();
+
+        if (!predictions.results || predictions.results.length === 0) {
+          return Response.json({
+            message: 'No evaluated predictions yet',
+            total_predictions: 0,
+            metrics: null,
+          }, { headers: corsHeaders });
+        }
+
+        // Calculate accuracy metrics
+        let d7_correct_direction = 0;
+        let d7_total = 0;
+        let d7_mae = 0; // Mean Absolute Error
+        let d30_correct_direction = 0;
+        let d30_total = 0;
+        let d30_mae = 0;
+
+        const recentPredictions: {
+          date: string;
+          predicted_7d: number | null;
+          actual_7d: number | null;
+          error_7d: number | null;
+          predicted_30d: number | null;
+          actual_30d: number | null;
+          error_30d: number | null;
+        }[] = [];
+
+        for (const p of predictions.results) {
+          const pred7d = p.predicted_change_7d;
+          const act7d = p.actual_change_7d;
+          const pred30d = p.predicted_change_30d;
+          const act30d = p.actual_change_30d;
+
+          let error7d: number | null = null;
+          let error30d: number | null = null;
+
+          if (pred7d !== null && act7d !== null) {
+            d7_total++;
+            error7d = Math.abs(pred7d - act7d);
+            d7_mae += error7d;
+            // Direction accuracy: both positive or both negative
+            if ((pred7d > 0 && act7d > 0) || (pred7d < 0 && act7d < 0) || (pred7d === 0 && act7d === 0)) {
+              d7_correct_direction++;
+            }
+          }
+
+          if (pred30d !== null && act30d !== null) {
+            d30_total++;
+            error30d = Math.abs(pred30d - act30d);
+            d30_mae += error30d;
+            if ((pred30d > 0 && act30d > 0) || (pred30d < 0 && act30d < 0) || (pred30d === 0 && act30d === 0)) {
+              d30_correct_direction++;
+            }
+          }
+
+          if (recentPredictions.length < 10) {
+            recentPredictions.push({
+              date: p.prediction_date,
+              predicted_7d: pred7d,
+              actual_7d: act7d,
+              error_7d: error7d,
+              predicted_30d: pred30d,
+              actual_30d: act30d,
+              error_30d: error30d,
+            });
+          }
+        }
+
+        return Response.json({
+          total_predictions: predictions.results.length,
+          metrics: {
+            d7: d7_total > 0 ? {
+              direction_accuracy: (d7_correct_direction / d7_total * 100).toFixed(1) + '%',
+              mean_absolute_error: (d7_mae / d7_total).toFixed(2),
+              sample_size: d7_total,
+            } : null,
+            d30: d30_total > 0 ? {
+              direction_accuracy: (d30_correct_direction / d30_total * 100).toFixed(1) + '%',
+              mean_absolute_error: (d30_mae / d30_total).toFixed(2),
+              sample_size: d30_total,
+            } : null,
+          },
+          recent_predictions: recentPredictions,
+        }, { headers: corsHeaders });
+      }
+
+      // Retrain: Update period accuracy scores and tune model parameters
+      if (url.pathname === '/api/retrain' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader || authHeader !== `Bearer ${env.WRITE_API_KEY}`) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        // Get all evaluated predictions with their similar periods
+        const evaluatedPreds = await env.DB.prepare(`
+          SELECT prediction_date, similar_periods, predicted_change_7d, predicted_change_30d,
+                 actual_change_7d, actual_change_30d
+          FROM prediction_log
+          WHERE (actual_change_7d IS NOT NULL OR actual_change_30d IS NOT NULL)
+            AND similar_periods IS NOT NULL
+        `).all<{
+          prediction_date: string;
+          similar_periods: string;
+          predicted_change_7d: number | null;
+          predicted_change_30d: number | null;
+          actual_change_7d: number | null;
+          actual_change_30d: number | null;
+        }>();
+
+        if (!evaluatedPreds.results || evaluatedPreds.results.length === 0) {
+          return Response.json({
+            message: 'No evaluated predictions to learn from',
+            periods_updated: 0,
+          }, { headers: corsHeaders });
+        }
+
+        // Track accuracy for each period
+        const periodStats: Record<string, {
+          times_used: number;
+          correct_7d: number;
+          total_7d: number;
+          errors_7d: number[];
+          correct_30d: number;
+          total_30d: number;
+          errors_30d: number[];
+        }> = {};
+
+        for (const pred of evaluatedPreds.results) {
+          let periods: string[] = [];
+          try {
+            periods = JSON.parse(pred.similar_periods);
+          } catch { continue; }
+
+          const pred7d = pred.predicted_change_7d;
+          const act7d = pred.actual_change_7d;
+          const pred30d = pred.predicted_change_30d;
+          const act30d = pred.actual_change_30d;
+
+          for (const periodDate of periods) {
+            if (!periodStats[periodDate]) {
+              periodStats[periodDate] = {
+                times_used: 0,
+                correct_7d: 0, total_7d: 0, errors_7d: [],
+                correct_30d: 0, total_30d: 0, errors_30d: [],
+              };
+            }
+            const stats = periodStats[periodDate];
+            stats.times_used++;
+
+            // 7d accuracy
+            if (pred7d !== null && act7d !== null) {
+              stats.total_7d++;
+              const correctDir = (pred7d > 0 && act7d > 0) || (pred7d < 0 && act7d < 0) || (pred7d === 0 && act7d === 0);
+              if (correctDir) stats.correct_7d++;
+              stats.errors_7d.push(Math.abs(pred7d - act7d));
+            }
+
+            // 30d accuracy
+            if (pred30d !== null && act30d !== null) {
+              stats.total_30d++;
+              const correctDir = (pred30d > 0 && act30d > 0) || (pred30d < 0 && act30d < 0) || (pred30d === 0 && act30d === 0);
+              if (correctDir) stats.correct_30d++;
+              stats.errors_30d.push(Math.abs(pred30d - act30d));
+            }
+          }
+        }
+
+        // Update period_accuracy table
+        let periodsUpdated = 0;
+        for (const [periodDate, stats] of Object.entries(periodStats)) {
+          // Calculate accuracy score (0-1) based on direction accuracy
+          const dir7d = stats.total_7d > 0 ? stats.correct_7d / stats.total_7d : 0.5;
+          const dir30d = stats.total_30d > 0 ? stats.correct_30d / stats.total_30d : 0.5;
+          // Weight 7d more since we have more data
+          const accuracyScore = stats.total_30d > 0
+            ? (dir7d * 0.6 + dir30d * 0.4)
+            : dir7d;
+
+          const avgError7d = stats.errors_7d.length > 0
+            ? stats.errors_7d.reduce((a, b) => a + b, 0) / stats.errors_7d.length
+            : null;
+          const avgError30d = stats.errors_30d.length > 0
+            ? stats.errors_30d.reduce((a, b) => a + b, 0) / stats.errors_30d.length
+            : null;
+
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO period_accuracy
+            (period_date, times_used, correct_direction_7d, correct_direction_30d,
+             total_7d_predictions, total_30d_predictions, avg_error_7d, avg_error_30d,
+             accuracy_score, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          `).bind(
+            periodDate,
+            stats.times_used,
+            stats.correct_7d,
+            stats.correct_30d,
+            stats.total_7d,
+            stats.total_30d,
+            avgError7d,
+            avgError30d,
+            accuracyScore
+          ).run();
+          periodsUpdated++;
+        }
+
+        // Tune model parameters based on overall accuracy
+        const totalPreds = evaluatedPreds.results.length;
+        let total7dCorrect = 0, total7d = 0;
+        for (const pred of evaluatedPreds.results) {
+          if (pred.predicted_change_7d !== null && pred.actual_change_7d !== null) {
+            total7d++;
+            const p = pred.predicted_change_7d;
+            const a = pred.actual_change_7d;
+            if ((p > 0 && a > 0) || (p < 0 && a < 0)) total7dCorrect++;
+          }
+        }
+        const overallAccuracy = total7d > 0 ? total7dCorrect / total7d : 0.5;
+
+        // Adjust accuracy_weight based on how well accuracy-weighted predictions are doing
+        // If overall accuracy > 60%, increase weight; if < 50%, decrease
+        let newAccuracyWeight = 0.3; // default
+        if (overallAccuracy > 0.65) {
+          newAccuracyWeight = 0.5; // Accuracy weighting is working well
+        } else if (overallAccuracy > 0.55) {
+          newAccuracyWeight = 0.4;
+        } else if (overallAccuracy < 0.45) {
+          newAccuracyWeight = 0.2; // Fall back more to similarity
+        }
+
+        await env.DB.prepare(`
+          UPDATE model_params SET param_value = ?, updated_at = datetime('now'),
+          notes = ? WHERE param_key = 'accuracy_weight'
+        `).bind(
+          newAccuracyWeight,
+          `Auto-tuned based on ${total7d} predictions (${(overallAccuracy * 100).toFixed(1)}% accuracy)`
+        ).run();
+
+        return Response.json({
+          success: true,
+          predictions_analyzed: totalPreds,
+          periods_updated: periodsUpdated,
+          overall_accuracy: (overallAccuracy * 100).toFixed(1) + '%',
+          new_accuracy_weight: newAccuracyWeight,
+          top_periods: Object.entries(periodStats)
+            .sort((a, b) => b[1].times_used - a[1].times_used)
+            .slice(0, 5)
+            .map(([date, s]) => ({
+              date,
+              times_used: s.times_used,
+              accuracy_7d: s.total_7d > 0 ? (s.correct_7d / s.total_7d * 100).toFixed(0) + '%' : 'N/A',
+            })),
+        }, { headers: corsHeaders });
+      }
+
+      // Get model parameters (for debugging/monitoring)
+      if (url.pathname === '/api/model' && request.method === 'GET') {
+        const params = await env.DB.prepare(
+          'SELECT param_key, param_value, updated_at, notes FROM model_params ORDER BY param_key'
+        ).all<{ param_key: string; param_value: number; updated_at: string; notes: string }>();
+
+        const periodAccuracy = await env.DB.prepare(`
+          SELECT period_date, accuracy_score, times_used, avg_error_7d
+          FROM period_accuracy
+          WHERE times_used >= 2
+          ORDER BY accuracy_score DESC
+          LIMIT 10
+        `).all<{ period_date: string; accuracy_score: number; times_used: number; avg_error_7d: number }>();
+
+        return Response.json({
+          params: params.results,
+          top_accurate_periods: periodAccuracy.results,
         }, { headers: corsHeaders });
       }
 
