@@ -1012,6 +1012,269 @@ export default {
         }, { headers: corsHeaders });
       }
 
+      // Backfill historical PXI scores and embeddings (requires auth)
+      if (url.pathname === '/api/backfill' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        const apiKey = authHeader?.replace('Bearer ', '');
+
+        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        const body = await request.json() as { start?: string; end?: string; limit?: number };
+        const limit = body.limit || 50; // Process 50 dates per request to avoid timeout
+
+        // Get all unique dates with indicator data that don't have PXI scores yet
+        const datesResult = await env.DB.prepare(`
+          SELECT DISTINCT iv.date
+          FROM indicator_values iv
+          LEFT JOIN pxi_scores ps ON iv.date = ps.date
+          WHERE ps.date IS NULL
+          ${body.start ? `AND iv.date >= '${body.start}'` : ''}
+          ${body.end ? `AND iv.date <= '${body.end}'` : ''}
+          ORDER BY iv.date DESC
+          LIMIT ?
+        `).bind(limit).all<{ date: string }>();
+
+        const dates = datesResult.results || [];
+        let processed = 0;
+        let succeeded = 0;
+        let embedded = 0;
+        const results: { date: string; score?: number; categories?: number; error?: string }[] = [];
+
+        for (const { date } of dates) {
+          processed++;
+          try {
+            const result = await calculatePXI(env.DB, date);
+
+            if (!result || result.categories.length < 2) {
+              results.push({ date, error: 'Insufficient data' });
+              continue;
+            }
+
+            // Write PXI score
+            await env.DB.prepare(`
+              INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).bind(
+              result.pxi.date,
+              result.pxi.score,
+              result.pxi.label,
+              result.pxi.status,
+              result.pxi.delta_1d,
+              result.pxi.delta_7d,
+              result.pxi.delta_30d
+            ).run();
+
+            // Write category scores
+            const catStmts = result.categories.map(cat =>
+              env.DB.prepare(`
+                INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
+                VALUES (?, ?, ?, ?, ?)
+              `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score)
+            );
+            if (catStmts.length > 0) {
+              await env.DB.batch(catStmts);
+            }
+
+            succeeded++;
+            results.push({ date, score: result.pxi.score, categories: result.categories.length });
+
+            // Generate embedding for Vectorize
+            try {
+              const indicators = await env.DB.prepare(`
+                SELECT indicator_id, value FROM indicator_values WHERE date = ? ORDER BY indicator_id
+              `).bind(date).all<{ indicator_id: string; value: number }>();
+
+              if (indicators.results && indicators.results.length >= 5) {
+                const indicatorText = indicators.results
+                  .map(i => `${i.indicator_id}: ${i.value.toFixed(4)}`)
+                  .join(', ');
+
+                const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+                  text: indicatorText,
+                });
+
+                await env.VECTORIZE.upsert([{
+                  id: date,
+                  values: embedding.data[0],
+                  metadata: { date, score: result.pxi.score, label: result.pxi.label },
+                }]);
+                embedded++;
+              }
+            } catch (e) {
+              // Embedding is best-effort
+              console.error(`Embedding failed for ${date}:`, e);
+            }
+          } catch (e) {
+            results.push({ date, error: e instanceof Error ? e.message : 'Unknown error' });
+          }
+        }
+
+        // Check remaining dates
+        const remainingResult = await env.DB.prepare(`
+          SELECT COUNT(DISTINCT iv.date) as cnt
+          FROM indicator_values iv
+          LEFT JOIN pxi_scores ps ON iv.date = ps.date
+          WHERE ps.date IS NULL
+        `).first<{ cnt: number }>();
+
+        return Response.json({
+          success: true,
+          processed,
+          succeeded,
+          embedded,
+          remaining: remainingResult?.cnt || 0,
+          results,
+        }, { headers: corsHeaders });
+      }
+
+      // Predict PXI direction based on similar historical regimes
+      if (url.pathname === '/api/predict' && request.method === 'GET') {
+        // Get latest indicator values
+        const latestDate = await env.DB.prepare(
+          'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 1'
+        ).first<{ date: string }>();
+
+        if (!latestDate) {
+          return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
+        }
+
+        // Get indicator values for embedding
+        const indicators = await env.DB.prepare(`
+          SELECT indicator_id, value FROM indicator_values
+          WHERE date = ? ORDER BY indicator_id
+        `).bind(latestDate.date).all<{ indicator_id: string; value: number }>();
+
+        if (!indicators.results || indicators.results.length < 5) {
+          return Response.json({ error: 'Insufficient indicators' }, { status: 400, headers: corsHeaders });
+        }
+
+        // Create embedding for current state
+        const indicatorText = indicators.results
+          .map(i => `${i.indicator_id}: ${i.value.toFixed(4)}`)
+          .join(', ');
+
+        const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+          text: indicatorText,
+        });
+
+        // Find similar historical periods (excluding recent 30 days)
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        const cutoffDate = formatDate(thirtyDaysAgo);
+
+        const similar = await env.VECTORIZE.query(embedding.data[0], {
+          topK: 10,
+          filter: { date: { $lt: cutoffDate } },
+          returnMetadata: 'all',
+        });
+
+        if (!similar.matches || similar.matches.length === 0) {
+          return Response.json({
+            error: 'No similar historical periods found',
+            hint: 'Run /api/backfill to populate historical embeddings'
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        // For each similar period, look at what happened next
+        const outcomes: { date: string; similarity: number; score: number; d7_change: number | null; d30_change: number | null }[] = [];
+
+        for (const match of similar.matches) {
+          const histDate = match.id;
+          const histScore = (match.metadata as any)?.score || 0;
+
+          // Get PXI 7 and 30 days after this date
+          const futureScores = await env.DB.prepare(`
+            SELECT date, score,
+              julianday(date) - julianday(?) as days_after
+            FROM pxi_scores
+            WHERE date > ? AND date <= date(?, '+35 days')
+            ORDER BY date
+          `).bind(histDate, histDate, histDate).all<{ date: string; score: number; days_after: number }>();
+
+          let d7_change: number | null = null;
+          let d30_change: number | null = null;
+
+          for (const fs of futureScores.results || []) {
+            if (fs.days_after >= 5 && fs.days_after <= 10 && d7_change === null) {
+              d7_change = fs.score - histScore;
+            }
+            if (fs.days_after >= 25 && fs.days_after <= 35 && d30_change === null) {
+              d30_change = fs.score - histScore;
+            }
+          }
+
+          outcomes.push({
+            date: histDate,
+            similarity: match.score,
+            score: histScore,
+            d7_change,
+            d30_change,
+          });
+        }
+
+        // Calculate weighted predictions
+        const validD7 = outcomes.filter(o => o.d7_change !== null);
+        const validD30 = outcomes.filter(o => o.d30_change !== null);
+
+        const weightedAvg = (items: typeof outcomes, key: 'd7_change' | 'd30_change') => {
+          const valid = items.filter(i => i[key] !== null);
+          if (valid.length === 0) return null;
+          const totalWeight = valid.reduce((sum, i) => sum + i.similarity, 0);
+          const weightedSum = valid.reduce((sum, i) => sum + (i[key]! * i.similarity), 0);
+          return weightedSum / totalWeight;
+        };
+
+        const d7_prediction = weightedAvg(outcomes, 'd7_change');
+        const d30_prediction = weightedAvg(outcomes, 'd30_change');
+
+        // Calculate confidence (based on agreement of similar periods)
+        const d7_directions = validD7.map(o => o.d7_change! > 0 ? 1 : -1);
+        const d7_agreement = d7_directions.length > 0
+          ? Math.abs(d7_directions.reduce((a, b) => a + b, 0)) / d7_directions.length
+          : 0;
+
+        const d30_directions = validD30.map(o => o.d30_change! > 0 ? 1 : -1);
+        const d30_agreement = d30_directions.length > 0
+          ? Math.abs(d30_directions.reduce((a, b) => a + b, 0)) / d30_directions.length
+          : 0;
+
+        // Get current PXI
+        const currentPxi = await env.DB.prepare(
+          'SELECT score, label FROM pxi_scores WHERE date = ?'
+        ).first<{ score: number; label: string }>(latestDate.date);
+
+        return Response.json({
+          current: {
+            date: latestDate.date,
+            score: currentPxi?.score,
+            label: currentPxi?.label,
+          },
+          prediction: {
+            d7: d7_prediction !== null ? {
+              expected_change: d7_prediction,
+              direction: d7_prediction > 0 ? 'UP' : 'DOWN',
+              confidence: d7_agreement,
+              based_on: validD7.length,
+            } : null,
+            d30: d30_prediction !== null ? {
+              expected_change: d30_prediction,
+              direction: d30_prediction > 0 ? 'UP' : 'DOWN',
+              confidence: d30_agreement,
+              based_on: validD30.length,
+            } : null,
+          },
+          similar_periods: outcomes.slice(0, 5).map(o => ({
+            date: o.date,
+            similarity: (o.similarity * 100).toFixed(1) + '%',
+            pxi_then: o.score.toFixed(1),
+            d7_change: o.d7_change?.toFixed(1),
+            d30_change: o.d30_change?.toFixed(1),
+          })),
+        }, { headers: corsHeaders });
+      }
+
       // AI: Analyze current regime
       if (url.pathname === '/api/analyze' && request.method === 'GET') {
         // Get latest PXI and categories
