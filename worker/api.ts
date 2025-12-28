@@ -918,6 +918,58 @@ export default {
         return Response.json({ success: true, written: totalWritten }, { headers: corsHeaders });
       }
 
+      // Recalculate PXI for a given date (requires auth)
+      if (url.pathname === '/api/recalculate' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        const apiKey = authHeader?.replace('Bearer ', '');
+
+        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        const body = await request.json() as { date?: string };
+        const targetDate = body.date || formatDate(new Date());
+
+        const result = await calculatePXI(env.DB, targetDate);
+
+        if (!result) {
+          return Response.json({ error: 'Insufficient data for calculation', date: targetDate }, { status: 400, headers: corsHeaders });
+        }
+
+        // Write PXI score
+        await env.DB.prepare(`
+          INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          result.pxi.date,
+          result.pxi.score,
+          result.pxi.label,
+          result.pxi.status,
+          result.pxi.delta_1d,
+          result.pxi.delta_7d,
+          result.pxi.delta_30d
+        ).run();
+
+        // Write category scores
+        const catStmts = result.categories.map(cat =>
+          env.DB.prepare(`
+            INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
+            VALUES (?, ?, ?, ?, ?)
+          `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score)
+        );
+        if (catStmts.length > 0) {
+          await env.DB.batch(catStmts);
+        }
+
+        return Response.json({
+          success: true,
+          date: targetDate,
+          score: result.pxi.score,
+          label: result.pxi.label,
+          categories: result.categories.length,
+        }, { headers: corsHeaders });
+      }
+
       // AI: Analyze current regime
       if (url.pathname === '/api/analyze' && request.method === 'GET') {
         // Get latest PXI and categories
