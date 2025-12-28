@@ -1003,12 +1003,40 @@ export default {
           await env.DB.batch(catStmts);
         }
 
+        // Generate embedding for Vectorize (for similarity search)
+        let embedded = false;
+        try {
+          const indicators = await env.DB.prepare(`
+            SELECT indicator_id, value FROM indicator_values WHERE date = ? ORDER BY indicator_id
+          `).bind(targetDate).all<{ indicator_id: string; value: number }>();
+
+          if (indicators.results && indicators.results.length >= 5) {
+            const indicatorText = indicators.results
+              .map(i => `${i.indicator_id}: ${i.value.toFixed(4)}`)
+              .join(', ');
+
+            const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+              text: indicatorText,
+            });
+
+            await env.VECTORIZE.upsert([{
+              id: targetDate,
+              values: embedding.data[0],
+              metadata: { date: targetDate, score: result.pxi.score, label: result.pxi.label },
+            }]);
+            embedded = true;
+          }
+        } catch (e) {
+          console.error('Embedding generation failed:', e);
+        }
+
         return Response.json({
           success: true,
           date: targetDate,
           score: result.pxi.score,
           label: result.pxi.label,
           categories: result.categories.length,
+          embedded,
         }, { headers: corsHeaders });
       }
 
