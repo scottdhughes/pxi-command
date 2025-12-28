@@ -320,43 +320,65 @@ interface IndicatorConfig {
   invert: boolean;
 }
 
+// Full 28-indicator configuration matching src/config/indicators.ts
+// Total weights sum to 1.0 (100%)
 const INDICATOR_CONFIG: IndicatorConfig[] = [
-  // Liquidity (30%)
-  { id: 'net_liquidity', category: 'liquidity', weight: 0.15, invert: false },
-  { id: 'fed_balance_sheet', category: 'liquidity', weight: 0.08, invert: false },
-  { id: 'reverse_repo', category: 'liquidity', weight: 0.04, invert: true },
-  { id: 'stablecoin_mcap', category: 'liquidity', weight: 0.03, invert: false },
+  // ============== LIQUIDITY (22%) ==============
+  { id: 'fed_balance_sheet', category: 'liquidity', weight: 0.07, invert: false },
+  { id: 'treasury_general_account', category: 'liquidity', weight: 0.05, invert: true },
+  { id: 'reverse_repo', category: 'liquidity', weight: 0.05, invert: true },
+  { id: 'net_liquidity', category: 'liquidity', weight: 0.05, invert: false },
 
-  // Credit (20%)
-  { id: 'high_yield_spread', category: 'credit', weight: 0.08, invert: true },
-  { id: 'investment_grade_spread', category: 'credit', weight: 0.06, invert: true },
-  { id: 'hyg', category: 'credit', weight: 0.03, invert: false },
-  { id: 'lqd', category: 'credit', weight: 0.03, invert: false },
+  // ============== CREDIT (18%) ==============
+  { id: 'hy_oas_spread', category: 'credit', weight: 0.05, invert: true },
+  { id: 'ig_oas_spread', category: 'credit', weight: 0.04, invert: true },
+  { id: 'yield_curve_2s10s', category: 'credit', weight: 0.05, invert: false },
+  { id: 'bbb_aaa_spread', category: 'credit', weight: 0.04, invert: true },
 
-  // Volatility (20%)
-  { id: 'vix', category: 'volatility', weight: 0.10, invert: true },
+  // ============== VOLATILITY (18%) ==============
+  { id: 'vix', category: 'volatility', weight: 0.08, invert: true },
   { id: 'vix_term_structure', category: 'volatility', weight: 0.05, invert: true },
-  { id: 'tlt', category: 'volatility', weight: 0.05, invert: false },
+  { id: 'aaii_sentiment', category: 'volatility', weight: 0.05, invert: false },
 
-  // Rates (15%)
-  { id: 'yield_curve', category: 'rates', weight: 0.08, invert: false },
-  { id: 'ten_year_yield', category: 'rates', weight: 0.07, invert: true },
+  // ============== BREADTH (12%) ==============
+  { id: 'rsp_spy_ratio', category: 'breadth', weight: 0.04, invert: false },
+  { id: 'sector_breadth', category: 'breadth', weight: 0.04, invert: false },
+  { id: 'small_cap_strength', category: 'breadth', weight: 0.02, invert: false },
+  { id: 'midcap_strength', category: 'breadth', weight: 0.02, invert: false },
 
-  // Risk Appetite (15%)
-  { id: 'rsp_spy_ratio', category: 'risk_appetite', weight: 0.05, invert: false },
-  { id: 'copper_gold_ratio', category: 'risk_appetite', weight: 0.05, invert: false },
-  { id: 'fear_greed', category: 'risk_appetite', weight: 0.05, invert: false },
+  // ============== MACRO (10%) ==============
+  { id: 'ism_manufacturing', category: 'macro', weight: 0.03, invert: false },
+  { id: 'jobless_claims', category: 'macro', weight: 0.04, invert: true },
+  { id: 'cfnai', category: 'macro', weight: 0.03, invert: false },
+
+  // ============== GLOBAL (10%) ==============
+  { id: 'dxy', category: 'global', weight: 0.03, invert: true },
+  { id: 'copper_gold_ratio', category: 'global', weight: 0.03, invert: false },
+  { id: 'em_spread', category: 'global', weight: 0.02, invert: true },
+  { id: 'audjpy', category: 'global', weight: 0.02, invert: false },
+
+  // ============== CRYPTO (10%) ==============
+  { id: 'btc_vs_200dma', category: 'crypto', weight: 0.04, invert: false },
+  { id: 'stablecoin_mcap', category: 'crypto', weight: 0.03, invert: false },
+  { id: 'btc_price', category: 'crypto', weight: 0.03, invert: false },
 ];
 
+// Proper empirical percentile calculation
 function calculatePercentile(value: number, history: number[]): number {
   if (history.length === 0) return 50;
   const sorted = [...history].sort((a, b) => a - b);
-  let rank = 0;
+
+  // Count values less than current value
+  let below = 0;
+  let equal = 0;
   for (const v of sorted) {
-    if (v < value) rank++;
-    else break;
+    if (v < value) below++;
+    else if (v === value) equal++;
   }
-  return (rank / sorted.length) * 100;
+
+  // Use midpoint for ties (standard practice)
+  const rank = below + equal / 2;
+  return (rank / history.length) * 100;
 }
 
 function getLabel(score: number): string {

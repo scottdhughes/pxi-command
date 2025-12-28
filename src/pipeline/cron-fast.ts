@@ -352,6 +352,42 @@ async function postToWorkerAPI(): Promise<void> {
   console.log(`\n✅ Total written: ${totalWritten} records`);
 }
 
+// ============== Trigger PXI Recalculation ==============
+
+async function triggerRecalculation(): Promise<void> {
+  if (!WRITE_API_KEY) {
+    throw new Error('WRITE_API_KEY not set');
+  }
+
+  const baseUrl = WRITE_API_URL.replace('/api/write', '');
+  const today = new Date().toISOString().split('T')[0];
+
+  console.log(`\n━━━ Recalculating PXI ━━━`);
+  console.log(`  Date: ${today}`);
+
+  try {
+    const response = await fetch(`${baseUrl}/api/recalculate`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${WRITE_API_KEY}`,
+      },
+      body: JSON.stringify({ date: today }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Recalculate error ${response.status}: ${errorText}`);
+    }
+
+    const result = await response.json() as { success: boolean; score: number; label: string; categories: number };
+    console.log(`  ✓ PXI: ${result.score.toFixed(1)} (${result.label})`);
+    console.log(`  ✓ Categories: ${result.categories}`);
+  } catch (err: any) {
+    console.error(`  ✗ Recalculation failed: ${err.message}`);
+  }
+}
+
 // ============== Main ==============
 
 async function main(): Promise<void> {
@@ -371,6 +407,9 @@ async function main(): Promise<void> {
 
     // Post to Worker API
     await postToWorkerAPI();
+
+    // Trigger PXI recalculation
+    await triggerRecalculation();
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`\n✅ Daily refresh complete in ${duration}s`);

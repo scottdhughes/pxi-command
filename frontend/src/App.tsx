@@ -84,11 +84,12 @@ function StatusBadge({ status, label }: { status: string; label: string }) {
 
 function CategoryBar({ name, score }: { name: string; score: number }) {
   const isHigh = score >= 70
+  const displayName = name.replace(/_/g, ' ')
 
   return (
     <div className="flex items-center gap-2 sm:gap-4">
-      <span className="w-16 sm:w-24 text-right text-[#949ba5] text-[11px] sm:text-[13px] tracking-wide capitalize">
-        {name}
+      <span className="w-20 sm:w-28 text-right text-[#949ba5] text-[11px] sm:text-[13px] tracking-wide capitalize">
+        {displayName}
       </span>
       <div className="flex-1 h-[3px] bg-[#26272b] rounded-full overflow-hidden">
         <div

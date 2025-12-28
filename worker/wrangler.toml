@@ -18,6 +18,6 @@ index_name = "pxi-embeddings"
 [ai]
 binding = "AI"
 
-# Cron Triggers - Daily refresh at 6:00 AM UTC
-[triggers]
-crons = ["0 6 * * *"]
+# Cron Triggers - Disabled (using GitHub Actions instead due to Yahoo API blocking Workers)
+# [triggers]
+# crons = ["0 6 * * *"]
