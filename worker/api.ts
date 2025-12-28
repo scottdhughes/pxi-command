@@ -671,19 +671,39 @@ export default {
 
       // Main PXI endpoint
       if (url.pathname === '/api/pxi') {
-        // Get latest PXI score
-        const pxi = await env.DB.prepare(
-          'SELECT date, score, label, status, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 1'
-        ).first<PXIRow>();
+        // Find the most recent date with at least 3 categories (skip incomplete weekend data)
+        const recentScores = await env.DB.prepare(
+          'SELECT date, score, label, status, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 10'
+        ).all<PXIRow>();
+
+        let pxi: PXIRow | null = null;
+        let catResult: D1Result<CategoryRow> | null = null;
+
+        for (const candidate of recentScores.results || []) {
+          const cats = await env.DB.prepare(
+            'SELECT category, score, weight FROM category_scores WHERE date = ?'
+          ).bind(candidate.date).all<CategoryRow>();
+
+          if ((cats.results?.length || 0) >= 3) {
+            pxi = candidate;
+            catResult = cats;
+            break;
+          }
+        }
+
+        // Fallback to latest if no date has 3+ categories
+        if (!pxi) {
+          pxi = recentScores.results?.[0] || null;
+          if (pxi) {
+            catResult = await env.DB.prepare(
+              'SELECT category, score, weight FROM category_scores WHERE date = ?'
+            ).bind(pxi.date).all<CategoryRow>();
+          }
+        }
 
         if (!pxi) {
           return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
         }
-
-        // Get categories for the same date
-        const catResult = await env.DB.prepare(
-          'SELECT category, score, weight FROM category_scores WHERE date = ?'
-        ).bind(pxi.date).all<CategoryRow>();
 
         // Get sparkline (last 30 days)
         const sparkResult = await env.DB.prepare(
@@ -700,7 +720,7 @@ export default {
             d7: pxi.delta_7d,
             d30: pxi.delta_30d,
           },
-          categories: (catResult.results || []).map((c) => ({
+          categories: (catResult?.results || []).map((c) => ({
             name: c.category,
             score: c.score,
             weight: c.weight,
