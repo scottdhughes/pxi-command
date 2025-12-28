@@ -755,6 +755,91 @@ async function handleScheduled(env: Env): Promise<void> {
     } catch (evalErr) {
       console.error('Prediction evaluation failed:', evalErr);
     }
+
+    // Retrain model periodically (update period accuracy scores and tune params)
+    try {
+      const evaluatedPreds = await env.DB.prepare(`
+        SELECT prediction_date, similar_periods, predicted_change_7d, predicted_change_30d,
+               actual_change_7d, actual_change_30d
+        FROM prediction_log
+        WHERE (actual_change_7d IS NOT NULL OR actual_change_30d IS NOT NULL)
+          AND similar_periods IS NOT NULL
+      `).all<{
+        prediction_date: string;
+        similar_periods: string;
+        predicted_change_7d: number | null;
+        predicted_change_30d: number | null;
+        actual_change_7d: number | null;
+        actual_change_30d: number | null;
+      }>();
+
+      if (evaluatedPreds.results && evaluatedPreds.results.length >= 3) {
+        // Track accuracy for each period
+        const periodStats: Record<string, {
+          times_used: number;
+          correct_7d: number;
+          total_7d: number;
+          errors_7d: number[];
+        }> = {};
+
+        for (const pred of evaluatedPreds.results) {
+          let periods: string[] = [];
+          try { periods = JSON.parse(pred.similar_periods); } catch { continue; }
+
+          for (const periodDate of periods) {
+            if (!periodStats[periodDate]) {
+              periodStats[periodDate] = { times_used: 0, correct_7d: 0, total_7d: 0, errors_7d: [] };
+            }
+            const stats = periodStats[periodDate];
+            stats.times_used++;
+
+            if (pred.predicted_change_7d !== null && pred.actual_change_7d !== null) {
+              stats.total_7d++;
+              const p = pred.predicted_change_7d, a = pred.actual_change_7d;
+              if ((p > 0 && a > 0) || (p < 0 && a < 0)) stats.correct_7d++;
+              stats.errors_7d.push(Math.abs(p - a));
+            }
+          }
+        }
+
+        // Update period_accuracy table
+        for (const [periodDate, stats] of Object.entries(periodStats)) {
+          const accuracyScore = stats.total_7d > 0 ? stats.correct_7d / stats.total_7d : 0.5;
+          const avgError = stats.errors_7d.length > 0
+            ? stats.errors_7d.reduce((a, b) => a + b, 0) / stats.errors_7d.length : null;
+
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO period_accuracy
+            (period_date, times_used, correct_direction_7d, total_7d_predictions, avg_error_7d, accuracy_score, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+          `).bind(periodDate, stats.times_used, stats.correct_7d, stats.total_7d, avgError, accuracyScore).run();
+        }
+
+        // Auto-tune accuracy_weight
+        let total7dCorrect = 0, total7d = 0;
+        for (const pred of evaluatedPreds.results) {
+          if (pred.predicted_change_7d !== null && pred.actual_change_7d !== null) {
+            total7d++;
+            const p = pred.predicted_change_7d, a = pred.actual_change_7d;
+            if ((p > 0 && a > 0) || (p < 0 && a < 0)) total7dCorrect++;
+          }
+        }
+        const overallAccuracy = total7d > 0 ? total7dCorrect / total7d : 0.5;
+        let newWeight = 0.3;
+        if (overallAccuracy > 0.65) newWeight = 0.5;
+        else if (overallAccuracy > 0.55) newWeight = 0.4;
+        else if (overallAccuracy < 0.45) newWeight = 0.2;
+
+        await env.DB.prepare(`
+          UPDATE model_params SET param_value = ?, updated_at = datetime('now'),
+          notes = ? WHERE param_key = 'accuracy_weight'
+        `).bind(newWeight, `Auto-tuned: ${(overallAccuracy * 100).toFixed(0)}% accuracy on ${total7d} predictions`).run();
+
+        console.log(`🧠 Retrained model: ${Object.keys(periodStats).length} periods, ${(overallAccuracy * 100).toFixed(0)}% accuracy, weight=${newWeight}`);
+      }
+    } catch (retrainErr) {
+      console.error('Model retrain failed:', retrainErr);
+    }
   } else {
     console.log('⚠️ Could not calculate PXI - insufficient data');
   }
