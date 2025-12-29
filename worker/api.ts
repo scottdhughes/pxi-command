@@ -401,10 +401,18 @@ async function calculatePXI(db: D1Database, targetDate: string): Promise<{
   pxi: { date: string; score: number; label: string; status: string; delta_1d: number | null; delta_7d: number | null; delta_30d: number | null };
   categories: { category: string; date: string; score: number; weight: number; weighted_score: number }[];
 } | null> {
-  // Get indicator values for target date
+  // Get most recent indicator values for each indicator (up to target date)
+  // This allows using lagging data when today's data isn't available yet
   const latestValues = await db.prepare(`
-    SELECT indicator_id, value FROM indicator_values WHERE date = ?
-  `).bind(targetDate).all<{ indicator_id: string; value: number }>();
+    SELECT iv.indicator_id, iv.value, iv.date
+    FROM indicator_values iv
+    INNER JOIN (
+      SELECT indicator_id, MAX(date) as max_date
+      FROM indicator_values
+      WHERE date <= ?
+      GROUP BY indicator_id
+    ) latest ON iv.indicator_id = latest.indicator_id AND iv.date = latest.max_date
+  `).bind(targetDate).all<{ indicator_id: string; value: number; date: string }>();
 
   if (!latestValues.results || latestValues.results.length === 0) {
     return null;
