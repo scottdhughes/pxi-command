@@ -26,28 +26,38 @@ interface PredictionData {
     date: string
     score: number
     label: string
+    bucket: string
   }
   prediction: {
+    method: string
     d7: {
-      expected_change: number
-      direction: 'UP' | 'DOWN'
-      confidence: number
-      based_on: number
-    } | null
+      avg_return: number | null
+      median_return: number | null
+      win_rate: number | null
+      sample_size: number
+    }
     d30: {
-      expected_change: number
-      direction: 'UP' | 'DOWN'
-      confidence: number
-      based_on: number
-    } | null
+      avg_return: number | null
+      median_return: number | null
+      win_rate: number | null
+      sample_size: number
+    }
   }
-  similar_periods: {
-    date: string
-    similarity: string
-    pxi_then: string
-    d7_change: string | null
-    d30_change: string | null
-  }[]
+  extreme_reading: {
+    type: 'OVERSOLD' | 'OVERBOUGHT'
+    threshold: string
+    historical_count: number
+    avg_return_7d: number | null
+    avg_return_30d: number | null
+    win_rate_7d: number | null
+    win_rate_30d: number | null
+    signal: 'BULLISH' | 'BEARISH'
+  } | null
+  interpretation: {
+    bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+    confidence: 'HIGH' | 'MEDIUM' | 'LOW'
+    note: string
+  }
 }
 
 function Sparkline({ data }: { data: { score: number }[] }) {
@@ -136,55 +146,95 @@ function CategoryBar({ name, score }: { name: string; score: number }) {
 }
 
 function PredictionCard({ prediction }: { prediction: PredictionData }) {
-  const d7 = prediction.prediction.d7
-  const d30 = prediction.prediction.d30
+  const { d7, d30 } = prediction.prediction
+  const extreme = prediction.extreme_reading
+  const { bias, confidence, note } = prediction.interpretation
 
-  if (!d7 && !d30) return null
+  const formatReturn = (val: number | null) => {
+    if (val === null) return '—'
+    return `${val >= 0 ? '+' : ''}${val.toFixed(2)}%`
+  }
+
+  const formatWinRate = (val: number | null) => {
+    if (val === null) return '—'
+    return `${Math.round(val)}%`
+  }
+
+  const biasColor = bias === 'BULLISH' ? 'text-[#00a3ff]' : bias === 'BEARISH' ? 'text-[#ff6b6b]' : 'text-[#949ba5]'
 
   return (
     <div className="w-full mt-6 sm:mt-10">
-      <div className="text-[10px] sm:text-[11px] text-[#949ba5]/50 uppercase tracking-widest mb-4 text-center">
-        Forecast
-      </div>
-      <div className="flex justify-center gap-6 sm:gap-10">
-        {d7 && (
-          <div className="text-center">
-            <div className={`text-2xl sm:text-3xl font-light ${
-              d7.direction === 'UP' ? 'text-[#00a3ff]' : 'text-[#949ba5]'
-            }`}>
-              {d7.direction === 'UP' ? '+' : ''}{d7.expected_change.toFixed(1)}
-            </div>
-            <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mt-1">
-              7d
-            </div>
-            <div className="text-[9px] text-[#949ba5]/30 mt-0.5">
-              {Math.round(d7.confidence * 100)}% conf
-            </div>
+      {/* Extreme reading alert */}
+      {extreme && (
+        <div className={`mb-4 px-4 py-2 rounded text-center ${
+          extreme.signal === 'BULLISH' ? 'bg-[#00a3ff]/10 border border-[#00a3ff]/30' : 'bg-[#ff6b6b]/10 border border-[#ff6b6b]/30'
+        }`}>
+          <div className={`text-[11px] font-medium uppercase tracking-wider ${
+            extreme.signal === 'BULLISH' ? 'text-[#00a3ff]' : 'text-[#ff6b6b]'
+          }`}>
+            {extreme.type} — {extreme.signal}
           </div>
-        )}
-        {d30 && (
-          <div className="text-center">
-            <div className={`text-2xl sm:text-3xl font-light ${
-              d30.direction === 'UP' ? 'text-[#00a3ff]' : 'text-[#949ba5]'
-            }`}>
-              {d30.direction === 'UP' ? '+' : ''}{d30.expected_change.toFixed(1)}
-            </div>
-            <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mt-1">
-              30d
-            </div>
-            <div className="text-[9px] text-[#949ba5]/30 mt-0.5">
-              {Math.round(d30.confidence * 100)}% conf
-            </div>
-          </div>
-        )}
-      </div>
-      {prediction.similar_periods.length > 0 && (
-        <div className="mt-4 text-center">
-          <div className="text-[9px] text-[#949ba5]/30">
-            Based on {prediction.similar_periods.length} similar periods
+          <div className="text-[9px] text-[#949ba5]/50 mt-1">
+            {extreme.historical_count} similar readings → {formatWinRate(extreme.win_rate_30d)} win rate
           </div>
         </div>
       )}
+
+      <div className="text-[10px] sm:text-[11px] text-[#949ba5]/50 uppercase tracking-widest mb-4 text-center">
+        Historical Outlook
+      </div>
+
+      {/* Main stats */}
+      <div className="flex justify-center gap-8 sm:gap-12">
+        <div className="text-center">
+          <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mb-2">7 Day</div>
+          <div className={`text-2xl sm:text-3xl font-light ${
+            (d7.avg_return ?? 0) >= 0 ? 'text-[#00a3ff]' : 'text-[#949ba5]'
+          }`}>
+            {formatReturn(d7.avg_return)}
+          </div>
+          <div className="text-[10px] text-[#949ba5]/60 mt-1">
+            avg return
+          </div>
+          <div className="text-[13px] font-mono text-[#f3f3f3]/80 mt-2">
+            {formatWinRate(d7.win_rate)}
+          </div>
+          <div className="text-[9px] text-[#949ba5]/40">
+            win rate
+          </div>
+        </div>
+
+        <div className="text-center">
+          <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mb-2">30 Day</div>
+          <div className={`text-2xl sm:text-3xl font-light ${
+            (d30.avg_return ?? 0) >= 0 ? 'text-[#00a3ff]' : 'text-[#949ba5]'
+          }`}>
+            {formatReturn(d30.avg_return)}
+          </div>
+          <div className="text-[10px] text-[#949ba5]/60 mt-1">
+            avg return
+          </div>
+          <div className="text-[13px] font-mono text-[#f3f3f3]/80 mt-2">
+            {formatWinRate(d30.win_rate)}
+          </div>
+          <div className="text-[9px] text-[#949ba5]/40">
+            win rate
+          </div>
+        </div>
+      </div>
+
+      {/* Interpretation */}
+      <div className="mt-6 text-center">
+        <div className={`text-[11px] font-medium uppercase tracking-wider ${biasColor}`}>
+          {bias}
+        </div>
+        <div className="text-[9px] text-[#949ba5]/40 mt-1">
+          {note}
+        </div>
+        <div className="text-[8px] text-[#949ba5]/30 mt-2">
+          Based on {d7.sample_size} observations • {confidence.toLowerCase()} confidence
+        </div>
+      </div>
     </div>
   )
 }

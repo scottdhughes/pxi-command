@@ -172,6 +172,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     { ticker: 'TLT', id: 'tlt' },
     { ticker: 'GLD', id: 'gold' },
     { ticker: 'BTC-USD', id: 'btc_price' },
+    { ticker: 'SPY', id: 'spy_close' },  // For backtesting forward returns
   ];
 
   for (const { ticker, id } of yahooIndicators) {
@@ -1763,196 +1764,166 @@ export default {
         }, { headers: corsHeaders });
       }
 
-      // Predict PXI direction based on similar historical regimes
+      // Predict SPY returns based on empirical backtest data
       if (url.pathname === '/api/predict' && request.method === 'GET') {
-        // Get latest indicator values
-        const latestDate = await env.DB.prepare(
-          'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 1'
-        ).first<{ date: string }>();
-
-        if (!latestDate) {
-          return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
-        }
-
-        // Get indicator values for embedding
-        const indicators = await env.DB.prepare(`
-          SELECT indicator_id, value FROM indicator_values
-          WHERE date = ? ORDER BY indicator_id
-        `).bind(latestDate.date).all<{ indicator_id: string; value: number }>();
-
-        if (!indicators.results || indicators.results.length < 5) {
-          return Response.json({ error: 'Insufficient indicators' }, { status: 400, headers: corsHeaders });
-        }
-
-        // Create embedding for current state
-        const indicatorText = indicators.results
-          .map(i => `${i.indicator_id}: ${i.value.toFixed(4)}`)
-          .join(', ');
-
-        const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-          text: indicatorText,
-        });
-
-        // Find similar historical periods (excluding recent 30 days)
-        const thirtyDaysAgo = new Date();
-        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-        const cutoffDate = formatDate(thirtyDaysAgo);
-
-        const similar = await env.VECTORIZE.query(embedding.data[0], {
-          topK: 50, // Get more and filter manually
-          returnMetadata: 'all',
-        });
-
-        // Filter out recent dates manually (limit to 5 to avoid timeout)
-        const filteredMatches = (similar.matches || []).filter(m => {
-          const matchDate = (m.metadata as any)?.date || m.id;
-          return matchDate < cutoffDate;
-        }).slice(0, 5);
-
-        if (filteredMatches.length === 0) {
-          return Response.json({
-            error: 'No similar historical periods found',
-            hint: 'Run /api/backfill to populate historical embeddings'
-          }, { status: 400, headers: corsHeaders });
-        }
-
-        // For each similar period, look at what happened next
-        const outcomes: { date: string; similarity: number; score: number; d7_change: number | null; d30_change: number | null }[] = [];
-
-        for (const match of filteredMatches) {
-          const histDate = match.id;
-          const histScore = (match.metadata as any)?.score || 0;
-
-          // Get PXI 7 and 30 days after this date
-          // Calculate date 35 days after
-          const histDateObj = new Date(histDate);
-          histDateObj.setDate(histDateObj.getDate() + 35);
-          const endDate = formatDate(histDateObj);
-
-          const futureScores = await env.DB.prepare(`
-            SELECT date, score FROM pxi_scores
-            WHERE date > ? AND date <= ?
-            ORDER BY date LIMIT 35
-          `).bind(histDate, endDate).all<{ date: string; score: number }>();
-
-          // Calculate days after manually
-          const histDateMs = new Date(histDate).getTime();
-
-          let d7_change: number | null = null;
-          let d30_change: number | null = null;
-
-          for (const fs of futureScores.results || []) {
-            const daysAfter = Math.round((new Date(fs.date).getTime() - histDateMs) / (1000 * 60 * 60 * 24));
-            if (daysAfter >= 5 && daysAfter <= 10 && d7_change === null) {
-              d7_change = fs.score - histScore;
-            }
-            if (daysAfter >= 25 && daysAfter <= 35 && d30_change === null) {
-              d30_change = fs.score - histScore;
-            }
-          }
-
-          outcomes.push({
-            date: histDate,
-            similarity: match.score,
-            score: histScore,
-            d7_change,
-            d30_change,
-          });
-        }
-
-        // Load model params for accuracy weighting
-        const modelParams = await env.DB.prepare(
-          'SELECT param_key, param_value FROM model_params'
-        ).all<{ param_key: string; param_value: number }>();
-        const params: Record<string, number> = {};
-        for (const p of modelParams.results || []) {
-          params[p.param_key] = p.param_value;
-        }
-        const accuracyWeight = params['accuracy_weight'] || 0.3;
-        const minPredictions = params['min_predictions_for_weight'] || 3;
-
-        // Look up historical accuracy for each period
-        const periodDates = outcomes.map(o => o.date);
-        const accuracyScores: Record<string, number> = {};
-        if (periodDates.length > 0) {
-          const placeholders = periodDates.map(() => '?').join(',');
-          const accuracyResults = await env.DB.prepare(`
-            SELECT period_date, accuracy_score, times_used
-            FROM period_accuracy
-            WHERE period_date IN (${placeholders})
-          `).bind(...periodDates).all<{ period_date: string; accuracy_score: number; times_used: number }>();
-          for (const a of accuracyResults.results || []) {
-            // Only use accuracy weight if period has been used enough times
-            if (a.times_used >= minPredictions) {
-              accuracyScores[a.period_date] = a.accuracy_score;
-            }
-          }
-        }
-
-        // Calculate weighted predictions (combining similarity + accuracy)
-        const validD7 = outcomes.filter(o => o.d7_change !== null);
-        const validD30 = outcomes.filter(o => o.d30_change !== null);
-
-        const getWeight = (o: typeof outcomes[0]) => {
-          const accScore = accuracyScores[o.date] ?? 0.5; // Default to 0.5 if no history
-          // Blend similarity and accuracy: (1-w)*similarity + w*accuracy
-          return (1 - accuracyWeight) * o.similarity + accuracyWeight * accScore;
-        };
-
-        const weightedAvg = (items: typeof outcomes, key: 'd7_change' | 'd30_change') => {
-          const valid = items.filter(i => i[key] !== null);
-          if (valid.length === 0) return null;
-          const totalWeight = valid.reduce((sum, i) => sum + getWeight(i), 0);
-          const weightedSum = valid.reduce((sum, i) => sum + (i[key]! * getWeight(i)), 0);
-          return weightedSum / totalWeight;
-        };
-
-        const d7_prediction = weightedAvg(outcomes, 'd7_change');
-        const d30_prediction = weightedAvg(outcomes, 'd30_change');
-
-        // Calculate confidence (based on agreement of similar periods)
-        const d7_directions = validD7.map(o => o.d7_change! > 0 ? 1 : -1);
-        const d7_agreement = d7_directions.length > 0
-          ? Math.abs(d7_directions.reduce((a, b) => a + b, 0)) / d7_directions.length
-          : 0;
-
-        const d30_directions = validD30.map(o => o.d30_change! > 0 ? 1 : -1);
-        const d30_agreement = d30_directions.length > 0
-          ? Math.abs(d30_directions.reduce((a, b) => a + b, 0)) / d30_directions.length
-          : 0;
-
-        // Get current PXI
+        // Get current PXI score
         const currentPxi = await env.DB.prepare(
-          'SELECT score, label FROM pxi_scores WHERE date = ?'
-        ).bind(latestDate.date).first<{ score: number; label: string }>();
+          'SELECT date, score, label FROM pxi_scores ORDER BY date DESC LIMIT 1'
+        ).first<{ date: string; score: number; label: string }>();
+
+        if (!currentPxi) {
+          return Response.json({ error: 'No PXI data' }, { status: 404, headers: corsHeaders });
+        }
+
+        // Get all historical PXI scores with SPY forward returns
+        const pxiScores = await env.DB.prepare(
+          'SELECT date, score FROM pxi_scores ORDER BY date ASC'
+        ).all<{ date: string; score: number }>();
+
+        const spyPrices = await env.DB.prepare(`
+          SELECT date, value FROM indicator_values
+          WHERE indicator_id = 'spy_close' ORDER BY date ASC
+        `).all<{ date: string; value: number }>();
+
+        // Build SPY price map
+        const spyMap = new Map<string, number>();
+        for (const p of spyPrices.results || []) {
+          spyMap.set(p.date, p.value);
+        }
+
+        // Helper to get SPY price (handling weekends)
+        const getSpyPrice = (dateStr: string, maxDays = 5): number | null => {
+          const date = new Date(dateStr);
+          for (let i = 0; i <= maxDays; i++) {
+            const check = new Date(date);
+            check.setDate(check.getDate() + i);
+            const key = check.toISOString().split('T')[0];
+            if (spyMap.has(key)) return spyMap.get(key)!;
+          }
+          return null;
+        };
+
+        // Determine current bucket
+        const score = currentPxi.score;
+        let bucket: string;
+        if (score < 20) bucket = '0-20';
+        else if (score < 40) bucket = '20-40';
+        else if (score < 60) bucket = '40-60';
+        else if (score < 80) bucket = '60-80';
+        else bucket = '80-100';
+
+        // Calculate stats for current bucket from historical data
+        const bucketReturns7d: number[] = [];
+        const bucketReturns30d: number[] = [];
+
+        for (const pxi of pxiScores.results || []) {
+          // Check if this PXI is in the same bucket
+          let pxiBucket: string;
+          if (pxi.score < 20) pxiBucket = '0-20';
+          else if (pxi.score < 40) pxiBucket = '20-40';
+          else if (pxi.score < 60) pxiBucket = '40-60';
+          else if (pxi.score < 80) pxiBucket = '60-80';
+          else pxiBucket = '80-100';
+
+          if (pxiBucket !== bucket) continue;
+
+          // Calculate forward returns
+          const spyNow = getSpyPrice(pxi.date);
+          if (!spyNow) continue;
+
+          const date = new Date(pxi.date);
+          const date7d = new Date(date); date7d.setDate(date7d.getDate() + 7);
+          const date30d = new Date(date); date30d.setDate(date30d.getDate() + 30);
+
+          const spy7d = getSpyPrice(date7d.toISOString().split('T')[0]);
+          const spy30d = getSpyPrice(date30d.toISOString().split('T')[0]);
+
+          if (spy7d) bucketReturns7d.push(((spy7d - spyNow) / spyNow) * 100);
+          if (spy30d) bucketReturns30d.push(((spy30d - spyNow) / spyNow) * 100);
+        }
+
+        // Calculate bucket statistics
+        const avg = (arr: number[]) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+        const winRate = (arr: number[]) => arr.length > 0 ? (arr.filter(r => r > 0).length / arr.length) * 100 : null;
+        const median = (arr: number[]) => {
+          if (arr.length === 0) return null;
+          const sorted = [...arr].sort((a, b) => a - b);
+          const mid = Math.floor(sorted.length / 2);
+          return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        };
+
+        // Check for extreme readings
+        const isExtremeLow = score < 25;
+        const isExtremeHigh = score > 75;
+
+        // Calculate extreme stats if applicable
+        let extremeStats = null;
+        if (isExtremeLow || isExtremeHigh) {
+          const extremeReturns7d: number[] = [];
+          const extremeReturns30d: number[] = [];
+
+          for (const pxi of pxiScores.results || []) {
+            const inRange = isExtremeLow ? pxi.score < 25 : pxi.score > 75;
+            if (!inRange) continue;
+
+            const spyNow = getSpyPrice(pxi.date);
+            if (!spyNow) continue;
+
+            const date = new Date(pxi.date);
+            const date7d = new Date(date); date7d.setDate(date7d.getDate() + 7);
+            const date30d = new Date(date); date30d.setDate(date30d.getDate() + 30);
+
+            const spy7d = getSpyPrice(date7d.toISOString().split('T')[0]);
+            const spy30d = getSpyPrice(date30d.toISOString().split('T')[0]);
+
+            if (spy7d) extremeReturns7d.push(((spy7d - spyNow) / spyNow) * 100);
+            if (spy30d) extremeReturns30d.push(((spy30d - spyNow) / spyNow) * 100);
+          }
+
+          extremeStats = {
+            type: isExtremeLow ? 'OVERSOLD' : 'OVERBOUGHT',
+            threshold: isExtremeLow ? '<25' : '>75',
+            historical_count: extremeReturns7d.length,
+            avg_return_7d: avg(extremeReturns7d),
+            avg_return_30d: avg(extremeReturns30d),
+            win_rate_7d: winRate(extremeReturns7d),
+            win_rate_30d: winRate(extremeReturns30d),
+            signal: isExtremeLow ? 'BULLISH' : 'BEARISH',
+          };
+        }
 
         return Response.json({
           current: {
-            date: latestDate.date,
-            score: currentPxi?.score,
-            label: currentPxi?.label,
+            date: currentPxi.date,
+            score: currentPxi.score,
+            label: currentPxi.label,
+            bucket,
           },
           prediction: {
-            d7: d7_prediction !== null ? {
-              expected_change: d7_prediction,
-              direction: d7_prediction > 0 ? 'UP' : 'DOWN',
-              confidence: d7_agreement,
-              based_on: validD7.length,
-            } : null,
-            d30: d30_prediction !== null ? {
-              expected_change: d30_prediction,
-              direction: d30_prediction > 0 ? 'UP' : 'DOWN',
-              confidence: d30_agreement,
-              based_on: validD30.length,
-            } : null,
+            method: 'empirical_backtest',
+            d7: {
+              avg_return: avg(bucketReturns7d),
+              median_return: median(bucketReturns7d),
+              win_rate: winRate(bucketReturns7d),
+              sample_size: bucketReturns7d.length,
+            },
+            d30: {
+              avg_return: avg(bucketReturns30d),
+              median_return: median(bucketReturns30d),
+              win_rate: winRate(bucketReturns30d),
+              sample_size: bucketReturns30d.length,
+            },
           },
-          similar_periods: outcomes.slice(0, 5).map(o => ({
-            date: o.date,
-            similarity: (o.similarity * 100).toFixed(1) + '%',
-            pxi_then: o.score.toFixed(1),
-            d7_change: o.d7_change?.toFixed(1),
-            d30_change: o.d30_change?.toFixed(1),
-          })),
+          extreme_reading: extremeStats,
+          interpretation: {
+            bias: (winRate(bucketReturns7d) || 50) > 55 ? 'BULLISH' : (winRate(bucketReturns7d) || 50) < 45 ? 'BEARISH' : 'NEUTRAL',
+            confidence: bucketReturns7d.length >= 50 ? 'HIGH' : bucketReturns7d.length >= 20 ? 'MEDIUM' : 'LOW',
+            note: isExtremeLow
+              ? 'PXI in oversold territory - historically bullish setup'
+              : isExtremeHigh
+              ? 'PXI in overbought territory - expect mean reversion'
+              : `PXI in ${bucket} range - typical market conditions`,
+          },
         }, { headers: corsHeaders });
       }
 
@@ -2369,6 +2340,209 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         return Response.json({
           params: params.results,
           top_accurate_periods: periodAccuracy.results,
+        }, { headers: corsHeaders });
+      }
+
+      // Backtest endpoint - calculate conditional return distributions
+      if (url.pathname === '/api/backtest' && request.method === 'GET') {
+        // Get all PXI scores with their dates
+        const pxiScores = await env.DB.prepare(`
+          SELECT date, score FROM pxi_scores ORDER BY date ASC
+        `).all<{ date: string; score: number }>();
+
+        // Get all SPY prices
+        const spyPrices = await env.DB.prepare(`
+          SELECT date, value FROM indicator_values
+          WHERE indicator_id = 'spy_close'
+          ORDER BY date ASC
+        `).all<{ date: string; value: number }>();
+
+        if (!spyPrices.results || spyPrices.results.length === 0) {
+          return Response.json({
+            error: 'No SPY price data available. Run /api/refresh to fetch SPY prices.',
+            hint: 'POST /api/refresh with Authorization header'
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        // Build SPY price lookup map
+        const spyMap = new Map<string, number>();
+        for (const p of spyPrices.results) {
+          spyMap.set(p.date, p.value);
+        }
+
+        // Helper to get SPY price on or after a date (handle weekends/holidays)
+        const getSpyPrice = (dateStr: string, maxDaysForward: number = 5): number | null => {
+          const date = new Date(dateStr);
+          for (let i = 0; i <= maxDaysForward; i++) {
+            const checkDate = new Date(date);
+            checkDate.setDate(checkDate.getDate() + i);
+            const checkStr = checkDate.toISOString().split('T')[0];
+            if (spyMap.has(checkStr)) {
+              return spyMap.get(checkStr)!;
+            }
+          }
+          return null;
+        };
+
+        // Calculate forward returns for each PXI score
+        interface BacktestResult {
+          date: string;
+          pxi_score: number;
+          pxi_bucket: string;
+          spy_price: number | null;
+          spy_7d: number | null;
+          spy_30d: number | null;
+          return_7d: number | null;
+          return_30d: number | null;
+        }
+
+        const results: BacktestResult[] = [];
+
+        for (const pxi of pxiScores.results || []) {
+          const spyNow = getSpyPrice(pxi.date);
+
+          // Get future SPY prices
+          const date = new Date(pxi.date);
+          const date7d = new Date(date);
+          date7d.setDate(date7d.getDate() + 7);
+          const date30d = new Date(date);
+          date30d.setDate(date30d.getDate() + 30);
+
+          const spy7d = getSpyPrice(date7d.toISOString().split('T')[0]);
+          const spy30d = getSpyPrice(date30d.toISOString().split('T')[0]);
+
+          // Calculate returns
+          const return7d = spyNow && spy7d ? ((spy7d - spyNow) / spyNow) * 100 : null;
+          const return30d = spyNow && spy30d ? ((spy30d - spyNow) / spyNow) * 100 : null;
+
+          // Determine PXI bucket
+          let bucket = 'unknown';
+          if (pxi.score < 20) bucket = '0-20';
+          else if (pxi.score < 40) bucket = '20-40';
+          else if (pxi.score < 60) bucket = '40-60';
+          else if (pxi.score < 80) bucket = '60-80';
+          else bucket = '80-100';
+
+          results.push({
+            date: pxi.date,
+            pxi_score: pxi.score,
+            pxi_bucket: bucket,
+            spy_price: spyNow,
+            spy_7d: spy7d,
+            spy_30d: spy30d,
+            return_7d: return7d,
+            return_30d: return30d,
+          });
+        }
+
+        // Aggregate by bucket
+        interface BucketStats {
+          bucket: string;
+          count: number;
+          avg_return_7d: number | null;
+          avg_return_30d: number | null;
+          win_rate_7d: number | null;  // % of positive 7d returns
+          win_rate_30d: number | null; // % of positive 30d returns
+          median_return_7d: number | null;
+          median_return_30d: number | null;
+          min_return_7d: number | null;
+          max_return_7d: number | null;
+          min_return_30d: number | null;
+          max_return_30d: number | null;
+        }
+
+        const buckets = ['0-20', '20-40', '40-60', '60-80', '80-100'];
+        const bucketStats: BucketStats[] = [];
+
+        for (const bucket of buckets) {
+          const bucketResults = results.filter(r => r.pxi_bucket === bucket);
+          const returns7d = bucketResults.map(r => r.return_7d).filter((r): r is number => r !== null);
+          const returns30d = bucketResults.map(r => r.return_30d).filter((r): r is number => r !== null);
+
+          const median = (arr: number[]): number | null => {
+            if (arr.length === 0) return null;
+            const sorted = [...arr].sort((a, b) => a - b);
+            const mid = Math.floor(sorted.length / 2);
+            return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+          };
+
+          bucketStats.push({
+            bucket,
+            count: bucketResults.length,
+            avg_return_7d: returns7d.length > 0 ? returns7d.reduce((a, b) => a + b, 0) / returns7d.length : null,
+            avg_return_30d: returns30d.length > 0 ? returns30d.reduce((a, b) => a + b, 0) / returns30d.length : null,
+            win_rate_7d: returns7d.length > 0 ? (returns7d.filter(r => r > 0).length / returns7d.length) * 100 : null,
+            win_rate_30d: returns30d.length > 0 ? (returns30d.filter(r => r > 0).length / returns30d.length) * 100 : null,
+            median_return_7d: median(returns7d),
+            median_return_30d: median(returns30d),
+            min_return_7d: returns7d.length > 0 ? Math.min(...returns7d) : null,
+            max_return_7d: returns7d.length > 0 ? Math.max(...returns7d) : null,
+            min_return_30d: returns30d.length > 0 ? Math.min(...returns30d) : null,
+            max_return_30d: returns30d.length > 0 ? Math.max(...returns30d) : null,
+          });
+        }
+
+        // Overall stats
+        const allReturns7d = results.map(r => r.return_7d).filter((r): r is number => r !== null);
+        const allReturns30d = results.map(r => r.return_30d).filter((r): r is number => r !== null);
+
+        // Calculate extreme readings analysis
+        const extremeLow = results.filter(r => r.pxi_score < 25);
+        const extremeHigh = results.filter(r => r.pxi_score > 75);
+
+        const extremeLowReturns7d = extremeLow.map(r => r.return_7d).filter((r): r is number => r !== null);
+        const extremeLowReturns30d = extremeLow.map(r => r.return_30d).filter((r): r is number => r !== null);
+        const extremeHighReturns7d = extremeHigh.map(r => r.return_7d).filter((r): r is number => r !== null);
+        const extremeHighReturns30d = extremeHigh.map(r => r.return_30d).filter((r): r is number => r !== null);
+
+        return Response.json({
+          summary: {
+            total_observations: results.length,
+            with_7d_return: allReturns7d.length,
+            with_30d_return: allReturns30d.length,
+            date_range: {
+              start: results[0]?.date,
+              end: results[results.length - 1]?.date,
+            },
+            spy_data_points: spyPrices.results.length,
+          },
+          bucket_analysis: bucketStats,
+          extreme_readings: {
+            low_pxi: {
+              threshold: '<25',
+              count: extremeLow.length,
+              avg_return_7d: extremeLowReturns7d.length > 0
+                ? extremeLowReturns7d.reduce((a, b) => a + b, 0) / extremeLowReturns7d.length
+                : null,
+              avg_return_30d: extremeLowReturns30d.length > 0
+                ? extremeLowReturns30d.reduce((a, b) => a + b, 0) / extremeLowReturns30d.length
+                : null,
+              win_rate_7d: extremeLowReturns7d.length > 0
+                ? (extremeLowReturns7d.filter(r => r > 0).length / extremeLowReturns7d.length) * 100
+                : null,
+              win_rate_30d: extremeLowReturns30d.length > 0
+                ? (extremeLowReturns30d.filter(r => r > 0).length / extremeLowReturns30d.length) * 100
+                : null,
+            },
+            high_pxi: {
+              threshold: '>75',
+              count: extremeHigh.length,
+              avg_return_7d: extremeHighReturns7d.length > 0
+                ? extremeHighReturns7d.reduce((a, b) => a + b, 0) / extremeHighReturns7d.length
+                : null,
+              avg_return_30d: extremeHighReturns30d.length > 0
+                ? extremeHighReturns30d.reduce((a, b) => a + b, 0) / extremeHighReturns30d.length
+                : null,
+              win_rate_7d: extremeHighReturns7d.length > 0
+                ? (extremeHighReturns7d.filter(r => r > 0).length / extremeHighReturns7d.length) * 100
+                : null,
+              win_rate_30d: extremeHighReturns30d.length > 0
+                ? (extremeHighReturns30d.filter(r => r > 0).length / extremeHighReturns30d.length) * 100
+                : null,
+            },
+          },
+          // Include raw data for detailed analysis (optional query param)
+          raw_data: url.searchParams.get('raw') === 'true' ? results : undefined,
         }, { headers: corsHeaders });
       }
 
