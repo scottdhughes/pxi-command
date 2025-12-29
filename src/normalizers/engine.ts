@@ -216,7 +216,7 @@ export async function calculateCategoryScores(
   const dateStr = format(targetDate, 'yyyy-MM-dd');
 
   const categories: Category[] = [
-    'liquidity',
+    'positioning',  // v1.1: was 'liquidity'
     'credit',
     'volatility',
     'breadth',

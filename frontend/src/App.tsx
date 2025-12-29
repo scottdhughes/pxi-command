@@ -31,8 +31,39 @@ interface PXIData {
       title: string
       description: string
       actionable: boolean
+      metrics?: {
+        historical_frequency: number
+        median_return_7d: number | null
+        median_return_30d: number | null
+        false_positive_rate: number | null
+      }
     }[]
   } | null
+}
+
+// v1.1: Signal layer data
+interface SignalData {
+  date: string
+  state: {
+    score: number
+    label: string
+    status: string
+    delta: { d1: number | null; d7: number | null; d30: number | null }
+    categories: { name: string; score: number; weight: number }[]
+  }
+  signal: {
+    type: 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE'
+    risk_allocation: number
+    volatility_percentile: number | null
+    category_dispersion: number
+    adjustments: string[]
+  }
+  regime: {
+    type: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
+    confidence: number
+    description: string
+  } | null
+  divergence: PXIData['divergence']
 }
 
 interface PredictionData {
@@ -160,6 +191,65 @@ function RegimeBadge({ regime }: { regime: PXIData['regime'] }) {
   )
 }
 
+// v1.1: Signal indicator component
+function SignalIndicator({ signal }: { signal: SignalData['signal'] | null }) {
+  if (!signal) return null
+
+  const signalColors: Record<string, string> = {
+    'FULL_RISK': '#00c896',
+    'REDUCED_RISK': '#f59e0b',
+    'RISK_OFF': '#ff6b6b',
+    'DEFENSIVE': '#dc2626',
+  }
+
+  const signalLabels: Record<string, string> = {
+    'FULL_RISK': 'Full Risk',
+    'REDUCED_RISK': 'Reduced',
+    'RISK_OFF': 'Risk Off',
+    'DEFENSIVE': 'Defensive',
+  }
+
+  const color = signalColors[signal.type] || '#949ba5'
+  const allocationPct = Math.round(signal.risk_allocation * 100)
+
+  return (
+    <div className="flex items-center gap-2 sm:gap-4 mb-6">
+      <div className="w-20 sm:w-28 shrink-0 text-right">
+        <span className="text-[9px] text-[#949ba5]/50 uppercase tracking-widest">Signal</span>
+      </div>
+      <div className="flex-1 flex items-center gap-3">
+        <div
+          className="bg-[#0a0a0a]/80 backdrop-blur-sm rounded px-3 py-2"
+          style={{ borderLeft: `2px solid ${color}` }}
+        >
+          <div className="flex items-center gap-3">
+            <span
+              className="text-[11px] font-medium uppercase tracking-wide"
+              style={{ color }}
+            >
+              {signalLabels[signal.type]}
+            </span>
+            <span className="text-[11px] text-[#f3f3f3]/80 font-mono">
+              {allocationPct}%
+            </span>
+          </div>
+          {signal.adjustments.length > 0 && (
+            <p className="text-[9px] text-[#949ba5]/50 mt-1">
+              {signal.adjustments.join(' · ')}
+            </p>
+          )}
+        </div>
+        {signal.volatility_percentile !== null && (
+          <span className="text-[9px] text-[#949ba5]/40">
+            Vol: {signal.volatility_percentile}th pct
+          </span>
+        )}
+      </div>
+      <div className="w-6 sm:w-8 shrink-0" />
+    </div>
+  )
+}
+
 function DivergenceAlerts({ divergence }: { divergence: PXIData['divergence'] }) {
   if (!divergence || divergence.alerts.length === 0) return null
 
@@ -196,6 +286,11 @@ function DivergenceAlerts({ divergence }: { divergence: PXIData['divergence'] })
               <p className="text-[10px] text-[#949ba5]/60 leading-relaxed mt-1">
                 {alert.description}
               </p>
+              {alert.metrics && alert.metrics.historical_frequency > 0 && (
+                <p className="text-[8px] text-[#949ba5]/40 mt-1">
+                  Historically occurred {alert.metrics.historical_frequency.toFixed(1)}% of days
+                </p>
+              )}
             </div>
             <div className="w-6 sm:w-8 shrink-0" />
           </div>
@@ -353,8 +448,8 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Definition</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
             PXI (Pamp Index) is a composite indicator measuring macro market strength across seven
-            dimensions. It synthesizes volatility, credit conditions, breadth, liquidity, and global
-            flows into a single 0-100 score.
+            dimensions. It synthesizes volatility, credit conditions, breadth, positioning, macro,
+            global, and crypto signals into a single 0-100 score using 5-year rolling percentiles.
           </p>
           <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[12px] text-[#f3f3f3]/80">
             PXI = Σ(Cᵢ × Wᵢ) / Σ(Wᵢ)
@@ -369,13 +464,13 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Category Composition</h2>
           <div className="space-y-4">
             {[
-              { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, realized vol', formula: '100 - normalize(VIX, 12, 35)' },
-              { name: 'Credit', weight: 20, indicators: 'HY spreads, IG spreads, HYG/LQD ratio', formula: '100 - normalize(HY_spread, 300, 600)' },
-              { name: 'Breadth', weight: 15, indicators: 'Sector performance dispersion, % sectors > 200DMA', formula: 'pct_sectors_above_avg × 100' },
-              { name: 'Liquidity', weight: 15, indicators: 'TLT flows, gold flows, USD strength', formula: 'composite(TLT_chg, GLD_chg, -DXY_chg)' },
-              { name: 'Macro', weight: 10, indicators: 'Yield curve (10Y-2Y), rate expectations', formula: 'normalize(curve_spread, -50, 150)' },
-              { name: 'Global', weight: 10, indicators: 'EM flows, DXY, global risk appetite', formula: 'composite(EM_perf, -DXY_str, EU_perf)' },
-              { name: 'Crypto', weight: 10, indicators: 'BTC trend, crypto sentiment', formula: 'normalize(BTC_30d_chg, -20, 30)' },
+              { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, AAII sentiment', formula: '100 - percentile(VIX, 5yr)' },
+              { name: 'Credit', weight: 20, indicators: 'HY OAS, IG OAS, 2s10s curve, BBB-AAA spread', formula: '100 - percentile(HY_spread, 5yr)' },
+              { name: 'Breadth', weight: 15, indicators: 'RSP/SPY ratio, sector breadth, small/mid cap strength', formula: 'percentile(breadth_composite, 5yr)' },
+              { name: 'Positioning', weight: 15, indicators: 'Fed balance sheet, TGA, reverse repo, net liquidity', formula: 'percentile(net_liq, 5yr)' },
+              { name: 'Macro', weight: 10, indicators: 'ISM manufacturing, jobless claims, CFNAI', formula: 'percentile(macro_composite, 5yr)' },
+              { name: 'Global', weight: 10, indicators: 'DXY, copper/gold ratio, EM spreads, AUD/JPY', formula: 'percentile(global_composite, 5yr)' },
+              { name: 'Crypto', weight: 10, indicators: 'BTC vs 200DMA, stablecoin mcap, BTC price', formula: 'percentile(crypto_composite, 5yr)' },
             ].map((cat) => (
               <div key={cat.name} className="bg-[#0a0a0a]/60 rounded px-4 py-3">
                 <div className="flex justify-between items-center mb-2">
@@ -391,20 +486,20 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 
         {/* Regime Detection */}
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Regime Detection</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Regime Detection (v1.1)</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
-            Market regime is classified using a voting system across five macro indicators.
-            Each indicator votes RISK_ON (+1), RISK_OFF (-1), or NEUTRAL (0).
+            Market regime is classified using a voting system with percentile-based thresholds
+            calculated over a 5-year rolling window. Each indicator votes RISK_ON, RISK_OFF, or NEUTRAL.
           </p>
           <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[11px] text-[#f3f3f3]/70 space-y-1">
-            <div>VIX &lt; 18 → RISK_ON | VIX &gt; 25 → RISK_OFF</div>
-            <div>HY_spread &lt; 350bp → RISK_ON | &gt; 500bp → RISK_OFF</div>
-            <div>Sector_breadth &gt; 60% → RISK_ON | &lt; 40% → RISK_OFF</div>
-            <div>Yield_curve &gt; 50bp → RISK_ON | &lt; 0 → RISK_OFF</div>
-            <div>DXY &lt; 100 → RISK_ON | &gt; 105 → RISK_OFF</div>
+            <div>VIX &lt; 30th pct → RISK_ON | &gt; 70th pct → RISK_OFF</div>
+            <div>HY_OAS &lt; 30th pct → RISK_ON | &gt; 70th pct → RISK_OFF</div>
+            <div>Breadth &gt; 60% → RISK_ON | &lt; 40% → RISK_OFF (direct)</div>
+            <div>Yield_curve &gt; 60th pct → RISK_ON | &lt; 20th pct → RISK_OFF</div>
+            <div>DXY &lt; 40th pct → RISK_ON | &gt; 70th pct → RISK_OFF</div>
           </div>
           <p className="text-[10px] text-[#949ba5]/50 mt-2">
-            Regime = RISK_ON if Σ(votes) ≥ 2 | RISK_OFF if Σ(votes) ≤ -2 | else TRANSITION
+            Regime = RISK_ON if votes ≥ 3 (or 2 with 0 RISK_OFF) | RISK_OFF if votes ≥ 3 (or 2 with 0 RISK_ON) | else TRANSITION
           </p>
         </section>
 
@@ -530,6 +625,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 function App() {
   const [data, setData] = useState<PXIData | null>(null)
   const [prediction, setPrediction] = useState<PredictionData | null>(null)
+  const [signal, setSignal] = useState<SignalData | null>(null)  // v1.1
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSpec, setShowSpec] = useState(false)
@@ -552,15 +648,24 @@ function App() {
       try {
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
 
-        // Fetch PXI data and predictions in parallel
-        const [pxiRes, predRes] = await Promise.all([
+        // Fetch PXI data, signal data, and predictions in parallel
+        const [pxiRes, signalRes, predRes] = await Promise.all([
           fetch(`${apiUrl}/api/pxi`),
+          fetch(`${apiUrl}/api/signal`).catch(() => null),  // v1.1
           fetch(`${apiUrl}/api/predict`).catch(() => null)
         ])
 
         if (!pxiRes.ok) throw new Error('Failed to fetch')
         const pxiJson = await pxiRes.json()
         setData(pxiJson)
+
+        // v1.1: Signal data
+        if (signalRes?.ok) {
+          const signalJson = await signalRes.json()
+          if (!signalJson.error) {
+            setSignal(signalJson)
+          }
+        }
 
         // Predictions are optional - don't fail if unavailable
         if (predRes?.ok) {
@@ -693,6 +798,9 @@ function App() {
               <CategoryBar key={cat.name} name={cat.name} score={cat.score} />
             ))}
         </div>
+
+        {/* v1.1: Signal Indicator */}
+        {signal && <SignalIndicator signal={signal.signal} />}
 
         {/* Divergence Alerts */}
         {data.divergence && <DivergenceAlerts divergence={data.divergence} />}

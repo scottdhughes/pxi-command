@@ -1,5 +1,5 @@
 export type Category =
-  | 'liquidity'
+  | 'positioning'  // v1.1: renamed from 'liquidity'
   | 'credit'
   | 'volatility'
   | 'breadth'
@@ -72,11 +72,12 @@ export interface PXIResult {
   delta30d?: number;
 }
 
+// v1.1 category weights
 export const CATEGORY_WEIGHTS: Record<Category, number> = {
-  liquidity: 0.22,
-  credit: 0.18,
-  volatility: 0.18,
-  breadth: 0.12,
+  positioning: 0.15,  // v1.1: was liquidity 0.22
+  credit: 0.20,       // v1.1: was 0.18
+  volatility: 0.20,   // v1.1: was 0.18
+  breadth: 0.15,      // v1.1: was 0.12
   macro: 0.10,
   global: 0.10,
   crypto: 0.10,

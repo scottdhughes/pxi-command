@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS indicator_scores (
     raw_value REAL NOT NULL,
     normalized_value REAL NOT NULL,
     percentile_rank REAL,
-    lookback_days INTEGER DEFAULT 504,
+    lookback_days INTEGER DEFAULT 1260,
     calculated_at TEXT DEFAULT (datetime('now')),
     UNIQUE(indicator_id, date)
 );
@@ -87,3 +87,67 @@ CREATE TABLE IF NOT EXISTS market_embeddings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_market_embeddings_date ON market_embeddings(date DESC);
+
+-- ============================================
+-- PXI v1.1 Schema Extensions
+-- ============================================
+
+-- PXI Signal layer (trading/risk allocation)
+CREATE TABLE IF NOT EXISTS pxi_signal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL UNIQUE,
+    pxi_level REAL NOT NULL,
+    delta_pxi_7d REAL,
+    delta_pxi_30d REAL,
+    category_dispersion REAL,
+    regime TEXT NOT NULL,
+    volatility_percentile REAL,
+    risk_allocation REAL NOT NULL,
+    signal_type TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pxi_signal_date ON pxi_signal(date DESC);
+CREATE INDEX IF NOT EXISTS idx_pxi_signal_regime ON pxi_signal(regime);
+CREATE INDEX IF NOT EXISTS idx_pxi_signal_type ON pxi_signal(signal_type);
+
+-- Alert history with performance metrics
+CREATE TABLE IF NOT EXISTS alert_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_date TEXT NOT NULL,
+    alert_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    pxi_at_alert REAL,
+    historical_frequency REAL,
+    median_return_7d REAL,
+    median_return_30d REAL,
+    false_positive_rate REAL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(alert_date, alert_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_history_date ON alert_history(alert_date DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_history_type ON alert_history(alert_type);
+
+-- Backtest results for validation
+CREATE TABLE IF NOT EXISTS backtest_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    lookback_start TEXT NOT NULL,
+    lookback_end TEXT NOT NULL,
+    cagr REAL,
+    volatility REAL,
+    sharpe REAL,
+    max_drawdown REAL,
+    total_trades INTEGER,
+    win_rate REAL,
+    baseline_comparison TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(run_date, strategy)
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_results_date ON backtest_results(run_date DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_results_strategy ON backtest_results(strategy);

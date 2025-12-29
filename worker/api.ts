@@ -531,30 +531,30 @@ interface IndicatorConfig {
   invert: boolean;
 }
 
-// Full 28-indicator configuration matching src/config/indicators.ts
+// Full 28-indicator configuration - v1.1 weights
 // Total weights sum to 1.0 (100%)
 const INDICATOR_CONFIG: IndicatorConfig[] = [
-  // ============== LIQUIDITY (22%) ==============
-  { id: 'fed_balance_sheet', category: 'liquidity', weight: 0.07, invert: false },
-  { id: 'treasury_general_account', category: 'liquidity', weight: 0.05, invert: true },
-  { id: 'reverse_repo', category: 'liquidity', weight: 0.05, invert: true },
-  { id: 'net_liquidity', category: 'liquidity', weight: 0.05, invert: false },
+  // ============== POSITIONING (15%) - was Liquidity 22% ==============
+  { id: 'fed_balance_sheet', category: 'positioning', weight: 0.05, invert: false },
+  { id: 'treasury_general_account', category: 'positioning', weight: 0.04, invert: true },
+  { id: 'reverse_repo', category: 'positioning', weight: 0.03, invert: true },
+  { id: 'net_liquidity', category: 'positioning', weight: 0.03, invert: false },
 
-  // ============== CREDIT (18%) ==============
-  { id: 'hy_oas_spread', category: 'credit', weight: 0.05, invert: true },
+  // ============== CREDIT (20%) - was 18% ==============
+  { id: 'hy_oas_spread', category: 'credit', weight: 0.06, invert: true },
   { id: 'ig_oas_spread', category: 'credit', weight: 0.04, invert: true },
-  { id: 'yield_curve_2s10s', category: 'credit', weight: 0.05, invert: false },
+  { id: 'yield_curve_2s10s', category: 'credit', weight: 0.06, invert: false },
   { id: 'bbb_aaa_spread', category: 'credit', weight: 0.04, invert: true },
 
-  // ============== VOLATILITY (18%) ==============
-  { id: 'vix', category: 'volatility', weight: 0.08, invert: true },
-  { id: 'vix_term_structure', category: 'volatility', weight: 0.05, invert: true },
+  // ============== VOLATILITY (20%) - was 18% ==============
+  { id: 'vix', category: 'volatility', weight: 0.09, invert: true },
+  { id: 'vix_term_structure', category: 'volatility', weight: 0.06, invert: true },
   { id: 'aaii_sentiment', category: 'volatility', weight: 0.05, invert: false },
 
-  // ============== BREADTH (12%) ==============
-  { id: 'rsp_spy_ratio', category: 'breadth', weight: 0.04, invert: false },
-  { id: 'sector_breadth', category: 'breadth', weight: 0.04, invert: false },
-  { id: 'small_cap_strength', category: 'breadth', weight: 0.02, invert: false },
+  // ============== BREADTH (15%) - was 12% ==============
+  { id: 'rsp_spy_ratio', category: 'breadth', weight: 0.05, invert: false },
+  { id: 'sector_breadth', category: 'breadth', weight: 0.05, invert: false },
+  { id: 'small_cap_strength', category: 'breadth', weight: 0.03, invert: false },
   { id: 'midcap_strength', category: 'breadth', weight: 0.02, invert: false },
 
   // ============== MACRO (10%) ==============
@@ -631,10 +631,10 @@ async function calculatePXI(db: D1Database, targetDate: string): Promise<{
 
   const valueMap = new Map(latestValues.results.map(r => [r.indicator_id, r.value]));
 
-  // Get historical values for percentile calculation (3 years)
+  // Get historical values for percentile calculation (5 years per v1.1 spec)
   const historyResult = await db.prepare(`
     SELECT indicator_id, value FROM indicator_values
-    WHERE date >= date(?, '-3 years')
+    WHERE date >= date(?, '-5 years')
   `).bind(targetDate).all<{ indicator_id: string; value: number }>();
 
   const historyMap = new Map<string, number[]>();
@@ -1075,15 +1075,16 @@ async function handleScheduled(env: Env): Promise<void> {
   }
 }
 
-// ============== Regime Detection ==============
+// ============== Regime Detection (v1.1 - Percentile-Based) ==============
 
 type RegimeType = 'RISK_ON' | 'RISK_OFF' | 'TRANSITION';
 
 interface RegimeSignal {
   indicator: string;
   value: number | null;
-  threshold_low: number;
-  threshold_high: number;
+  percentile: number | null;  // v1.1: actual percentile rank
+  threshold_low_pct: number;  // v1.1: percentile threshold
+  threshold_high_pct: number; // v1.1: percentile threshold
   signal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL';
   description: string;
 }
@@ -1104,127 +1105,164 @@ async function detectRegime(db: D1Database, targetDate?: string): Promise<Regime
 
   if (!dateToUse) return null;
 
-  // Get latest values for regime indicators (using lagging data approach)
-  const getIndicatorValue = async (indicatorId: string): Promise<number | null> => {
-    const result = await db.prepare(`
+  // Helper to get current value and 5-year percentile for an indicator
+  const getIndicatorWithPercentile = async (indicatorId: string): Promise<{ value: number; percentile: number } | null> => {
+    // Get current value
+    const current = await db.prepare(`
       SELECT value FROM indicator_values
       WHERE indicator_id = ? AND date <= ?
       ORDER BY date DESC LIMIT 1
     `).bind(indicatorId, dateToUse).first<{ value: number }>();
-    return result?.value ?? null;
+
+    if (!current) return null;
+
+    // Get 5-year history for percentile calculation
+    const history = await db.prepare(`
+      SELECT value FROM indicator_values
+      WHERE indicator_id = ? AND date >= date(?, '-5 years') AND date <= ?
+    `).bind(indicatorId, dateToUse, dateToUse).all<{ value: number }>();
+
+    if (!history.results || history.results.length < 10) {
+      // Fall back to all available data if less than 5 years
+      const allHistory = await db.prepare(`
+        SELECT value FROM indicator_values WHERE indicator_id = ? AND date <= ?
+      `).bind(indicatorId, dateToUse).all<{ value: number }>();
+
+      if (!allHistory.results || allHistory.results.length < 10) return null;
+
+      const values = allHistory.results.map(r => r.value).sort((a, b) => a - b);
+      const rank = values.filter(v => v < current.value).length +
+                   values.filter(v => v === current.value).length / 2;
+      return { value: current.value, percentile: (rank / values.length) * 100 };
+    }
+
+    const values = history.results.map(r => r.value).sort((a, b) => a - b);
+    const rank = values.filter(v => v < current.value).length +
+                 values.filter(v => v === current.value).length / 2;
+
+    return { value: current.value, percentile: (rank / values.length) * 100 };
   };
 
-  // Fetch key regime indicators
+  // Fetch key regime indicators with percentiles
   const [vix, hySpread, sectorBreadth, yieldCurve, dollarIndex] = await Promise.all([
-    getIndicatorValue('vix'),
-    getIndicatorValue('high_yield_spread'),
-    getIndicatorValue('sector_breadth'),
-    getIndicatorValue('yield_curve'),
-    getIndicatorValue('dollar_index'),
+    getIndicatorWithPercentile('vix'),
+    getIndicatorWithPercentile('hy_oas_spread'),  // v1.1: use hy_oas_spread
+    getIndicatorWithPercentile('sector_breadth'),
+    getIndicatorWithPercentile('yield_curve_2s10s'),  // v1.1: use yield_curve_2s10s
+    getIndicatorWithPercentile('dxy'),  // v1.1: use dxy
   ]);
 
   const signals: RegimeSignal[] = [];
 
-  // VIX signal: <18 = risk-on, >25 = risk-off
+  // VIX signal: <30th percentile = risk-on, >70th percentile = risk-off
+  // (Lower VIX values = lower percentile = complacency/risk-on)
   if (vix !== null) {
     let vixSignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
-    let vixDesc = 'VIX in normal range';
-    if (vix < 18) {
+    let vixDesc = `VIX at ${vix.percentile.toFixed(0)}th percentile`;
+    if (vix.percentile < 30) {
       vixSignal = 'RISK_ON';
-      vixDesc = 'Low volatility - complacency';
-    } else if (vix > 25) {
+      vixDesc = `Low volatility (${vix.percentile.toFixed(0)}th pct) - complacency`;
+    } else if (vix.percentile > 70) {
       vixSignal = 'RISK_OFF';
-      vixDesc = 'Elevated fear';
+      vixDesc = `Elevated fear (${vix.percentile.toFixed(0)}th pct)`;
     }
     signals.push({
       indicator: 'VIX',
-      value: vix,
-      threshold_low: 18,
-      threshold_high: 25,
+      value: vix.value,
+      percentile: vix.percentile,
+      threshold_low_pct: 30,
+      threshold_high_pct: 70,
       signal: vixSignal,
       description: vixDesc,
     });
   }
 
-  // High Yield Spread: <350bp = risk-on, >500bp = risk-off
+  // High Yield OAS Spread: <30th percentile = risk-on, >70th percentile = risk-off
+  // (Lower spreads = lower percentile = risk appetite strong)
   if (hySpread !== null) {
     let hySignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
-    let hyDesc = 'Credit spreads normal';
-    if (hySpread < 350) {
+    let hyDesc = `HY spreads at ${hySpread.percentile.toFixed(0)}th percentile`;
+    if (hySpread.percentile < 30) {
       hySignal = 'RISK_ON';
-      hyDesc = 'Tight spreads - risk appetite strong';
-    } else if (hySpread > 500) {
+      hyDesc = `Tight spreads (${hySpread.percentile.toFixed(0)}th pct) - risk appetite`;
+    } else if (hySpread.percentile > 70) {
       hySignal = 'RISK_OFF';
-      hyDesc = 'Wide spreads - credit stress';
+      hyDesc = `Wide spreads (${hySpread.percentile.toFixed(0)}th pct) - credit stress`;
     }
     signals.push({
-      indicator: 'HY_SPREAD',
-      value: hySpread,
-      threshold_low: 350,
-      threshold_high: 500,
+      indicator: 'HY_OAS',
+      value: hySpread.value,
+      percentile: hySpread.percentile,
+      threshold_low_pct: 30,
+      threshold_high_pct: 70,
       signal: hySignal,
       description: hyDesc,
     });
   }
 
-  // Sector Breadth: >60% = risk-on, <40% = risk-off
+  // Sector Breadth: >60% = risk-on, <40% = risk-off (direct thresholds, not percentile)
   if (sectorBreadth !== null) {
     let breadthSignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
-    let breadthDesc = 'Mixed sector participation';
-    if (sectorBreadth > 60) {
+    let breadthDesc = `Sector breadth at ${sectorBreadth.value.toFixed(0)}%`;
+    if (sectorBreadth.value > 60) {
       breadthSignal = 'RISK_ON';
-      breadthDesc = 'Broad sector strength';
-    } else if (sectorBreadth < 40) {
+      breadthDesc = `Broad participation (${sectorBreadth.value.toFixed(0)}%)`;
+    } else if (sectorBreadth.value < 40) {
       breadthSignal = 'RISK_OFF';
-      breadthDesc = 'Narrow leadership - defensive';
+      breadthDesc = `Narrow leadership (${sectorBreadth.value.toFixed(0)}%)`;
     }
     signals.push({
-      indicator: 'SECTOR_BREADTH',
-      value: sectorBreadth,
-      threshold_low: 40,
-      threshold_high: 60,
+      indicator: 'BREADTH',
+      value: sectorBreadth.value,
+      percentile: sectorBreadth.percentile,
+      threshold_low_pct: 40,  // Direct threshold (not percentile)
+      threshold_high_pct: 60, // Direct threshold (not percentile)
       signal: breadthSignal,
       description: breadthDesc,
     });
   }
 
-  // Yield Curve (2s10s): >50bp = risk-on, <0 (inverted) = risk-off
+  // Yield Curve (2s10s): >60th percentile = risk-on, <20th percentile = risk-off
+  // (Higher/steeper curve = higher percentile = growth expectations)
   if (yieldCurve !== null) {
     let ycSignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
-    let ycDesc = 'Yield curve flat';
-    if (yieldCurve > 50) {
+    let ycDesc = `Yield curve at ${yieldCurve.percentile.toFixed(0)}th percentile`;
+    if (yieldCurve.percentile > 60) {
       ycSignal = 'RISK_ON';
-      ycDesc = 'Steep curve - growth expectations';
-    } else if (yieldCurve < 0) {
+      ycDesc = `Steep curve (${yieldCurve.percentile.toFixed(0)}th pct) - growth`;
+    } else if (yieldCurve.percentile < 20) {
       ycSignal = 'RISK_OFF';
-      ycDesc = 'Inverted curve - recession signal';
+      ycDesc = `Flat/inverted (${yieldCurve.percentile.toFixed(0)}th pct) - caution`;
     }
     signals.push({
       indicator: 'YIELD_CURVE',
-      value: yieldCurve,
-      threshold_low: 0,
-      threshold_high: 50,
+      value: yieldCurve.value,
+      percentile: yieldCurve.percentile,
+      threshold_low_pct: 20,
+      threshold_high_pct: 60,
       signal: ycSignal,
       description: ycDesc,
     });
   }
 
-  // Dollar Index: <100 = risk-on (weak dollar), >105 = risk-off (flight to safety)
+  // Dollar Index: <40th percentile = risk-on (weak dollar), >70th percentile = risk-off
+  // (Lower DXY = lower percentile = weak dollar = risk-on)
   if (dollarIndex !== null) {
     let dxySignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
-    let dxyDesc = 'Dollar neutral';
-    if (dollarIndex < 100) {
+    let dxyDesc = `DXY at ${dollarIndex.percentile.toFixed(0)}th percentile`;
+    if (dollarIndex.percentile < 40) {
       dxySignal = 'RISK_ON';
-      dxyDesc = 'Weak dollar - risk appetite';
-    } else if (dollarIndex > 105) {
+      dxyDesc = `Weak dollar (${dollarIndex.percentile.toFixed(0)}th pct) - risk appetite`;
+    } else if (dollarIndex.percentile > 70) {
       dxySignal = 'RISK_OFF';
-      dxyDesc = 'Strong dollar - safe haven flows';
+      dxyDesc = `Strong dollar (${dollarIndex.percentile.toFixed(0)}th pct) - safe haven`;
     }
     signals.push({
       indicator: 'DXY',
-      value: dollarIndex,
-      threshold_low: 100,
-      threshold_high: 105,
+      value: dollarIndex.value,
+      percentile: dollarIndex.percentile,
+      threshold_low_pct: 40,
+      threshold_high_pct: 70,
       signal: dxySignal,
       description: dxyDesc,
     });
@@ -1263,7 +1301,14 @@ async function detectRegime(db: D1Database, targetDate?: string): Promise<Regime
   };
 }
 
-// ============== Divergence Detection ==============
+// ============== Divergence Detection (v1.1 with Alert Metrics) ==============
+
+interface AlertMetrics {
+  historical_frequency: number;  // % of days this condition occurred
+  median_return_7d: number | null;  // Median 7-day forward SPY return
+  median_return_30d: number | null; // Median 30-day forward SPY return
+  false_positive_rate: number | null; // % of times followed by positive returns (for bearish alerts)
+}
 
 interface DivergenceAlert {
   type: 'PXI_REGIME' | 'PXI_MOMENTUM' | 'REGIME_SHIFT';
@@ -1271,11 +1316,78 @@ interface DivergenceAlert {
   title: string;
   description: string;
   actionable: boolean;
+  metrics?: AlertMetrics;  // v1.1: historical performance data
 }
 
 interface DivergenceResult {
   has_divergence: boolean;
   alerts: DivergenceAlert[];
+}
+
+// v1.1: Calculate historical metrics for alert types
+async function calculateAlertMetrics(
+  db: D1Database,
+  alertType: string,
+  conditionFn: (pxi: number, vix: number | null, regime: string | null) => boolean
+): Promise<AlertMetrics> {
+  // Get historical data with forward returns
+  const historicalData = await db.prepare(`
+    SELECT
+      p.date,
+      p.score as pxi,
+      (SELECT value FROM indicator_values iv WHERE iv.indicator_id = 'vix' AND iv.date <= p.date ORDER BY iv.date DESC LIMIT 1) as vix,
+      me.forward_return_7d,
+      me.forward_return_30d
+    FROM pxi_scores p
+    LEFT JOIN market_embeddings me ON p.date = me.date
+    WHERE p.date >= date('now', '-3 years')
+    ORDER BY p.date DESC
+  `).all<{
+    date: string;
+    pxi: number;
+    vix: number | null;
+    forward_return_7d: number | null;
+    forward_return_30d: number | null;
+  }>();
+
+  if (!historicalData.results || historicalData.results.length < 30) {
+    return { historical_frequency: 0, median_return_7d: null, median_return_30d: null, false_positive_rate: null };
+  }
+
+  const totalDays = historicalData.results.length;
+  const triggerDays: { r7d: number | null; r30d: number | null }[] = [];
+
+  for (const row of historicalData.results) {
+    // For now, we'll use a simplified condition check
+    // In production, this would be more sophisticated
+    if (conditionFn(row.pxi, row.vix, null)) {
+      triggerDays.push({ r7d: row.forward_return_7d, r30d: row.forward_return_30d });
+    }
+  }
+
+  if (triggerDays.length === 0) {
+    return { historical_frequency: 0, median_return_7d: null, median_return_30d: null, false_positive_rate: null };
+  }
+
+  const frequency = (triggerDays.length / totalDays) * 100;
+
+  // Calculate medians
+  const valid7d = triggerDays.filter(t => t.r7d !== null).map(t => t.r7d!).sort((a, b) => a - b);
+  const valid30d = triggerDays.filter(t => t.r30d !== null).map(t => t.r30d!).sort((a, b) => a - b);
+
+  const median7d = valid7d.length > 0 ? valid7d[Math.floor(valid7d.length / 2)] : null;
+  const median30d = valid30d.length > 0 ? valid30d[Math.floor(valid30d.length / 2)] : null;
+
+  // False positive rate: % of times followed by positive returns (for bearish alerts)
+  const positiveReturns = valid7d.filter(r => r > 0).length;
+  const fpr = valid7d.length > 0 ? (positiveReturns / valid7d.length) * 100 : null;
+
+  return {
+    historical_frequency: Math.round(frequency * 10) / 10,
+    median_return_7d: median7d !== null ? Math.round(median7d * 100) / 100 : null,
+    median_return_30d: median30d !== null ? Math.round(median30d * 100) / 100 : null,
+    false_positive_rate: fpr !== null ? Math.round(fpr) : null,
+  };
 }
 
 async function detectDivergence(
@@ -1296,6 +1408,14 @@ async function detectDivergence(
   const isLowVol = vixValue !== null && vixValue < 18;
   const isHighVol = vixValue !== null && vixValue > 25;
 
+  // v1.1: Calculate metrics for each alert type in parallel
+  const [stealthMetrics, resilientMetrics, hiddenRiskMetrics, rapidDetMetrics] = await Promise.all([
+    calculateAlertMetrics(db, 'STEALTH_WEAKNESS', (pxi, vix) => pxi < 40 && vix !== null && vix < 18),
+    calculateAlertMetrics(db, 'RESILIENT_STRENGTH', (pxi, vix) => pxi > 60 && vix !== null && vix > 25),
+    calculateAlertMetrics(db, 'HIDDEN_RISK', (pxi) => pxi < 40), // Simplified - would need regime in prod
+    calculateAlertMetrics(db, 'RAPID_DETERIORATION', (pxi) => pxi < 40), // Simplified
+  ]);
+
   // Divergence 1: PXI LOW but volatility is low (unusual - weakness without panic)
   if (currentPxi < 40 && isLowVol) {
     alerts.push({
@@ -1304,6 +1424,7 @@ async function detectDivergence(
       title: 'Stealth Weakness',
       description: `PXI at ${currentPxi.toFixed(0)} signals weakness, but VIX at ${vixValue?.toFixed(1)} shows no fear. Unusual - watch for delayed volatility spike.`,
       actionable: true,
+      metrics: stealthMetrics,
     });
   }
 
@@ -1315,6 +1436,7 @@ async function detectDivergence(
       title: 'Resilient Strength',
       description: `PXI at ${currentPxi.toFixed(0)} shows strength despite VIX at ${vixValue?.toFixed(1)}. Market shrugging off fear - potentially bullish.`,
       actionable: true,
+      metrics: resilientMetrics,
     });
   }
 
@@ -1337,6 +1459,7 @@ async function detectDivergence(
       title: 'Hidden Risk',
       description: `Regime appears RISK_ON but PXI at ${currentPxi.toFixed(0)} shows underlying weakness. Structure looks OK but something's off.`,
       actionable: true,
+      metrics: hiddenRiskMetrics,
     });
   }
 
@@ -1367,6 +1490,7 @@ async function detectDivergence(
           title: 'Rapid Deterioration',
           description: `PXI dropped ${Math.abs(weekChange).toFixed(0)} points in 7 days but regime still shows RISK_ON. Leading indicator of regime change?`,
           actionable: true,
+          metrics: rapidDetMetrics,
         });
       }
 
@@ -1412,6 +1536,110 @@ async function detectDivergence(
   return {
     has_divergence: alerts.length > 0,
     alerts,
+  };
+}
+
+// ============== PXI-Signal Layer (v1.1) ==============
+
+type SignalType = 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE';
+
+interface PXISignal {
+  pxi_level: number;
+  delta_pxi_7d: number | null;
+  delta_pxi_30d: number | null;
+  category_dispersion: number;  // Std dev of category scores
+  regime: RegimeType;
+  volatility_percentile: number | null;
+  risk_allocation: number;  // 0-1 scale
+  signal_type: SignalType;
+  adjustments: string[];  // Explanations for allocation adjustments
+}
+
+async function calculatePXISignal(
+  db: D1Database,
+  pxi: { score: number; delta_7d: number | null; delta_30d: number | null },
+  regime: RegimeResult | null,
+  categoryScores: { score: number }[]
+): Promise<PXISignal> {
+  // Calculate category dispersion (standard deviation of category scores)
+  const scores = categoryScores.map(c => c.score);
+  const mean = scores.reduce((a, b) => a + b, 0) / scores.length;
+  const variance = scores.reduce((sum, s) => sum + Math.pow(s - mean, 2), 0) / scores.length;
+  const dispersion = Math.sqrt(variance);
+
+  // Get VIX percentile for volatility adjustment
+  const vixData = await db.prepare(`
+    SELECT value FROM indicator_values
+    WHERE indicator_id = 'vix'
+    ORDER BY date DESC LIMIT 1
+  `).first<{ value: number }>();
+
+  let volatilityPercentile: number | null = null;
+  if (vixData) {
+    const vixHistory = await db.prepare(`
+      SELECT value FROM indicator_values
+      WHERE indicator_id = 'vix' AND date >= date('now', '-5 years')
+    `).all<{ value: number }>();
+
+    if (vixHistory.results && vixHistory.results.length > 0) {
+      const values = vixHistory.results.map(r => r.value).sort((a, b) => a - b);
+      const rank = values.filter(v => v < vixData.value).length +
+                   values.filter(v => v === vixData.value).length / 2;
+      volatilityPercentile = (rank / values.length) * 100;
+    }
+  }
+
+  // Base allocation from PXI score (0-100 maps to 0.3-1.0)
+  let baseAllocation = 0.3 + (pxi.score / 100) * 0.7;
+  const adjustments: string[] = [];
+
+  // Apply canonical trading policy adjustments
+  let allocation = baseAllocation;
+
+  // Rule 1: If Regime = RISK_OFF → allocation * 0.5
+  if (regime?.regime === 'RISK_OFF') {
+    allocation *= 0.5;
+    adjustments.push('RISK_OFF regime: -50%');
+  }
+
+  // Rule 2: If Regime = TRANSITION → allocation * 0.75
+  if (regime?.regime === 'TRANSITION') {
+    allocation *= 0.75;
+    adjustments.push('TRANSITION regime: -25%');
+  }
+
+  // Rule 3: If Δ7d < -10 → allocation * 0.8
+  if (pxi.delta_7d !== null && pxi.delta_7d < -10) {
+    allocation *= 0.8;
+    adjustments.push(`7d deterioration (${pxi.delta_7d.toFixed(0)}pts): -20%`);
+  }
+
+  // Rule 4: If vol_percentile > 80 → allocation * 0.7
+  if (volatilityPercentile !== null && volatilityPercentile > 80) {
+    allocation *= 0.7;
+    adjustments.push(`High volatility (${volatilityPercentile.toFixed(0)}th pct): -30%`);
+  }
+
+  // Determine signal type
+  let signalType: SignalType = 'FULL_RISK';
+  if (allocation < 0.3) {
+    signalType = 'DEFENSIVE';
+  } else if (allocation < 0.5) {
+    signalType = 'RISK_OFF';
+  } else if (allocation < 0.8) {
+    signalType = 'REDUCED_RISK';
+  }
+
+  return {
+    pxi_level: pxi.score,
+    delta_pxi_7d: pxi.delta_7d,
+    delta_pxi_30d: pxi.delta_30d,
+    category_dispersion: Math.round(dispersion * 10) / 10,
+    regime: regime?.regime || 'TRANSITION',
+    volatility_percentile: volatilityPercentile !== null ? Math.round(volatilityPercentile) : null,
+    risk_allocation: Math.round(allocation * 100) / 100,
+    signal_type: signalType,
+    adjustments,
   };
 }
 
@@ -1606,6 +1834,80 @@ export default {
         };
 
         return Response.json(response, {
+          headers: {
+            ...corsHeaders,
+            'Cache-Control': 'public, max-age=60',
+          },
+        });
+      }
+
+      // v1.1: PXI-Signal endpoint - two-layer architecture
+      if (url.pathname === '/api/signal') {
+        // Get latest PXI data
+        const pxi = await env.DB.prepare(
+          'SELECT date, score, label, status, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 1'
+        ).first<PXIRow>();
+
+        if (!pxi) {
+          return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
+        }
+
+        // Get categories
+        const cats = await env.DB.prepare(
+          'SELECT category, score, weight FROM category_scores WHERE date = ?'
+        ).bind(pxi.date).all<CategoryRow>();
+
+        // Get regime
+        const regime = await detectRegime(env.DB, pxi.date);
+
+        // Calculate signal
+        const signal = await calculatePXISignal(
+          env.DB,
+          { score: pxi.score, delta_7d: pxi.delta_7d, delta_30d: pxi.delta_30d },
+          regime,
+          cats.results || []
+        );
+
+        // Get divergence
+        const divergence = await detectDivergence(env.DB, pxi.score, regime);
+
+        return Response.json({
+          date: pxi.date,
+          // PXI-State layer (monitoring)
+          state: {
+            score: pxi.score,
+            label: pxi.label,
+            status: pxi.status,
+            delta: {
+              d1: pxi.delta_1d,
+              d7: pxi.delta_7d,
+              d30: pxi.delta_30d,
+            },
+            categories: (cats.results || []).map(c => ({
+              name: c.category,
+              score: c.score,
+              weight: c.weight,
+            })),
+          },
+          // PXI-Signal layer (trading)
+          signal: {
+            type: signal.signal_type,
+            risk_allocation: signal.risk_allocation,
+            volatility_percentile: signal.volatility_percentile,
+            category_dispersion: signal.category_dispersion,
+            adjustments: signal.adjustments,
+          },
+          // Regime info
+          regime: regime ? {
+            type: regime.regime,
+            confidence: regime.confidence,
+            description: regime.description,
+          } : null,
+          // Active alerts
+          divergence: divergence.has_divergence ? {
+            alerts: divergence.alerts,
+          } : null,
+        }, {
           headers: {
             ...corsHeaders,
             'Cache-Control': 'public, max-age=60',

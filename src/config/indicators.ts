@@ -1,11 +1,11 @@
 import type { IndicatorDefinition } from '../types/indicators.js';
 
 export const INDICATORS: IndicatorDefinition[] = [
-  // ============== LIQUIDITY (22%) ==============
+  // ============== POSITIONING (15%) - v1.1: was Liquidity 22% ==============
   {
     id: 'fed_balance_sheet',
     name: 'Fed Balance Sheet',
-    category: 'liquidity',
+    category: 'positioning',
     source: 'fred',
     ticker: 'WALCL',
     frequency: 'weekly',
@@ -16,7 +16,7 @@ export const INDICATORS: IndicatorDefinition[] = [
   {
     id: 'treasury_general_account',
     name: 'Treasury General Account',
-    category: 'liquidity',
+    category: 'positioning',
     source: 'fred',
     ticker: 'WTREGEN',
     frequency: 'weekly',
@@ -27,7 +27,7 @@ export const INDICATORS: IndicatorDefinition[] = [
   {
     id: 'reverse_repo',
     name: 'Reverse Repo Facility',
-    category: 'liquidity',
+    category: 'positioning',
     source: 'fred',
     ticker: 'RRPONTSYD',
     frequency: 'daily',
@@ -38,7 +38,7 @@ export const INDICATORS: IndicatorDefinition[] = [
   {
     id: 'm2_yoy',
     name: 'M2 Money Supply YoY%',
-    category: 'liquidity',
+    category: 'positioning',
     source: 'fred',
     ticker: 'M2SL',
     frequency: 'monthly',
