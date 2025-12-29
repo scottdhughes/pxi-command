@@ -3249,6 +3249,398 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         }, { headers: corsHeaders });
       }
 
+      // ============== v1.1: Walk-Forward Signal Backtest ==============
+      // Compares PXI-Signal strategy vs baselines (200DMA, buy-and-hold)
+      if (url.pathname === '/api/backtest/signal' && request.method === 'GET') {
+        // Get all historical signal data
+        const signals = await env.DB.prepare(`
+          SELECT date, pxi_level, risk_allocation, signal_type, regime
+          FROM pxi_signal ORDER BY date ASC
+        `).all<{ date: string; pxi_level: number; risk_allocation: number; signal_type: string; regime: string }>();
+
+        // Get SPY prices for return calculation
+        const spyPrices = await env.DB.prepare(`
+          SELECT date, value FROM indicator_values
+          WHERE indicator_id = 'spy_close'
+          ORDER BY date ASC
+        `).all<{ date: string; value: number }>();
+
+        if (!signals.results || signals.results.length < 30) {
+          return Response.json({
+            error: 'Insufficient signal data. Run historical recalculation first.',
+            signal_count: signals.results?.length || 0,
+            hint: 'POST /api/recalculate-all-signals with Authorization header'
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        if (!spyPrices.results || spyPrices.results.length === 0) {
+          return Response.json({
+            error: 'No SPY price data available.',
+            hint: 'POST /api/refresh to fetch SPY prices'
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        // Build price lookup maps
+        const spyMap = new Map<string, number>();
+        for (const p of spyPrices.results) {
+          spyMap.set(p.date, p.value);
+        }
+
+        // Calculate 200DMA for baseline comparison
+        const spy200dma = new Map<string, number>();
+        const spyDates = spyPrices.results.map(p => p.date).sort();
+        for (let i = 199; i < spyDates.length; i++) {
+          const window = spyDates.slice(i - 199, i + 1);
+          const avg = window.reduce((sum, d) => sum + (spyMap.get(d) || 0), 0) / 200;
+          spy200dma.set(spyDates[i], avg);
+        }
+
+        // Calculate strategy returns
+        interface DailyReturn {
+          date: string;
+          spy_return: number;
+          pxi_signal_return: number;   // PXI-Signal strategy (allocation-weighted)
+          dma200_return: number;       // 200DMA strategy (100% when SPY > 200DMA, 0% otherwise)
+          buy_hold_return: number;     // Buy and hold (always 100%)
+          allocation: number;
+          signal_type: string;
+        }
+
+        const dailyReturns: DailyReturn[] = [];
+        let prevDate: string | null = null;
+
+        for (const signal of signals.results) {
+          if (!prevDate) {
+            prevDate = signal.date;
+            continue;
+          }
+
+          const prevPrice = spyMap.get(prevDate);
+          const currPrice = spyMap.get(signal.date);
+
+          if (prevPrice && currPrice) {
+            const dailyReturn = (currPrice - prevPrice) / prevPrice;
+            const prevDma = spy200dma.get(prevDate);
+            const isDmaRiskOn = prevDma ? prevPrice > prevDma : true;
+
+            dailyReturns.push({
+              date: signal.date,
+              spy_return: dailyReturn,
+              pxi_signal_return: dailyReturn * signal.risk_allocation,
+              dma200_return: isDmaRiskOn ? dailyReturn : 0,
+              buy_hold_return: dailyReturn,
+              allocation: signal.risk_allocation,
+              signal_type: signal.signal_type,
+            });
+          }
+
+          prevDate = signal.date;
+        }
+
+        // Calculate cumulative returns and metrics
+        const calculateMetrics = (returns: number[], name: string) => {
+          if (returns.length === 0) return null;
+
+          // Cumulative return
+          let cumulative = 1;
+          let peak = 1;
+          let maxDrawdown = 0;
+
+          for (const r of returns) {
+            cumulative *= (1 + r);
+            if (cumulative > peak) peak = cumulative;
+            const drawdown = (peak - cumulative) / peak;
+            if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+          }
+
+          // Annualized metrics (assuming ~252 trading days/year)
+          const years = returns.length / 252;
+          const cagr = years > 0 ? Math.pow(cumulative, 1 / years) - 1 : 0;
+
+          // Volatility (annualized)
+          const avgReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+          const variance = returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length;
+          const dailyVol = Math.sqrt(variance);
+          const annualVol = dailyVol * Math.sqrt(252);
+
+          // Sharpe ratio (assuming 0% risk-free rate for simplicity)
+          const sharpe = annualVol > 0 ? cagr / annualVol : 0;
+
+          // Win rate
+          const winningDays = returns.filter(r => r > 0).length;
+          const winRate = (winningDays / returns.length) * 100;
+
+          return {
+            strategy: name,
+            total_return_pct: (cumulative - 1) * 100,
+            cagr_pct: cagr * 100,
+            volatility_pct: annualVol * 100,
+            sharpe_ratio: Math.round(sharpe * 100) / 100,
+            max_drawdown_pct: maxDrawdown * 100,
+            win_rate_pct: winRate,
+            trading_days: returns.length,
+          };
+        };
+
+        const pxiSignalMetrics = calculateMetrics(dailyReturns.map(r => r.pxi_signal_return), 'PXI-Signal');
+        const dma200Metrics = calculateMetrics(dailyReturns.map(r => r.dma200_return), '200DMA');
+        const buyHoldMetrics = calculateMetrics(dailyReturns.map(r => r.buy_hold_return), 'Buy-and-Hold');
+
+        // Calculate signal type distribution
+        const signalDistribution: Record<string, number> = {};
+        for (const r of dailyReturns) {
+          signalDistribution[r.signal_type] = (signalDistribution[r.signal_type] || 0) + 1;
+        }
+
+        // Average allocation by signal type
+        const avgAllocationBySignal: Record<string, number> = {};
+        const signalReturns: Record<string, number[]> = {};
+
+        for (const r of dailyReturns) {
+          if (!avgAllocationBySignal[r.signal_type]) {
+            avgAllocationBySignal[r.signal_type] = 0;
+            signalReturns[r.signal_type] = [];
+          }
+          avgAllocationBySignal[r.signal_type] += r.allocation;
+          signalReturns[r.signal_type].push(r.pxi_signal_return);
+        }
+
+        for (const type of Object.keys(avgAllocationBySignal)) {
+          avgAllocationBySignal[type] = avgAllocationBySignal[type] / signalDistribution[type];
+        }
+
+        // Store results in backtest_results table
+        const runDate = formatDate(new Date());
+        if (pxiSignalMetrics) {
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO backtest_results
+            (run_date, strategy, lookback_start, lookback_end, cagr, volatility, sharpe, max_drawdown, total_trades, win_rate, baseline_comparison)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            runDate,
+            'PXI-Signal',
+            dailyReturns[0]?.date || '',
+            dailyReturns[dailyReturns.length - 1]?.date || '',
+            pxiSignalMetrics.cagr_pct,
+            pxiSignalMetrics.volatility_pct,
+            pxiSignalMetrics.sharpe_ratio,
+            pxiSignalMetrics.max_drawdown_pct,
+            dailyReturns.length,
+            pxiSignalMetrics.win_rate_pct,
+            JSON.stringify({
+              vs_buy_hold: buyHoldMetrics ? {
+                cagr_diff: pxiSignalMetrics.cagr_pct - buyHoldMetrics.cagr_pct,
+                vol_diff: pxiSignalMetrics.volatility_pct - buyHoldMetrics.volatility_pct,
+                sharpe_diff: pxiSignalMetrics.sharpe_ratio - buyHoldMetrics.sharpe_ratio,
+              } : null,
+              vs_200dma: dma200Metrics ? {
+                cagr_diff: pxiSignalMetrics.cagr_pct - dma200Metrics.cagr_pct,
+                vol_diff: pxiSignalMetrics.volatility_pct - dma200Metrics.volatility_pct,
+                sharpe_diff: pxiSignalMetrics.sharpe_ratio - dma200Metrics.sharpe_ratio,
+              } : null,
+            })
+          ).run();
+        }
+
+        return Response.json({
+          summary: {
+            date_range: {
+              start: dailyReturns[0]?.date,
+              end: dailyReturns[dailyReturns.length - 1]?.date,
+            },
+            trading_days: dailyReturns.length,
+            signal_data_points: signals.results.length,
+          },
+          strategies: {
+            pxi_signal: pxiSignalMetrics,
+            dma_200: dma200Metrics,
+            buy_and_hold: buyHoldMetrics,
+          },
+          signal_analysis: {
+            distribution: signalDistribution,
+            avg_allocation_by_signal: avgAllocationBySignal,
+          },
+          comparison: {
+            pxi_vs_buy_hold: pxiSignalMetrics && buyHoldMetrics ? {
+              cagr_advantage: Math.round((pxiSignalMetrics.cagr_pct - buyHoldMetrics.cagr_pct) * 100) / 100,
+              volatility_reduction: Math.round((buyHoldMetrics.volatility_pct - pxiSignalMetrics.volatility_pct) * 100) / 100,
+              sharpe_improvement: Math.round((pxiSignalMetrics.sharpe_ratio - buyHoldMetrics.sharpe_ratio) * 100) / 100,
+              max_dd_improvement: Math.round((buyHoldMetrics.max_drawdown_pct - pxiSignalMetrics.max_drawdown_pct) * 100) / 100,
+            } : null,
+            pxi_vs_200dma: pxiSignalMetrics && dma200Metrics ? {
+              cagr_advantage: Math.round((pxiSignalMetrics.cagr_pct - dma200Metrics.cagr_pct) * 100) / 100,
+              volatility_diff: Math.round((pxiSignalMetrics.volatility_pct - dma200Metrics.volatility_pct) * 100) / 100,
+              sharpe_improvement: Math.round((pxiSignalMetrics.sharpe_ratio - dma200Metrics.sharpe_ratio) * 100) / 100,
+            } : null,
+          },
+        }, { headers: corsHeaders });
+      }
+
+      // ============== v1.1: Historical Signal Recalculation ==============
+      // Generates signal layer data for all historical PXI scores
+      if (url.pathname === '/api/recalculate-all-signals' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        const apiKey = authHeader?.replace('Bearer ', '');
+
+        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        try {
+          // Get all PXI scores
+          const pxiScores = await env.DB.prepare(`
+            SELECT date, score, delta_7d, delta_30d FROM pxi_scores ORDER BY date ASC
+          `).all<{ date: string; score: number; delta_7d: number | null; delta_30d: number | null }>();
+
+          if (!pxiScores.results || pxiScores.results.length === 0) {
+            return Response.json({ error: 'No PXI scores found' }, { status: 400, headers: corsHeaders });
+          }
+
+          // Pre-load ALL category scores in one query
+          const allCatScores = await env.DB.prepare(`
+            SELECT date, category, score FROM category_scores ORDER BY date
+          `).all<{ date: string; category: string; score: number }>();
+
+          // Build lookup map by date
+          const catScoresByDate = new Map<string, { score: number }[]>();
+          for (const cs of allCatScores.results || []) {
+            if (!catScoresByDate.has(cs.date)) {
+              catScoresByDate.set(cs.date, []);
+            }
+            catScoresByDate.get(cs.date)!.push({ score: cs.score });
+          }
+
+          // Get all VIX values for historical percentile calculation
+          const vixHistory = await env.DB.prepare(`
+            SELECT date, value FROM indicator_values
+            WHERE indicator_id = 'vix'
+            ORDER BY date ASC
+          `).all<{ date: string; value: number }>();
+
+          const vixMap = new Map<string, number>();
+          const vixValues: number[] = [];
+          for (const v of vixHistory.results || []) {
+            vixMap.set(v.date, v.value);
+            vixValues.push(v.value);
+          }
+          const sortedVix = [...vixValues].sort((a, b) => a - b);
+
+          // Build all signals in memory first
+          const signals: Array<{
+            date: string; pxi_level: number; delta_pxi_7d: number | null;
+            delta_pxi_30d: number | null; category_dispersion: number;
+            regime: string; volatility_percentile: number | null;
+            risk_allocation: number; signal_type: string;
+          }> = [];
+
+          for (const pxi of pxiScores.results) {
+            // Get VIX percentile for this date
+            const vix = vixMap.get(pxi.date);
+            let vixPercentile: number | null = null;
+            if (vix !== undefined && sortedVix.length > 0) {
+              const rank = sortedVix.filter(v => v < vix).length +
+                          sortedVix.filter(v => v === vix).length / 2;
+              vixPercentile = (rank / sortedVix.length) * 100;
+            }
+
+            // Get category scores for this date
+            const catScores = catScoresByDate.get(pxi.date) || [];
+
+            // Calculate category dispersion
+            const scores = catScores.map(c => c.score);
+            const mean = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 50;
+            const variance = scores.length > 0
+              ? scores.reduce((sum, s) => sum + Math.pow(s - mean, 2), 0) / scores.length
+              : 0;
+            const dispersion = Math.sqrt(variance);
+
+            // Determine regime from PXI level (simplified for historical)
+            let regime: string = 'TRANSITION';
+            if (pxi.score >= 65) regime = 'RISK_ON';
+            else if (pxi.score <= 35) regime = 'RISK_OFF';
+
+            // Base allocation from PXI score
+            let allocation = 0.3 + (pxi.score / 100) * 0.7;
+
+            // Rule 1: If regime = RISK_OFF → allocation * 0.5
+            if (regime === 'RISK_OFF') allocation *= 0.5;
+
+            // Rule 2: If regime = TRANSITION → allocation * 0.75
+            if (regime === 'TRANSITION') allocation *= 0.75;
+
+            // Rule 3: If Δ7d < -10 → allocation * 0.8
+            if (pxi.delta_7d !== null && pxi.delta_7d < -10) allocation *= 0.8;
+
+            // Rule 4: If vol_percentile > 80 → allocation * 0.7
+            if (vixPercentile !== null && vixPercentile > 80) allocation *= 0.7;
+
+            // Determine signal type
+            let signalType: string = 'FULL_RISK';
+            if (allocation < 0.3) signalType = 'DEFENSIVE';
+            else if (allocation < 0.5) signalType = 'RISK_OFF';
+            else if (allocation < 0.8) signalType = 'REDUCED_RISK';
+
+            signals.push({
+              date: pxi.date,
+              pxi_level: pxi.score,
+              delta_pxi_7d: pxi.delta_7d,
+              delta_pxi_30d: pxi.delta_30d,
+              category_dispersion: Math.round(dispersion * 10) / 10,
+              regime,
+              volatility_percentile: vixPercentile !== null ? Math.round(vixPercentile) : null,
+              risk_allocation: Math.round(allocation * 100) / 100,
+              signal_type: signalType,
+            });
+          }
+
+          // Batch insert all signals (100 at a time)
+          const batchSize = 100;
+          let processed = 0;
+
+          for (let i = 0; i < signals.length; i += batchSize) {
+            const batch = signals.slice(i, i + batchSize);
+            const statements = batch.map(s =>
+              env.DB.prepare(`
+                INSERT OR REPLACE INTO pxi_signal
+                (date, pxi_level, delta_pxi_7d, delta_pxi_30d, category_dispersion, regime, volatility_percentile, risk_allocation, signal_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `).bind(
+                s.date, s.pxi_level, s.delta_pxi_7d, s.delta_pxi_30d,
+                s.category_dispersion, s.regime, s.volatility_percentile,
+                s.risk_allocation, s.signal_type
+              )
+            );
+            await env.DB.batch(statements);
+            processed += batch.length;
+          }
+
+          return Response.json({
+            success: true,
+            processed,
+            total: pxiScores.results.length,
+            message: `Generated signal data for ${processed} dates`,
+          }, { headers: corsHeaders });
+
+        } catch (err) {
+          console.error('Signal recalculation error:', err);
+          return Response.json({
+            error: 'Signal recalculation failed',
+            details: err instanceof Error ? err.message : String(err)
+          }, { status: 500, headers: corsHeaders });
+        }
+      }
+
+      // Get backtest history
+      if (url.pathname === '/api/backtest/history' && request.method === 'GET') {
+        const results = await env.DB.prepare(`
+          SELECT * FROM backtest_results ORDER BY run_date DESC LIMIT 10
+        `).all();
+
+        return Response.json({
+          history: results.results || [],
+        }, { headers: corsHeaders });
+      }
+
       return Response.json({ error: 'Not found' }, { status: 404, headers: corsHeaders });
     } catch (err: unknown) {
       console.error('API error:', err instanceof Error ? err.message : err);
