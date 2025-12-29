@@ -163,33 +163,36 @@ function RegimeBadge({ regime }: { regime: PXIData['regime'] }) {
 function DivergenceAlerts({ divergence }: { divergence: PXIData['divergence'] }) {
   if (!divergence || divergence.alerts.length === 0) return null
 
-  const severityStyles: Record<string, { bg: string; border: string; icon: string }> = {
-    HIGH: { bg: 'bg-[#ff6b6b]/10', border: 'border-[#ff6b6b]/40', icon: '⚠' },
-    MEDIUM: { bg: 'bg-[#f59e0b]/10', border: 'border-[#f59e0b]/40', icon: '⚡' },
-    LOW: { bg: 'bg-[#949ba5]/10', border: 'border-[#949ba5]/40', icon: 'ℹ' },
+  const severityColors: Record<string, string> = {
+    HIGH: '#ff6b6b',
+    MEDIUM: '#f59e0b',
+    LOW: '#949ba5',
   }
 
   return (
-    <div className="w-full mt-4 space-y-2">
+    <div className="w-full mt-6 space-y-3">
       {divergence.alerts.map((alert, i) => {
-        const style = severityStyles[alert.severity] || severityStyles.LOW
+        const color = severityColors[alert.severity] || severityColors.LOW
         return (
           <div
             key={i}
-            className={`${style.bg} ${style.border} border rounded-lg px-4 py-3`}
+            className="bg-[#0a0a0a]/80 backdrop-blur-sm rounded px-4 py-3"
+            style={{ borderLeft: `2px solid ${color}` }}
           >
-            <div className="flex items-center gap-2 mb-1">
-              <span className="text-sm">{style.icon}</span>
-              <span className="text-[11px] font-medium text-[#f3f3f3] uppercase tracking-wide">
+            <div className="flex items-center justify-between mb-1.5">
+              <span
+                className="text-[10px] font-medium uppercase tracking-wider"
+                style={{ color }}
+              >
                 {alert.title}
               </span>
               {alert.actionable && (
-                <span className="text-[8px] text-[#f59e0b] uppercase tracking-wider ml-auto">
+                <span className="text-[8px] text-[#949ba5]/60 uppercase tracking-widest">
                   Actionable
                 </span>
               )}
             </div>
-            <p className="text-[10px] text-[#949ba5] leading-relaxed">
+            <p className="text-[10px] text-[#949ba5]/70 leading-relaxed">
               {alert.description}
             </p>
           </div>
