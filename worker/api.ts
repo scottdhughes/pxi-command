@@ -237,6 +237,216 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     console.error('Fear & Greed failed:', e);
   }
 
+  // Small cap strength (IWM vs SPY)
+  try {
+    const [iwm, spy] = await Promise.all([
+      fetchYahooSeries('IWM', 'iwm_temp'),
+      fetchYahooSeries('SPY', 'spy_temp2'),
+    ]);
+    const spyMap = new Map(spy.map(s => [s.date, s.value]));
+    for (const i of iwm) {
+      const s = spyMap.get(i.date);
+      if (s) {
+        all.push({ indicator_id: 'small_cap_strength', date: i.date, value: (i.value / s) * 100, source: 'yahoo' });
+      }
+    }
+    console.log('Small cap strength: calculated');
+  } catch (e) {
+    console.error('Small cap strength failed:', e);
+  }
+
+  // Mid cap strength (IJH vs SPY)
+  try {
+    const [ijh, spy] = await Promise.all([
+      fetchYahooSeries('IJH', 'ijh_temp'),
+      fetchYahooSeries('SPY', 'spy_temp3'),
+    ]);
+    const spyMap = new Map(spy.map(s => [s.date, s.value]));
+    for (const i of ijh) {
+      const s = spyMap.get(i.date);
+      if (s) {
+        all.push({ indicator_id: 'midcap_strength', date: i.date, value: (i.value / s) * 100, source: 'yahoo' });
+      }
+    }
+    console.log('Midcap strength: calculated');
+  } catch (e) {
+    console.error('Midcap strength failed:', e);
+  }
+
+  // Sector breadth (% of sector ETFs above their 50-day MA)
+  try {
+    const sectorETFs = ['XLB', 'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY'];
+    const sectorData = await Promise.all(sectorETFs.map(t => fetchYahooSeries(t, t.toLowerCase())));
+
+    // Get all unique dates across all sectors
+    const allDates = new Set<string>();
+    for (const data of sectorData) {
+      for (const d of data) allDates.add(d.date);
+    }
+
+    // For each date, calculate % of sectors above 50-day MA
+    const sectorMaps = sectorData.map(data => new Map(data.map(d => [d.date, d.value])));
+    const sortedDates = [...allDates].sort();
+
+    for (let i = 50; i < sortedDates.length; i++) {
+      const date = sortedDates[i];
+      let above = 0;
+      let total = 0;
+
+      for (let s = 0; s < sectorData.length; s++) {
+        const currentVal = sectorMaps[s].get(date);
+        if (currentVal === undefined) continue;
+
+        // Calculate 50-day MA
+        let sum = 0;
+        let count = 0;
+        for (let j = i - 50; j < i; j++) {
+          const val = sectorMaps[s].get(sortedDates[j]);
+          if (val !== undefined) { sum += val; count++; }
+        }
+
+        if (count >= 40) { // Need at least 40 days of data
+          const ma50 = sum / count;
+          if (currentVal > ma50) above++;
+          total++;
+        }
+      }
+
+      if (total >= 8) { // Need at least 8 sectors
+        all.push({ indicator_id: 'sector_breadth', date, value: (above / total) * 100, source: 'yahoo' });
+      }
+    }
+    console.log('Sector breadth: calculated');
+  } catch (e) {
+    console.error('Sector breadth failed:', e);
+  }
+
+  // AAII Sentiment (bulls - bears spread) - use CNN Fear & Greed as proxy
+  try {
+    const fgValues = all.filter(i => i.indicator_id === 'fear_greed');
+    for (const fg of fgValues) {
+      // Convert 0-100 fear/greed to -50 to +50 sentiment spread
+      all.push({ indicator_id: 'aaii_sentiment', date: fg.date, value: fg.value - 50, source: 'derived' });
+    }
+    console.log('AAII sentiment (proxy): calculated');
+  } catch (e) {
+    console.error('AAII sentiment failed:', e);
+  }
+
+  // BTC vs 200-day MA
+  try {
+    const btcData = all.filter(i => i.indicator_id === 'btc_price').sort((a, b) => a.date.localeCompare(b.date));
+    for (let i = 200; i < btcData.length; i++) {
+      let sum = 0;
+      for (let j = i - 200; j < i; j++) {
+        sum += btcData[j].value;
+      }
+      const ma200 = sum / 200;
+      const pctAbove = ((btcData[i].value - ma200) / ma200) * 100;
+      all.push({ indicator_id: 'btc_vs_200dma', date: btcData[i].date, value: pctAbove, source: 'yahoo' });
+    }
+    console.log('BTC vs 200dma: calculated');
+  } catch (e) {
+    console.error('BTC vs 200dma failed:', e);
+  }
+
+  // AUD/JPY (risk sentiment indicator)
+  try {
+    const audjpy = await fetchYahooSeries('AUDJPY=X', 'audjpy');
+    all.push(...audjpy);
+    console.log(`AUDJPY: ${audjpy.length} values`);
+  } catch (e) {
+    console.error('AUDJPY failed:', e);
+  }
+
+  // DXY (dollar index)
+  try {
+    const dxy = await fetchYahooSeries('DX-Y.NYB', 'dxy');
+    all.push(...dxy);
+    console.log(`DXY: ${dxy.length} values`);
+  } catch (e) {
+    console.error('DXY failed:', e);
+  }
+
+  // Credit spreads from FRED (map to expected IDs)
+  try {
+    const hySpread = await fetchFredSeries('BAMLH0A0HYM2', 'hy_oas_spread', fredApiKey);
+    all.push(...hySpread);
+    console.log(`HY OAS Spread: ${hySpread.length} values`);
+  } catch (e) {
+    console.error('HY OAS Spread failed:', e);
+  }
+
+  try {
+    const igSpread = await fetchFredSeries('BAMLC0A4CBBBEY', 'ig_oas_spread', fredApiKey);
+    all.push(...igSpread);
+    console.log(`IG OAS Spread: ${igSpread.length} values`);
+  } catch (e) {
+    console.error('IG OAS Spread failed:', e);
+  }
+
+  try {
+    const yieldCurve = await fetchFredSeries('T10Y2Y', 'yield_curve_2s10s', fredApiKey);
+    all.push(...yieldCurve);
+    console.log(`Yield curve 2s10s: ${yieldCurve.length} values`);
+  } catch (e) {
+    console.error('Yield curve failed:', e);
+  }
+
+  // BBB-AAA spread
+  try {
+    const [bbb, aaa] = await Promise.all([
+      fetchFredSeries('BAMLC0A4CBBBEY', 'bbb_temp', fredApiKey),
+      fetchFredSeries('BAMLC0A1CAAAEY', 'aaa_temp', fredApiKey),
+    ]);
+    const aaaMap = new Map(aaa.map(a => [a.date, a.value]));
+    for (const b of bbb) {
+      const a = aaaMap.get(b.date);
+      if (a !== undefined) {
+        all.push({ indicator_id: 'bbb_aaa_spread', date: b.date, value: b.value - a, source: 'fred' });
+      }
+    }
+    console.log('BBB-AAA spread: calculated');
+  } catch (e) {
+    console.error('BBB-AAA spread failed:', e);
+  }
+
+  // EM Spread
+  try {
+    const emSpread = await fetchFredSeries('BAMLEMCBPIOAS', 'em_spread', fredApiKey);
+    all.push(...emSpread);
+    console.log(`EM Spread: ${emSpread.length} values`);
+  } catch (e) {
+    console.error('EM Spread failed:', e);
+  }
+
+  // ISM Manufacturing PMI
+  try {
+    const ism = await fetchFredSeries('MANEMP', 'ism_manufacturing', fredApiKey);
+    all.push(...ism);
+    console.log(`ISM Manufacturing: ${ism.length} values`);
+  } catch (e) {
+    console.error('ISM Manufacturing failed:', e);
+  }
+
+  // Initial Jobless Claims
+  try {
+    const claims = await fetchFredSeries('ICSA', 'jobless_claims', fredApiKey);
+    all.push(...claims);
+    console.log(`Jobless claims: ${claims.length} values`);
+  } catch (e) {
+    console.error('Jobless claims failed:', e);
+  }
+
+  // CFNAI
+  try {
+    const cfnai = await fetchFredSeries('CFNAI', 'cfnai', fredApiKey);
+    all.push(...cfnai);
+    console.log(`CFNAI: ${cfnai.length} values`);
+  } catch (e) {
+    console.error('CFNAI failed:', e);
+  }
+
   return all;
 }
 
