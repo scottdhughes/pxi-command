@@ -174,27 +174,30 @@ function DivergenceAlerts({ divergence }: { divergence: PXIData['divergence'] })
       {divergence.alerts.map((alert, i) => {
         const color = severityColors[alert.severity] || severityColors.LOW
         return (
-          <div
-            key={i}
-            className="bg-[#0a0a0a]/80 backdrop-blur-sm rounded px-4 py-3"
-            style={{ borderLeft: `2px solid ${color}` }}
-          >
-            <div className="flex items-center justify-between mb-1.5">
-              <span
-                className="text-[10px] font-medium uppercase tracking-wider"
-                style={{ color }}
-              >
-                {alert.title}
-              </span>
-              {alert.actionable && (
-                <span className="text-[8px] text-[#949ba5]/60 uppercase tracking-widest">
-                  Actionable
+          <div key={i} className="flex items-start gap-2 sm:gap-4">
+            <div className="w-20 sm:w-28 shrink-0" />
+            <div
+              className="flex-1 bg-[#0a0a0a]/80 backdrop-blur-sm rounded px-3 py-2.5"
+              style={{ borderLeft: `2px solid ${color}` }}
+            >
+              <div className="flex items-center justify-between gap-4">
+                <span
+                  className="text-[10px] font-medium uppercase tracking-wider"
+                  style={{ color }}
+                >
+                  {alert.title}
                 </span>
-              )}
+                {alert.actionable && (
+                  <span className="text-[8px] text-[#949ba5]/50 uppercase tracking-widest shrink-0">
+                    Actionable
+                  </span>
+                )}
+              </div>
+              <p className="text-[10px] text-[#949ba5]/60 leading-relaxed mt-1">
+                {alert.description}
+              </p>
             </div>
-            <p className="text-[10px] text-[#949ba5]/70 leading-relaxed">
-              {alert.description}
-            </p>
+            <div className="w-6 sm:w-8 shrink-0" />
           </div>
         )
       })}
