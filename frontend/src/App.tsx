@@ -440,8 +440,38 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           Protocol Specification
         </h1>
         <p className="text-[11px] text-[#949ba5]/60 mb-12 uppercase tracking-widest">
-          Macro Market Strength Index — Quantitative Framework
+          Macro Market Strength Index — Quantitative Framework v1.1
         </p>
+
+        {/* Two-Layer Architecture */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Two-Layer Architecture</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            v1.1 introduces a two-layer system separating descriptive state from actionable signals.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#00a3ff]">
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">PXI-State</div>
+              <p className="text-[10px] text-[#949ba5]/70 mb-2">Descriptive layer for monitoring macro conditions</p>
+              <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
+                <li>• Composite score (0-100)</li>
+                <li>• Category breakdowns</li>
+                <li>• Market regime classification</li>
+                <li>• Divergence alerts</li>
+              </ul>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#00c896]">
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">PXI-Signal</div>
+              <p className="text-[10px] text-[#949ba5]/70 mb-2">Actionable layer for risk allocation</p>
+              <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
+                <li>• Risk allocation (0-100%)</li>
+                <li>• Signal type classification</li>
+                <li>• Volatility percentile</li>
+                <li>• Adjustment explanations</li>
+              </ul>
+            </div>
+          </div>
+        </section>
 
         {/* Definition */}
         <section className="mb-12">
@@ -461,7 +491,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 
         {/* Categories */}
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Category Composition</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Category Composition (v1.1)</h2>
           <div className="space-y-4">
             {[
               { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, AAII sentiment', formula: '100 - percentile(VIX, 5yr)' },
@@ -470,7 +500,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
               { name: 'Positioning', weight: 15, indicators: 'Fed balance sheet, TGA, reverse repo, net liquidity', formula: 'percentile(net_liq, 5yr)' },
               { name: 'Macro', weight: 10, indicators: 'ISM manufacturing, jobless claims, CFNAI', formula: 'percentile(macro_composite, 5yr)' },
               { name: 'Global', weight: 10, indicators: 'DXY, copper/gold ratio, EM spreads, AUD/JPY', formula: 'percentile(global_composite, 5yr)' },
-              { name: 'Crypto', weight: 10, indicators: 'BTC vs 200DMA, stablecoin mcap, BTC price', formula: 'percentile(crypto_composite, 5yr)' },
+              { name: 'Crypto', weight: 10, indicators: 'BTC vs 200DMA, stablecoin mcap, BTC ETF flows, funding rates', formula: 'percentile(crypto_composite, 5yr)' },
             ].map((cat) => (
               <div key={cat.name} className="bg-[#0a0a0a]/60 rounded px-4 py-3">
                 <div className="flex justify-between items-center mb-2">
@@ -484,9 +514,43 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           </div>
         </section>
 
+        {/* PXI-Signal Trading Policy */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">PXI-Signal Trading Policy</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            The signal layer applies a canonical trading policy to convert PXI state into risk allocation.
+            Base allocation scales linearly from 30% (PXI=0) to 100% (PXI=100).
+          </p>
+          <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[11px] text-[#f3f3f3]/70 space-y-1 mb-4">
+            <div>Base = 0.3 + (PXI / 100) × 0.7</div>
+            <div className="text-[#ff6b6b]">If Regime = RISK_OFF → allocation × 0.5</div>
+            <div className="text-[#f59e0b]">If Regime = TRANSITION → allocation × 0.75</div>
+            <div className="text-[#f59e0b]">If Δ7d &lt; -10 → allocation × 0.8</div>
+            <div className="text-[#f59e0b]">If VIX_percentile &gt; 80 → allocation × 0.7</div>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px]">
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-2 text-center">
+              <div className="text-[#00c896] font-medium">FULL_RISK</div>
+              <div className="text-[#949ba5]/60">≥80% alloc</div>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-2 text-center">
+              <div className="text-[#f59e0b] font-medium">REDUCED</div>
+              <div className="text-[#949ba5]/60">50-80% alloc</div>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-2 text-center">
+              <div className="text-[#ff6b6b] font-medium">RISK_OFF</div>
+              <div className="text-[#949ba5]/60">30-50% alloc</div>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-2 text-center">
+              <div className="text-[#dc2626] font-medium">DEFENSIVE</div>
+              <div className="text-[#949ba5]/60">&lt;30% alloc</div>
+            </div>
+          </div>
+        </section>
+
         {/* Regime Detection */}
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Regime Detection (v1.1)</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Regime Detection</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
             Market regime is classified using a voting system with percentile-based thresholds
             calculated over a 5-year rolling window. Each indicator votes RISK_ON, RISK_OFF, or NEUTRAL.
@@ -503,12 +567,71 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           </p>
         </section>
 
+        {/* Backtest Results */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Backtest Results (2022-2024)</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            Walk-forward backtest comparing PXI-Signal strategy against baseline strategies.
+            583 trading days, returns measured on SPY.
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-[#949ba5]/50 uppercase tracking-wider">
+                  <th className="text-left py-2">Strategy</th>
+                  <th className="text-right py-2">CAGR</th>
+                  <th className="text-right py-2">Vol</th>
+                  <th className="text-right py-2">Sharpe</th>
+                  <th className="text-right py-2">Max DD</th>
+                </tr>
+              </thead>
+              <tbody className="text-[#f3f3f3]/80 font-mono">
+                <tr className="border-t border-[#26272b]">
+                  <td className="py-2 text-[#00c896]">PXI-Signal</td>
+                  <td className="text-right">12.3%</td>
+                  <td className="text-right text-[#00c896]">6.2%</td>
+                  <td className="text-right text-[#00c896]">2.00</td>
+                  <td className="text-right text-[#00c896]">6.3%</td>
+                </tr>
+                <tr className="border-t border-[#26272b]">
+                  <td className="py-2">200DMA</td>
+                  <td className="text-right">15.3%</td>
+                  <td className="text-right">12.4%</td>
+                  <td className="text-right">1.24</td>
+                  <td className="text-right">13.8%</td>
+                </tr>
+                <tr className="border-t border-[#26272b]">
+                  <td className="py-2 text-[#949ba5]">Buy-and-Hold</td>
+                  <td className="text-right text-[#949ba5]">17.0%</td>
+                  <td className="text-right text-[#ff6b6b]">16.0%</td>
+                  <td className="text-right text-[#949ba5]">1.06</td>
+                  <td className="text-right text-[#ff6b6b]">17.5%</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-4 grid grid-cols-3 gap-2 text-[10px]">
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-2 text-center">
+              <div className="text-[#00c896] font-mono text-lg">+0.94</div>
+              <div className="text-[#949ba5]/50">Sharpe vs B&H</div>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-2 text-center">
+              <div className="text-[#00c896] font-mono text-lg">-9.9%</div>
+              <div className="text-[#949ba5]/50">Vol reduction</div>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-2 text-center">
+              <div className="text-[#00c896] font-mono text-lg">-11.2%</div>
+              <div className="text-[#949ba5]/50">Max DD improve</div>
+            </div>
+          </div>
+        </section>
+
         {/* Empirical Model */}
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Empirical Model</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Forward Return Model</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
-            Forward return predictions use conditional probability distributions derived from
-            historical backtesting. Returns are bucketed by PXI score at observation time.
+            Conditional probability distributions derived from historical data.
+            Returns bucketed by PXI score at observation time.
           </p>
           <div className="overflow-x-auto">
             <table className="w-full text-[10px]">
@@ -560,17 +683,14 @@ function SpecPage({ onClose }: { onClose: () => void }) {
               </tbody>
             </table>
           </div>
-          <p className="text-[10px] text-[#949ba5]/50 mt-3">
-            Sample period: Dec 2022 – Dec 2025 | Forward returns measured on SPY
-          </p>
         </section>
 
         {/* Divergence Detection */}
         <section className="mb-12">
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Divergence Alerts</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
-            Divergence signals flag conflicts between PXI score and market regime, potentially
-            indicating regime transitions or hidden risks.
+            Divergence signals flag conflicts between PXI score and market regime. Alerts include
+            historical metrics: frequency, median forward returns, and false positive rates.
           </p>
           <div className="space-y-2 text-[11px]">
             {[
@@ -587,6 +707,32 @@ function SpecPage({ onClose }: { onClose: () => void }) {
                 <p className="text-[10px] text-[#949ba5]/60 mt-1">{alert.desc}</p>
               </div>
             ))}
+          </div>
+        </section>
+
+        {/* Signal Distribution */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Historical Signal Distribution</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            Distribution of signal types over the backtest period (1100 observations).
+          </p>
+          <div className="grid grid-cols-4 gap-2 text-[10px]">
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-3 text-center">
+              <div className="text-[#ff6b6b] font-mono text-lg">38%</div>
+              <div className="text-[#949ba5]/50 text-[9px]">RISK_OFF</div>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-3 text-center">
+              <div className="text-[#f59e0b] font-mono text-lg">36%</div>
+              <div className="text-[#949ba5]/50 text-[9px]">REDUCED</div>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-3 text-center">
+              <div className="text-[#dc2626] font-mono text-lg">18%</div>
+              <div className="text-[#949ba5]/50 text-[9px]">DEFENSIVE</div>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-3 py-3 text-center">
+              <div className="text-[#00c896] font-mono text-lg">8%</div>
+              <div className="text-[#949ba5]/50 text-[9px]">FULL_RISK</div>
+            </div>
           </div>
         </section>
 
@@ -615,7 +761,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 
         {/* Footer */}
         <div className="text-[9px] text-[#949ba5]/30 font-mono tracking-wider text-center uppercase pt-8 border-t border-[#26272b]">
-          PXI/COMMAND Protocol v1.0
+          PXI/COMMAND Protocol v1.1
         </div>
       </div>
     </div>
