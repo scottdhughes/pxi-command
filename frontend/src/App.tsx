@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 
 interface PXIData {
   date: string
@@ -323,11 +323,229 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
   )
 }
 
+function SpecPage({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-16 overflow-auto">
+      <div className="max-w-2xl mx-auto">
+        {/* Header */}
+        <div className="flex justify-between items-center mb-12">
+          <div className="text-[10px] sm:text-[11px] font-mono tracking-[0.2em] text-[#949ba5] uppercase">
+            PXI<span className="text-[#00a3ff]">/</span>spec
+          </div>
+          <button
+            onClick={onClose}
+            className="text-[10px] text-[#949ba5]/50 hover:text-[#f3f3f3] uppercase tracking-widest transition-colors"
+          >
+            Close
+          </button>
+        </div>
+
+        {/* Title */}
+        <h1 className="text-2xl sm:text-3xl font-extralight mb-2 tracking-tight">
+          Protocol Specification
+        </h1>
+        <p className="text-[11px] text-[#949ba5]/60 mb-12 uppercase tracking-widest">
+          Macro Market Strength Index — Quantitative Framework
+        </p>
+
+        {/* Definition */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Definition</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            PXI (Pamp Index) is a composite indicator measuring macro market strength across seven
+            dimensions. It synthesizes volatility, credit conditions, breadth, liquidity, and global
+            flows into a single 0-100 score.
+          </p>
+          <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[12px] text-[#f3f3f3]/80">
+            PXI = Σ(Cᵢ × Wᵢ) / Σ(Wᵢ)
+          </div>
+          <p className="text-[10px] text-[#949ba5]/50 mt-2">
+            Where Cᵢ = category score [0,100] and Wᵢ = category weight
+          </p>
+        </section>
+
+        {/* Categories */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Category Composition</h2>
+          <div className="space-y-4">
+            {[
+              { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, realized vol', formula: '100 - normalize(VIX, 12, 35)' },
+              { name: 'Credit', weight: 20, indicators: 'HY spreads, IG spreads, HYG/LQD ratio', formula: '100 - normalize(HY_spread, 300, 600)' },
+              { name: 'Breadth', weight: 15, indicators: 'Sector performance dispersion, % sectors > 200DMA', formula: 'pct_sectors_above_avg × 100' },
+              { name: 'Liquidity', weight: 15, indicators: 'TLT flows, gold flows, USD strength', formula: 'composite(TLT_chg, GLD_chg, -DXY_chg)' },
+              { name: 'Macro', weight: 10, indicators: 'Yield curve (10Y-2Y), rate expectations', formula: 'normalize(curve_spread, -50, 150)' },
+              { name: 'Global', weight: 10, indicators: 'EM flows, DXY, global risk appetite', formula: 'composite(EM_perf, -DXY_str, EU_perf)' },
+              { name: 'Crypto', weight: 10, indicators: 'BTC trend, crypto sentiment', formula: 'normalize(BTC_30d_chg, -20, 30)' },
+            ].map((cat) => (
+              <div key={cat.name} className="bg-[#0a0a0a]/60 rounded px-4 py-3">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="text-[11px] font-medium uppercase tracking-wide">{cat.name}</span>
+                  <span className="text-[10px] text-[#949ba5]/50">w = {cat.weight}%</span>
+                </div>
+                <p className="text-[10px] text-[#949ba5]/70 mb-1">{cat.indicators}</p>
+                <code className="text-[9px] text-[#00a3ff]/60 font-mono">{cat.formula}</code>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* Regime Detection */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Regime Detection</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            Market regime is classified using a voting system across five macro indicators.
+            Each indicator votes RISK_ON (+1), RISK_OFF (-1), or NEUTRAL (0).
+          </p>
+          <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[11px] text-[#f3f3f3]/70 space-y-1">
+            <div>VIX &lt; 18 → RISK_ON | VIX &gt; 25 → RISK_OFF</div>
+            <div>HY_spread &lt; 350bp → RISK_ON | &gt; 500bp → RISK_OFF</div>
+            <div>Sector_breadth &gt; 60% → RISK_ON | &lt; 40% → RISK_OFF</div>
+            <div>Yield_curve &gt; 50bp → RISK_ON | &lt; 0 → RISK_OFF</div>
+            <div>DXY &lt; 100 → RISK_ON | &gt; 105 → RISK_OFF</div>
+          </div>
+          <p className="text-[10px] text-[#949ba5]/50 mt-2">
+            Regime = RISK_ON if Σ(votes) ≥ 2 | RISK_OFF if Σ(votes) ≤ -2 | else TRANSITION
+          </p>
+        </section>
+
+        {/* Empirical Model */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Empirical Model</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            Forward return predictions use conditional probability distributions derived from
+            historical backtesting. Returns are bucketed by PXI score at observation time.
+          </p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-[10px]">
+              <thead>
+                <tr className="text-[#949ba5]/50 uppercase tracking-wider">
+                  <th className="text-left py-2">PXI Range</th>
+                  <th className="text-right py-2">n</th>
+                  <th className="text-right py-2">E[R₇ᵈ]</th>
+                  <th className="text-right py-2">E[R₃₀ᵈ]</th>
+                  <th className="text-right py-2">P(R₃₀ᵈ &gt; 0)</th>
+                </tr>
+              </thead>
+              <tbody className="text-[#f3f3f3]/80 font-mono">
+                <tr className="border-t border-[#26272b]">
+                  <td className="py-2">0–20</td>
+                  <td className="text-right">44</td>
+                  <td className="text-right text-[#00a3ff]">+0.59%</td>
+                  <td className="text-right text-[#00a3ff]">+1.64%</td>
+                  <td className="text-right">70%</td>
+                </tr>
+                <tr className="border-t border-[#26272b]">
+                  <td className="py-2">20–40</td>
+                  <td className="text-right">222</td>
+                  <td className="text-right text-[#00a3ff]">+0.70%</td>
+                  <td className="text-right text-[#00a3ff]">+2.66%</td>
+                  <td className="text-right">75%</td>
+                </tr>
+                <tr className="border-t border-[#26272b]">
+                  <td className="py-2">40–60</td>
+                  <td className="text-right">580</td>
+                  <td className="text-right text-[#00a3ff]">+0.38%</td>
+                  <td className="text-right text-[#00a3ff]">+1.64%</td>
+                  <td className="text-right">75%</td>
+                </tr>
+                <tr className="border-t border-[#26272b]">
+                  <td className="py-2">60–80</td>
+                  <td className="text-right">226</td>
+                  <td className="text-right">+0.17%</td>
+                  <td className="text-right">+0.84%</td>
+                  <td className="text-right">73%</td>
+                </tr>
+                <tr className="border-t border-[#26272b]">
+                  <td className="py-2 text-[#949ba5]">80–100</td>
+                  <td className="text-right text-[#949ba5]">27</td>
+                  <td className="text-right text-[#ff6b6b]">−0.23%</td>
+                  <td className="text-right text-[#949ba5]">+0.13%</td>
+                  <td className="text-right text-[#949ba5]">63%</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p className="text-[10px] text-[#949ba5]/50 mt-3">
+            Sample period: Dec 2022 – Dec 2025 | Forward returns measured on SPY
+          </p>
+        </section>
+
+        {/* Divergence Detection */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Divergence Alerts</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            Divergence signals flag conflicts between PXI score and market regime, potentially
+            indicating regime transitions or hidden risks.
+          </p>
+          <div className="space-y-2 text-[11px]">
+            {[
+              { name: 'Stealth Weakness', condition: 'PXI < 30 ∧ VIX < 15', desc: 'Low index despite low vol — complacency risk' },
+              { name: 'Resilient Strength', condition: 'PXI > 70 ∧ VIX > 25', desc: 'High index despite elevated vol — market absorbing fear' },
+              { name: 'Rapid Deterioration', condition: 'ΔPXI₇ᵈ < -15 ∧ Regime = RISK_ON', desc: 'Sharp drop while regime stable — leading indicator' },
+              { name: 'Hidden Risk', condition: 'Regime = RISK_ON ∧ PXI < 40', desc: 'Regime looks fine but underlying weakness' },
+            ].map((alert) => (
+              <div key={alert.name} className="bg-[#0a0a0a]/60 rounded px-4 py-2">
+                <div className="flex justify-between items-center">
+                  <span className="font-medium">{alert.name}</span>
+                  <code className="text-[9px] text-[#00a3ff]/60 font-mono">{alert.condition}</code>
+                </div>
+                <p className="text-[10px] text-[#949ba5]/60 mt-1">{alert.desc}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* Interpretation */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Interpretation Guide</h2>
+          <div className="grid grid-cols-2 gap-4 text-[11px]">
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
+              <div className="text-[#00a3ff] font-medium mb-1">0–40: Weak</div>
+              <p className="text-[10px] text-[#949ba5]/70">Risk-off conditions. Historically favorable for forward returns (mean reversion).</p>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
+              <div className="text-[#949ba5] font-medium mb-1">40–60: Neutral</div>
+              <p className="text-[10px] text-[#949ba5]/70">Typical conditions. No strong directional bias.</p>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
+              <div className="text-[#f59e0b] font-medium mb-1">60–80: Strong</div>
+              <p className="text-[10px] text-[#949ba5]/70">Risk-on conditions. Watch for overextension.</p>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
+              <div className="text-[#ff6b6b] font-medium mb-1">80–100: Extended</div>
+              <p className="text-[10px] text-[#949ba5]/70">Historically poor forward returns. Elevated reversal risk.</p>
+            </div>
+          </div>
+        </section>
+
+        {/* Footer */}
+        <div className="text-[9px] text-[#949ba5]/30 font-mono tracking-wider text-center uppercase pt-8 border-t border-[#26272b]">
+          PXI/COMMAND Protocol v1.0
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [data, setData] = useState<PXIData | null>(null)
   const [prediction, setPrediction] = useState<PredictionData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [showSpec, setShowSpec] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  // Close menu when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
 
   useEffect(() => {
     const fetchData = async () => {
@@ -386,6 +604,11 @@ function App() {
     )
   }
 
+  // Show spec page
+  if (showSpec) {
+    return <SpecPage onClose={() => setShowSpec(false)} />
+  }
+
   const delta7d = data.delta.d7
   const deltaDisplay = delta7d !== null
     ? `${delta7d >= 0 ? '+' : ''}${delta7d.toFixed(1)}`
@@ -394,9 +617,28 @@ function App() {
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] flex flex-col items-center justify-center px-4 sm:px-8 py-12 sm:py-16">
       {/* Header */}
-      <header className="fixed top-0 left-0 right-0 p-4 sm:p-6 flex justify-between items-center">
-        <div className="text-[10px] sm:text-[11px] font-mono tracking-[0.2em] text-[#949ba5] uppercase">
-          PXI<span className="text-[#00a3ff]">/</span>command
+      <header className="fixed top-0 left-0 right-0 p-4 sm:p-6 flex justify-between items-center z-50">
+        <div className="relative" ref={menuRef}>
+          <button
+            onClick={() => setMenuOpen(!menuOpen)}
+            className="text-[10px] sm:text-[11px] font-mono tracking-[0.2em] text-[#949ba5] uppercase hover:text-[#f3f3f3] transition-colors"
+          >
+            PXI<span className="text-[#00a3ff]">/</span>command
+            <span className="ml-2 text-[#949ba5]/50">{menuOpen ? '▲' : '▼'}</span>
+          </button>
+          {menuOpen && (
+            <div className="absolute top-full left-0 mt-2 bg-[#0a0a0a] border border-[#26272b] rounded shadow-lg min-w-[120px]">
+              <button
+                onClick={() => {
+                  setShowSpec(true)
+                  setMenuOpen(false)
+                }}
+                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
+              >
+                /spec
+              </button>
+            </div>
+          )}
         </div>
         <div className="text-[10px] sm:text-[11px] font-mono text-[#949ba5]/50">
           {new Date(data.date).toLocaleDateString('en-US', {
