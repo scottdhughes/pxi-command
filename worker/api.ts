@@ -1214,6 +1214,67 @@ export default {
         return Response.json({ success: true, written: totalWritten }, { headers: corsHeaders });
       }
 
+      // Manual refresh - fetch fresh data and recalculate (requires auth)
+      if (url.pathname === '/api/refresh' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader || authHeader !== `Bearer ${env.WRITE_API_KEY}`) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        if (!env.FRED_API_KEY) {
+          return Response.json({ error: 'FRED_API_KEY not configured' }, { status: 500, headers: corsHeaders });
+        }
+
+        // Fetch all indicator data
+        const indicators = await fetchAllIndicators(env.FRED_API_KEY);
+
+        // Write indicators to D1 in batches
+        const BATCH_SIZE = 100;
+        let written = 0;
+        for (let i = 0; i < indicators.length; i += BATCH_SIZE) {
+          const batch = indicators.slice(i, i + BATCH_SIZE);
+          const stmts = batch.map(ind =>
+            env.DB.prepare(`
+              INSERT OR REPLACE INTO indicator_values (indicator_id, date, value, source)
+              VALUES (?, ?, ?, ?)
+            `).bind(ind.indicator_id, ind.date, ind.value, ind.source)
+          );
+          await env.DB.batch(stmts);
+          written += batch.length;
+        }
+
+        // Calculate PXI for today
+        const today = formatDate(new Date());
+        const result = await calculatePXI(env.DB, today);
+
+        if (result) {
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            result.pxi.date, result.pxi.score, result.pxi.label, result.pxi.status,
+            result.pxi.delta_1d, result.pxi.delta_7d, result.pxi.delta_30d
+          ).run();
+
+          const catStmts = result.categories.map(cat =>
+            env.DB.prepare(`
+              INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
+              VALUES (?, ?, ?, ?, ?)
+            `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score)
+          );
+          if (catStmts.length > 0) {
+            await env.DB.batch(catStmts);
+          }
+        }
+
+        return Response.json({
+          success: true,
+          indicators_fetched: indicators.length,
+          indicators_written: written,
+          pxi: result ? { date: today, score: result.pxi.score, label: result.pxi.label, categories: result.categories.length } : null,
+        }, { headers: corsHeaders });
+      }
+
       // Recalculate PXI for a given date (requires auth)
       if (url.pathname === '/api/recalculate' && request.method === 'POST') {
         const authHeader = request.headers.get('Authorization');
