@@ -1064,6 +1064,194 @@ async function handleScheduled(env: Env): Promise<void> {
   }
 }
 
+// ============== Regime Detection ==============
+
+type RegimeType = 'RISK_ON' | 'RISK_OFF' | 'TRANSITION';
+
+interface RegimeSignal {
+  indicator: string;
+  value: number | null;
+  threshold_low: number;
+  threshold_high: number;
+  signal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL';
+  description: string;
+}
+
+interface RegimeResult {
+  regime: RegimeType;
+  confidence: number;
+  signals: RegimeSignal[];
+  description: string;
+  date: string;
+}
+
+async function detectRegime(db: D1Database, targetDate?: string): Promise<RegimeResult | null> {
+  // Get the date to analyze
+  const dateToUse = targetDate || (await db.prepare(
+    'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 1'
+  ).first<{ date: string }>())?.date;
+
+  if (!dateToUse) return null;
+
+  // Get latest values for regime indicators (using lagging data approach)
+  const getIndicatorValue = async (indicatorId: string): Promise<number | null> => {
+    const result = await db.prepare(`
+      SELECT value FROM indicator_values
+      WHERE indicator_id = ? AND date <= ?
+      ORDER BY date DESC LIMIT 1
+    `).bind(indicatorId, dateToUse).first<{ value: number }>();
+    return result?.value ?? null;
+  };
+
+  // Fetch key regime indicators
+  const [vix, hySpread, sectorBreadth, yieldCurve, dollarIndex] = await Promise.all([
+    getIndicatorValue('vix'),
+    getIndicatorValue('high_yield_spread'),
+    getIndicatorValue('sector_breadth'),
+    getIndicatorValue('yield_curve'),
+    getIndicatorValue('dollar_index'),
+  ]);
+
+  const signals: RegimeSignal[] = [];
+
+  // VIX signal: <18 = risk-on, >25 = risk-off
+  if (vix !== null) {
+    let vixSignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
+    let vixDesc = 'VIX in normal range';
+    if (vix < 18) {
+      vixSignal = 'RISK_ON';
+      vixDesc = 'Low volatility - complacency';
+    } else if (vix > 25) {
+      vixSignal = 'RISK_OFF';
+      vixDesc = 'Elevated fear';
+    }
+    signals.push({
+      indicator: 'VIX',
+      value: vix,
+      threshold_low: 18,
+      threshold_high: 25,
+      signal: vixSignal,
+      description: vixDesc,
+    });
+  }
+
+  // High Yield Spread: <350bp = risk-on, >500bp = risk-off
+  if (hySpread !== null) {
+    let hySignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
+    let hyDesc = 'Credit spreads normal';
+    if (hySpread < 350) {
+      hySignal = 'RISK_ON';
+      hyDesc = 'Tight spreads - risk appetite strong';
+    } else if (hySpread > 500) {
+      hySignal = 'RISK_OFF';
+      hyDesc = 'Wide spreads - credit stress';
+    }
+    signals.push({
+      indicator: 'HY_SPREAD',
+      value: hySpread,
+      threshold_low: 350,
+      threshold_high: 500,
+      signal: hySignal,
+      description: hyDesc,
+    });
+  }
+
+  // Sector Breadth: >60% = risk-on, <40% = risk-off
+  if (sectorBreadth !== null) {
+    let breadthSignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
+    let breadthDesc = 'Mixed sector participation';
+    if (sectorBreadth > 60) {
+      breadthSignal = 'RISK_ON';
+      breadthDesc = 'Broad sector strength';
+    } else if (sectorBreadth < 40) {
+      breadthSignal = 'RISK_OFF';
+      breadthDesc = 'Narrow leadership - defensive';
+    }
+    signals.push({
+      indicator: 'SECTOR_BREADTH',
+      value: sectorBreadth,
+      threshold_low: 40,
+      threshold_high: 60,
+      signal: breadthSignal,
+      description: breadthDesc,
+    });
+  }
+
+  // Yield Curve (2s10s): >50bp = risk-on, <0 (inverted) = risk-off
+  if (yieldCurve !== null) {
+    let ycSignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
+    let ycDesc = 'Yield curve flat';
+    if (yieldCurve > 50) {
+      ycSignal = 'RISK_ON';
+      ycDesc = 'Steep curve - growth expectations';
+    } else if (yieldCurve < 0) {
+      ycSignal = 'RISK_OFF';
+      ycDesc = 'Inverted curve - recession signal';
+    }
+    signals.push({
+      indicator: 'YIELD_CURVE',
+      value: yieldCurve,
+      threshold_low: 0,
+      threshold_high: 50,
+      signal: ycSignal,
+      description: ycDesc,
+    });
+  }
+
+  // Dollar Index: <100 = risk-on (weak dollar), >105 = risk-off (flight to safety)
+  if (dollarIndex !== null) {
+    let dxySignal: 'RISK_ON' | 'RISK_OFF' | 'NEUTRAL' = 'NEUTRAL';
+    let dxyDesc = 'Dollar neutral';
+    if (dollarIndex < 100) {
+      dxySignal = 'RISK_ON';
+      dxyDesc = 'Weak dollar - risk appetite';
+    } else if (dollarIndex > 105) {
+      dxySignal = 'RISK_OFF';
+      dxyDesc = 'Strong dollar - safe haven flows';
+    }
+    signals.push({
+      indicator: 'DXY',
+      value: dollarIndex,
+      threshold_low: 100,
+      threshold_high: 105,
+      signal: dxySignal,
+      description: dxyDesc,
+    });
+  }
+
+  // Count votes
+  const riskOnVotes = signals.filter(s => s.signal === 'RISK_ON').length;
+  const riskOffVotes = signals.filter(s => s.signal === 'RISK_OFF').length;
+  const totalSignals = signals.length;
+
+  // Determine regime
+  let regime: RegimeType = 'TRANSITION';
+  let description = 'Mixed signals - market in transition';
+  let confidence = 0.5;
+
+  if (totalSignals > 0) {
+    if (riskOnVotes >= 3 || (riskOnVotes >= 2 && riskOffVotes === 0)) {
+      regime = 'RISK_ON';
+      description = 'Risk-on environment - favorable for equities';
+      confidence = riskOnVotes / totalSignals;
+    } else if (riskOffVotes >= 3 || (riskOffVotes >= 2 && riskOnVotes === 0)) {
+      regime = 'RISK_OFF';
+      description = 'Risk-off environment - defensive positioning recommended';
+      confidence = riskOffVotes / totalSignals;
+    } else {
+      confidence = 1 - Math.abs(riskOnVotes - riskOffVotes) / totalSignals;
+    }
+  }
+
+  return {
+    regime,
+    confidence,
+    signals,
+    description,
+    date: dateToUse,
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -1100,6 +1288,42 @@ export default {
           { status: 'healthy', db: result?.ok === 1, timestamp: new Date().toISOString() },
           { headers: { ...corsHeaders, 'Cache-Control': 'no-store' } }
         );
+      }
+
+      // Regime detection endpoint
+      if (url.pathname === '/api/regime') {
+        const regime = await detectRegime(env.DB);
+        if (!regime) {
+          return Response.json({ error: 'Could not detect regime' }, { status: 500, headers: corsHeaders });
+        }
+
+        // Get regime history for context
+        const recentDates = await env.DB.prepare(
+          'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 30'
+        ).all<{ date: string }>();
+
+        const regimeHistory: { date: string; regime: RegimeType }[] = [];
+        for (const d of (recentDates.results || []).slice(0, 10)) {
+          const r = await detectRegime(env.DB, d.date);
+          if (r) {
+            regimeHistory.push({ date: r.date, regime: r.regime });
+          }
+        }
+
+        // Count regime changes in last 30 days
+        let regimeChanges = 0;
+        for (let i = 1; i < regimeHistory.length; i++) {
+          if (regimeHistory[i].regime !== regimeHistory[i - 1].regime) {
+            regimeChanges++;
+          }
+        }
+
+        return Response.json({
+          current: regime,
+          history: regimeHistory,
+          stability: regimeChanges <= 1 ? 'STABLE' : regimeChanges <= 3 ? 'MODERATE' : 'VOLATILE',
+          regime_changes_10d: regimeChanges,
+        }, { headers: corsHeaders });
       }
 
       // OG Image endpoint
@@ -1183,6 +1407,9 @@ export default {
           'SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 30'
         ).all<SparklineRow>();
 
+        // Detect current regime
+        const regime = await detectRegime(env.DB, pxi.date);
+
         const response = {
           date: pxi.date,
           score: pxi.score,
@@ -1202,6 +1429,11 @@ export default {
             date: r.date,
             score: r.score,
           })),
+          regime: regime ? {
+            type: regime.regime,
+            confidence: regime.confidence,
+            description: regime.description,
+          } : null,
         };
 
         return Response.json(response, {

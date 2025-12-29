@@ -19,6 +19,11 @@ interface PXIData {
     date: string
     score: number
   }[]
+  regime: {
+    type: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
+    confidence: number
+    description: string
+  } | null
 }
 
 interface PredictionData {
@@ -118,6 +123,31 @@ function StatusBadge({ status, label }: { status: string; label: string }) {
     <span className={`${styles[status] || styles.neutral} px-4 py-1.5 rounded text-[11px] font-medium tracking-[0.1em] uppercase`}>
       {label}
     </span>
+  )
+}
+
+function RegimeBadge({ regime }: { regime: PXIData['regime'] }) {
+  if (!regime) return null
+
+  const styles: Record<string, { bg: string; text: string; icon: string }> = {
+    RISK_ON: { bg: 'bg-[#00a3ff]/10 border-[#00a3ff]/30', text: 'text-[#00a3ff]', icon: '↗' },
+    RISK_OFF: { bg: 'bg-[#ff6b6b]/10 border-[#ff6b6b]/30', text: 'text-[#ff6b6b]', icon: '↘' },
+    TRANSITION: { bg: 'bg-[#f59e0b]/10 border-[#f59e0b]/30', text: 'text-[#f59e0b]', icon: '↔' },
+  }
+
+  const style = styles[regime.type] || styles.TRANSITION
+  const label = regime.type.replace('_', ' ')
+
+  return (
+    <div className={`${style.bg} border rounded px-3 py-1.5 flex items-center gap-2`}>
+      <span className={`${style.text} text-sm`}>{style.icon}</span>
+      <span className={`${style.text} text-[10px] font-medium tracking-wider uppercase`}>
+        {label}
+      </span>
+      <span className="text-[9px] text-[#949ba5]/50">
+        {Math.round(regime.confidence * 100)}%
+      </span>
+    </div>
   )
 }
 
@@ -324,9 +354,10 @@ function App() {
 
       {/* Main Content */}
       <main className="flex flex-col items-center max-w-lg w-full pt-8 sm:pt-0">
-        {/* Status Badge */}
-        <div className="mb-6 sm:mb-8">
+        {/* Status Badge & Regime */}
+        <div className="mb-6 sm:mb-8 flex flex-col items-center gap-3">
           <StatusBadge status={data.status} label={data.label} />
+          {data.regime && <RegimeBadge regime={data.regime} />}
         </div>
 
         {/* Hero Score */}
