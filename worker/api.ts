@@ -693,16 +693,27 @@ async function calculatePXI(db: D1Database, targetDate: string): Promise<{
 
   const pxiScore = totalScore / totalWeight;
 
-  // Get historical PXI for deltas
-  const historicalPxi = await db.prepare(`
-    SELECT date, score FROM pxi_scores
-    WHERE date < ? ORDER BY date DESC LIMIT 30
-  `).bind(targetDate).all<{ date: string; score: number }>();
+  // Get historical PXI for deltas using actual calendar dates
+  const targetDateObj = new Date(targetDate);
+  const date1d = new Date(targetDateObj);
+  date1d.setDate(date1d.getDate() - 1);
+  const date7d = new Date(targetDateObj);
+  date7d.setDate(date7d.getDate() - 7);
+  const date30d = new Date(targetDateObj);
+  date30d.setDate(date30d.getDate() - 30);
 
-  const pxiHistory = historicalPxi.results || [];
-  const delta_1d = pxiHistory.length >= 1 ? pxiScore - pxiHistory[0].score : null;
-  const delta_7d = pxiHistory.length >= 7 ? pxiScore - pxiHistory[6].score : null;
-  const delta_30d = pxiHistory.length >= 30 ? pxiScore - pxiHistory[29].score : null;
+  const formatDate = (d: Date) => d.toISOString().split('T')[0];
+
+  // Get closest available scores to target dates
+  const [hist1d, hist7d, hist30d] = await Promise.all([
+    db.prepare(`SELECT score FROM pxi_scores WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date1d)).first<{ score: number }>(),
+    db.prepare(`SELECT score FROM pxi_scores WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date7d)).first<{ score: number }>(),
+    db.prepare(`SELECT score FROM pxi_scores WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date30d)).first<{ score: number }>(),
+  ]);
+
+  const delta_1d = hist1d ? pxiScore - hist1d.score : null;
+  const delta_7d = hist7d ? pxiScore - hist7d.score : null;
+  const delta_30d = hist30d ? pxiScore - hist30d.score : null;
 
   return {
     pxi: {
@@ -1330,16 +1341,23 @@ async function detectDivergence(
   }
 
   // Divergence 5: Check PXI momentum - falling sharply while regime stable
-  const recentPxi = await db.prepare(`
-    SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 8
-  `).all<{ date: string; score: number }>();
+  // Use calendar date (7 days ago) not index-based lookup
+  const latestPxi = await db.prepare(`
+    SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 1
+  `).first<{ date: string; score: number }>();
 
-  if (recentPxi.results && recentPxi.results.length >= 7) {
-    const latest = recentPxi.results[0].score;
-    const weekAgo = recentPxi.results[6]?.score;
+  if (latestPxi) {
+    const latestDate = new Date(latestPxi.date);
+    const date7dAgo = new Date(latestDate);
+    date7dAgo.setDate(date7dAgo.getDate() - 7);
+    const date7dStr = date7dAgo.toISOString().split('T')[0];
 
-    if (weekAgo !== undefined) {
-      const weekChange = latest - weekAgo;
+    const pxi7dAgo = await db.prepare(`
+      SELECT score FROM pxi_scores WHERE date <= ? ORDER BY date DESC LIMIT 1
+    `).bind(date7dStr).first<{ score: number }>();
+
+    if (pxi7dAgo) {
+      const weekChange = latestPxi.score - pxi7dAgo.score;
 
       // Sharp drop (>15 points) while regime is still RISK_ON
       if (weekChange < -15 && regime?.regime === 'RISK_ON') {
