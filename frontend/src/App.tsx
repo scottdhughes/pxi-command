@@ -24,6 +24,15 @@ interface PXIData {
     confidence: number
     description: string
   } | null
+  divergence: {
+    alerts: {
+      type: 'PXI_REGIME' | 'PXI_MOMENTUM' | 'REGIME_SHIFT'
+      severity: 'LOW' | 'MEDIUM' | 'HIGH'
+      title: string
+      description: string
+      actionable: boolean
+    }[]
+  } | null
 }
 
 interface PredictionData {
@@ -147,6 +156,45 @@ function RegimeBadge({ regime }: { regime: PXIData['regime'] }) {
       <span className="text-[9px] text-[#949ba5]/50">
         {Math.round(regime.confidence * 100)}%
       </span>
+    </div>
+  )
+}
+
+function DivergenceAlerts({ divergence }: { divergence: PXIData['divergence'] }) {
+  if (!divergence || divergence.alerts.length === 0) return null
+
+  const severityStyles: Record<string, { bg: string; border: string; icon: string }> = {
+    HIGH: { bg: 'bg-[#ff6b6b]/10', border: 'border-[#ff6b6b]/40', icon: '⚠' },
+    MEDIUM: { bg: 'bg-[#f59e0b]/10', border: 'border-[#f59e0b]/40', icon: '⚡' },
+    LOW: { bg: 'bg-[#949ba5]/10', border: 'border-[#949ba5]/40', icon: 'ℹ' },
+  }
+
+  return (
+    <div className="w-full mt-4 space-y-2">
+      {divergence.alerts.map((alert, i) => {
+        const style = severityStyles[alert.severity] || severityStyles.LOW
+        return (
+          <div
+            key={i}
+            className={`${style.bg} ${style.border} border rounded-lg px-4 py-3`}
+          >
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-sm">{style.icon}</span>
+              <span className="text-[11px] font-medium text-[#f3f3f3] uppercase tracking-wide">
+                {alert.title}
+              </span>
+              {alert.actionable && (
+                <span className="text-[8px] text-[#f59e0b] uppercase tracking-wider ml-auto">
+                  Actionable
+                </span>
+              )}
+            </div>
+            <p className="text-[10px] text-[#949ba5] leading-relaxed">
+              {alert.description}
+            </p>
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -397,6 +445,9 @@ function App() {
               <CategoryBar key={cat.name} name={cat.name} score={cat.score} />
             ))}
         </div>
+
+        {/* Divergence Alerts */}
+        {data.divergence && <DivergenceAlerts divergence={data.divergence} />}
 
         {/* Predictions */}
         {prediction && <PredictionCard prediction={prediction} />}

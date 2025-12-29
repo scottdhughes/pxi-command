@@ -1252,6 +1252,151 @@ async function detectRegime(db: D1Database, targetDate?: string): Promise<Regime
   };
 }
 
+// ============== Divergence Detection ==============
+
+interface DivergenceAlert {
+  type: 'PXI_REGIME' | 'PXI_MOMENTUM' | 'REGIME_SHIFT';
+  severity: 'LOW' | 'MEDIUM' | 'HIGH';
+  title: string;
+  description: string;
+  actionable: boolean;
+}
+
+interface DivergenceResult {
+  has_divergence: boolean;
+  alerts: DivergenceAlert[];
+}
+
+async function detectDivergence(
+  db: D1Database,
+  currentPxi: number,
+  regime: RegimeResult | null
+): Promise<DivergenceResult> {
+  const alerts: DivergenceAlert[] = [];
+
+  // Get VIX for more granular analysis
+  const vix = await db.prepare(`
+    SELECT value FROM indicator_values
+    WHERE indicator_id = 'vix'
+    ORDER BY date DESC LIMIT 1
+  `).first<{ value: number }>();
+
+  const vixValue = vix?.value ?? null;
+  const isLowVol = vixValue !== null && vixValue < 18;
+  const isHighVol = vixValue !== null && vixValue > 25;
+
+  // Divergence 1: PXI LOW but volatility is low (unusual - weakness without panic)
+  if (currentPxi < 40 && isLowVol) {
+    alerts.push({
+      type: 'PXI_REGIME',
+      severity: 'HIGH',
+      title: 'Stealth Weakness',
+      description: `PXI at ${currentPxi.toFixed(0)} signals weakness, but VIX at ${vixValue?.toFixed(1)} shows no fear. Unusual - watch for delayed volatility spike.`,
+      actionable: true,
+    });
+  }
+
+  // Divergence 2: PXI HIGH but volatility elevated (rare - strength despite fear)
+  if (currentPxi > 60 && isHighVol) {
+    alerts.push({
+      type: 'PXI_REGIME',
+      severity: 'MEDIUM',
+      title: 'Resilient Strength',
+      description: `PXI at ${currentPxi.toFixed(0)} shows strength despite VIX at ${vixValue?.toFixed(1)}. Market shrugging off fear - potentially bullish.`,
+      actionable: true,
+    });
+  }
+
+  // Divergence 3: Regime is RISK_OFF but PXI is high
+  if (regime?.regime === 'RISK_OFF' && currentPxi > 50) {
+    alerts.push({
+      type: 'PXI_REGIME',
+      severity: 'MEDIUM',
+      title: 'Regime Divergence',
+      description: `Regime signals RISK_OFF but PXI at ${currentPxi.toFixed(0)} remains elevated. Conflicting signals - proceed with caution.`,
+      actionable: true,
+    });
+  }
+
+  // Divergence 4: Regime is RISK_ON but PXI is low
+  if (regime?.regime === 'RISK_ON' && currentPxi < 40) {
+    alerts.push({
+      type: 'PXI_REGIME',
+      severity: 'HIGH',
+      title: 'Hidden Risk',
+      description: `Regime appears RISK_ON but PXI at ${currentPxi.toFixed(0)} shows underlying weakness. Structure looks OK but something's off.`,
+      actionable: true,
+    });
+  }
+
+  // Divergence 5: Check PXI momentum - falling sharply while regime stable
+  const recentPxi = await db.prepare(`
+    SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 8
+  `).all<{ date: string; score: number }>();
+
+  if (recentPxi.results && recentPxi.results.length >= 7) {
+    const latest = recentPxi.results[0].score;
+    const weekAgo = recentPxi.results[6]?.score;
+
+    if (weekAgo !== undefined) {
+      const weekChange = latest - weekAgo;
+
+      // Sharp drop (>15 points) while regime is still RISK_ON
+      if (weekChange < -15 && regime?.regime === 'RISK_ON') {
+        alerts.push({
+          type: 'PXI_MOMENTUM',
+          severity: 'HIGH',
+          title: 'Rapid Deterioration',
+          description: `PXI dropped ${Math.abs(weekChange).toFixed(0)} points in 7 days but regime still shows RISK_ON. Leading indicator of regime change?`,
+          actionable: true,
+        });
+      }
+
+      // Sharp rise (>15 points) while regime is RISK_OFF
+      if (weekChange > 15 && regime?.regime === 'RISK_OFF') {
+        alerts.push({
+          type: 'PXI_MOMENTUM',
+          severity: 'MEDIUM',
+          title: 'Potential Regime Shift',
+          description: `PXI rose ${weekChange.toFixed(0)} points in 7 days despite RISK_OFF regime. Early signs of improvement.`,
+          actionable: true,
+        });
+      }
+    }
+  }
+
+  // Divergence 6: Check for regime instability (multiple changes recently)
+  const recentDates = await db.prepare(
+    'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 15'
+  ).all<{ date: string }>();
+
+  let regimeChanges = 0;
+  let lastRegime: RegimeType | null = null;
+
+  for (const d of (recentDates.results || []).slice(0, 10)) {
+    const r = await detectRegime(db, d.date);
+    if (r && lastRegime && r.regime !== lastRegime) {
+      regimeChanges++;
+    }
+    if (r) lastRegime = r.regime;
+  }
+
+  if (regimeChanges >= 3) {
+    alerts.push({
+      type: 'REGIME_SHIFT',
+      severity: 'MEDIUM',
+      title: 'Unstable Regime',
+      description: `${regimeChanges} regime changes in last 10 days. Market in transition - signals less reliable.`,
+      actionable: false,
+    });
+  }
+
+  return {
+    has_divergence: alerts.length > 0,
+    alerts,
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -1410,6 +1555,9 @@ export default {
         // Detect current regime
         const regime = await detectRegime(env.DB, pxi.date);
 
+        // Detect divergences
+        const divergence = await detectDivergence(env.DB, pxi.score, regime);
+
         const response = {
           date: pxi.date,
           score: pxi.score,
@@ -1433,6 +1581,9 @@ export default {
             type: regime.regime,
             confidence: regime.confidence,
             description: regime.description,
+          } : null,
+          divergence: divergence.has_divergence ? {
+            alerts: divergence.alerts,
           } : null,
         };
 
