@@ -1,0 +1,11 @@
+# PXI/COMMAND - Macro Market Strength Index
+# https://pxi.pages.dev
+
+User-agent: *
+Allow: /
+
+# Sitemap
+Sitemap: https://pxi.pages.dev/sitemap.xml
+
+# Crawl-delay for politeness
+Crawl-delay: 1
