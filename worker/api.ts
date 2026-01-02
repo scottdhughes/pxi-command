@@ -29,6 +29,104 @@ function subYears(date: Date, years: number): Date {
   return d;
 }
 
+// Generate rich embedding text with engineered features
+interface EmbeddingContext {
+  indicators: { indicator_id: string; value: number }[];
+  pxi?: { score: number; delta_7d: number | null; delta_30d: number | null };
+  categories?: { category: string; score: number }[];
+}
+
+function generateEmbeddingText(ctx: EmbeddingContext): string {
+  const parts: string[] = [];
+
+  // 1. Raw indicator values (base features)
+  if (ctx.indicators.length > 0) {
+    const indicatorText = ctx.indicators
+      .map(i => `${i.indicator_id}: ${i.value.toFixed(2)}`)
+      .join(', ');
+    parts.push(`indicators: ${indicatorText}`);
+  }
+
+  // 2. PXI score bucket and momentum (engineered features)
+  if (ctx.pxi) {
+    // Score bucket (0-20, 20-40, 40-60, 60-80, 80-100)
+    const bucket = ctx.pxi.score < 20 ? 'very_low' :
+                   ctx.pxi.score < 40 ? 'low' :
+                   ctx.pxi.score < 60 ? 'neutral' :
+                   ctx.pxi.score < 80 ? 'high' : 'very_high';
+    parts.push(`pxi_bucket: ${bucket}`);
+    parts.push(`pxi_score: ${ctx.pxi.score.toFixed(1)}`);
+
+    // Momentum signals
+    if (ctx.pxi.delta_7d !== null) {
+      const momentum7d = ctx.pxi.delta_7d > 5 ? 'strong_up' :
+                         ctx.pxi.delta_7d > 2 ? 'up' :
+                         ctx.pxi.delta_7d > -2 ? 'flat' :
+                         ctx.pxi.delta_7d > -5 ? 'down' : 'strong_down';
+      parts.push(`momentum_7d: ${momentum7d} (${ctx.pxi.delta_7d.toFixed(1)})`);
+    }
+
+    if (ctx.pxi.delta_30d !== null) {
+      const momentum30d = ctx.pxi.delta_30d > 10 ? 'strong_up' :
+                          ctx.pxi.delta_30d > 4 ? 'up' :
+                          ctx.pxi.delta_30d > -4 ? 'flat' :
+                          ctx.pxi.delta_30d > -10 ? 'down' : 'strong_down';
+      parts.push(`momentum_30d: ${momentum30d} (${ctx.pxi.delta_30d.toFixed(1)})`);
+    }
+
+    // Rate of change acceleration (7d vs 30d normalized)
+    if (ctx.pxi.delta_7d !== null && ctx.pxi.delta_30d !== null) {
+      const weeklyRate = ctx.pxi.delta_7d;
+      const monthlyWeeklyRate = ctx.pxi.delta_30d / 4.3; // Normalize to weekly
+      const acceleration = weeklyRate - monthlyWeeklyRate;
+      const accelSignal = acceleration > 2 ? 'accelerating' :
+                          acceleration < -2 ? 'decelerating' : 'steady';
+      parts.push(`acceleration: ${accelSignal}`);
+    }
+  }
+
+  // 3. Category dispersion and extremes
+  if (ctx.categories && ctx.categories.length > 0) {
+    const scores = ctx.categories.map(c => c.score);
+    const maxScore = Math.max(...scores);
+    const minScore = Math.min(...scores);
+    const dispersion = maxScore - minScore;
+
+    // Dispersion signal (high dispersion = mixed signals)
+    const dispersionSignal = dispersion > 40 ? 'high_dispersion' :
+                             dispersion > 20 ? 'moderate_dispersion' : 'low_dispersion';
+    parts.push(`category_dispersion: ${dispersionSignal} (${dispersion.toFixed(0)})`);
+
+    // Identify extreme categories
+    const extremeHigh = ctx.categories.filter(c => c.score > 70).map(c => c.category);
+    const extremeLow = ctx.categories.filter(c => c.score < 30).map(c => c.category);
+
+    if (extremeHigh.length > 0) {
+      parts.push(`strong_categories: ${extremeHigh.join(', ')}`);
+    }
+    if (extremeLow.length > 0) {
+      parts.push(`weak_categories: ${extremeLow.join(', ')}`);
+    }
+
+    // Category scores
+    const catText = ctx.categories
+      .map(c => `${c.category}: ${c.score.toFixed(0)}`)
+      .join(', ');
+    parts.push(`categories: ${catText}`);
+  }
+
+  // 4. Extract volatility regime from indicators if available
+  const vixIndicator = ctx.indicators.find(i => i.indicator_id === 'vix' || i.indicator_id === 'VIX');
+  if (vixIndicator) {
+    const volRegime = vixIndicator.value < 15 ? 'low_vol' :
+                      vixIndicator.value < 20 ? 'normal_vol' :
+                      vixIndicator.value < 30 ? 'elevated_vol' : 'high_vol';
+    parts.push(`vol_regime: ${volRegime}`);
+  }
+
+  return parts.join(' | ');
+}
+
 // FRED API fetcher
 async function fetchFredSeries(seriesId: string, indicatorId: string, apiKey: string): Promise<IndicatorValue[]> {
   const startDate = formatDate(subYears(new Date(), 3));
@@ -792,16 +890,22 @@ async function handleScheduled(env: Env): Promise<void> {
       await env.DB.batch(catStmts);
     }
 
-    // Generate embedding for vector similarity
-    try {
-      const indicatorText = indicators
-        .filter(i => i.date === today)
-        .map(i => `${i.indicator_id}: ${i.value.toFixed(2)}`)
-        .join(', ');
+    // Generate embedding for vector similarity with engineered features
+    const todayIndicators = indicators.filter(i => i.date === today);
+    const embeddingText = generateEmbeddingText({
+      indicators: todayIndicators,
+      pxi: {
+        score: result.pxi.score,
+        delta_7d: result.pxi.delta_7d,
+        delta_30d: result.pxi.delta_30d,
+      },
+      categories: result.categories.map(c => ({ category: c.category, score: c.score })),
+    });
 
-      if (indicatorText) {
+    try {
+      if (embeddingText) {
         const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-          text: indicatorText,
+          text: embeddingText,
         });
 
         await env.VECTORIZE.upsert([{
@@ -809,7 +913,7 @@ async function handleScheduled(env: Env): Promise<void> {
           values: embedding.data[0],
           metadata: { date: today, score: result.pxi.score },
         }]);
-        console.log('🔮 Generated and stored embedding');
+        console.log('🔮 Generated and stored embedding with engineered features');
       }
     } catch (e) {
       console.error('Embedding generation failed:', e);
@@ -823,12 +927,9 @@ async function handleScheduled(env: Env): Promise<void> {
       thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
       const cutoffDate = formatDate(thirtyDaysAgo);
 
-      // Get embedding for today (just created above)
+      // Get embedding for today (reuse the same embedding text)
       const todayEmbedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-        text: indicators
-          .filter(i => i.date === today)
-          .map(i => `${i.indicator_id}: ${i.value.toFixed(2)}`)
-          .join(', '),
+        text: embeddingText,
       });
 
       const similar = await env.VECTORIZE.query(todayEmbedding.data[0], {
@@ -2112,35 +2213,47 @@ export default {
       // AI: Find similar market regimes
       if (url.pathname === '/api/similar' && request.method === 'GET') {
         try {
-          // Get today's indicator snapshot
-          const latestDate = await env.DB.prepare(
-            'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 1'
-          ).first<{ date: string }>();
+          // Get today's PXI data including deltas
+          const latestPxi = await env.DB.prepare(
+            'SELECT date, score, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 1'
+          ).first<{ date: string; score: number; delta_7d: number | null; delta_30d: number | null }>();
 
-          if (!latestDate) {
+          if (!latestPxi) {
             return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
           }
 
-          // Get indicator values for embedding
-          const indicators = await env.DB.prepare(`
-            SELECT indicator_id, value FROM indicator_values
-            WHERE date = ? ORDER BY indicator_id
-          `).bind(latestDate.date).all<IndicatorRow>();
+          // Get indicator values and category scores in parallel
+          const [indicators, categories] = await Promise.all([
+            env.DB.prepare(`
+              SELECT indicator_id, value FROM indicator_values
+              WHERE date = ? ORDER BY indicator_id
+            `).bind(latestPxi.date).all<IndicatorRow>(),
+            env.DB.prepare(`
+              SELECT category, score FROM category_scores
+              WHERE date = ? ORDER BY category
+            `).bind(latestPxi.date).all<{ category: string; score: number }>(),
+          ]);
 
           if (!indicators.results || indicators.results.length === 0) {
             return Response.json({ error: 'No indicators' }, { status: 404, headers: corsHeaders });
           }
 
-          // Create text representation for embedding
-          const indicatorText = indicators.results
-            .map((i) => `${i.indicator_id}: ${i.value.toFixed(2)}`)
-            .join(', ');
+          // Create rich embedding text with engineered features
+          const embeddingText = generateEmbeddingText({
+            indicators: indicators.results,
+            pxi: {
+              score: latestPxi.score,
+              delta_7d: latestPxi.delta_7d,
+              delta_30d: latestPxi.delta_30d,
+            },
+            categories: categories.results || [],
+          });
 
           // Generate embedding using Workers AI
           let embedding;
           try {
             embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-              text: indicatorText,
+              text: embeddingText,
             });
           } catch (aiError) {
             console.error('Workers AI embedding error:', aiError);
@@ -2190,7 +2303,7 @@ export default {
 
           if (similarDates.length === 0) {
             return Response.json({
-              current_date: latestDate.date,
+              current_date: latestPxi.date,
               cutoff_date: cutoffDateStr,
               similar_periods: [],
               total_matches: similar.matches?.length || 0,
@@ -2220,7 +2333,7 @@ export default {
           const todayMs = new Date().getTime();
 
           return Response.json({
-            current_date: latestDate.date,
+            current_date: latestPxi.date,
             cutoff_date: cutoffDateStr,
             similar_periods: filteredMatches.map((m) => {
               const hist = historicalScores.results?.find((s) => s.date === m.metadata?.date);
@@ -2526,7 +2639,7 @@ export default {
           await env.DB.batch(catStmts);
         }
 
-        // Generate embedding for Vectorize (for similarity search)
+        // Generate embedding for Vectorize (for similarity search) with engineered features
         let embedded = false;
         try {
           const indicators = await env.DB.prepare(`
@@ -2534,12 +2647,19 @@ export default {
           `).bind(targetDate).all<{ indicator_id: string; value: number }>();
 
           if (indicators.results && indicators.results.length >= 5) {
-            const indicatorText = indicators.results
-              .map(i => `${i.indicator_id}: ${i.value.toFixed(4)}`)
-              .join(', ');
+            // Generate rich embedding text with engineered features
+            const embeddingText = generateEmbeddingText({
+              indicators: indicators.results,
+              pxi: {
+                score: result.pxi.score,
+                delta_7d: result.pxi.delta_7d,
+                delta_30d: result.pxi.delta_30d,
+              },
+              categories: result.categories.map(c => ({ category: c.category, score: c.score })),
+            });
 
             const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-              text: indicatorText,
+              text: embeddingText,
             });
 
             await env.VECTORIZE.upsert([{
@@ -2704,19 +2824,26 @@ export default {
             succeeded++;
             results.push({ date, score: result.pxi.score, categories: result.categories.length });
 
-            // Generate embedding for Vectorize
+            // Generate embedding for Vectorize with engineered features
             try {
               const indicators = await env.DB.prepare(`
                 SELECT indicator_id, value FROM indicator_values WHERE date = ? ORDER BY indicator_id
               `).bind(date).all<{ indicator_id: string; value: number }>();
 
               if (indicators.results && indicators.results.length >= 5) {
-                const indicatorText = indicators.results
-                  .map(i => `${i.indicator_id}: ${i.value.toFixed(4)}`)
-                  .join(', ');
+                // Generate rich embedding text with engineered features
+                const embeddingText = generateEmbeddingText({
+                  indicators: indicators.results,
+                  pxi: {
+                    score: result.pxi.score,
+                    delta_7d: result.pxi.delta_7d,
+                    delta_30d: result.pxi.delta_30d,
+                  },
+                  categories: result.categories.map(c => ({ category: c.category, score: c.score })),
+                });
 
                 const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-                  text: indicatorText,
+                  text: embeddingText,
                 });
 
                 await env.VECTORIZE.upsert([{
