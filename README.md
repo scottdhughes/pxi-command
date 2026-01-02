@@ -5,7 +5,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 
-A real-time macro market strength index that aggregates 28 indicators across 7 categories to provide a single composite score (0-100) for market conditions.
+A real-time macro market strength index that aggregates 28 indicators across 7 categories to provide a single composite score (0-100) for market conditions, with ML-powered similar period detection and prediction tracking.
 
 **Live:** [pxicommand.com](https://pxicommand.com)
 
@@ -21,41 +21,93 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 | 30-44 | SOFT | Bearish conditions |
 | <30 | DUMPING | Extremely bearish conditions |
 
+## Features
+
+### Core Index
+- **28 indicators** across 7 categories normalized to 0-100 scale
+- **Real-time updates** via GitHub Actions cron (4x daily)
+- **Historical backtest** with 1000+ observations since Dec 2022
+
+### ML & Predictions (v1.1)
+- **Similar Period Detection** - Find historically similar market regimes using vector embeddings
+- **Prediction Tracking** - Log predictions and evaluate against actual outcomes
+- **Historical Outlook** - Forward returns and win rates by PXI bucket
+- **Signal Layer** - Risk allocation signals based on PXI, momentum, and volatility
+
+### Backtesting
+- **PXI-Signal Strategy** - Dynamic risk allocation (Sharpe ~2.0)
+- **Comparison** - vs 200DMA and buy-and-hold baselines
+- **Walk-forward validation** - Out-of-sample testing
+
 ## Categories & Weights
 
 | Category | Weight | Key Indicators |
 |----------|--------|----------------|
-| Liquidity | 22% | Fed balance sheet, TGA, reverse repo, M2 |
-| Credit | 18% | HY spreads, IG spreads, yield curve |
-| Volatility | 18% | VIX, VIX term structure, put/call ratio |
-| Breadth | 12% | RSP/SPY ratio, sector breadth, small/mid cap strength |
-| Macro | 10% | ISM PMI, jobless claims, CFNAI |
-| Global | 10% | DXY, copper/gold ratio, EM spreads, AUD/JPY |
-| Crypto | 10% | BTC vs 200 DMA, ETF flows, stablecoin mcap, funding rates |
+| Credit | 20% | HY spreads, IG spreads, yield curve |
+| Liquidity | 15% | Fed balance sheet, TGA, reverse repo, net liquidity |
+| Volatility | 15% | VIX, VIX term structure |
+| Breadth | 15% | RSP/SPY ratio, advance-decline |
+| Positioning | 15% | Put/call ratio, fear & greed |
+| Macro | 10% | 10Y yield, dollar index, oil |
+| Global | 10% | Copper/gold ratio, BTC, stablecoin flows |
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Data Sources  │────▶│  Node.js Backend │────▶│  Neon Postgres  │
-│  FRED, Yahoo,   │     │  Fetchers & Calc │     │   (Serverless)  │
+│   Data Sources  │────▶│  GitHub Actions  │────▶│  Cloudflare D1  │
+│  FRED, Yahoo,   │     │   (Daily Cron)   │     │   (SQLite)      │
 │  DeFiLlama...   │     └──────────────────┘     └────────┬────────┘
 └─────────────────┘                                       │
                                                           ▼
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  React Frontend │◀────│ Cloudflare Worker│◀────│   API Layer     │
-│  (CF Pages)     │     │    (Edge API)    │     │                 │
+│  React Frontend │◀────│ Cloudflare Worker│◀────│  Workers AI     │
+│  (CF Pages)     │     │    (Edge API)    │     │  + Vectorize    │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
 ```
 
 ## Tech Stack
 
 - **Backend:** TypeScript, Node.js
-- **Database:** Neon PostgreSQL (serverless)
+- **Database:** Cloudflare D1 (SQLite at edge)
+- **Vector Store:** Cloudflare Vectorize (768-dim embeddings)
+- **AI:** Cloudflare Workers AI (BGE embeddings, Llama analysis)
 - **API:** Cloudflare Workers
-- **Frontend:** React, Vite, Tailwind CSS
+- **Frontend:** React 19, Vite, Tailwind CSS
 - **Hosting:** Cloudflare Pages
-- **Scheduler:** GitHub Actions (daily cron)
+- **Scheduler:** GitHub Actions (4x daily cron)
+
+## API Endpoints
+
+### Core Data
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/pxi` | GET | Current PXI score, categories, sparkline, regime |
+| `/api/history` | GET | Historical PXI scores |
+| `/api/regime` | GET | Current market regime detection |
+| `/api/signal` | GET | PXI-Signal layer with risk allocation |
+
+### ML & Predictions
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/similar` | GET | Find similar historical periods (vector search) |
+| `/api/predict` | GET | Historical outlook by PXI bucket |
+| `/api/accuracy` | GET | Prediction accuracy metrics |
+| `/api/analyze` | GET | AI-generated market analysis |
+
+### Backtesting
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/backtest` | GET | PXI bucket forward returns analysis |
+| `/api/backtest/signal` | GET | Signal strategy vs baselines |
+
+### Admin (requires auth)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/write` | POST | Write indicator data |
+| `/api/recalculate` | POST | Recalculate PXI for date |
+| `/api/migrate` | POST | Create missing database tables |
+| `/api/evaluate` | POST | Evaluate past predictions |
 
 ## Development
 
@@ -67,36 +119,55 @@ npm install
 cp .env.example .env
 # Edit .env with your credentials
 
-# Run database migrations
-npm run migrate
-
-# Fetch indicator data
-npm run fetch
-
-# Calculate PXI score
-npm run calculate
+# Run daily data refresh
+npm run cron:daily
 
 # Start frontend dev server
 cd frontend && npm run dev
+
+# Deploy worker
+cd worker && npx wrangler deploy
 ```
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `PG_HOST` | Neon database host |
-| `PG_DATABASE` | Database name |
-| `PG_USER` | Database user |
-| `PG_PASSWORD` | Database password |
 | `FRED_API_KEY` | FRED API key ([get one free](https://fred.stlouisfed.org/docs/api/api_key.html)) |
+| `WRITE_API_KEY` | API key for write operations |
+| `WRITE_API_URL` | Worker API URL for cron |
+
+### Cloudflare Secrets (set via wrangler)
+```bash
+npx wrangler secret put WRITE_API_KEY
+npx wrangler secret put FRED_API_KEY
+```
+
+## Database Schema
+
+### Core Tables
+- `indicator_values` - Raw indicator data from sources
+- `indicator_scores` - Normalized 0-100 scores
+- `category_scores` - Category-level aggregations
+- `pxi_scores` - Final composite scores
+
+### ML Tables
+- `prediction_log` - Predictions vs actual outcomes
+- `model_params` - Tunable model parameters
+- `period_accuracy` - Historical period prediction quality
+- `market_embeddings` - Vector embeddings for similarity search
+
+### Signal Tables
+- `pxi_signal` - Risk allocation signals
+- `alert_history` - Generated alerts
+- `backtest_results` - Strategy performance
 
 ## Data Sources
 
-- **FRED** - Federal Reserve economic data
-- **Yahoo Finance** - Market prices, ETFs, currencies
+- **FRED** - Federal Reserve economic data (liquidity, credit spreads, yields)
+- **Yahoo Finance** - Market prices, ETFs, VIX, currencies
 - **DeFiLlama** - Stablecoin market cap
 - **Coinglass** - BTC funding rates
-- **Farside** - BTC ETF flows
 - **CNN** - Fear & Greed index
 
 ## License
