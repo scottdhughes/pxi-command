@@ -29,13 +29,13 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 - **Historical backtest** with 1000+ observations since Dec 2022
 
 ### ML & Predictions (v1.2)
-- **Similar Period Detection** - Find historically similar market regimes using vector embeddings with engineered features (momentum, dispersion, volatility regime)
-- **XGBoost Predictions** - Trained ML model predicting 7d/30d PXI changes using 36 features
-- **LSTM Predictions** - Recurrent neural network using 20-day sequences of 12 features for temporal pattern recognition
+- **Ensemble Predictions** - Weighted combination of XGBoost (60%) and LSTM (40%) with confidence scoring
+- **XGBoost Model** - Gradient boosted trees using 36 engineered features (momentum, dispersion, extremes)
+- **LSTM Model** - Recurrent neural network using 20-day sequences of 12 features for temporal patterns
+- **Similar Period Detection** - Find historically similar market regimes using vector embeddings
 - **Prediction Tracking** - Log predictions and evaluate against actual outcomes
 - **Historical Outlook** - Forward returns and win rates by PXI bucket with adaptive thresholds
 - **Signal Layer** - Risk allocation signals based on PXI, momentum, and volatility
-- **Confidence Scoring** - Multi-factor confidence (direction agreement, consistency, sample size, weight quality)
 
 ### Backtesting
 - **PXI-Signal Strategy** - Dynamic risk allocation (Sharpe ~2.0)
