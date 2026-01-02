@@ -104,6 +104,7 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 | `/api/predict` | GET | Historical outlook by PXI bucket with adaptive thresholds |
 | `/api/ml/predict` | GET | XGBoost model predictions for 7d/30d PXI changes |
 | `/api/ml/lstm` | GET | LSTM neural network predictions using 20-day sequences |
+| `/api/ml/ensemble` | GET | Weighted ensemble (60% XGBoost + 40% LSTM) with confidence |
 | `/api/accuracy` | GET | Prediction accuracy metrics |
 | `/api/analyze` | GET | AI-generated market analysis |
 

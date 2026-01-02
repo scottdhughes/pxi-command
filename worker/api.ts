@@ -3802,6 +3802,263 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         }, { headers: corsHeaders });
       }
 
+      // Ensemble prediction endpoint - combines XGBoost and LSTM
+      if (url.pathname === '/api/ml/ensemble' && request.method === 'GET') {
+        // Load both models
+        const [xgboostModel, lstmModel] = await Promise.all([
+          loadMLModel(env.ML_MODELS),
+          loadLSTMModel(env.ML_MODELS),
+        ]);
+
+        // Get current PXI and recent history
+        const currentPxi = await env.DB.prepare(
+          'SELECT date, score, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 1'
+        ).first<{ date: string; score: number; delta_1d: number | null; delta_7d: number | null; delta_30d: number | null }>();
+
+        if (!currentPxi) {
+          return Response.json({ error: 'No PXI data available' }, { status: 404, headers: corsHeaders });
+        }
+
+        const currentDate = currentPxi.date;
+        const currentScore = currentPxi.score;
+
+        // XGBoost prediction
+        let xgboost: { pred_7d: number | null; pred_30d: number | null; dir_7d: string | null; dir_30d: string | null } | null = null;
+        if (xgboostModel) {
+          const [categories, indicators, recentScores] = await Promise.all([
+            env.DB.prepare('SELECT category, score FROM category_scores WHERE date = ?').bind(currentDate).all<{ category: string; score: number }>(),
+            env.DB.prepare('SELECT indicator_id, value FROM indicator_values WHERE date = ?').bind(currentDate).all<{ indicator_id: string; value: number }>(),
+            env.DB.prepare('SELECT score FROM pxi_scores ORDER BY date DESC LIMIT 20').all<{ score: number }>(),
+          ]);
+
+          const scores = (recentScores.results || []).map(r => r.score);
+          const pxi_ma_5 = scores.slice(0, 5).reduce((a, b) => a + b, 0) / Math.min(5, scores.length);
+          const pxi_ma_20 = scores.reduce((a, b) => a + b, 0) / scores.length;
+          const pxi_std_20 = Math.sqrt(scores.reduce((sum, s) => sum + Math.pow(s - pxi_ma_20, 2), 0) / scores.length);
+
+          const categoryMap: Record<string, number> = {};
+          for (const c of categories.results || []) categoryMap[c.category] = c.score;
+
+          const indicatorMap: Record<string, number> = {};
+          for (const i of indicators.results || []) indicatorMap[i.indicator_id] = i.value;
+
+          const features = extractMLFeatures({
+            pxi_score: currentPxi.score,
+            pxi_delta_1d: currentPxi.delta_1d,
+            pxi_delta_7d: currentPxi.delta_7d,
+            pxi_delta_30d: currentPxi.delta_30d,
+            categories: categoryMap,
+            indicators: indicatorMap,
+            pxi_ma_5,
+            pxi_ma_20,
+            pxi_std_20,
+          });
+
+          const pred_7d = xgboostModel.m['7d'] ? xgbPredict(xgboostModel.m['7d'], features) : null;
+          const pred_30d = xgboostModel.m['30d'] ? xgbPredict(xgboostModel.m['30d'], features) : null;
+
+          const interpretDir = (p: number | null) => {
+            if (p === null) return null;
+            if (p > 5) return 'STRONG_UP';
+            if (p > 2) return 'UP';
+            if (p > -2) return 'FLAT';
+            if (p > -5) return 'DOWN';
+            return 'STRONG_DOWN';
+          };
+
+          xgboost = { pred_7d, pred_30d, dir_7d: interpretDir(pred_7d), dir_30d: interpretDir(pred_30d) };
+        }
+
+        // LSTM prediction
+        let lstm: { pred_7d: number | null; pred_30d: number | null; dir_7d: string | null; dir_30d: string | null } | null = null;
+        if (lstmModel) {
+          const seqLength = lstmModel.c.s;
+
+          const pxiHistory = await env.DB.prepare(
+            'SELECT date, score, delta_7d FROM pxi_scores ORDER BY date DESC LIMIT ?'
+          ).bind(seqLength).all<{ date: string; score: number; delta_7d: number | null }>();
+
+          if (pxiHistory.results && pxiHistory.results.length >= seqLength) {
+            const dates = pxiHistory.results.map(r => r.date);
+
+            const [categoryData, vixData] = await Promise.all([
+              env.DB.prepare(`SELECT date, category, score FROM category_scores WHERE date IN (${dates.map(() => '?').join(',')})`).bind(...dates).all<{ date: string; category: string; score: number }>(),
+              env.DB.prepare(`SELECT date, value FROM indicator_values WHERE indicator_id = 'vix' AND date IN (${dates.map(() => '?').join(',')})`).bind(...dates).all<{ date: string; value: number }>(),
+            ]);
+
+            const byDate = new Map<string, { score: number; delta_7d: number | null; categories: Record<string, number> }>();
+            for (const row of pxiHistory.results) {
+              byDate.set(row.date, { score: row.score, delta_7d: row.delta_7d, categories: {} });
+            }
+            for (const row of categoryData.results || []) {
+              if (byDate.has(row.date)) byDate.get(row.date)!.categories[row.category] = row.score;
+            }
+
+            const vixMap: Record<string, number> = {};
+            for (const v of vixData.results || []) vixMap[v.date] = v.value;
+
+            const sortedDates = [...dates].sort();
+            const sequence: number[][] = [];
+
+            for (const date of sortedDates) {
+              const day = byDate.get(date);
+              if (day) {
+                const features = extractLSTMFeatures({ ...day, vix: vixMap[date] }, lstmModel.n, lstmModel.c.f);
+                sequence.push(features);
+              }
+            }
+
+            if (sequence.length === seqLength) {
+              const pred_7d = lstmModel.m['7d'] ? lstmForward(sequence, lstmModel.m['7d'].lstm, lstmModel.m['7d'].fc, lstmModel.c.h) : null;
+              const pred_30d = lstmModel.m['30d'] ? lstmForward(sequence, lstmModel.m['30d'].lstm, lstmModel.m['30d'].fc, lstmModel.c.h) : null;
+
+              const interpretDir = (p: number | null) => {
+                if (p === null) return null;
+                if (p > 5) return 'STRONG_UP';
+                if (p > 2) return 'UP';
+                if (p > -2) return 'FLAT';
+                if (p > -5) return 'DOWN';
+                return 'STRONG_DOWN';
+              };
+
+              lstm = { pred_7d, pred_30d, dir_7d: interpretDir(pred_7d), dir_30d: interpretDir(pred_30d) };
+            }
+          }
+        }
+
+        if (!xgboost && !lstm) {
+          return Response.json({
+            error: 'No models available',
+            message: 'Neither XGBoost nor LSTM models could be loaded',
+          }, { status: 503, headers: corsHeaders });
+        }
+
+        // Ensemble weights (can be tuned based on historical accuracy)
+        const XGBOOST_WEIGHT = 0.6;  // XGBoost has more features
+        const LSTM_WEIGHT = 0.4;     // LSTM captures temporal patterns
+
+        const ensemblePredict = (
+          xgVal: number | null,
+          lstmVal: number | null
+        ): { value: number | null; xgboost_contrib: number | null; lstm_contrib: number | null } => {
+          if (xgVal !== null && lstmVal !== null) {
+            // Weighted average
+            return {
+              value: xgVal * XGBOOST_WEIGHT + lstmVal * LSTM_WEIGHT,
+              xgboost_contrib: xgVal * XGBOOST_WEIGHT,
+              lstm_contrib: lstmVal * LSTM_WEIGHT,
+            };
+          } else if (xgVal !== null) {
+            return { value: xgVal, xgboost_contrib: xgVal, lstm_contrib: null };
+          } else if (lstmVal !== null) {
+            return { value: lstmVal, xgboost_contrib: null, lstm_contrib: lstmVal };
+          }
+          return { value: null, xgboost_contrib: null, lstm_contrib: null };
+        };
+
+        const interpret = (pred: number | null) => {
+          if (pred === null) return null;
+          if (pred > 5) return 'STRONG_UP';
+          if (pred > 2) return 'UP';
+          if (pred > -2) return 'FLAT';
+          if (pred > -5) return 'DOWN';
+          return 'STRONG_DOWN';
+        };
+
+        // Calculate model agreement (confidence indicator)
+        const calcAgreement = (
+          xgDir: string | null,
+          lstmDir: string | null
+        ): { agreement: 'HIGH' | 'MEDIUM' | 'LOW' | null; note: string } => {
+          if (!xgDir || !lstmDir) {
+            return { agreement: null, note: 'Single model only' };
+          }
+
+          const upDirs = ['STRONG_UP', 'UP'];
+          const downDirs = ['STRONG_DOWN', 'DOWN'];
+
+          const xgUp = upDirs.includes(xgDir);
+          const xgDown = downDirs.includes(xgDir);
+          const lstmUp = upDirs.includes(lstmDir);
+          const lstmDown = downDirs.includes(lstmDir);
+
+          if (xgDir === lstmDir) {
+            return { agreement: 'HIGH', note: 'Models agree on direction and magnitude' };
+          } else if ((xgUp && lstmUp) || (xgDown && lstmDown)) {
+            return { agreement: 'MEDIUM', note: 'Models agree on direction' };
+          } else if (xgDir === 'FLAT' || lstmDir === 'FLAT') {
+            return { agreement: 'MEDIUM', note: 'One model neutral' };
+          } else {
+            return { agreement: 'LOW', note: 'Models disagree on direction' };
+          }
+        };
+
+        const xg7d = xgboost?.pred_7d ?? null;
+        const xg30d = xgboost?.pred_30d ?? null;
+        const lstm7d = lstm?.pred_7d ?? null;
+        const lstm30d = lstm?.pred_30d ?? null;
+
+        const ensemble7d = ensemblePredict(xg7d, lstm7d);
+        const ensemble30d = ensemblePredict(xg30d, lstm30d);
+
+        const agreement7d = calcAgreement(
+          xgboost?.dir_7d ?? null,
+          lstm?.dir_7d ?? null
+        );
+        const agreement30d = calcAgreement(
+          xgboost?.dir_30d ?? null,
+          lstm?.dir_30d ?? null
+        );
+
+        return Response.json({
+          date: currentDate,
+          current_score: currentScore,
+          ensemble: {
+            weights: { xgboost: XGBOOST_WEIGHT, lstm: LSTM_WEIGHT },
+            predictions: {
+              pxi_change_7d: {
+                value: ensemble7d.value,
+                direction: interpret(ensemble7d.value),
+                confidence: agreement7d.agreement,
+                components: {
+                  xgboost: xg7d,
+                  lstm: lstm7d,
+                },
+              },
+              pxi_change_30d: {
+                value: ensemble30d.value,
+                direction: interpret(ensemble30d.value),
+                confidence: agreement30d.agreement,
+                components: {
+                  xgboost: xg30d,
+                  lstm: lstm30d,
+                },
+              },
+            },
+          },
+          models: {
+            xgboost: xgboost ? {
+              available: true,
+              predictions: {
+                pxi_change_7d: { value: xgboost.pred_7d, direction: xgboost.dir_7d },
+                pxi_change_30d: { value: xgboost.pred_30d, direction: xgboost.dir_30d },
+              },
+            } : { available: false },
+            lstm: lstm ? {
+              available: true,
+              predictions: {
+                pxi_change_7d: { value: lstm.pred_7d, direction: lstm.dir_7d },
+                pxi_change_30d: { value: lstm.pred_30d, direction: lstm.dir_30d },
+              },
+            } : { available: false },
+          },
+          interpretation: {
+            d7: agreement7d,
+            d30: agreement30d,
+          },
+        }, { headers: corsHeaders });
+      }
+
       // Get prediction accuracy metrics
       if (url.pathname === '/api/accuracy' && request.method === 'GET') {
         const includePending = url.searchParams.get('include_pending') === 'true';

@@ -105,22 +105,31 @@ interface PredictionData {
   }
 }
 
-// ML Model predictions (XGBoost and LSTM)
-interface MLPrediction {
+// Ensemble prediction
+interface EnsemblePrediction {
   value: number | null
   direction: 'STRONG_UP' | 'UP' | 'FLAT' | 'DOWN' | 'STRONG_DOWN' | null
+  confidence: 'HIGH' | 'MEDIUM' | 'LOW' | null
+  components: {
+    xgboost: number | null
+    lstm: number | null
+  }
 }
 
-interface MLPredictData {
+interface EnsembleData {
   date: string
   current_score: number
-  model_type?: string  // 'lstm' for LSTM endpoint
-  model_version: string
-  predictions: {
-    pxi_change_7d: MLPrediction
-    pxi_change_30d: MLPrediction
+  ensemble: {
+    weights: { xgboost: number; lstm: number }
+    predictions: {
+      pxi_change_7d: EnsemblePrediction
+      pxi_change_30d: EnsemblePrediction
+    }
   }
-  features_used: number
+  interpretation: {
+    d7: { agreement: string | null; note: string }
+    d30: { agreement: string | null; note: string }
+  }
 }
 
 function Sparkline({ data }: { data: { score: number }[] }) {
@@ -436,8 +445,8 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
   )
 }
 
-function MLPredictionsCard({ xgboost, lstm }: { xgboost: MLPredictData | null; lstm: MLPredictData | null }) {
-  if (!xgboost && !lstm) return null
+function MLPredictionsCard({ ensemble }: { ensemble: EnsembleData | null }) {
+  if (!ensemble) return null
 
   const formatChange = (val: number | null) => {
     if (val === null) return '—'
@@ -460,92 +469,82 @@ function MLPredictionsCard({ xgboost, lstm }: { xgboost: MLPredictData | null; l
     return '→'
   }
 
+  const getConfidenceColor = (conf: string | null) => {
+    if (conf === 'HIGH') return 'text-[#00c896]'
+    if (conf === 'MEDIUM') return 'text-[#f59e0b]'
+    if (conf === 'LOW') return 'text-[#ff6b6b]'
+    return 'text-[#949ba5]'
+  }
+
+  const { pxi_change_7d, pxi_change_30d } = ensemble.ensemble.predictions
+
   return (
     <div className="w-full mt-6 sm:mt-8">
       <div className="text-[10px] sm:text-[11px] text-[#949ba5]/50 uppercase tracking-widest mb-4 text-center">
-        ML Predictions
+        ML Ensemble Prediction
       </div>
 
-      <div className="grid grid-cols-2 gap-4">
-        {/* XGBoost Model */}
-        <div className="bg-[#0a0a0a]/40 rounded-lg p-4 border border-[#1a1a1a]">
-          <div className="text-[9px] text-[#949ba5]/40 uppercase tracking-wider mb-3 text-center">
-            XGBoost
+      {/* Main ensemble predictions */}
+      <div className="flex justify-center gap-8 sm:gap-12 mb-4">
+        <div className="text-center">
+          <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mb-2">7 Day</div>
+          <div className={`text-2xl sm:text-3xl font-light flex items-center justify-center gap-2 ${getDirectionColor(pxi_change_7d.direction)}`}>
+            {formatChange(pxi_change_7d.value)}
+            <span className="text-lg">{getDirectionIcon(pxi_change_7d.direction)}</span>
           </div>
-          {xgboost ? (
-            <div className="space-y-3">
-              <div className="flex justify-between items-center">
-                <span className="text-[10px] text-[#949ba5]/60">7d</span>
-                <div className="flex items-center gap-1">
-                  <span className={`text-[13px] font-mono ${getDirectionColor(xgboost.predictions.pxi_change_7d.direction)}`}>
-                    {formatChange(xgboost.predictions.pxi_change_7d.value)}
-                  </span>
-                  <span className={`text-[11px] ${getDirectionColor(xgboost.predictions.pxi_change_7d.direction)}`}>
-                    {getDirectionIcon(xgboost.predictions.pxi_change_7d.direction)}
-                  </span>
-                </div>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-[10px] text-[#949ba5]/60">30d</span>
-                <div className="flex items-center gap-1">
-                  <span className={`text-[13px] font-mono ${getDirectionColor(xgboost.predictions.pxi_change_30d.direction)}`}>
-                    {formatChange(xgboost.predictions.pxi_change_30d.value)}
-                  </span>
-                  <span className={`text-[11px] ${getDirectionColor(xgboost.predictions.pxi_change_30d.direction)}`}>
-                    {getDirectionIcon(xgboost.predictions.pxi_change_30d.direction)}
-                  </span>
-                </div>
-              </div>
-              <div className="text-[8px] text-[#949ba5]/30 text-center pt-1">
-                {xgboost.features_used} features
-              </div>
-            </div>
-          ) : (
-            <div className="text-[10px] text-[#949ba5]/30 text-center py-2">unavailable</div>
-          )}
+          <div className={`text-[9px] mt-1 ${getConfidenceColor(pxi_change_7d.confidence)}`}>
+            {pxi_change_7d.confidence || '—'} confidence
+          </div>
         </div>
 
-        {/* LSTM Model */}
-        <div className="bg-[#0a0a0a]/40 rounded-lg p-4 border border-[#1a1a1a]">
-          <div className="text-[9px] text-[#949ba5]/40 uppercase tracking-wider mb-3 text-center">
-            LSTM
+        <div className="text-center">
+          <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mb-2">30 Day</div>
+          <div className={`text-2xl sm:text-3xl font-light flex items-center justify-center gap-2 ${getDirectionColor(pxi_change_30d.direction)}`}>
+            {formatChange(pxi_change_30d.value)}
+            <span className="text-lg">{getDirectionIcon(pxi_change_30d.direction)}</span>
           </div>
-          {lstm ? (
-            <div className="space-y-3">
-              <div className="flex justify-between items-center">
-                <span className="text-[10px] text-[#949ba5]/60">7d</span>
-                <div className="flex items-center gap-1">
-                  <span className={`text-[13px] font-mono ${getDirectionColor(lstm.predictions.pxi_change_7d.direction)}`}>
-                    {formatChange(lstm.predictions.pxi_change_7d.value)}
-                  </span>
-                  <span className={`text-[11px] ${getDirectionColor(lstm.predictions.pxi_change_7d.direction)}`}>
-                    {getDirectionIcon(lstm.predictions.pxi_change_7d.direction)}
-                  </span>
-                </div>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-[10px] text-[#949ba5]/60">30d</span>
-                <div className="flex items-center gap-1">
-                  <span className={`text-[13px] font-mono ${getDirectionColor(lstm.predictions.pxi_change_30d.direction)}`}>
-                    {formatChange(lstm.predictions.pxi_change_30d.value)}
-                  </span>
-                  <span className={`text-[11px] ${getDirectionColor(lstm.predictions.pxi_change_30d.direction)}`}>
-                    {getDirectionIcon(lstm.predictions.pxi_change_30d.direction)}
-                  </span>
-                </div>
-              </div>
-              <div className="text-[8px] text-[#949ba5]/30 text-center pt-1">
-                20-day sequence
-              </div>
-            </div>
-          ) : (
-            <div className="text-[10px] text-[#949ba5]/30 text-center py-2">unavailable</div>
-          )}
+          <div className={`text-[9px] mt-1 ${getConfidenceColor(pxi_change_30d.confidence)}`}>
+            {pxi_change_30d.confidence || '—'} confidence
+          </div>
+        </div>
+      </div>
+
+      {/* Component breakdown */}
+      <div className="grid grid-cols-2 gap-3 mt-4">
+        <div className="bg-[#0a0a0a]/40 rounded px-3 py-2 border border-[#1a1a1a]">
+          <div className="text-[8px] text-[#949ba5]/40 uppercase tracking-wider mb-1">XGBoost (60%)</div>
+          <div className="flex justify-between text-[10px]">
+            <span className="text-[#949ba5]/50">7d</span>
+            <span className={getDirectionColor(pxi_change_7d.components.xgboost !== null && pxi_change_7d.components.xgboost > 0 ? 'UP' : pxi_change_7d.components.xgboost !== null && pxi_change_7d.components.xgboost < 0 ? 'DOWN' : 'FLAT')}>
+              {formatChange(pxi_change_7d.components.xgboost)}
+            </span>
+          </div>
+          <div className="flex justify-between text-[10px]">
+            <span className="text-[#949ba5]/50">30d</span>
+            <span className={getDirectionColor(pxi_change_30d.components.xgboost !== null && pxi_change_30d.components.xgboost > 0 ? 'UP' : pxi_change_30d.components.xgboost !== null && pxi_change_30d.components.xgboost < 0 ? 'DOWN' : 'FLAT')}>
+              {formatChange(pxi_change_30d.components.xgboost)}
+            </span>
+          </div>
+        </div>
+        <div className="bg-[#0a0a0a]/40 rounded px-3 py-2 border border-[#1a1a1a]">
+          <div className="text-[8px] text-[#949ba5]/40 uppercase tracking-wider mb-1">LSTM (40%)</div>
+          <div className="flex justify-between text-[10px]">
+            <span className="text-[#949ba5]/50">7d</span>
+            <span className={getDirectionColor(pxi_change_7d.components.lstm !== null && pxi_change_7d.components.lstm > 0 ? 'UP' : pxi_change_7d.components.lstm !== null && pxi_change_7d.components.lstm < 0 ? 'DOWN' : 'FLAT')}>
+              {formatChange(pxi_change_7d.components.lstm)}
+            </span>
+          </div>
+          <div className="flex justify-between text-[10px]">
+            <span className="text-[#949ba5]/50">30d</span>
+            <span className={getDirectionColor(pxi_change_30d.components.lstm !== null && pxi_change_30d.components.lstm > 0 ? 'UP' : pxi_change_30d.components.lstm !== null && pxi_change_30d.components.lstm < 0 ? 'DOWN' : 'FLAT')}>
+              {formatChange(pxi_change_30d.components.lstm)}
+            </span>
+          </div>
         </div>
       </div>
 
       <div className="text-[8px] text-[#949ba5]/20 text-center mt-3">
-        Predicted PXI change • Updated with data refresh
+        Weighted ensemble • {ensemble.interpretation.d7.note}
       </div>
     </div>
   )
@@ -820,14 +819,14 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 
         {/* ML Predictions */}
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">ML Predictions (v1.2)</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">ML Ensemble (v1.2)</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
-            Two complementary models predict 7-day and 30-day PXI changes. Models are trained locally
-            and deployed as JSON weights for edge inference in Cloudflare Workers.
+            Weighted ensemble combining two models for 7-day and 30-day PXI predictions.
+            Models trained locally, deployed as JSON weights for edge inference.
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#00a3ff]">
-              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">XGBoost</div>
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">XGBoost (60%)</div>
               <p className="text-[10px] text-[#949ba5]/70 mb-2">Gradient boosted trees for tabular features</p>
               <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
                 <li>• 36 engineered features</li>
@@ -837,7 +836,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
               </ul>
             </div>
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#f59e0b]">
-              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">LSTM</div>
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">LSTM (40%)</div>
               <p className="text-[10px] text-[#949ba5]/70 mb-2">Recurrent neural network for sequences</p>
               <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
                 <li>• 20-day input sequences</li>
@@ -848,8 +847,8 @@ function SpecPage({ onClose }: { onClose: () => void }) {
             </div>
           </div>
           <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[11px] text-[#f3f3f3]/70 space-y-1">
-            <div>Features: PXI, Δ7d, categories, VIX, dispersion</div>
-            <div>Targets: PXI change at t+7, t+30</div>
+            <div>Ensemble = 0.6 × XGBoost + 0.4 × LSTM</div>
+            <div>Confidence: HIGH (same direction+magnitude) | MEDIUM (same direction) | LOW (disagree)</div>
             <div>Direction: STRONG_UP | UP | FLAT | DOWN | STRONG_DOWN</div>
           </div>
           <p className="text-[10px] text-[#949ba5]/50 mt-2">
@@ -944,8 +943,7 @@ function App() {
   const [data, setData] = useState<PXIData | null>(null)
   const [prediction, setPrediction] = useState<PredictionData | null>(null)
   const [signal, setSignal] = useState<SignalData | null>(null)  // v1.1
-  const [mlXgboost, setMlXgboost] = useState<MLPredictData | null>(null)  // ML predictions
-  const [mlLstm, setMlLstm] = useState<MLPredictData | null>(null)  // LSTM predictions
+  const [ensemble, setEnsemble] = useState<EnsembleData | null>(null)  // ML ensemble
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSpec, setShowSpec] = useState(false)
@@ -968,13 +966,12 @@ function App() {
       try {
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
 
-        // Fetch PXI data, signal data, predictions, and ML models in parallel
-        const [pxiRes, signalRes, predRes, mlXgboostRes, mlLstmRes] = await Promise.all([
+        // Fetch PXI data, signal data, predictions, and ML ensemble in parallel
+        const [pxiRes, signalRes, predRes, ensembleRes] = await Promise.all([
           fetch(`${apiUrl}/api/pxi`),
           fetch(`${apiUrl}/api/signal`).catch(() => null),  // v1.1
           fetch(`${apiUrl}/api/predict`).catch(() => null),
-          fetch(`${apiUrl}/api/ml/predict`).catch(() => null),  // XGBoost
-          fetch(`${apiUrl}/api/ml/lstm`).catch(() => null)  // LSTM
+          fetch(`${apiUrl}/api/ml/ensemble`).catch(() => null)  // Ensemble
         ])
 
         if (!pxiRes.ok) throw new Error('Failed to fetch')
@@ -997,19 +994,11 @@ function App() {
           }
         }
 
-        // ML XGBoost predictions
-        if (mlXgboostRes?.ok) {
-          const mlJson = await mlXgboostRes.json()
-          if (!mlJson.error) {
-            setMlXgboost(mlJson)
-          }
-        }
-
-        // ML LSTM predictions
-        if (mlLstmRes?.ok) {
-          const lstmJson = await mlLstmRes.json()
-          if (!lstmJson.error) {
-            setMlLstm(lstmJson)
+        // ML Ensemble predictions
+        if (ensembleRes?.ok) {
+          const ensembleJson = await ensembleRes.json()
+          if (!ensembleJson.error) {
+            setEnsemble(ensembleJson)
           }
         }
 
@@ -1146,8 +1135,8 @@ function App() {
         {/* Predictions */}
         {prediction && <PredictionCard prediction={prediction} />}
 
-        {/* ML Model Predictions */}
-        <MLPredictionsCard xgboost={mlXgboost} lstm={mlLstm} />
+        {/* ML Ensemble Predictions */}
+        <MLPredictionsCard ensemble={ensemble} />
       </main>
 
       {/* Footer */}
