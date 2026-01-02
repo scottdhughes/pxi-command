@@ -18,6 +18,11 @@ index_name = "pxi-embeddings"
 [ai]
 binding = "AI"
 
+# KV for ML models
+[[kv_namespaces]]
+binding = "ML_MODELS"
+id = "88901ff0216a484eb81b8004be0f5aea"
+
 # Cron Triggers - Disabled (using GitHub Actions instead due to Yahoo API blocking Workers)
 # [triggers]
 # crons = ["0 6 * * *"]

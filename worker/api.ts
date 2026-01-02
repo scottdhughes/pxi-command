@@ -6,6 +6,7 @@ interface Env {
   DB: D1Database;
   VECTORIZE: VectorizeIndex;
   AI: Ai;
+  ML_MODELS: KVNamespace;
   FRED_API_KEY?: string;
   WRITE_API_KEY?: string;
 }
@@ -125,6 +126,180 @@ function generateEmbeddingText(ctx: EmbeddingContext): string {
   }
 
   return parts.join(' | ');
+}
+
+// ============== XGBoost Inference ==============
+
+interface XGBTreeNode {
+  nodeid: number;
+  depth?: number;
+  split?: string;
+  split_condition?: number;
+  yes?: number;
+  no?: number;
+  missing?: number;
+  leaf?: number;
+  children?: XGBTreeNode[];
+}
+
+interface XGBModel {
+  b: number; // base_score
+  t: XGBTreeNode[]; // trees
+}
+
+interface MLModel {
+  v: string;
+  f: string[]; // feature_names
+  m: {
+    '7d': XGBModel;
+    '30d': XGBModel;
+  };
+}
+
+// Cache for loaded model
+let cachedModel: MLModel | null = null;
+let modelLoadTime = 0;
+const MODEL_CACHE_TTL = 3600000; // 1 hour
+
+async function loadMLModel(kv: KVNamespace): Promise<MLModel | null> {
+  const now = Date.now();
+  if (cachedModel && (now - modelLoadTime) < MODEL_CACHE_TTL) {
+    return cachedModel;
+  }
+
+  try {
+    const modelJson = await kv.get('pxi_model', 'json');
+    if (modelJson) {
+      cachedModel = modelJson as MLModel;
+      modelLoadTime = now;
+      return cachedModel;
+    }
+  } catch (e) {
+    console.error('Failed to load ML model from KV:', e);
+  }
+  return null;
+}
+
+// Traverse XGBoost tree to get prediction
+function traverseTree(node: XGBTreeNode, features: Record<string, number>): number {
+  // Leaf node
+  if (node.leaf !== undefined) {
+    return node.leaf;
+  }
+
+  // Get feature value (default to 0 if missing)
+  const featureValue = features[node.split!] ?? 0;
+
+  // Decision: go left (yes) if value < split_condition, else right (no)
+  // Missing values go to the 'missing' branch (usually yes)
+  const goLeft = featureValue < node.split_condition!;
+
+  // Find the child node
+  const targetNodeId = goLeft ? node.yes : node.no;
+
+  // Children are in the 'children' array
+  if (node.children) {
+    const child = node.children.find(c => c.nodeid === targetNodeId);
+    if (child) {
+      return traverseTree(child, features);
+    }
+  }
+
+  // Fallback: return 0 if structure is unexpected
+  return 0;
+}
+
+// XGBoost prediction: sum of all tree predictions + base score
+function xgbPredict(model: XGBModel, features: Record<string, number>): number {
+  let prediction = model.b; // base score
+
+  for (const tree of model.t) {
+    prediction += traverseTree(tree, features);
+  }
+
+  return prediction;
+}
+
+// Extract features matching the Python training script
+interface MLFeatures {
+  pxi_score: number;
+  pxi_delta_1d: number | null;
+  pxi_delta_7d: number | null;
+  pxi_delta_30d: number | null;
+  categories: Record<string, number>;
+  indicators: Record<string, number>;
+  pxi_ma_5?: number;
+  pxi_ma_20?: number;
+  pxi_std_20?: number;
+}
+
+function extractMLFeatures(data: MLFeatures): Record<string, number> {
+  const features: Record<string, number> = {};
+
+  // PXI features
+  features['pxi_score'] = data.pxi_score;
+  features['pxi_delta_1d'] = data.pxi_delta_1d ?? 0;
+  features['pxi_delta_7d'] = data.pxi_delta_7d ?? 0;
+  features['pxi_delta_30d'] = data.pxi_delta_30d ?? 0;
+
+  // Momentum signals
+  const d7 = data.pxi_delta_7d ?? 0;
+  features['momentum_7d_signal'] = d7 > 5 ? 2 : d7 > 2 ? 1 : d7 > -2 ? 0 : d7 > -5 ? -1 : -2;
+
+  const d30 = data.pxi_delta_30d ?? 0;
+  features['momentum_30d_signal'] = d30 > 10 ? 2 : d30 > 4 ? 1 : d30 > -4 ? 0 : d30 > -10 ? -1 : -2;
+
+  // Acceleration
+  features['acceleration'] = d7 - (d30 / 4.3);
+  features['acceleration_signal'] = features['acceleration'] > 2 ? 1 : features['acceleration'] < -2 ? -1 : 0;
+
+  // Category features
+  const catScores: number[] = [];
+  for (const cat of ['breadth', 'credit', 'crypto', 'global', 'liquidity', 'macro', 'positioning', 'volatility']) {
+    const score = data.categories[cat] ?? 0;
+    features[`cat_${cat}`] = score;
+    if (score > 0) catScores.push(score);
+  }
+
+  // Category dispersion
+  if (catScores.length > 0) {
+    features['category_dispersion'] = Math.max(...catScores) - Math.min(...catScores);
+    const mean = catScores.reduce((a, b) => a + b, 0) / catScores.length;
+    features['category_std'] = Math.sqrt(catScores.reduce((sum, s) => sum + Math.pow(s - mean, 2), 0) / catScores.length);
+  } else {
+    features['category_dispersion'] = 0;
+    features['category_std'] = 0;
+  }
+
+  // Extreme category counts
+  features['strong_categories_count'] = catScores.filter(s => s > 70).length;
+  features['weak_categories_count'] = catScores.filter(s => s < 30).length;
+
+  // Indicator features
+  features['vix'] = data.indicators['vix'] ?? 0;
+  features['hy_spread'] = data.indicators['hy_oas'] ?? data.indicators['hy_oas_spread'] ?? 0;
+  features['ig_spread'] = data.indicators['ig_oas'] ?? data.indicators['ig_oas_spread'] ?? 0;
+  features['breadth_ratio'] = data.indicators['rsp_spy_ratio'] ?? 0;
+  features['yield_curve'] = data.indicators['yield_curve_2s10s'] ?? 0;
+  features['dxy'] = data.indicators['dxy'] ?? 0;
+  features['btc_vs_200d'] = data.indicators['btc_vs_200d'] ?? 0;
+
+  // Derived features (from rolling windows - use provided or estimate)
+  features['pxi_ma_5'] = data.pxi_ma_5 ?? data.pxi_score;
+  features['pxi_ma_20'] = data.pxi_ma_20 ?? data.pxi_score;
+  features['pxi_std_20'] = data.pxi_std_20 ?? 10;
+  features['pxi_vs_ma_20'] = data.pxi_score - features['pxi_ma_20'];
+
+  // Binary features
+  features['above_50'] = data.pxi_score > 50 ? 1 : 0;
+  features['extreme_low'] = data.pxi_score < 25 ? 1 : 0;
+  features['extreme_high'] = data.pxi_score > 75 ? 1 : 0;
+
+  // VIX features
+  features['vix_ma_20'] = features['vix']; // Approximate
+  features['vix_vs_ma'] = 0;
+
+  return features;
 }
 
 // FRED API fetcher
@@ -3232,6 +3407,117 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         }, { headers: corsHeaders });
       }
 
+      // XGBoost ML prediction endpoint
+      if (url.pathname === '/api/ml/predict' && request.method === 'GET') {
+        // Load ML model from KV
+        const model = await loadMLModel(env.ML_MODELS);
+        if (!model) {
+          return Response.json({
+            error: 'ML model not loaded',
+            message: 'Model has not been uploaded to KV yet',
+          }, { status: 503, headers: corsHeaders });
+        }
+
+        // Get current PXI data with deltas
+        const currentPxi = await env.DB.prepare(`
+          SELECT date, score, delta_1d, delta_7d, delta_30d
+          FROM pxi_scores ORDER BY date DESC LIMIT 1
+        `).first<{
+          date: string;
+          score: number;
+          delta_1d: number | null;
+          delta_7d: number | null;
+          delta_30d: number | null;
+        }>();
+
+        if (!currentPxi) {
+          return Response.json({ error: 'No PXI data' }, { status: 404, headers: corsHeaders });
+        }
+
+        // Get category scores and indicators
+        const [categories, indicators, recentScores] = await Promise.all([
+          env.DB.prepare(`
+            SELECT category, score FROM category_scores WHERE date = ?
+          `).bind(currentPxi.date).all<{ category: string; score: number }>(),
+          env.DB.prepare(`
+            SELECT indicator_id, value FROM indicator_values WHERE date = ?
+          `).bind(currentPxi.date).all<{ indicator_id: string; value: number }>(),
+          env.DB.prepare(`
+            SELECT score FROM pxi_scores ORDER BY date DESC LIMIT 20
+          `).all<{ score: number }>(),
+        ]);
+
+        // Calculate rolling features
+        const scores = (recentScores.results || []).map(r => r.score);
+        const pxi_ma_5 = scores.slice(0, 5).reduce((a, b) => a + b, 0) / Math.min(5, scores.length);
+        const pxi_ma_20 = scores.reduce((a, b) => a + b, 0) / scores.length;
+        const mean = pxi_ma_20;
+        const pxi_std_20 = Math.sqrt(scores.reduce((sum, s) => sum + Math.pow(s - mean, 2), 0) / scores.length);
+
+        // Build category and indicator maps
+        const categoryMap: Record<string, number> = {};
+        for (const c of categories.results || []) {
+          categoryMap[c.category] = c.score;
+        }
+
+        const indicatorMap: Record<string, number> = {};
+        for (const i of indicators.results || []) {
+          indicatorMap[i.indicator_id] = i.value;
+        }
+
+        // Extract ML features
+        const features = extractMLFeatures({
+          pxi_score: currentPxi.score,
+          pxi_delta_1d: currentPxi.delta_1d,
+          pxi_delta_7d: currentPxi.delta_7d,
+          pxi_delta_30d: currentPxi.delta_30d,
+          categories: categoryMap,
+          indicators: indicatorMap,
+          pxi_ma_5,
+          pxi_ma_20,
+          pxi_std_20,
+        });
+
+        // Run predictions
+        const prediction_7d = model.m['7d'] ? xgbPredict(model.m['7d'], features) : null;
+        const prediction_30d = model.m['30d'] ? xgbPredict(model.m['30d'], features) : null;
+
+        // Interpret predictions
+        const interpret = (pred: number | null) => {
+          if (pred === null) return null;
+          if (pred > 5) return 'STRONG_UP';
+          if (pred > 2) return 'UP';
+          if (pred > -2) return 'FLAT';
+          if (pred > -5) return 'DOWN';
+          return 'STRONG_DOWN';
+        };
+
+        return Response.json({
+          date: currentPxi.date,
+          current_score: currentPxi.score,
+          model_version: model.v,
+          predictions: {
+            pxi_change_7d: {
+              value: prediction_7d,
+              direction: interpret(prediction_7d),
+            },
+            pxi_change_30d: {
+              value: prediction_30d,
+              direction: interpret(prediction_30d),
+            },
+          },
+          features_used: Object.keys(features).length,
+          // Include key features for transparency
+          key_features: {
+            extreme_low: features['extreme_low'],
+            extreme_high: features['extreme_high'],
+            pxi_vs_ma_20: features['pxi_vs_ma_20'],
+            category_dispersion: features['category_dispersion'],
+            weak_categories_count: features['weak_categories_count'],
+          },
+        }, { headers: corsHeaders });
+      }
+
       // Get prediction accuracy metrics
       if (url.pathname === '/api/accuracy' && request.method === 'GET') {
         const includePending = url.searchParams.get('include_pending') === 'true';
@@ -4243,6 +4529,89 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
 
         return Response.json({
           history: results.results || [],
+        }, { headers: corsHeaders });
+      }
+
+      // Export training data for ML model (requires auth)
+      if (url.pathname === '/api/export/training-data' && request.method === 'GET') {
+        const authHeader = request.headers.get('Authorization');
+        const apiKey = authHeader?.replace('Bearer ', '');
+        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        // Get all PXI scores with deltas and forward returns
+        const pxiData = await env.DB.prepare(`
+          SELECT
+            p.date,
+            p.score,
+            p.delta_1d,
+            p.delta_7d,
+            p.delta_30d,
+            p.label,
+            p.status,
+            me.forward_return_7d,
+            me.forward_return_30d
+          FROM pxi_scores p
+          LEFT JOIN market_embeddings me ON p.date = me.date
+          ORDER BY p.date ASC
+        `).all<{
+          date: string;
+          score: number;
+          delta_1d: number | null;
+          delta_7d: number | null;
+          delta_30d: number | null;
+          label: string;
+          status: string;
+          forward_return_7d: number | null;
+          forward_return_30d: number | null;
+        }>();
+
+        // Get category scores for each date
+        const categoryData = await env.DB.prepare(`
+          SELECT date, category, score FROM category_scores ORDER BY date, category
+        `).all<{ date: string; category: string; score: number }>();
+
+        // Get indicator values for each date
+        const indicatorData = await env.DB.prepare(`
+          SELECT date, indicator_id, value FROM indicator_values ORDER BY date, indicator_id
+        `).all<{ date: string; indicator_id: string; value: number }>();
+
+        // Group categories and indicators by date
+        const categoryMap = new Map<string, Record<string, number>>();
+        for (const c of categoryData.results || []) {
+          if (!categoryMap.has(c.date)) categoryMap.set(c.date, {});
+          categoryMap.get(c.date)![c.category] = c.score;
+        }
+
+        const indicatorMap = new Map<string, Record<string, number>>();
+        for (const i of indicatorData.results || []) {
+          if (!indicatorMap.has(i.date)) indicatorMap.set(i.date, {});
+          indicatorMap.get(i.date)![i.indicator_id] = i.value;
+        }
+
+        // Build training records
+        const trainingData = (pxiData.results || []).map(p => ({
+          date: p.date,
+          // Target variables
+          forward_return_7d: p.forward_return_7d,
+          forward_return_30d: p.forward_return_30d,
+          // PXI features
+          pxi_score: p.score,
+          pxi_delta_1d: p.delta_1d,
+          pxi_delta_7d: p.delta_7d,
+          pxi_delta_30d: p.delta_30d,
+          pxi_label: p.label,
+          pxi_status: p.status,
+          // Category scores
+          categories: categoryMap.get(p.date) || {},
+          // Raw indicators
+          indicators: indicatorMap.get(p.date) || {},
+        }));
+
+        return Response.json({
+          count: trainingData.length,
+          data: trainingData,
         }, { headers: corsHeaders });
       }
 
