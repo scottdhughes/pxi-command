@@ -573,14 +573,14 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           Protocol Specification
         </h1>
         <p className="text-[11px] text-[#949ba5]/60 mb-12 uppercase tracking-widest">
-          Macro Market Strength Index — Quantitative Framework v1.1
+          Macro Market Strength Index — Quantitative Framework v1.2
         </p>
 
         {/* Two-Layer Architecture */}
         <section className="mb-12">
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Two-Layer Architecture</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
-            v1.1 introduces a two-layer system separating descriptive state from actionable signals.
+            Two-layer system separating descriptive state from actionable signals.
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#00a3ff]">
@@ -624,7 +624,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 
         {/* Categories */}
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Category Composition (v1.1)</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Category Composition</h2>
           <div className="space-y-4">
             {[
               { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, AAII sentiment', formula: '100 - percentile(VIX, 5yr)' },
@@ -818,6 +818,45 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           </div>
         </section>
 
+        {/* ML Predictions */}
+        <section className="mb-12">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">ML Predictions (v1.2)</h2>
+          <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
+            Two complementary models predict 7-day and 30-day PXI changes. Models are trained locally
+            and deployed as JSON weights for edge inference in Cloudflare Workers.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#00a3ff]">
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">XGBoost</div>
+              <p className="text-[10px] text-[#949ba5]/70 mb-2">Gradient boosted trees for tabular features</p>
+              <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
+                <li>• 36 engineered features</li>
+                <li>• Momentum, dispersion, extremes</li>
+                <li>• Rolling statistics (7d, 14d, 30d)</li>
+                <li>• Point-in-time prediction</li>
+              </ul>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#f59e0b]">
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">LSTM</div>
+              <p className="text-[10px] text-[#949ba5]/70 mb-2">Recurrent neural network for sequences</p>
+              <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
+                <li>• 20-day input sequences</li>
+                <li>• 12 features per timestep</li>
+                <li>• 32 hidden units, single layer</li>
+                <li>• Temporal pattern recognition</li>
+              </ul>
+            </div>
+          </div>
+          <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[11px] text-[#f3f3f3]/70 space-y-1">
+            <div>Features: PXI, Δ7d, categories, VIX, dispersion</div>
+            <div>Targets: PXI change at t+7, t+30</div>
+            <div>Direction: STRONG_UP | UP | FLAT | DOWN | STRONG_DOWN</div>
+          </div>
+          <p className="text-[10px] text-[#949ba5]/50 mt-2">
+            Thresholds: |Δ| &gt; 5 = STRONG, |Δ| &gt; 2 = directional, else FLAT
+          </p>
+        </section>
+
         {/* Divergence Detection */}
         <section className="mb-12">
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Divergence Alerts</h2>
@@ -894,7 +933,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 
         {/* Footer */}
         <div className="text-[9px] text-[#949ba5]/30 font-mono tracking-wider text-center uppercase pt-8 border-t border-[#26272b]">
-          PXI/COMMAND Protocol v1.1
+          PXI/COMMAND Protocol v1.2
         </div>
       </div>
     </div>
