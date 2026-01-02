@@ -842,13 +842,43 @@ async function handleScheduled(env: Env): Promise<void> {
       }).slice(0, 5);
 
       if (filteredMatches.length > 0) {
-        // Calculate predictions from similar periods
-        const outcomes: { d7: number | null; d30: number | null; weight: number }[] = [];
+        // Fetch accuracy scores for similar periods
+        const periodDates = filteredMatches.map(m => (m.metadata as { date?: string })?.date || m.id);
+        const accuracyScores = await env.DB.prepare(`
+          SELECT period_date, accuracy_score, times_used FROM period_accuracy
+          WHERE period_date IN (${periodDates.map(() => '?').join(',')})
+        `).bind(...periodDates).all<{ period_date: string; accuracy_score: number; times_used: number }>();
+
+        const accuracyMap = new Map(
+          (accuracyScores.results || []).map(a => [a.period_date, { score: a.accuracy_score, used: a.times_used }])
+        );
+
+        // Calculate predictions from similar periods with enhanced weighting
+        const outcomes: { d7: number | null; d30: number | null; weight: number; breakdown: { similarity: number; recency: number; accuracy: number } }[] = [];
+        const todayMs = new Date().getTime();
 
         for (const match of filteredMatches) {
           const histDate = (match.metadata as { date?: string })?.date || match.id;
           const histScore = (match.metadata as { score?: number })?.score;
           if (!histScore) continue;
+
+          // Weight components:
+          // 1. Similarity (from Vectorize) - already 0-1
+          const similarityWeight = match.score;
+
+          // 2. Recency - exponential decay, half-life of 365 days
+          const histDateMs = new Date(histDate).getTime();
+          const daysSince = (todayMs - histDateMs) / (1000 * 60 * 60 * 24);
+          const recencyWeight = Math.exp(-daysSince / 365);
+
+          // 3. Accuracy - from period_accuracy table (default 0.5 if unknown)
+          const periodAccuracy = accuracyMap.get(histDate);
+          const accuracyWeight = periodAccuracy && periodAccuracy.used >= 2
+            ? periodAccuracy.score
+            : 0.5; // Default for unproven periods
+
+          // Combined weight (geometric mean preserves scale)
+          const combinedWeight = similarityWeight * (0.4 + 0.3 * recencyWeight + 0.3 * accuracyWeight);
 
           const endDate = new Date(histDate);
           endDate.setDate(endDate.getDate() + 35);
@@ -858,7 +888,6 @@ async function handleScheduled(env: Env): Promise<void> {
             SELECT date, score FROM pxi_scores WHERE date > ? AND date <= ? ORDER BY date LIMIT 35
           `).bind(histDate, endDateStr).all<{ date: string; score: number }>();
 
-          const histDateMs = new Date(histDate).getTime();
           let d7_change: number | null = null;
           let d30_change: number | null = null;
 
@@ -872,7 +901,12 @@ async function handleScheduled(env: Env): Promise<void> {
             }
           }
 
-          outcomes.push({ d7: d7_change, d30: d30_change, weight: match.score });
+          outcomes.push({
+            d7: d7_change,
+            d30: d30_change,
+            weight: combinedWeight,
+            breakdown: { similarity: similarityWeight, recency: recencyWeight, accuracy: accuracyWeight }
+          });
         }
 
         // Calculate weighted predictions
@@ -886,15 +920,67 @@ async function handleScheduled(env: Env): Promise<void> {
           ? validD30.reduce((sum, o) => sum + o.d30! * o.weight, 0) / validD30.reduce((sum, o) => sum + o.weight, 0)
           : null;
 
-        // Calculate confidence
-        const d7_directions = validD7.map(o => o.d7! > 0 ? 1 : -1);
-        const d7_confidence = d7_directions.length > 0
-          ? Math.abs(d7_directions.reduce((a, b) => a + b, 0)) / d7_directions.length
-          : 0;
-        const d30_directions = validD30.map(o => o.d30! > 0 ? 1 : -1);
-        const d30_confidence = d30_directions.length > 0
-          ? Math.abs(d30_directions.reduce((a, b) => a + b, 0)) / d30_directions.length
-          : 0;
+        // Enhanced confidence scoring
+        const calculateConfidence = (
+          values: number[],
+          weights: number[],
+          prediction: number | null
+        ) => {
+          if (values.length === 0 || prediction === null) return { score: 0, components: null };
+
+          const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+
+          // 1. Directional agreement (weighted) - do periods agree on direction?
+          let weightedDirection = 0;
+          for (let i = 0; i < values.length; i++) {
+            const direction = values[i] > 0 ? 1 : -1;
+            weightedDirection += direction * weights[i];
+          }
+          weightedDirection /= totalWeight;
+          const directionScore = Math.abs(weightedDirection); // 0-1, 1 = perfect agreement
+
+          // 2. Magnitude consistency - low variance = high confidence
+          const mean = values.reduce((a, b) => a + b, 0) / values.length;
+          const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / values.length;
+          const stdDev = Math.sqrt(variance);
+          // Normalize: stdDev of 0 = perfect, stdDev of 20+ = low confidence
+          const consistencyScore = Math.max(0, 1 - stdDev / 20);
+
+          // 3. Sample size factor - more samples = more confident (capped at 5)
+          const sampleScore = Math.min(values.length / 5, 1);
+
+          // 4. Weight quality - average combined weight of samples
+          const avgWeight = totalWeight / values.length;
+          const weightScore = avgWeight; // Already 0-1 range
+
+          // Combined confidence (weighted average of factors)
+          const confidence = (
+            directionScore * 0.35 +    // Direction agreement most important
+            consistencyScore * 0.25 +  // Magnitude consistency
+            sampleScore * 0.20 +       // Sample size
+            weightScore * 0.20         // Weight quality
+          );
+
+          return {
+            score: confidence,
+            components: {
+              direction: directionScore,
+              consistency: consistencyScore,
+              sample_size: sampleScore,
+              weight_quality: weightScore,
+            }
+          };
+        };
+
+        const d7_values = validD7.map(o => o.d7!);
+        const d7_weights = validD7.map(o => o.weight);
+        const d30_values = validD30.map(o => o.d30!);
+        const d30_weights = validD30.map(o => o.weight);
+
+        const d7_conf = calculateConfidence(d7_values, d7_weights, d7_prediction);
+        const d30_conf = calculateConfidence(d30_values, d30_weights, d30_prediction);
+        const d7_confidence = d7_conf.score;
+        const d30_confidence = d30_conf.score;
 
         // Calculate target dates
         const target7d = new Date();
@@ -1739,6 +1825,24 @@ export default {
             INSERT OR IGNORE INTO model_params (param_key, param_value, notes)
             VALUES ('similarity_threshold', 0.8, 'Minimum cosine similarity to include period')
           `).run();
+
+          // Adaptive bucket thresholds (default: 20, 40, 60, 80)
+          await env.DB.prepare(`
+            INSERT OR IGNORE INTO model_params (param_key, param_value, notes)
+            VALUES ('bucket_threshold_1', 20, 'Threshold between bucket 1 (0-X) and bucket 2')
+          `).run();
+          await env.DB.prepare(`
+            INSERT OR IGNORE INTO model_params (param_key, param_value, notes)
+            VALUES ('bucket_threshold_2', 40, 'Threshold between bucket 2 and bucket 3')
+          `).run();
+          await env.DB.prepare(`
+            INSERT OR IGNORE INTO model_params (param_key, param_value, notes)
+            VALUES ('bucket_threshold_3', 60, 'Threshold between bucket 3 and bucket 4')
+          `).run();
+          await env.DB.prepare(`
+            INSERT OR IGNORE INTO model_params (param_key, param_value, notes)
+            VALUES ('bucket_threshold_4', 80, 'Threshold between bucket 4 and bucket 5 (X-100)')
+          `).run();
         } catch (e) {
           console.error('model_params migration failed:', e);
         }
@@ -2103,14 +2207,43 @@ export default {
             WHERE p.date IN (${similarDates.map(() => '?').join(',')})
           `).bind(...similarDates).all<PXIRow & { forward_return_7d: number | null; forward_return_30d: number | null }>();
 
+          // Get accuracy scores for similar periods
+          const accuracyScores = await env.DB.prepare(`
+            SELECT period_date, accuracy_score, times_used FROM period_accuracy
+            WHERE period_date IN (${similarDates.map(() => '?').join(',')})
+          `).bind(...similarDates).all<{ period_date: string; accuracy_score: number; times_used: number }>();
+
+          const accuracyMap = new Map(
+            (accuracyScores.results || []).map(a => [a.period_date, { score: a.accuracy_score, used: a.times_used }])
+          );
+
+          const todayMs = new Date().getTime();
+
           return Response.json({
             current_date: latestDate.date,
             cutoff_date: cutoffDateStr,
             similar_periods: filteredMatches.map((m) => {
               const hist = historicalScores.results?.find((s) => s.date === m.metadata?.date);
+              const matchDate = m.metadata?.date as string;
+
+              // Calculate weight components
+              const similarityWeight = m.score;
+              const daysSince = matchDate ? (todayMs - new Date(matchDate).getTime()) / (1000 * 60 * 60 * 24) : 0;
+              const recencyWeight = Math.exp(-daysSince / 365);
+              const periodAccuracy = matchDate ? accuracyMap.get(matchDate) : null;
+              const accuracyWeight = periodAccuracy && periodAccuracy.used >= 2 ? periodAccuracy.score : 0.5;
+              const combinedWeight = similarityWeight * (0.4 + 0.3 * recencyWeight + 0.3 * accuracyWeight);
+
               return {
-                date: m.metadata?.date,
+                date: matchDate,
                 similarity: m.score,
+                weights: {
+                  combined: combinedWeight,
+                  similarity: similarityWeight,
+                  recency: recencyWeight,
+                  accuracy: accuracyWeight,
+                  accuracy_sample: periodAccuracy?.used || 0,
+                },
                 pxi: hist ? {
                   date: hist.date,
                   score: hist.score,
@@ -2659,14 +2792,34 @@ export default {
           return null;
         };
 
-        // Determine current bucket
+        // Fetch adaptive bucket thresholds from model_params
+        const thresholdParams = await env.DB.prepare(`
+          SELECT param_key, param_value FROM model_params
+          WHERE param_key LIKE 'bucket_threshold_%'
+        `).all<{ param_key: string; param_value: number }>();
+
+        const thresholds = {
+          t1: 20, t2: 40, t3: 60, t4: 80 // defaults
+        };
+        for (const p of thresholdParams.results || []) {
+          if (p.param_key === 'bucket_threshold_1') thresholds.t1 = p.param_value;
+          if (p.param_key === 'bucket_threshold_2') thresholds.t2 = p.param_value;
+          if (p.param_key === 'bucket_threshold_3') thresholds.t3 = p.param_value;
+          if (p.param_key === 'bucket_threshold_4') thresholds.t4 = p.param_value;
+        }
+
+        // Helper to get bucket from score using adaptive thresholds
+        const getBucket = (s: number): string => {
+          if (s < thresholds.t1) return `0-${thresholds.t1}`;
+          if (s < thresholds.t2) return `${thresholds.t1}-${thresholds.t2}`;
+          if (s < thresholds.t3) return `${thresholds.t2}-${thresholds.t3}`;
+          if (s < thresholds.t4) return `${thresholds.t3}-${thresholds.t4}`;
+          return `${thresholds.t4}-100`;
+        };
+
+        // Determine current bucket using adaptive thresholds
         const score = currentPxi.score;
-        let bucket: string;
-        if (score < 20) bucket = '0-20';
-        else if (score < 40) bucket = '20-40';
-        else if (score < 60) bucket = '40-60';
-        else if (score < 80) bucket = '60-80';
-        else bucket = '80-100';
+        const bucket = getBucket(score);
 
         // Calculate stats for current bucket from historical data
         const bucketReturns7d: number[] = [];
@@ -2674,12 +2827,7 @@ export default {
 
         for (const pxi of pxiScores.results || []) {
           // Check if this PXI is in the same bucket
-          let pxiBucket: string;
-          if (pxi.score < 20) pxiBucket = '0-20';
-          else if (pxi.score < 40) pxiBucket = '20-40';
-          else if (pxi.score < 60) pxiBucket = '40-60';
-          else if (pxi.score < 80) pxiBucket = '60-80';
-          else pxiBucket = '80-100';
+          const pxiBucket = getBucket(pxi.score);
 
           if (pxiBucket !== bucket) continue;
 
@@ -2708,9 +2856,12 @@ export default {
           return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
         };
 
-        // Check for extreme readings
-        const isExtremeLow = score < 25;
-        const isExtremeHigh = score > 75;
+        // Check for extreme readings using adaptive thresholds
+        // Extreme low = below midpoint of first bucket, Extreme high = above midpoint of last bucket
+        const extremeLowThreshold = thresholds.t1 * 1.25; // e.g., 25 for t1=20
+        const extremeHighThreshold = thresholds.t4 - (100 - thresholds.t4) * 0.25; // e.g., 75 for t4=80
+        const isExtremeLow = score < extremeLowThreshold;
+        const isExtremeHigh = score > extremeHighThreshold;
 
         // Calculate extreme stats if applicable
         let extremeStats = null;
@@ -2719,7 +2870,7 @@ export default {
           const extremeReturns30d: number[] = [];
 
           for (const pxi of pxiScores.results || []) {
-            const inRange = isExtremeLow ? pxi.score < 25 : pxi.score > 75;
+            const inRange = isExtremeLow ? pxi.score < extremeLowThreshold : pxi.score > extremeHighThreshold;
             if (!inRange) continue;
 
             const spyNow = getSpyPrice(pxi.date);
@@ -2738,7 +2889,7 @@ export default {
 
           extremeStats = {
             type: isExtremeLow ? 'OVERSOLD' : 'OVERBOUGHT',
-            threshold: isExtremeLow ? '<25' : '>75',
+            threshold: isExtremeLow ? `<${extremeLowThreshold.toFixed(0)}` : `>${extremeHighThreshold.toFixed(0)}`,
             historical_count: extremeReturns7d.length,
             avg_return_7d: avg(extremeReturns7d),
             avg_return_30d: avg(extremeReturns30d),
@@ -2748,12 +2899,43 @@ export default {
           };
         }
 
+        // Get ML prediction from prediction_log (if available)
+        const mlPrediction = await env.DB.prepare(`
+          SELECT predicted_change_7d, predicted_change_30d, confidence_7d, confidence_30d, similar_periods
+          FROM prediction_log
+          WHERE prediction_date = ?
+        `).bind(currentPxi.date).first<{
+          predicted_change_7d: number | null;
+          predicted_change_30d: number | null;
+          confidence_7d: number | null;
+          confidence_30d: number | null;
+          similar_periods: string | null;
+        }>();
+
+        // Calculate confidence label
+        const getConfidenceLabel = (conf: number | null) => {
+          if (conf === null) return 'N/A';
+          if (conf >= 0.7) return 'HIGH';
+          if (conf >= 0.4) return 'MEDIUM';
+          return 'LOW';
+        };
+
         return Response.json({
           current: {
             date: currentPxi.date,
             score: currentPxi.score,
             label: currentPxi.label,
             bucket,
+          },
+          adaptive_thresholds: {
+            buckets: [
+              `0-${thresholds.t1}`,
+              `${thresholds.t1}-${thresholds.t2}`,
+              `${thresholds.t2}-${thresholds.t3}`,
+              `${thresholds.t3}-${thresholds.t4}`,
+              `${thresholds.t4}-100`
+            ],
+            values: thresholds,
           },
           prediction: {
             method: 'empirical_backtest',
@@ -2770,10 +2952,27 @@ export default {
               sample_size: bucketReturns30d.length,
             },
           },
+          ml_prediction: mlPrediction ? {
+            method: 'similar_period_weighted',
+            d7: {
+              predicted_change: mlPrediction.predicted_change_7d,
+              confidence: mlPrediction.confidence_7d,
+              confidence_label: getConfidenceLabel(mlPrediction.confidence_7d),
+            },
+            d30: {
+              predicted_change: mlPrediction.predicted_change_30d,
+              confidence: mlPrediction.confidence_30d,
+              confidence_label: getConfidenceLabel(mlPrediction.confidence_30d),
+            },
+            similar_periods_count: mlPrediction.similar_periods
+              ? JSON.parse(mlPrediction.similar_periods).length
+              : 0,
+          } : null,
           extreme_reading: extremeStats,
           interpretation: {
             bias: (winRate(bucketReturns7d) || 50) > 55 ? 'BULLISH' : (winRate(bucketReturns7d) || 50) < 45 ? 'BEARISH' : 'NEUTRAL',
             confidence: bucketReturns7d.length >= 50 ? 'HIGH' : bucketReturns7d.length >= 20 ? 'MEDIUM' : 'LOW',
+            ml_confidence: mlPrediction ? getConfidenceLabel(mlPrediction.confidence_7d) : null,
             note: isExtremeLow
               ? 'PXI in oversold territory - historically bullish setup'
               : isExtremeHigh
@@ -2908,12 +3107,14 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
 
       // Get prediction accuracy metrics
       if (url.pathname === '/api/accuracy' && request.method === 'GET') {
-        // Get all evaluated predictions
+        const includePending = url.searchParams.get('include_pending') === 'true';
+
+        // Get all predictions (optionally including pending)
         const predictions = await env.DB.prepare(`
           SELECT prediction_date, predicted_change_7d, predicted_change_30d,
                  actual_change_7d, actual_change_30d, confidence_7d, confidence_30d
           FROM prediction_log
-          WHERE actual_change_7d IS NOT NULL OR actual_change_30d IS NOT NULL
+          ${includePending ? '' : 'WHERE actual_change_7d IS NOT NULL OR actual_change_30d IS NOT NULL'}
           ORDER BY prediction_date DESC
           LIMIT 100
         `).all<{
@@ -2928,11 +3129,17 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
 
         if (!predictions.results || predictions.results.length === 0) {
           return Response.json({
-            message: 'No evaluated predictions yet',
+            message: includePending ? 'No predictions logged yet' : 'No evaluated predictions yet',
             total_predictions: 0,
             metrics: null,
           }, { headers: corsHeaders });
         }
+
+        // Count pending vs evaluated
+        const pendingCount = predictions.results.filter(p =>
+          p.actual_change_7d === null && p.actual_change_30d === null
+        ).length;
+        const evaluatedCount = predictions.results.length - pendingCount;
 
         // Calculate accuracy metrics
         let d7_correct_direction = 0;
@@ -2995,6 +3202,8 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
 
         return Response.json({
           total_predictions: predictions.results.length,
+          evaluated_count: evaluatedCount,
+          pending_count: pendingCount,
           metrics: {
             d7: d7_total > 0 ? {
               direction_accuracy: (d7_correct_direction / d7_total * 100).toFixed(1) + '%',
@@ -3162,12 +3371,128 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           `Auto-tuned based on ${total7d} predictions (${(overallAccuracy * 100).toFixed(1)}% accuracy)`
         ).run();
 
+        // Adaptive bucket threshold tuning
+        // Get current thresholds
+        const thresholdParams = await env.DB.prepare(`
+          SELECT param_key, param_value FROM model_params
+          WHERE param_key LIKE 'bucket_threshold_%'
+        `).all<{ param_key: string; param_value: number }>();
+
+        const currentThresholds = { t1: 20, t2: 40, t3: 60, t4: 80 };
+        for (const p of thresholdParams.results || []) {
+          if (p.param_key === 'bucket_threshold_1') currentThresholds.t1 = p.param_value;
+          if (p.param_key === 'bucket_threshold_2') currentThresholds.t2 = p.param_value;
+          if (p.param_key === 'bucket_threshold_3') currentThresholds.t3 = p.param_value;
+          if (p.param_key === 'bucket_threshold_4') currentThresholds.t4 = p.param_value;
+        }
+
+        // Get PXI scores for each prediction to determine bucket
+        const pxiScoresForPreds = await env.DB.prepare(`
+          SELECT pl.prediction_date, ps.score, pl.predicted_change_7d, pl.actual_change_7d
+          FROM prediction_log pl
+          JOIN pxi_scores ps ON pl.prediction_date = ps.date
+          WHERE pl.actual_change_7d IS NOT NULL
+        `).all<{ prediction_date: string; score: number; predicted_change_7d: number; actual_change_7d: number }>();
+
+        // Helper to get bucket index (0-4) from score
+        const getBucketIdx = (s: number, t: typeof currentThresholds): number => {
+          if (s < t.t1) return 0;
+          if (s < t.t2) return 1;
+          if (s < t.t3) return 2;
+          if (s < t.t4) return 3;
+          return 4;
+        };
+
+        // Calculate accuracy by bucket
+        const bucketStats = [
+          { correct: 0, total: 0 },
+          { correct: 0, total: 0 },
+          { correct: 0, total: 0 },
+          { correct: 0, total: 0 },
+          { correct: 0, total: 0 },
+        ];
+
+        for (const pred of pxiScoresForPreds.results || []) {
+          const bucketIdx = getBucketIdx(pred.score, currentThresholds);
+          bucketStats[bucketIdx].total++;
+          const p = pred.predicted_change_7d;
+          const a = pred.actual_change_7d;
+          if ((p > 0 && a > 0) || (p < 0 && a < 0)) {
+            bucketStats[bucketIdx].correct++;
+          }
+        }
+
+        // Calculate accuracy per bucket
+        const bucketAccuracies = bucketStats.map(b =>
+          b.total >= 3 ? b.correct / b.total : null // Need at least 3 samples
+        );
+
+        // Adjust thresholds: if adjacent buckets have very different accuracies,
+        // shift the boundary toward the more accurate bucket
+        const newThresholds = { ...currentThresholds };
+        const minDiff = 8; // Minimum 8 points between thresholds
+
+        // Only tune if we have enough data
+        if (bucketStats.reduce((sum, b) => sum + b.total, 0) >= 10) {
+          // Tune t1 based on bucket 0 vs bucket 1 accuracy
+          if (bucketAccuracies[0] !== null && bucketAccuracies[1] !== null) {
+            const diff = bucketAccuracies[0] - bucketAccuracies[1];
+            if (diff > 0.15) newThresholds.t1 = Math.min(currentThresholds.t1 + 2, currentThresholds.t2 - minDiff);
+            else if (diff < -0.15) newThresholds.t1 = Math.max(currentThresholds.t1 - 2, 10);
+          }
+
+          // Tune t2 based on bucket 1 vs bucket 2 accuracy
+          if (bucketAccuracies[1] !== null && bucketAccuracies[2] !== null) {
+            const diff = bucketAccuracies[1] - bucketAccuracies[2];
+            if (diff > 0.15) newThresholds.t2 = Math.min(currentThresholds.t2 + 2, currentThresholds.t3 - minDiff);
+            else if (diff < -0.15) newThresholds.t2 = Math.max(currentThresholds.t2 - 2, newThresholds.t1 + minDiff);
+          }
+
+          // Tune t3 based on bucket 2 vs bucket 3 accuracy
+          if (bucketAccuracies[2] !== null && bucketAccuracies[3] !== null) {
+            const diff = bucketAccuracies[2] - bucketAccuracies[3];
+            if (diff > 0.15) newThresholds.t3 = Math.min(currentThresholds.t3 + 2, currentThresholds.t4 - minDiff);
+            else if (diff < -0.15) newThresholds.t3 = Math.max(currentThresholds.t3 - 2, newThresholds.t2 + minDiff);
+          }
+
+          // Tune t4 based on bucket 3 vs bucket 4 accuracy
+          if (bucketAccuracies[3] !== null && bucketAccuracies[4] !== null) {
+            const diff = bucketAccuracies[3] - bucketAccuracies[4];
+            if (diff > 0.15) newThresholds.t4 = Math.min(currentThresholds.t4 + 2, 90);
+            else if (diff < -0.15) newThresholds.t4 = Math.max(currentThresholds.t4 - 2, newThresholds.t3 + minDiff);
+          }
+
+          // Update thresholds in database
+          const thresholdUpdates = [
+            { key: 'bucket_threshold_1', val: newThresholds.t1, old: currentThresholds.t1 },
+            { key: 'bucket_threshold_2', val: newThresholds.t2, old: currentThresholds.t2 },
+            { key: 'bucket_threshold_3', val: newThresholds.t3, old: currentThresholds.t3 },
+            { key: 'bucket_threshold_4', val: newThresholds.t4, old: currentThresholds.t4 },
+          ];
+
+          for (const t of thresholdUpdates) {
+            if (t.val !== t.old) {
+              await env.DB.prepare(`
+                UPDATE model_params SET param_value = ?, updated_at = datetime('now'),
+                notes = ? WHERE param_key = ?
+              `).bind(t.val, `Tuned from ${t.old} (bucket accuracies: ${bucketAccuracies.map(a => a ? (a * 100).toFixed(0) + '%' : 'N/A').join(', ')})`, t.key).run();
+            }
+          }
+        }
+
         return Response.json({
           success: true,
           predictions_analyzed: totalPreds,
           periods_updated: periodsUpdated,
           overall_accuracy: (overallAccuracy * 100).toFixed(1) + '%',
           new_accuracy_weight: newAccuracyWeight,
+          bucket_tuning: {
+            samples_per_bucket: bucketStats.map(b => b.total),
+            accuracy_per_bucket: bucketAccuracies.map(a => a !== null ? (a * 100).toFixed(0) + '%' : 'N/A'),
+            old_thresholds: currentThresholds,
+            new_thresholds: newThresholds,
+            changed: JSON.stringify(currentThresholds) !== JSON.stringify(newThresholds),
+          },
           top_periods: Object.entries(periodStats)
             .sort((a, b) => b[1].times_used - a[1].times_used)
             .slice(0, 5)
