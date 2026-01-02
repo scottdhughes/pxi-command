@@ -355,8 +355,8 @@ async function postToWorkerAPI(): Promise<void> {
 // ============== Trigger PXI Recalculation ==============
 
 async function triggerRecalculation(): Promise<void> {
-  if (!WRITE_API_KEY) {
-    throw new Error('WRITE_API_KEY not set');
+  if (!WRITE_API_KEY || !WRITE_API_URL) {
+    throw new Error('WRITE_API_KEY and WRITE_API_URL must be set');
   }
 
   const baseUrl = WRITE_API_URL.replace('/api/write', '');
@@ -380,11 +380,43 @@ async function triggerRecalculation(): Promise<void> {
       throw new Error(`Recalculate error ${response.status}: ${errorText}`);
     }
 
-    const result = await response.json() as { success: boolean; score: number; label: string; categories: number };
+    const result = await response.json() as { success: boolean; score: number; label: string; categories: number; embedded?: boolean };
     console.log(`  ✓ PXI: ${result.score.toFixed(1)} (${result.label})`);
     console.log(`  ✓ Categories: ${result.categories}`);
+    console.log(`  ✓ Embedding: ${result.embedded ? 'generated' : 'skipped'}`);
   } catch (err: any) {
     console.error(`  ✗ Recalculation failed: ${err.message}`);
+  }
+}
+
+async function evaluatePredictions(): Promise<void> {
+  if (!WRITE_API_KEY || !WRITE_API_URL) {
+    throw new Error('WRITE_API_KEY and WRITE_API_URL must be set');
+  }
+
+  const baseUrl = WRITE_API_URL.replace('/api/write', '');
+
+  console.log(`\n━━━ Evaluating Past Predictions ━━━`);
+
+  try {
+    const response = await fetch(`${baseUrl}/api/evaluate`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${WRITE_API_KEY}`,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Evaluate error ${response.status}: ${errorText}`);
+    }
+
+    const result = await response.json() as { success: boolean; pending: number; evaluated: number };
+    console.log(`  ✓ Pending predictions: ${result.pending}`);
+    console.log(`  ✓ Evaluated: ${result.evaluated}`);
+  } catch (err: any) {
+    console.error(`  ✗ Evaluation failed: ${err.message}`);
   }
 }
 
@@ -408,8 +440,11 @@ async function main(): Promise<void> {
     // Post to Worker API
     await postToWorkerAPI();
 
-    // Trigger PXI recalculation
+    // Trigger PXI recalculation (also logs predictions)
     await triggerRecalculation();
+
+    // Evaluate past predictions against actual outcomes
+    await evaluatePredictions();
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`\n✅ Daily refresh complete in ${duration}s`);

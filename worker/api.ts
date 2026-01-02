@@ -1681,6 +1681,96 @@ export default {
         );
       }
 
+      // Database migration - create any missing tables (requires auth)
+      if (url.pathname === '/api/migrate' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader || authHeader !== `Bearer ${env.WRITE_API_KEY}`) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
+
+        const migrations: string[] = [];
+
+        // Create prediction_log table if it doesn't exist
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS prediction_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              prediction_date TEXT NOT NULL UNIQUE,
+              target_date_7d TEXT,
+              target_date_30d TEXT,
+              current_score REAL NOT NULL,
+              predicted_change_7d REAL,
+              predicted_change_30d REAL,
+              actual_change_7d REAL,
+              actual_change_30d REAL,
+              confidence_7d REAL,
+              confidence_30d REAL,
+              similar_periods TEXT,
+              evaluated_at TEXT,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_prediction_log_date ON prediction_log(prediction_date DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_prediction_log_evaluated ON prediction_log(evaluated_at)`).run();
+          migrations.push('prediction_log');
+        } catch (e) {
+          console.error('prediction_log migration failed:', e);
+        }
+
+        // Create model_params table if it doesn't exist
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS model_params (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              param_key TEXT NOT NULL UNIQUE,
+              param_value REAL NOT NULL,
+              notes TEXT,
+              updated_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          migrations.push('model_params');
+
+          // Insert default params if they don't exist
+          await env.DB.prepare(`
+            INSERT OR IGNORE INTO model_params (param_key, param_value, notes)
+            VALUES ('accuracy_weight', 0.3, 'Weight given to period accuracy vs similarity')
+          `).run();
+          await env.DB.prepare(`
+            INSERT OR IGNORE INTO model_params (param_key, param_value, notes)
+            VALUES ('similarity_threshold', 0.8, 'Minimum cosine similarity to include period')
+          `).run();
+        } catch (e) {
+          console.error('model_params migration failed:', e);
+        }
+
+        // Create period_accuracy table if it doesn't exist
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS period_accuracy (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              period_date TEXT NOT NULL UNIQUE,
+              times_used INTEGER DEFAULT 0,
+              correct_predictions INTEGER DEFAULT 0,
+              total_predictions INTEGER DEFAULT 0,
+              mean_absolute_error REAL,
+              accuracy_score REAL,
+              updated_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_period_accuracy_date ON period_accuracy(period_date DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_period_accuracy_score ON period_accuracy(accuracy_score DESC)`).run();
+          migrations.push('period_accuracy');
+        } catch (e) {
+          console.error('period_accuracy migration failed:', e);
+        }
+
+        return Response.json({
+          success: true,
+          tables_created: migrations,
+          message: `Migration complete. Created/verified: ${migrations.join(', ')}`,
+        }, { headers: corsHeaders });
+      }
+
       // Regime detection endpoint
       if (url.pathname === '/api/regime') {
         const regime = await detectRegime(env.DB);
@@ -1946,14 +2036,27 @@ export default {
           text: indicatorText,
         });
 
-        // Query Vectorize for similar days
+        // Query Vectorize for similar days - get more candidates for filtering
         const similar = await env.VECTORIZE.query(embedding.data[0], {
-          topK: 5,
+          topK: 100,  // Get more candidates to filter
           returnMetadata: 'all',
         });
 
+        // Calculate cutoff date (30 days ago) to exclude recent periods
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - 30);
+        const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
+
+        // Filter out recent dates and take top 5
+        const filteredMatches = (similar.matches || [])
+          .filter((m) => {
+            const matchDate = m.metadata?.date as string;
+            return matchDate && matchDate < cutoffDateStr;
+          })
+          .slice(0, 5);
+
         // Get PXI scores for similar dates
-        const similarDates = similar.matches
+        const similarDates = filteredMatches
           .filter((m) => m.metadata?.date)
           .map((m) => m.metadata!.date as string);
 
@@ -1961,22 +2064,39 @@ export default {
           return Response.json({
             current_date: latestDate.date,
             similar_periods: [],
-            message: 'No historical embeddings yet. Run /api/embed to generate.',
+            message: 'No historical periods found (excluding last 30 days). Need more historical data.',
           }, { headers: corsHeaders });
         }
 
+        // Get PXI scores and forward returns for similar dates
         const historicalScores = await env.DB.prepare(`
-          SELECT date, score, label, status FROM pxi_scores
-          WHERE date IN (${similarDates.map(() => '?').join(',')})
-        `).bind(...similarDates).all<PXIRow>();
+          SELECT p.date, p.score, p.label, p.status,
+                 me.forward_return_7d, me.forward_return_30d
+          FROM pxi_scores p
+          LEFT JOIN market_embeddings me ON p.date = me.date
+          WHERE p.date IN (${similarDates.map(() => '?').join(',')})
+        `).bind(...similarDates).all<PXIRow & { forward_return_7d: number | null; forward_return_30d: number | null }>();
 
         return Response.json({
           current_date: latestDate.date,
-          similar_periods: similar.matches.map((m, i) => ({
-            date: m.metadata?.date,
-            similarity: m.score,
-            pxi: historicalScores.results?.find((s) => s.date === m.metadata?.date),
-          })),
+          cutoff_date: cutoffDateStr,
+          similar_periods: filteredMatches.map((m) => {
+            const hist = historicalScores.results?.find((s) => s.date === m.metadata?.date);
+            return {
+              date: m.metadata?.date,
+              similarity: m.score,
+              pxi: hist ? {
+                date: hist.date,
+                score: hist.score,
+                label: hist.label,
+                status: hist.status,
+              } : null,
+              forward_returns: hist ? {
+                d7: hist.forward_return_7d,
+                d30: hist.forward_return_30d,
+              } : null,
+            };
+          }),
         }, { headers: corsHeaders });
       }
 

@@ -151,3 +151,52 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 
 CREATE INDEX IF NOT EXISTS idx_backtest_results_date ON backtest_results(run_date DESC);
 CREATE INDEX IF NOT EXISTS idx_backtest_results_strategy ON backtest_results(strategy);
+
+-- ============================================
+-- ML/Prediction Tracking Tables
+-- ============================================
+
+-- Prediction log for tracking predictions vs actual outcomes
+CREATE TABLE IF NOT EXISTS prediction_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_date TEXT NOT NULL UNIQUE,
+    target_date_7d TEXT,
+    target_date_30d TEXT,
+    current_score REAL NOT NULL,
+    predicted_change_7d REAL,
+    predicted_change_30d REAL,
+    actual_change_7d REAL,
+    actual_change_30d REAL,
+    confidence_7d REAL,
+    confidence_30d REAL,
+    similar_periods TEXT,  -- JSON array of period dates used
+    evaluated_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_log_date ON prediction_log(prediction_date DESC);
+CREATE INDEX IF NOT EXISTS idx_prediction_log_evaluated ON prediction_log(evaluated_at);
+
+-- Model parameters for tuning
+CREATE TABLE IF NOT EXISTS model_params (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    param_key TEXT NOT NULL UNIQUE,
+    param_value REAL NOT NULL,
+    notes TEXT,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Period accuracy tracking (which historical periods are good predictors)
+CREATE TABLE IF NOT EXISTS period_accuracy (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_date TEXT NOT NULL UNIQUE,
+    times_used INTEGER DEFAULT 0,
+    correct_predictions INTEGER DEFAULT 0,
+    total_predictions INTEGER DEFAULT 0,
+    mean_absolute_error REAL,
+    accuracy_score REAL,  -- 0-1 score based on prediction quality
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_period_accuracy_date ON period_accuracy(period_date DESC);
+CREATE INDEX IF NOT EXISTS idx_period_accuracy_score ON period_accuracy(accuracy_score DESC);
