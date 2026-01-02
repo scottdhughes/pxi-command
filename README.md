@@ -31,6 +31,7 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 ### ML & Predictions (v1.2)
 - **Similar Period Detection** - Find historically similar market regimes using vector embeddings with engineered features (momentum, dispersion, volatility regime)
 - **XGBoost Predictions** - Trained ML model predicting 7d/30d PXI changes using 36 features
+- **LSTM Predictions** - Recurrent neural network using 20-day sequences of 12 features for temporal pattern recognition
 - **Prediction Tracking** - Log predictions and evaluate against actual outcomes
 - **Historical Outlook** - Forward returns and win rates by PXI bucket with adaptive thresholds
 - **Signal Layer** - Risk allocation signals based on PXI, momentum, and volatility
@@ -79,7 +80,7 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 - **Backend:** TypeScript, Node.js
 - **Database:** Cloudflare D1 (SQLite at edge)
 - **Vector Store:** Cloudflare Vectorize (768-dim embeddings)
-- **ML Models:** XGBoost (trained locally, inference at edge via KV)
+- **ML Models:** XGBoost + LSTM (trained locally, inference at edge via KV)
 - **AI:** Cloudflare Workers AI (BGE embeddings, Llama analysis)
 - **API:** Cloudflare Workers
 - **Frontend:** React 19, Vite, Tailwind CSS
@@ -102,6 +103,7 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 | `/api/similar` | GET | Find similar historical periods (vector search with weighted scoring) |
 | `/api/predict` | GET | Historical outlook by PXI bucket with adaptive thresholds |
 | `/api/ml/predict` | GET | XGBoost model predictions for 7d/30d PXI changes |
+| `/api/ml/lstm` | GET | LSTM neural network predictions using 20-day sequences |
 | `/api/accuracy` | GET | Prediction accuracy metrics |
 | `/api/analyze` | GET | AI-generated market analysis |
 
@@ -151,16 +153,26 @@ cd ml && pip install -r requirements.txt
 export WRITE_API_KEY=your_key
 python train_xgboost.py
 
-# Upload model to Cloudflare KV
+# Train LSTM models (requires PyTorch)
+pip install torch
+python train_lstm.py
+
+# Upload models to Cloudflare KV
 npx wrangler kv key put "pxi_model" --path=pxi_model_compact.json \
+  --namespace-id=88901ff0216a484eb81b8004be0f5aea --remote
+npx wrangler kv key put "pxi_lstm_model" --path=pxi_lstm_compact.json \
   --namespace-id=88901ff0216a484eb81b8004be0f5aea --remote
 ```
 
-The training script:
-1. Fetches historical PXI data via `/api/export/training-data`
-2. Engineers 36 features (momentum, dispersion, extremes, rolling stats)
-3. Trains XGBoost models for 7d and 30d PXI change prediction
-4. Exports to JSON for edge inference (318KB compact)
+**XGBoost** (`train_xgboost.py`):
+- Engineers 36 features (momentum, dispersion, extremes, rolling stats)
+- Gradient boosted trees for 7d/30d PXI change prediction
+- Exports to JSON (318KB compact)
+
+**LSTM** (`train_lstm.py`):
+- Uses 20-day sequences of 12 features (PXI, categories, VIX, dispersion)
+- Single-layer LSTM with 32 hidden units
+- Exports weights to JSON for edge inference (239KB compact)
 
 ## Environment Variables
 

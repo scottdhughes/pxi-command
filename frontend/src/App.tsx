@@ -105,6 +105,24 @@ interface PredictionData {
   }
 }
 
+// ML Model predictions (XGBoost and LSTM)
+interface MLPrediction {
+  value: number | null
+  direction: 'STRONG_UP' | 'UP' | 'FLAT' | 'DOWN' | 'STRONG_DOWN' | null
+}
+
+interface MLPredictData {
+  date: string
+  current_score: number
+  model_type?: string  // 'lstm' for LSTM endpoint
+  model_version: string
+  predictions: {
+    pxi_change_7d: MLPrediction
+    pxi_change_30d: MLPrediction
+  }
+  features_used: number
+}
+
 function Sparkline({ data }: { data: { score: number }[] }) {
   if (data.length === 0) return null
 
@@ -413,6 +431,121 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
         <div className="text-[8px] text-[#949ba5]/30 mt-2">
           Based on {d7.sample_size} observations • {confidence.toLowerCase()} confidence
         </div>
+      </div>
+    </div>
+  )
+}
+
+function MLPredictionsCard({ xgboost, lstm }: { xgboost: MLPredictData | null; lstm: MLPredictData | null }) {
+  if (!xgboost && !lstm) return null
+
+  const formatChange = (val: number | null) => {
+    if (val === null) return '—'
+    return `${val >= 0 ? '+' : ''}${val.toFixed(1)}`
+  }
+
+  const getDirectionColor = (dir: string | null) => {
+    if (!dir) return 'text-[#949ba5]'
+    if (dir === 'STRONG_UP' || dir === 'UP') return 'text-[#00a3ff]'
+    if (dir === 'STRONG_DOWN' || dir === 'DOWN') return 'text-[#ff6b6b]'
+    return 'text-[#949ba5]'
+  }
+
+  const getDirectionIcon = (dir: string | null) => {
+    if (!dir || dir === 'FLAT') return '→'
+    if (dir === 'STRONG_UP') return '↑↑'
+    if (dir === 'UP') return '↑'
+    if (dir === 'DOWN') return '↓'
+    if (dir === 'STRONG_DOWN') return '↓↓'
+    return '→'
+  }
+
+  return (
+    <div className="w-full mt-6 sm:mt-8">
+      <div className="text-[10px] sm:text-[11px] text-[#949ba5]/50 uppercase tracking-widest mb-4 text-center">
+        ML Predictions
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        {/* XGBoost Model */}
+        <div className="bg-[#0a0a0a]/40 rounded-lg p-4 border border-[#1a1a1a]">
+          <div className="text-[9px] text-[#949ba5]/40 uppercase tracking-wider mb-3 text-center">
+            XGBoost
+          </div>
+          {xgboost ? (
+            <div className="space-y-3">
+              <div className="flex justify-between items-center">
+                <span className="text-[10px] text-[#949ba5]/60">7d</span>
+                <div className="flex items-center gap-1">
+                  <span className={`text-[13px] font-mono ${getDirectionColor(xgboost.predictions.pxi_change_7d.direction)}`}>
+                    {formatChange(xgboost.predictions.pxi_change_7d.value)}
+                  </span>
+                  <span className={`text-[11px] ${getDirectionColor(xgboost.predictions.pxi_change_7d.direction)}`}>
+                    {getDirectionIcon(xgboost.predictions.pxi_change_7d.direction)}
+                  </span>
+                </div>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-[10px] text-[#949ba5]/60">30d</span>
+                <div className="flex items-center gap-1">
+                  <span className={`text-[13px] font-mono ${getDirectionColor(xgboost.predictions.pxi_change_30d.direction)}`}>
+                    {formatChange(xgboost.predictions.pxi_change_30d.value)}
+                  </span>
+                  <span className={`text-[11px] ${getDirectionColor(xgboost.predictions.pxi_change_30d.direction)}`}>
+                    {getDirectionIcon(xgboost.predictions.pxi_change_30d.direction)}
+                  </span>
+                </div>
+              </div>
+              <div className="text-[8px] text-[#949ba5]/30 text-center pt-1">
+                {xgboost.features_used} features
+              </div>
+            </div>
+          ) : (
+            <div className="text-[10px] text-[#949ba5]/30 text-center py-2">unavailable</div>
+          )}
+        </div>
+
+        {/* LSTM Model */}
+        <div className="bg-[#0a0a0a]/40 rounded-lg p-4 border border-[#1a1a1a]">
+          <div className="text-[9px] text-[#949ba5]/40 uppercase tracking-wider mb-3 text-center">
+            LSTM
+          </div>
+          {lstm ? (
+            <div className="space-y-3">
+              <div className="flex justify-between items-center">
+                <span className="text-[10px] text-[#949ba5]/60">7d</span>
+                <div className="flex items-center gap-1">
+                  <span className={`text-[13px] font-mono ${getDirectionColor(lstm.predictions.pxi_change_7d.direction)}`}>
+                    {formatChange(lstm.predictions.pxi_change_7d.value)}
+                  </span>
+                  <span className={`text-[11px] ${getDirectionColor(lstm.predictions.pxi_change_7d.direction)}`}>
+                    {getDirectionIcon(lstm.predictions.pxi_change_7d.direction)}
+                  </span>
+                </div>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-[10px] text-[#949ba5]/60">30d</span>
+                <div className="flex items-center gap-1">
+                  <span className={`text-[13px] font-mono ${getDirectionColor(lstm.predictions.pxi_change_30d.direction)}`}>
+                    {formatChange(lstm.predictions.pxi_change_30d.value)}
+                  </span>
+                  <span className={`text-[11px] ${getDirectionColor(lstm.predictions.pxi_change_30d.direction)}`}>
+                    {getDirectionIcon(lstm.predictions.pxi_change_30d.direction)}
+                  </span>
+                </div>
+              </div>
+              <div className="text-[8px] text-[#949ba5]/30 text-center pt-1">
+                20-day sequence
+              </div>
+            </div>
+          ) : (
+            <div className="text-[10px] text-[#949ba5]/30 text-center py-2">unavailable</div>
+          )}
+        </div>
+      </div>
+
+      <div className="text-[8px] text-[#949ba5]/20 text-center mt-3">
+        Predicted PXI change • Updated with data refresh
       </div>
     </div>
   )
@@ -772,6 +905,8 @@ function App() {
   const [data, setData] = useState<PXIData | null>(null)
   const [prediction, setPrediction] = useState<PredictionData | null>(null)
   const [signal, setSignal] = useState<SignalData | null>(null)  // v1.1
+  const [mlXgboost, setMlXgboost] = useState<MLPredictData | null>(null)  // ML predictions
+  const [mlLstm, setMlLstm] = useState<MLPredictData | null>(null)  // LSTM predictions
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSpec, setShowSpec] = useState(false)
@@ -794,11 +929,13 @@ function App() {
       try {
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
 
-        // Fetch PXI data, signal data, and predictions in parallel
-        const [pxiRes, signalRes, predRes] = await Promise.all([
+        // Fetch PXI data, signal data, predictions, and ML models in parallel
+        const [pxiRes, signalRes, predRes, mlXgboostRes, mlLstmRes] = await Promise.all([
           fetch(`${apiUrl}/api/pxi`),
           fetch(`${apiUrl}/api/signal`).catch(() => null),  // v1.1
-          fetch(`${apiUrl}/api/predict`).catch(() => null)
+          fetch(`${apiUrl}/api/predict`).catch(() => null),
+          fetch(`${apiUrl}/api/ml/predict`).catch(() => null),  // XGBoost
+          fetch(`${apiUrl}/api/ml/lstm`).catch(() => null)  // LSTM
         ])
 
         if (!pxiRes.ok) throw new Error('Failed to fetch')
@@ -818,6 +955,22 @@ function App() {
           const predJson = await predRes.json()
           if (!predJson.error) {
             setPrediction(predJson)
+          }
+        }
+
+        // ML XGBoost predictions
+        if (mlXgboostRes?.ok) {
+          const mlJson = await mlXgboostRes.json()
+          if (!mlJson.error) {
+            setMlXgboost(mlJson)
+          }
+        }
+
+        // ML LSTM predictions
+        if (mlLstmRes?.ok) {
+          const lstmJson = await mlLstmRes.json()
+          if (!lstmJson.error) {
+            setMlLstm(lstmJson)
           }
         }
 
@@ -953,6 +1106,9 @@ function App() {
 
         {/* Predictions */}
         {prediction && <PredictionCard prediction={prediction} />}
+
+        {/* ML Model Predictions */}
+        <MLPredictionsCard xgboost={mlXgboost} lstm={mlLstm} />
       </main>
 
       {/* Footer */}
