@@ -892,7 +892,7 @@ function App() {
           )}
         </div>
         <div className="text-[10px] sm:text-[11px] font-mono text-[#949ba5]/50">
-          {new Date(data.date).toLocaleDateString('en-US', {
+          {new Date(data.date + 'T12:00:00').toLocaleDateString('en-US', {
             month: 'short',
             day: 'numeric',
           })}
