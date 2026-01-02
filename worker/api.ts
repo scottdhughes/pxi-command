@@ -2007,97 +2007,130 @@ export default {
 
       // AI: Find similar market regimes
       if (url.pathname === '/api/similar' && request.method === 'GET') {
-        // Get today's indicator snapshot
-        const latestDate = await env.DB.prepare(
-          'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 1'
-        ).first<{ date: string }>();
+        try {
+          // Get today's indicator snapshot
+          const latestDate = await env.DB.prepare(
+            'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 1'
+          ).first<{ date: string }>();
 
-        if (!latestDate) {
-          return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
-        }
+          if (!latestDate) {
+            return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
+          }
 
-        // Get indicator values for embedding
-        const indicators = await env.DB.prepare(`
-          SELECT indicator_id, value FROM indicator_values
-          WHERE date = ? ORDER BY indicator_id
-        `).bind(latestDate.date).all<IndicatorRow>();
+          // Get indicator values for embedding
+          const indicators = await env.DB.prepare(`
+            SELECT indicator_id, value FROM indicator_values
+            WHERE date = ? ORDER BY indicator_id
+          `).bind(latestDate.date).all<IndicatorRow>();
 
-        if (!indicators.results || indicators.results.length === 0) {
-          return Response.json({ error: 'No indicators' }, { status: 404, headers: corsHeaders });
-        }
+          if (!indicators.results || indicators.results.length === 0) {
+            return Response.json({ error: 'No indicators' }, { status: 404, headers: corsHeaders });
+          }
 
-        // Create text representation for embedding
-        const indicatorText = indicators.results
-          .map((i) => `${i.indicator_id}: ${i.value.toFixed(2)}`)
-          .join(', ');
+          // Create text representation for embedding
+          const indicatorText = indicators.results
+            .map((i) => `${i.indicator_id}: ${i.value.toFixed(2)}`)
+            .join(', ');
 
-        // Generate embedding using Workers AI
-        const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-          text: indicatorText,
-        });
+          // Generate embedding using Workers AI
+          let embedding;
+          try {
+            embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+              text: indicatorText,
+            });
+          } catch (aiError) {
+            console.error('Workers AI embedding error:', aiError);
+            return Response.json({
+              error: 'AI embedding failed',
+              details: aiError instanceof Error ? aiError.message : String(aiError)
+            }, { status: 503, headers: corsHeaders });
+          }
 
-        // Query Vectorize for similar days - get more candidates for filtering
-        const similar = await env.VECTORIZE.query(embedding.data[0], {
-          topK: 100,  // Get more candidates to filter
-          returnMetadata: 'all',
-        });
+          if (!embedding?.data?.[0]) {
+            return Response.json({ error: 'Empty embedding response' }, { status: 500, headers: corsHeaders });
+          }
 
-        // Calculate cutoff date (30 days ago) to exclude recent periods
-        const cutoffDate = new Date();
-        cutoffDate.setDate(cutoffDate.getDate() - 30);
-        const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
+          // Query Vectorize for similar days - get more candidates for filtering
+          // Note: max topK is 50 when returnMetadata='all'
+          let similar;
+          try {
+            similar = await env.VECTORIZE.query(embedding.data[0], {
+              topK: 50,
+              returnMetadata: 'all',
+            });
+          } catch (vecError) {
+            console.error('Vectorize query error:', vecError);
+            return Response.json({
+              error: 'Vectorize query failed',
+              details: vecError instanceof Error ? vecError.message : String(vecError)
+            }, { status: 503, headers: corsHeaders });
+          }
 
-        // Filter out recent dates and take top 5
-        const filteredMatches = (similar.matches || [])
-          .filter((m) => {
-            const matchDate = m.metadata?.date as string;
-            return matchDate && matchDate < cutoffDateStr;
-          })
-          .slice(0, 5);
+          // Calculate cutoff date (30 days ago) to exclude recent periods
+          const cutoffDate = new Date();
+          cutoffDate.setDate(cutoffDate.getDate() - 30);
+          const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
 
-        // Get PXI scores for similar dates
-        const similarDates = filteredMatches
-          .filter((m) => m.metadata?.date)
-          .map((m) => m.metadata!.date as string);
+          // Filter out recent dates and take top 5
+          const filteredMatches = (similar.matches || [])
+            .filter((m) => {
+              const matchDate = m.metadata?.date as string;
+              return matchDate && matchDate < cutoffDateStr;
+            })
+            .slice(0, 5);
 
-        if (similarDates.length === 0) {
+          // Get PXI scores for similar dates
+          const similarDates = filteredMatches
+            .filter((m) => m.metadata?.date)
+            .map((m) => m.metadata!.date as string);
+
+          if (similarDates.length === 0) {
+            return Response.json({
+              current_date: latestDate.date,
+              cutoff_date: cutoffDateStr,
+              similar_periods: [],
+              total_matches: similar.matches?.length || 0,
+              message: 'No historical periods found (excluding last 30 days). Need more historical data.',
+            }, { headers: corsHeaders });
+          }
+
+          // Get PXI scores and forward returns for similar dates
+          const historicalScores = await env.DB.prepare(`
+            SELECT p.date, p.score, p.label, p.status,
+                   me.forward_return_7d, me.forward_return_30d
+            FROM pxi_scores p
+            LEFT JOIN market_embeddings me ON p.date = me.date
+            WHERE p.date IN (${similarDates.map(() => '?').join(',')})
+          `).bind(...similarDates).all<PXIRow & { forward_return_7d: number | null; forward_return_30d: number | null }>();
+
           return Response.json({
             current_date: latestDate.date,
-            similar_periods: [],
-            message: 'No historical periods found (excluding last 30 days). Need more historical data.',
+            cutoff_date: cutoffDateStr,
+            similar_periods: filteredMatches.map((m) => {
+              const hist = historicalScores.results?.find((s) => s.date === m.metadata?.date);
+              return {
+                date: m.metadata?.date,
+                similarity: m.score,
+                pxi: hist ? {
+                  date: hist.date,
+                  score: hist.score,
+                  label: hist.label,
+                  status: hist.status,
+                } : null,
+                forward_returns: hist ? {
+                  d7: hist.forward_return_7d,
+                  d30: hist.forward_return_30d,
+                } : null,
+              };
+            }),
           }, { headers: corsHeaders });
+        } catch (err) {
+          console.error('Similar endpoint error:', err);
+          return Response.json({
+            error: 'Similar search failed',
+            details: err instanceof Error ? err.message : String(err)
+          }, { status: 500, headers: corsHeaders });
         }
-
-        // Get PXI scores and forward returns for similar dates
-        const historicalScores = await env.DB.prepare(`
-          SELECT p.date, p.score, p.label, p.status,
-                 me.forward_return_7d, me.forward_return_30d
-          FROM pxi_scores p
-          LEFT JOIN market_embeddings me ON p.date = me.date
-          WHERE p.date IN (${similarDates.map(() => '?').join(',')})
-        `).bind(...similarDates).all<PXIRow & { forward_return_7d: number | null; forward_return_30d: number | null }>();
-
-        return Response.json({
-          current_date: latestDate.date,
-          cutoff_date: cutoffDateStr,
-          similar_periods: filteredMatches.map((m) => {
-            const hist = historicalScores.results?.find((s) => s.date === m.metadata?.date);
-            return {
-              date: m.metadata?.date,
-              similarity: m.score,
-              pxi: hist ? {
-                date: hist.date,
-                score: hist.score,
-                label: hist.label,
-                status: hist.status,
-              } : null,
-              forward_returns: hist ? {
-                d7: hist.forward_return_7d,
-                d30: hist.forward_return_30d,
-              } : null,
-            };
-          }),
-        }, { headers: corsHeaders });
       }
 
       // AI: Generate embeddings for historical data
