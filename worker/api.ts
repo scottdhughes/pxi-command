@@ -5073,14 +5073,13 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         }, { headers: corsHeaders });
       }
 
-      // Export training data for ML model (auth temporarily disabled for LSTM training)
+      // Export training data for ML model (requires auth)
       if (url.pathname === '/api/export/training-data' && request.method === 'GET') {
-        // TODO: Re-enable auth after LSTM training complete
-        // const authHeader = request.headers.get('Authorization');
-        // const apiKey = authHeader?.replace('Bearer ', '');
-        // if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
-        //   return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
-        // }
+        const authHeader = request.headers.get('Authorization');
+        const apiKey = authHeader?.replace('Bearer ', '');
+        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+        }
 
         // Get all PXI scores with deltas and forward returns
         const pxiData = await env.DB.prepare(`
