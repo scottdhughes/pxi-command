@@ -42,6 +42,11 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 - **Comparison** - vs 200DMA and buy-and-hold baselines
 - **Walk-forward validation** - Out-of-sample testing
 
+### MCP Server (AI Agent Integration)
+- **Model Context Protocol** - Enables Claude and other LLM agents to query PXI
+- **7 Tools** - get_pxi, get_predictions, get_similar_periods, get_signal, get_regime, get_market_context, get_history
+- **Agent-Optimized** - Structured responses with suggested actions and risk assessments
+
 ## Categories & Weights
 
 | Category | Weight | Key Indicators |
@@ -68,11 +73,12 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 │  (CF Pages)     │     │    (Edge API)    │     │  + Vectorize    │
 └─────────────────┘     └────────┬─────────┘     └─────────────────┘
                                  │
-                                 ▼
-                        ┌─────────────────┐
-                        │  Cloudflare KV  │
-                        │  (ML Models)    │
-                        └─────────────────┘
+                    ┌────────────┼────────────┐
+                    ▼            ▼            ▼
+           ┌──────────────┐ ┌─────────┐ ┌─────────────┐
+           │ Cloudflare KV│ │   MCP   │ │  AI Agents  │
+           │ (ML Models)  │ │ Server  │ │  (Claude)   │
+           └──────────────┘ └─────────┘ └─────────────┘
 ```
 
 ## Tech Stack
@@ -86,6 +92,7 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 - **Frontend:** React 19, Vite, Tailwind CSS
 - **Hosting:** Cloudflare Pages
 - **Scheduler:** GitHub Actions (4x daily cron)
+- **Agent Integration:** MCP Server (Model Context Protocol)
 
 ## API Endpoints
 
@@ -174,6 +181,36 @@ npx wrangler kv key put "pxi_lstm_model" --path=pxi_lstm_compact.json \
 - Uses 20-day sequences of 12 features (PXI, categories, VIX, dispersion)
 - Single-layer LSTM with 32 hidden units
 - Exports weights to JSON for edge inference (239KB compact)
+
+### MCP Server Setup
+
+```bash
+# Build the MCP server
+cd mcp-server && npm install && npm run build
+```
+
+**Claude Desktop** - add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "pxi": {
+      "command": "node",
+      "args": ["/path/to/pxi/mcp-server/dist/index.js"]
+    }
+  }
+}
+```
+
+**Available Tools:**
+| Tool | Description |
+|------|-------------|
+| `get_pxi` | Current score, categories, trend |
+| `get_predictions` | ML ensemble forecasts (7d/30d) |
+| `get_similar_periods` | Vector similarity search |
+| `get_signal` | Risk allocation signal |
+| `get_regime` | Market regime analysis |
+| `get_market_context` | Comprehensive agent context |
+| `get_history` | Historical scores |
 
 ## Environment Variables
 
