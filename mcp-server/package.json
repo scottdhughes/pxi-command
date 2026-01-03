@@ -1,0 +1,32 @@
+{
+  "name": "pxi-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for PXI macro market index - enables AI agents to query market conditions",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "pxi-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "pxi",
+    "market",
+    "trading",
+    "ai-agents",
+    "claude"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.0.0"
+  }
+}
