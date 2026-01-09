@@ -200,3 +200,36 @@ CREATE TABLE IF NOT EXISTS period_accuracy (
 
 CREATE INDEX IF NOT EXISTS idx_period_accuracy_date ON period_accuracy(period_date DESC);
 CREATE INDEX IF NOT EXISTS idx_period_accuracy_score ON period_accuracy(accuracy_score DESC);
+
+-- ML Ensemble prediction tracking (XGBoost + LSTM)
+CREATE TABLE IF NOT EXISTS ensemble_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_date TEXT NOT NULL UNIQUE,
+    target_date_7d TEXT NOT NULL,
+    target_date_30d TEXT NOT NULL,
+    current_score REAL NOT NULL,
+    -- XGBoost predictions
+    xgboost_7d REAL,
+    xgboost_30d REAL,
+    -- LSTM predictions
+    lstm_7d REAL,
+    lstm_30d REAL,
+    -- Ensemble (weighted average)
+    ensemble_7d REAL,
+    ensemble_30d REAL,
+    -- Confidence based on model agreement
+    confidence_7d TEXT,  -- HIGH, MEDIUM, LOW
+    confidence_30d TEXT,
+    -- Actual outcomes (filled in when target date arrives)
+    actual_change_7d REAL,
+    actual_change_30d REAL,
+    -- Evaluation metadata
+    direction_correct_7d INTEGER,  -- 1 = correct, 0 = wrong, NULL = not evaluated
+    direction_correct_30d INTEGER,
+    evaluated_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_date ON ensemble_predictions(prediction_date DESC);
+CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_target7d ON ensemble_predictions(target_date_7d);
+CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_target30d ON ensemble_predictions(target_date_30d);

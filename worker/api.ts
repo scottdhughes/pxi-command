@@ -1593,6 +1593,97 @@ async function handleScheduled(env: Env): Promise<void> {
     } catch (retrainErr) {
       console.error('Model retrain failed:', retrainErr);
     }
+
+    // Evaluate ensemble (ML) predictions
+    try {
+      const pendingEnsemble = await env.DB.prepare(`
+        SELECT id, prediction_date, target_date_7d, target_date_30d, current_score,
+               ensemble_7d, ensemble_30d, xgboost_7d, xgboost_30d, lstm_7d, lstm_30d,
+               actual_change_7d, actual_change_30d
+        FROM ensemble_predictions
+        WHERE evaluated_at IS NULL
+      `).all<{
+        id: number;
+        prediction_date: string;
+        target_date_7d: string;
+        target_date_30d: string;
+        current_score: number;
+        ensemble_7d: number | null;
+        ensemble_30d: number | null;
+        xgboost_7d: number | null;
+        xgboost_30d: number | null;
+        lstm_7d: number | null;
+        lstm_30d: number | null;
+        actual_change_7d: number | null;
+        actual_change_30d: number | null;
+      }>();
+
+      let ensembleEvaluated = 0;
+      for (const pred of pendingEnsemble.results || []) {
+        let needsUpdate = false;
+        let actual7d = pred.actual_change_7d;
+        let actual30d = pred.actual_change_30d;
+        let dir7d: number | null = null;
+        let dir30d: number | null = null;
+
+        // Check 7d prediction
+        if (pred.target_date_7d <= today && actual7d === null) {
+          const score7d = await env.DB.prepare(
+            'SELECT score FROM pxi_scores WHERE date = ?'
+          ).bind(pred.target_date_7d).first<{ score: number }>();
+          if (score7d) {
+            actual7d = score7d.score - pred.current_score;
+            needsUpdate = true;
+            // Check if direction was correct
+            if (pred.ensemble_7d !== null) {
+              const predictedUp = pred.ensemble_7d > 0;
+              const actualUp = actual7d > 0;
+              dir7d = (predictedUp === actualUp) ? 1 : 0;
+            }
+          }
+        }
+
+        // Check 30d prediction
+        if (pred.target_date_30d <= today && actual30d === null) {
+          const score30d = await env.DB.prepare(
+            'SELECT score FROM pxi_scores WHERE date = ?'
+          ).bind(pred.target_date_30d).first<{ score: number }>();
+          if (score30d) {
+            actual30d = score30d.score - pred.current_score;
+            needsUpdate = true;
+            // Check if direction was correct
+            if (pred.ensemble_30d !== null) {
+              const predictedUp = pred.ensemble_30d > 0;
+              const actualUp = actual30d > 0;
+              dir30d = (predictedUp === actualUp) ? 1 : 0;
+            }
+          }
+        }
+
+        if (needsUpdate) {
+          const fullyEvaluated = (actual7d !== null) && (actual30d !== null);
+          await env.DB.prepare(`
+            UPDATE ensemble_predictions
+            SET actual_change_7d = ?, actual_change_30d = ?,
+                direction_correct_7d = ?, direction_correct_30d = ?,
+                evaluated_at = ?
+            WHERE id = ?
+          `).bind(
+            actual7d, actual30d,
+            dir7d, dir30d,
+            fullyEvaluated ? new Date().toISOString() : null,
+            pred.id
+          ).run();
+          ensembleEvaluated++;
+        }
+      }
+
+      if (ensembleEvaluated > 0) {
+        console.log(`🤖 Evaluated ${ensembleEvaluated} ensemble predictions`);
+      }
+    } catch (ensembleErr) {
+      console.error('Ensemble evaluation failed:', ensembleErr);
+    }
   } else {
     console.log('⚠️ Could not calculate PXI - insufficient data');
   }
@@ -2167,7 +2258,7 @@ async function calculatePXISignal(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get('Origin');
     const corsHeaders = getCorsHeaders(origin);
@@ -4010,6 +4101,46 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           lstm?.dir_30d ?? null
         );
 
+        // Log ensemble prediction to database (non-blocking)
+        const logPrediction = async () => {
+          try {
+            // Calculate target dates
+            const predDate = new Date(currentDate);
+            const target7d = new Date(predDate);
+            target7d.setDate(target7d.getDate() + 7);
+            const target30d = new Date(predDate);
+            target30d.setDate(target30d.getDate() + 30);
+
+            const formatDate = (d: Date) => d.toISOString().split('T')[0];
+
+            await env.DB.prepare(`
+              INSERT OR REPLACE INTO ensemble_predictions (
+                prediction_date, target_date_7d, target_date_30d, current_score,
+                xgboost_7d, xgboost_30d, lstm_7d, lstm_30d,
+                ensemble_7d, ensemble_30d, confidence_7d, confidence_30d
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).bind(
+              currentDate,
+              formatDate(target7d),
+              formatDate(target30d),
+              currentScore,
+              xg7d,
+              xg30d,
+              lstm7d,
+              lstm30d,
+              ensemble7d.value,
+              ensemble30d.value,
+              agreement7d.agreement,
+              agreement30d.agreement
+            ).run();
+          } catch (e) {
+            console.error('Failed to log ensemble prediction:', e);
+          }
+        };
+
+        // Execute logging in background (don't block response)
+        ctx.waitUntil(logPrediction());
+
         return Response.json({
           date: currentDate,
           current_score: currentScore,
@@ -4169,6 +4300,179 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
               mean_absolute_error: (d30_mae / d30_total).toFixed(2),
               sample_size: d30_total,
             } : null,
+          },
+          recent_predictions: recentPredictions,
+        }, { headers: corsHeaders });
+      }
+
+      // Get ML ensemble prediction accuracy metrics
+      if (url.pathname === '/api/ml/accuracy' && request.method === 'GET') {
+        const includePending = url.searchParams.get('include_pending') === 'true';
+
+        // Get all ensemble predictions
+        const predictions = await env.DB.prepare(`
+          SELECT prediction_date, target_date_7d, target_date_30d, current_score,
+                 xgboost_7d, xgboost_30d, lstm_7d, lstm_30d,
+                 ensemble_7d, ensemble_30d, confidence_7d, confidence_30d,
+                 actual_change_7d, actual_change_30d,
+                 direction_correct_7d, direction_correct_30d, evaluated_at
+          FROM ensemble_predictions
+          ${includePending ? '' : 'WHERE evaluated_at IS NOT NULL'}
+          ORDER BY prediction_date DESC
+          LIMIT 100
+        `).all<{
+          prediction_date: string;
+          target_date_7d: string;
+          target_date_30d: string;
+          current_score: number;
+          xgboost_7d: number | null;
+          xgboost_30d: number | null;
+          lstm_7d: number | null;
+          lstm_30d: number | null;
+          ensemble_7d: number | null;
+          ensemble_30d: number | null;
+          confidence_7d: string | null;
+          confidence_30d: string | null;
+          actual_change_7d: number | null;
+          actual_change_30d: number | null;
+          direction_correct_7d: number | null;
+          direction_correct_30d: number | null;
+          evaluated_at: string | null;
+        }>();
+
+        if (!predictions.results || predictions.results.length === 0) {
+          return Response.json({
+            message: includePending ? 'No ensemble predictions logged yet' : 'No evaluated ensemble predictions yet',
+            total_predictions: 0,
+            metrics: null,
+          }, { headers: corsHeaders });
+        }
+
+        // Count pending vs evaluated
+        const pendingCount = predictions.results.filter(p => p.evaluated_at === null).length;
+        const evaluatedCount = predictions.results.length - pendingCount;
+
+        // Calculate accuracy metrics for each model
+        const metrics = {
+          xgboost: { d7_correct: 0, d7_total: 0, d7_mae: 0, d30_correct: 0, d30_total: 0, d30_mae: 0 },
+          lstm: { d7_correct: 0, d7_total: 0, d7_mae: 0, d30_correct: 0, d30_total: 0, d30_mae: 0 },
+          ensemble: { d7_correct: 0, d7_total: 0, d7_mae: 0, d30_correct: 0, d30_total: 0, d30_mae: 0 },
+        };
+
+        const recentPredictions: {
+          date: string;
+          current_score: number;
+          xgboost_7d: number | null;
+          lstm_7d: number | null;
+          ensemble_7d: number | null;
+          actual_7d: number | null;
+          xgboost_30d: number | null;
+          lstm_30d: number | null;
+          ensemble_30d: number | null;
+          actual_30d: number | null;
+          confidence_7d: string | null;
+          confidence_30d: string | null;
+        }[] = [];
+
+        for (const p of predictions.results) {
+          const act7d = p.actual_change_7d;
+          const act30d = p.actual_change_30d;
+
+          // 7-day metrics
+          if (act7d !== null) {
+            // XGBoost
+            if (p.xgboost_7d !== null) {
+              metrics.xgboost.d7_total++;
+              metrics.xgboost.d7_mae += Math.abs(p.xgboost_7d - act7d);
+              if ((p.xgboost_7d > 0 && act7d > 0) || (p.xgboost_7d < 0 && act7d < 0)) {
+                metrics.xgboost.d7_correct++;
+              }
+            }
+            // LSTM
+            if (p.lstm_7d !== null) {
+              metrics.lstm.d7_total++;
+              metrics.lstm.d7_mae += Math.abs(p.lstm_7d - act7d);
+              if ((p.lstm_7d > 0 && act7d > 0) || (p.lstm_7d < 0 && act7d < 0)) {
+                metrics.lstm.d7_correct++;
+              }
+            }
+            // Ensemble
+            if (p.ensemble_7d !== null) {
+              metrics.ensemble.d7_total++;
+              metrics.ensemble.d7_mae += Math.abs(p.ensemble_7d - act7d);
+              if ((p.ensemble_7d > 0 && act7d > 0) || (p.ensemble_7d < 0 && act7d < 0)) {
+                metrics.ensemble.d7_correct++;
+              }
+            }
+          }
+
+          // 30-day metrics
+          if (act30d !== null) {
+            // XGBoost
+            if (p.xgboost_30d !== null) {
+              metrics.xgboost.d30_total++;
+              metrics.xgboost.d30_mae += Math.abs(p.xgboost_30d - act30d);
+              if ((p.xgboost_30d > 0 && act30d > 0) || (p.xgboost_30d < 0 && act30d < 0)) {
+                metrics.xgboost.d30_correct++;
+              }
+            }
+            // LSTM
+            if (p.lstm_30d !== null) {
+              metrics.lstm.d30_total++;
+              metrics.lstm.d30_mae += Math.abs(p.lstm_30d - act30d);
+              if ((p.lstm_30d > 0 && act30d > 0) || (p.lstm_30d < 0 && act30d < 0)) {
+                metrics.lstm.d30_correct++;
+              }
+            }
+            // Ensemble
+            if (p.ensemble_30d !== null) {
+              metrics.ensemble.d30_total++;
+              metrics.ensemble.d30_mae += Math.abs(p.ensemble_30d - act30d);
+              if ((p.ensemble_30d > 0 && act30d > 0) || (p.ensemble_30d < 0 && act30d < 0)) {
+                metrics.ensemble.d30_correct++;
+              }
+            }
+          }
+
+          if (recentPredictions.length < 10) {
+            recentPredictions.push({
+              date: p.prediction_date,
+              current_score: p.current_score,
+              xgboost_7d: p.xgboost_7d,
+              lstm_7d: p.lstm_7d,
+              ensemble_7d: p.ensemble_7d,
+              actual_7d: act7d,
+              xgboost_30d: p.xgboost_30d,
+              lstm_30d: p.lstm_30d,
+              ensemble_30d: p.ensemble_30d,
+              actual_30d: act30d,
+              confidence_7d: p.confidence_7d,
+              confidence_30d: p.confidence_30d,
+            });
+          }
+        }
+
+        const formatMetrics = (m: typeof metrics.xgboost) => ({
+          d7: m.d7_total > 0 ? {
+            direction_accuracy: (m.d7_correct / m.d7_total * 100).toFixed(1) + '%',
+            mean_absolute_error: (m.d7_mae / m.d7_total).toFixed(2),
+            sample_size: m.d7_total,
+          } : null,
+          d30: m.d30_total > 0 ? {
+            direction_accuracy: (m.d30_correct / m.d30_total * 100).toFixed(1) + '%',
+            mean_absolute_error: (m.d30_mae / m.d30_total).toFixed(2),
+            sample_size: m.d30_total,
+          } : null,
+        });
+
+        return Response.json({
+          total_predictions: predictions.results.length,
+          evaluated_count: evaluatedCount,
+          pending_count: pendingCount,
+          metrics: {
+            xgboost: formatMetrics(metrics.xgboost),
+            lstm: formatMetrics(metrics.lstm),
+            ensemble: formatMetrics(metrics.ensemble),
           },
           recent_predictions: recentPredictions,
         }, { headers: corsHeaders });
