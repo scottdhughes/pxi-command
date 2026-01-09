@@ -15,7 +15,8 @@ export type DataSource =
   | 'barchart'
   | 'farside'
   | 'defillama'
-  | 'coinglass';
+  | 'coinglass'
+  | 'calculated';
 
 export type NormalizationMethod =
   | 'percentile'

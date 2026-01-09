@@ -2,7 +2,7 @@
 // Collects writes in memory and batch-POSTs to Worker API
 // Compatible with the old pg-style query interface
 
-const WRITE_API_URL = process.env.WRITE_API_URL;
+const WRITE_API_URL = process.env.WRITE_API_URL!;
 if (!WRITE_API_URL) {
   throw new Error('WRITE_API_URL environment variable is required');
 }

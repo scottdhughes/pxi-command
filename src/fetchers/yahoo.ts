@@ -6,8 +6,8 @@ import type { IndicatorValue } from '../types/indicators.js';
 
 interface YahooQuote {
   date: Date;
-  close: number;
-  adjClose?: number;
+  close: number | null;
+  adjclose?: number | null;
 }
 
 export async function fetchYahooSeries(
@@ -31,11 +31,11 @@ export async function fetchYahooSeries(
     }
 
     return result.quotes
-      .filter((q): q is YahooQuote => q.close !== null && q.date !== null)
+      .filter((q) => q.close !== null && q.date !== null)
       .map((q) => ({
         indicatorId: symbol,
-        date: q.date,
-        value: q.adjClose ?? q.close,
+        date: q.date!,
+        value: q.adjclose ?? q.close!,
       }));
   } catch (err: any) {
     console.error(`Yahoo fetch error for ${symbol}:`, err.message);

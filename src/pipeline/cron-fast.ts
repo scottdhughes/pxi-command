@@ -8,7 +8,7 @@ import { format, subYears } from 'date-fns';
 import axios from 'axios';
 import yahooFinance from 'yahoo-finance2';
 
-const WRITE_API_URL = process.env.WRITE_API_URL;
+const WRITE_API_URL = process.env.WRITE_API_URL!;
 if (!WRITE_API_URL) {
   throw new Error('WRITE_API_URL environment variable is required');
 }
@@ -120,7 +120,7 @@ async function fetchYahooSeries(symbol: string, indicatorId: string): Promise<vo
         allIndicators.push({
           indicator_id: indicatorId,
           date: format(q.date, 'yyyy-MM-dd'),
-          value: q.adjClose ?? q.close,
+          value: q.adjclose ?? q.close!,
           source: 'yahoo',
         });
       }
