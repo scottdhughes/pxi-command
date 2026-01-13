@@ -7,6 +7,7 @@ dotenv.config();
 import { format, subYears } from 'date-fns';
 import axios from 'axios';
 import yahooFinance from 'yahoo-finance2';
+import { fetchSentimentFromFearGreed } from '../fetchers/alternative-sources.js';
 
 const WRITE_API_URL = process.env.WRITE_API_URL!;
 if (!WRITE_API_URL) {
@@ -290,19 +291,19 @@ async function fetchCrypto(): Promise<void> {
 async function fetchAlternative(): Promise<void> {
   console.log('\n━━━ Alternative Data ━━━');
 
-  // CNN Fear & Greed Index
+  // Fear & Greed Index (CNN with Alternative.me fallback)
   try {
-    const response = await axios.get('https://production.dataviz.cnn.io/index/fearandgreed/graphdata');
-    const data = response.data;
-
-    if (data?.fear_and_greed?.score) {
+    const sentiment = await fetchSentimentFromFearGreed();
+    if (sentiment !== null) {
+      // Convert back from bull-bear spread (-50 to +50) to raw score (0-100)
+      const rawScore = sentiment + 50;
       allIndicators.push({
         indicator_id: 'fear_greed',
         date: format(new Date(), 'yyyy-MM-dd'),
-        value: data.fear_and_greed.score,
-        source: 'cnn',
+        value: rawScore,
+        source: 'cnn_or_alt',
       });
-      console.log(`  ✓ fear_greed: ${data.fear_and_greed.score}`);
+      console.log(`  ✓ fear_greed: ${rawScore.toFixed(0)}`);
     }
   } catch (err: any) {
     console.error(`  ✗ fear_greed: ${err.message}`);

@@ -116,17 +116,27 @@ export async function fetchPutCallFromYahoo(): Promise<number | null> {
   }
 }
 
-// ============== AAII Sentiment approximation ==============
+// ============== Fear & Greed with fallback ==============
 
-export async function fetchSentimentFromFearGreed(): Promise<number | null> {
+// CNN Fear & Greed Index (primary source)
+async function fetchFearGreedFromCNN(): Promise<number | null> {
   try {
-    // CNN Fear & Greed Index as sentiment proxy
     const response = await axios.get(
       'https://production.dataviz.cnn.io/index/fearandgreed/graphdata',
       {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json, text/plain, */*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Referer': 'https://www.cnn.com/markets/fear-and-greed',
+          'Origin': 'https://www.cnn.com',
+          'Connection': 'keep-alive',
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'same-site',
         },
+        timeout: 10000,
       }
     );
 
@@ -134,13 +144,51 @@ export async function fetchSentimentFromFearGreed(): Promise<number | null> {
     if (score === undefined) return null;
 
     // Convert 0-100 Fear/Greed to bull-bear spread (-50 to +50)
-    // F&G 0 = extreme fear = bearish, F&G 100 = extreme greed = bullish
-    const bullBearSpread = (score - 50);
-    return bullBearSpread;
+    return score - 50;
   } catch (err: any) {
-    console.error('Fear & Greed fetch error:', err.message);
+    console.error('CNN Fear & Greed error:', err.message);
     return null;
   }
+}
+
+// Alternative.me Crypto Fear & Greed (fallback source)
+async function fetchFearGreedFromAlternative(): Promise<number | null> {
+  try {
+    const response = await axios.get(
+      'https://api.alternative.me/fng/',
+      { timeout: 10000 }
+    );
+
+    const value = response.data?.data?.[0]?.value;
+    const score = parseInt(value, 10);
+    if (isNaN(score)) return null;
+
+    // Convert 0-100 to bull-bear spread (-50 to +50)
+    return score - 50;
+  } catch (err: any) {
+    console.error('Alternative.me Fear & Greed error:', err.message);
+    return null;
+  }
+}
+
+// Main export: tries CNN first, then Alternative.me
+export async function fetchSentimentFromFearGreed(): Promise<number | null> {
+  // Try CNN first (traditional market sentiment)
+  const cnnResult = await fetchFearGreedFromCNN();
+  if (cnnResult !== null) {
+    return cnnResult;
+  }
+
+  console.log('  CNN Fear & Greed failed, trying Alternative.me...');
+
+  // Fallback to Alternative.me (crypto-focused but correlated)
+  const altResult = await fetchFearGreedFromAlternative();
+  if (altResult !== null) {
+    return altResult;
+  }
+
+  console.error('  All Fear & Greed sources failed');
+  return null;
 }
 
 // ============== NYSE Highs/Lows from WSJ ==============
