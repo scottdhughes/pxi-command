@@ -10,3 +10,6 @@ frontend/dist/
 *.pem
 *.key
 scripts/d1-data.sql
+
+# ML generated files
+ml/*.json
