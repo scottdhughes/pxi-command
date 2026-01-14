@@ -854,6 +854,32 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           <p className="text-[10px] text-[#949ba5]/50 mt-2">
             Thresholds: |Δ| &gt; 5 = STRONG, |Δ| &gt; 2 = directional, else FLAT
           </p>
+
+          {/* XGBoost Backtest Metrics */}
+          <div className="mt-4 bg-[#0a0a0a]/60 rounded px-4 py-3 border border-[#1a1a1a]">
+            <div className="text-[10px] text-[#00a3ff]/80 uppercase tracking-wider mb-2">XGBoost In-Sample Backtest</div>
+            <div className="grid grid-cols-2 gap-4 text-[10px]">
+              <div>
+                <div className="text-[#949ba5]/60 mb-1">7-Day Predictions</div>
+                <div className="space-y-0.5 text-[#949ba5]">
+                  <div>Direction Accuracy: <span className="text-[#22c55e]">77%</span></div>
+                  <div>R²: <span className="text-[#949ba5]/80">0.64</span></div>
+                  <div>MAE: <span className="text-[#949ba5]/80">3.2 pts</span></div>
+                </div>
+              </div>
+              <div>
+                <div className="text-[#949ba5]/60 mb-1">30-Day Predictions</div>
+                <div className="space-y-0.5 text-[#949ba5]">
+                  <div>Direction Accuracy: <span className="text-[#22c55e]">90%</span></div>
+                  <div>R²: <span className="text-[#949ba5]/80">0.88</span></div>
+                  <div>MAE: <span className="text-[#949ba5]/80">4.8 pts</span></div>
+                </div>
+              </div>
+            </div>
+            <p className="text-[9px] text-[#949ba5]/40 mt-2">
+              ⚠️ In-sample metrics (trained on this data). Live OOS accuracy tracked via /api/ml/accuracy
+            </p>
+          </div>
         </section>
 
         {/* Divergence Detection */}
