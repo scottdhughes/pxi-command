@@ -138,6 +138,17 @@ export const INDICATORS: IndicatorDefinition[] = [
     inverted: false,
     description: 'AAII investor sentiment survey spread',
   },
+  {
+    id: 'gex',
+    name: 'SPX Gamma Exposure',
+    category: 'volatility',
+    source: 'cboe',
+    ticker: 'SPX',
+    frequency: 'daily',
+    normalization: 'percentile',
+    inverted: false,
+    description: 'Market maker gamma exposure. Positive = low vol regime, negative = high vol regime.',
+  },
 
   // ============== MARKET BREADTH (12%) ==============
   {

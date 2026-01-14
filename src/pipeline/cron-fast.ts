@@ -8,6 +8,7 @@ import { format, subYears } from 'date-fns';
 import axios from 'axios';
 import yahooFinance from 'yahoo-finance2';
 import { fetchSentimentFromFearGreed } from '../fetchers/alternative-sources.js';
+import { fetchGEX } from '../fetchers/gex.js';
 
 const WRITE_API_URL = process.env.WRITE_API_URL!;
 if (!WRITE_API_URL) {
@@ -307,6 +308,22 @@ async function fetchAlternative(): Promise<void> {
     }
   } catch (err: any) {
     console.error(`  ✗ fear_greed: ${err.message}`);
+  }
+
+  // GEX (Gamma Exposure) from CBOE options data
+  try {
+    const gex = await fetchGEX();
+    if (gex !== null) {
+      allIndicators.push({
+        indicator_id: 'gex',
+        date: format(new Date(), 'yyyy-MM-dd'),
+        value: gex,
+        source: 'cboe',
+      });
+      console.log(`  ✓ gex: ${gex.toFixed(2)}B`);
+    }
+  } catch (err: any) {
+    console.error(`  ✗ gex: ${err.message}`);
   }
 }
 

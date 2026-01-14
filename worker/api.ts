@@ -981,9 +981,10 @@ const INDICATOR_CONFIG: IndicatorConfig[] = [
   { id: 'bbb_aaa_spread', category: 'credit', weight: 0.04, invert: true },
 
   // ============== VOLATILITY (20%) - was 18% ==============
-  { id: 'vix', category: 'volatility', weight: 0.09, invert: true },
-  { id: 'vix_term_structure', category: 'volatility', weight: 0.06, invert: true },
-  { id: 'aaii_sentiment', category: 'volatility', weight: 0.05, invert: false },
+  { id: 'vix', category: 'volatility', weight: 0.07, invert: true },
+  { id: 'vix_term_structure', category: 'volatility', weight: 0.05, invert: true },
+  { id: 'aaii_sentiment', category: 'volatility', weight: 0.04, invert: false },
+  { id: 'gex', category: 'volatility', weight: 0.04, invert: false },
 
   // ============== BREADTH (15%) - was 12% ==============
   { id: 'rsp_spy_ratio', category: 'breadth', weight: 0.05, invert: false },

@@ -7,6 +7,7 @@ import { fetchAllYahooIndicators } from '../fetchers/yahoo.js';
 import { fetchAllCryptoIndicators } from '../fetchers/crypto.js';
 import { fetchAllScrapedIndicators } from '../fetchers/scrapers.js';
 import { fetchAlternativeIndicators } from '../fetchers/alternative-sources.js';
+import { fetchGEX } from '../fetchers/gex.js';
 import { format } from 'date-fns';
 import { query } from '../db/connection.js';
 
@@ -122,6 +123,41 @@ async function runFetchPipeline(): Promise<void> {
     const { success, failed } = await fetchAlternativeIndicators();
     results.push({
       source: 'Alternative',
+      success,
+      failed,
+      duration: Date.now() - start,
+    });
+  }
+
+  // 6. GEX (Gamma Exposure) from CBOE
+  {
+    const start = Date.now();
+    const success: string[] = [];
+    const failed: string[] = [];
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('📊 CBOE GEX...\n');
+    try {
+      const gex = await fetchGEX();
+      if (gex !== null) {
+        const today = format(new Date(), 'yyyy-MM-dd');
+        await query(
+          `INSERT INTO indicator_values (indicator_id, date, value, source)
+           VALUES ('gex', $1, $2, 'cboe')
+           ON CONFLICT (indicator_id, date) DO UPDATE SET value = EXCLUDED.value`,
+          [today, gex]
+        );
+        success.push('gex');
+        console.log(`  ✓ gex: ${gex.toFixed(2)}B`);
+      } else {
+        failed.push('gex');
+        console.error('  ✗ gex: No data returned');
+      }
+    } catch (err: any) {
+      console.error(`  ✗ gex: ${err.message}`);
+      failed.push('gex');
+    }
+    results.push({
+      source: 'CBOE GEX',
       success,
       failed,
       duration: Date.now() - start,
