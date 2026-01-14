@@ -572,7 +572,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           Protocol Specification
         </h1>
         <p className="text-[11px] text-[#949ba5]/60 mb-12 uppercase tracking-widest">
-          Macro Market Strength Index — Quantitative Framework v1.2
+          Macro Market Strength Index — Quantitative Framework v1.3
         </p>
 
         {/* Two-Layer Architecture */}
@@ -626,7 +626,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Category Composition</h2>
           <div className="space-y-4">
             {[
-              { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, AAII sentiment', formula: '100 - percentile(VIX, 5yr)' },
+              { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, AAII sentiment, GEX (gamma exposure)', formula: '100 - percentile(VIX, 5yr)' },
               { name: 'Credit', weight: 20, indicators: 'HY OAS, IG OAS, 2s10s curve, BBB-AAA spread', formula: '100 - percentile(HY_spread, 5yr)' },
               { name: 'Breadth', weight: 15, indicators: 'RSP/SPY ratio, sector breadth, small/mid cap strength', formula: 'percentile(breadth_composite, 5yr)' },
               { name: 'Positioning', weight: 15, indicators: 'Fed balance sheet, TGA, reverse repo, net liquidity', formula: 'percentile(net_liq, 5yr)' },
@@ -819,7 +819,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 
         {/* ML Predictions */}
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">ML Ensemble (v1.2)</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">ML Ensemble (v1.3)</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
             Weighted ensemble combining two models for 7-day and 30-day PXI predictions.
             Models trained locally, deployed as JSON weights for edge inference.
@@ -932,7 +932,7 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 
         {/* Footer */}
         <div className="text-[9px] text-[#949ba5]/30 font-mono tracking-wider text-center uppercase pt-8 border-t border-[#26272b]">
-          PXI/COMMAND Protocol v1.2
+          PXI/COMMAND Protocol v1.3
         </div>
       </div>
     </div>
