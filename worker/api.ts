@@ -372,6 +372,74 @@ async function loadLSTMModel(kv: KVNamespace): Promise<LSTMModel | null> {
   return null;
 }
 
+// SPY Return Prediction Model (predicts actual market returns, not PXI changes)
+interface SPYReturnModel {
+  created_at: string;
+  model_type: string;
+  feature_names: string[];
+  models: {
+    '7d': {
+      type: string;
+      version: string;
+      n_estimators: number;
+      base_score: number;
+      feature_names: string[];
+      trees: XGBTreeNode[];
+    };
+    '30d': {
+      type: string;
+      version: string;
+      n_estimators: number;
+      base_score: number;
+      feature_names: string[];
+      trees: XGBTreeNode[];
+    };
+  };
+  metrics: {
+    '7d': { cv_direction_acc: number; cv_mae_mean: number; cv_r2_mean: number };
+    '30d': { cv_direction_acc: number; cv_mae_mean: number; cv_r2_mean: number };
+  };
+}
+
+let cachedSPYModel: SPYReturnModel | null = null;
+let spyModelLoadTime = 0;
+
+async function loadSPYReturnModel(kv: KVNamespace): Promise<SPYReturnModel | null> {
+  const now = Date.now();
+  if (cachedSPYModel && (now - spyModelLoadTime) < MODEL_CACHE_TTL) {
+    return cachedSPYModel;
+  }
+
+  try {
+    const modelJson = await kv.get('spy_return_model', 'json');
+    if (modelJson) {
+      cachedSPYModel = modelJson as SPYReturnModel;
+      spyModelLoadTime = now;
+      return cachedSPYModel;
+    }
+  } catch (e) {
+    console.error('Failed to load SPY return model from KV:', e);
+  }
+  return null;
+}
+
+// Predict SPY returns using XGBoost model
+function predictSPYReturn(
+  model: SPYReturnModel,
+  features: Record<string, number>,
+  horizon: '7d' | '30d'
+): number {
+  const horizonModel = model.models[horizon];
+  const featureNames = horizonModel.feature_names;
+
+  let prediction = horizonModel.base_score;
+  for (const tree of horizonModel.trees) {
+    prediction += traverseTree(tree, features, featureNames);
+  }
+
+  return prediction;
+}
+
 // Sigmoid activation
 function sigmoid(x: number): number {
   return 1 / (1 + Math.exp(-Math.max(-500, Math.min(500, x))));
@@ -3918,6 +3986,181 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         }, { headers: corsHeaders });
       }
 
+      // SPY Return Prediction endpoint - predicts actual market returns (ALPHA model)
+      if (url.pathname === '/api/predict/returns' && request.method === 'GET') {
+        const model = await loadSPYReturnModel(env.ML_MODELS);
+        if (!model) {
+          return Response.json({
+            error: 'SPY return model not loaded',
+            message: 'Model has not been uploaded to KV yet',
+          }, { status: 503, headers: corsHeaders });
+        }
+
+        // Get current PXI data with deltas
+        const currentPxi = await env.DB.prepare(`
+          SELECT date, score, delta_1d, delta_7d, delta_30d
+          FROM pxi_scores ORDER BY date DESC LIMIT 1
+        `).first<{
+          date: string;
+          score: number;
+          delta_1d: number | null;
+          delta_7d: number | null;
+          delta_30d: number | null;
+        }>();
+
+        if (!currentPxi) {
+          return Response.json({ error: 'No PXI data' }, { status: 404, headers: corsHeaders });
+        }
+
+        // Get category scores, indicators, and recent PXI scores
+        const [categories, indicators, recentScores, vixHistory] = await Promise.all([
+          env.DB.prepare(`
+            SELECT category, score FROM category_scores WHERE date = ?
+          `).bind(currentPxi.date).all<{ category: string; score: number }>(),
+          env.DB.prepare(`
+            SELECT indicator_id, value FROM indicator_values WHERE date = ?
+          `).bind(currentPxi.date).all<{ indicator_id: string; value: number }>(),
+          env.DB.prepare(`
+            SELECT score FROM pxi_scores ORDER BY date DESC LIMIT 20
+          `).all<{ score: number }>(),
+          env.DB.prepare(`
+            SELECT value FROM indicator_values WHERE indicator_id = 'vix' ORDER BY date DESC LIMIT 20
+          `).all<{ value: number }>(),
+        ]);
+
+        // Calculate rolling features
+        const scores = (recentScores.results || []).map(r => r.score);
+        const pxi_ma_5 = scores.slice(0, 5).reduce((a, b) => a + b, 0) / Math.min(5, scores.length);
+        const pxi_ma_20 = scores.reduce((a, b) => a + b, 0) / scores.length;
+        const pxi_std_20 = Math.sqrt(scores.reduce((sum, s) => sum + Math.pow(s - pxi_ma_20, 2), 0) / scores.length);
+        const pxi_vs_ma_20 = currentPxi.score - pxi_ma_20;
+
+        // VIX features
+        const vixValues = (vixHistory.results || []).map(r => r.value);
+        const vix = vixValues[0] || 0;
+        const vix_ma_20 = vixValues.length > 0 ? vixValues.reduce((a, b) => a + b, 0) / vixValues.length : 0;
+        const vix_vs_ma = vix - vix_ma_20;
+
+        // Build category map
+        const categoryMap: Record<string, number> = {};
+        for (const c of categories.results || []) {
+          categoryMap[c.category] = c.score;
+        }
+
+        // Build indicator map
+        const indicatorMap: Record<string, number> = {};
+        for (const i of indicators.results || []) {
+          indicatorMap[i.indicator_id] = i.value;
+        }
+
+        // Category stats
+        const catValues = Object.values(categoryMap);
+        const category_mean = catValues.length > 0 ? catValues.reduce((a, b) => a + b, 0) / catValues.length : 50;
+        const category_max = catValues.length > 0 ? Math.max(...catValues) : 50;
+        const category_min = catValues.length > 0 ? Math.min(...catValues) : 50;
+        const category_dispersion = category_max - category_min;
+        const category_std = catValues.length > 0 ? Math.sqrt(catValues.reduce((sum, v) => sum + Math.pow(v - category_mean, 2), 0) / catValues.length) : 0;
+        const strong_categories = catValues.filter(v => v > 70).length;
+        const weak_categories = catValues.filter(v => v < 30).length;
+
+        // Build features matching the Python training script
+        const features: Record<string, number> = {
+          // PXI features
+          pxi_score: currentPxi.score,
+          pxi_delta_1d: currentPxi.delta_1d ?? 0,
+          pxi_delta_7d: currentPxi.delta_7d ?? 0,
+          pxi_delta_30d: currentPxi.delta_30d ?? 0,
+          pxi_bucket: currentPxi.score < 20 ? 0 : currentPxi.score < 40 ? 1 : currentPxi.score < 60 ? 2 : currentPxi.score < 80 ? 3 : 4,
+
+          // Momentum signals
+          momentum_7d_signal: (currentPxi.delta_7d ?? 0) > 5 ? 2 : (currentPxi.delta_7d ?? 0) > 2 ? 1 : (currentPxi.delta_7d ?? 0) > -2 ? 0 : (currentPxi.delta_7d ?? 0) > -5 ? -1 : -2,
+          momentum_30d_signal: (currentPxi.delta_30d ?? 0) > 10 ? 2 : (currentPxi.delta_30d ?? 0) > 4 ? 1 : (currentPxi.delta_30d ?? 0) > -4 ? 0 : (currentPxi.delta_30d ?? 0) > -10 ? -1 : -2,
+
+          // Acceleration
+          acceleration: (currentPxi.delta_7d ?? 0) - ((currentPxi.delta_30d ?? 0) / 4.3),
+          acceleration_signal: 0,
+
+          // Category features
+          cat_breadth: categoryMap['breadth'] ?? 50,
+          cat_credit: categoryMap['credit'] ?? 50,
+          cat_crypto: categoryMap['crypto'] ?? 50,
+          cat_global: categoryMap['global'] ?? 50,
+          cat_liquidity: categoryMap['liquidity'] ?? 50,
+          cat_macro: categoryMap['macro'] ?? 50,
+          cat_positioning: categoryMap['positioning'] ?? 50,
+          cat_volatility: categoryMap['volatility'] ?? 50,
+          category_mean,
+          category_dispersion,
+          category_std,
+          strong_categories,
+          weak_categories,
+
+          // Indicators
+          vix,
+          hy_spread: indicatorMap['hy_oas'] ?? 0,
+          ig_spread: indicatorMap['ig_oas'] ?? 0,
+          breadth_ratio: indicatorMap['rsp_spy_ratio'] ?? 1,
+          yield_curve: indicatorMap['yield_curve_2s10s'] ?? 0,
+          dxy: indicatorMap['dxy'] ?? 100,
+          btc_vs_200d: indicatorMap['btc_vs_200d'] ?? 0,
+
+          // Derived features
+          vix_high: vix > 25 ? 1 : 0,
+          vix_low: vix < 15 ? 1 : 0,
+          vix_ma_20,
+          vix_vs_ma,
+          pxi_ma_5,
+          pxi_ma_20,
+          pxi_std_20,
+          pxi_vs_ma_20,
+          above_50: currentPxi.score > 50 ? 1 : 0,
+          extreme_low: currentPxi.score < 25 ? 1 : 0,
+          extreme_high: currentPxi.score > 75 ? 1 : 0,
+          spread_widening: 0,
+        };
+
+        // Set acceleration signal
+        features.acceleration_signal = features.acceleration > 2 ? 1 : features.acceleration < -2 ? -1 : 0;
+
+        // Run predictions
+        const return_7d = predictSPYReturn(model, features, '7d');
+        const return_30d = predictSPYReturn(model, features, '30d');
+
+        // Interpret predictions (for market returns)
+        const interpretReturn = (ret: number) => {
+          if (ret > 3) return 'STRONG_BULLISH';
+          if (ret > 1) return 'BULLISH';
+          if (ret > -1) return 'NEUTRAL';
+          if (ret > -3) return 'BEARISH';
+          return 'STRONG_BEARISH';
+        };
+
+        return Response.json({
+          date: currentPxi.date,
+          current_pxi: currentPxi.score,
+          model_created: model.created_at,
+          predictions: {
+            spy_return_7d: {
+              value: Math.round(return_7d * 100) / 100,
+              outlook: interpretReturn(return_7d),
+              unit: '%',
+            },
+            spy_return_30d: {
+              value: Math.round(return_30d * 100) / 100,
+              outlook: interpretReturn(return_30d),
+              unit: '%',
+            },
+          },
+          model_accuracy: {
+            direction_acc_7d: model.metrics['7d'].cv_direction_acc,
+            direction_acc_30d: model.metrics['30d'].cv_direction_acc,
+            mae_7d: model.metrics['7d'].cv_mae_mean,
+            mae_30d: model.metrics['30d'].cv_mae_mean,
+          },
+          disclaimer: 'Alpha model - predicts SPY returns, not PXI changes. Accuracy is modest (~53% 7d, ~65% 30d direction).',
+        }, { headers: corsHeaders });
+      }
+
       // Ensemble prediction endpoint - combines XGBoost and LSTM
       if (url.pathname === '/api/ml/ensemble' && request.method === 'GET') {
         // Load both models
@@ -5714,7 +5957,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
         }
 
-        // Get all PXI scores with deltas and forward returns
+        // Get all PXI scores with deltas
         const pxiData = await env.DB.prepare(`
           SELECT
             p.date,
@@ -5723,11 +5966,8 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
             p.delta_7d,
             p.delta_30d,
             p.label,
-            p.status,
-            me.forward_return_7d,
-            me.forward_return_30d
+            p.status
           FROM pxi_scores p
-          LEFT JOIN market_embeddings me ON p.date = me.date
           ORDER BY p.date ASC
         `).all<{
           date: string;
@@ -5737,9 +5977,32 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           delta_30d: number | null;
           label: string;
           status: string;
-          forward_return_7d: number | null;
-          forward_return_30d: number | null;
         }>();
+
+        // Get SPY prices for return calculation
+        const spyPrices = await env.DB.prepare(`
+          SELECT date, value FROM indicator_values
+          WHERE indicator_id = 'spy_close'
+          ORDER BY date ASC
+        `).all<{ date: string; value: number }>();
+
+        // Build SPY price lookup map
+        const spyMap = new Map<string, number>();
+        for (const p of spyPrices.results || []) {
+          spyMap.set(p.date, p.value);
+        }
+
+        // Helper to get SPY price on or after a date (handle weekends)
+        const getSpyPrice = (dateStr: string, maxDays: number = 5): number | null => {
+          const date = new Date(dateStr);
+          for (let i = 0; i <= maxDays; i++) {
+            const check = new Date(date);
+            check.setDate(check.getDate() + i);
+            const key = check.toISOString().split('T')[0];
+            if (spyMap.has(key)) return spyMap.get(key)!;
+          }
+          return null;
+        };
 
         // Get category scores for each date
         const categoryData = await env.DB.prepare(`
@@ -5764,27 +6027,55 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           indicatorMap.get(i.date)![i.indicator_id] = i.value;
         }
 
-        // Build training records
-        const trainingData = (pxiData.results || []).map(p => ({
-          date: p.date,
-          // Target variables
-          forward_return_7d: p.forward_return_7d,
-          forward_return_30d: p.forward_return_30d,
-          // PXI features
-          pxi_score: p.score,
-          pxi_delta_1d: p.delta_1d,
-          pxi_delta_7d: p.delta_7d,
-          pxi_delta_30d: p.delta_30d,
-          pxi_label: p.label,
-          pxi_status: p.status,
-          // Category scores
-          categories: categoryMap.get(p.date) || {},
-          // Raw indicators
-          indicators: indicatorMap.get(p.date) || {},
-        }));
+        // Build training records with calculated SPY returns
+        const trainingData = (pxiData.results || []).map(p => {
+          // Calculate SPY forward returns
+          const spyNow = getSpyPrice(p.date);
+          let spyReturn7d: number | null = null;
+          let spyReturn30d: number | null = null;
+
+          if (spyNow) {
+            const date = new Date(p.date);
+
+            // 7-day forward return
+            const date7d = new Date(date);
+            date7d.setDate(date7d.getDate() + 7);
+            const spy7d = getSpyPrice(date7d.toISOString().split('T')[0]);
+            if (spy7d) {
+              spyReturn7d = ((spy7d - spyNow) / spyNow) * 100;
+            }
+
+            // 30-day forward return
+            const date30d = new Date(date);
+            date30d.setDate(date30d.getDate() + 30);
+            const spy30d = getSpyPrice(date30d.toISOString().split('T')[0]);
+            if (spy30d) {
+              spyReturn30d = ((spy30d - spyNow) / spyNow) * 100;
+            }
+          }
+
+          return {
+            date: p.date,
+            // Target variables - actual SPY returns (%)
+            spy_return_7d: spyReturn7d,
+            spy_return_30d: spyReturn30d,
+            // PXI features
+            pxi_score: p.score,
+            pxi_delta_1d: p.delta_1d,
+            pxi_delta_7d: p.delta_7d,
+            pxi_delta_30d: p.delta_30d,
+            pxi_label: p.label,
+            pxi_status: p.status,
+            // Category scores
+            categories: categoryMap.get(p.date) || {},
+            // Raw indicators
+            indicators: indicatorMap.get(p.date) || {},
+          };
+        });
 
         return Response.json({
           count: trainingData.length,
+          spy_data_points: spyPrices.results?.length || 0,
           data: trainingData,
         }, { headers: corsHeaders });
       }
