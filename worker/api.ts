@@ -181,14 +181,27 @@ async function loadMLModel(kv: KVNamespace): Promise<MLModel | null> {
 }
 
 // Traverse XGBoost tree to get prediction
-function traverseTree(node: XGBTreeNode, features: Record<string, number>): number {
+function traverseTree(node: XGBTreeNode, features: Record<string, number>, featureNames: string[]): number {
   // Leaf node
   if (node.leaf !== undefined) {
     return node.leaf;
   }
 
-  // Get feature value (default to 0 if missing)
-  const featureValue = features[node.split!] ?? 0;
+  // Get feature value - handle both indexed (f0, f1) and named features
+  let featureValue = 0;
+  const splitName = node.split!;
+
+  if (splitName.startsWith('f')) {
+    // Indexed feature name (e.g., "f9") - convert to actual name
+    const featureIndex = parseInt(splitName.slice(1), 10);
+    if (featureIndex >= 0 && featureIndex < featureNames.length) {
+      const actualName = featureNames[featureIndex];
+      featureValue = features[actualName] ?? 0;
+    }
+  } else {
+    // Named feature
+    featureValue = features[splitName] ?? 0;
+  }
 
   // Decision: go left (yes) if value < split_condition, else right (no)
   // Missing values go to the 'missing' branch (usually yes)
@@ -201,7 +214,7 @@ function traverseTree(node: XGBTreeNode, features: Record<string, number>): numb
   if (node.children) {
     const child = node.children.find(c => c.nodeid === targetNodeId);
     if (child) {
-      return traverseTree(child, features);
+      return traverseTree(child, features, featureNames);
     }
   }
 
@@ -210,11 +223,12 @@ function traverseTree(node: XGBTreeNode, features: Record<string, number>): numb
 }
 
 // XGBoost prediction: sum of all tree predictions + base score
-function xgbPredict(model: XGBModel, features: Record<string, number>): number {
+function xgbPredict(model: XGBModel, features: Record<string, number>, featureNames?: string[]): number {
   let prediction = model.b; // base score
 
+  const names = featureNames || [];
   for (const tree of model.t) {
-    prediction += traverseTree(tree, features);
+    prediction += traverseTree(tree, features, names);
   }
 
   return prediction;
@@ -261,19 +275,23 @@ function extractMLFeatures(data: MLFeatures): Record<string, number> {
     if (score > 0) catScores.push(score);
   }
 
-  // Category dispersion
+  // Category dispersion and mean
   if (catScores.length > 0) {
     features['category_dispersion'] = Math.max(...catScores) - Math.min(...catScores);
     const mean = catScores.reduce((a, b) => a + b, 0) / catScores.length;
     features['category_std'] = Math.sqrt(catScores.reduce((sum, s) => sum + Math.pow(s - mean, 2), 0) / catScores.length);
+    features['category_mean'] = mean;
   } else {
     features['category_dispersion'] = 0;
     features['category_std'] = 0;
+    features['category_mean'] = 50;
   }
 
-  // Extreme category counts
-  features['strong_categories_count'] = catScores.filter(s => s > 70).length;
-  features['weak_categories_count'] = catScores.filter(s => s < 30).length;
+  // Extreme category counts (use both naming conventions for compatibility)
+  features['strong_categories'] = catScores.filter(s => s > 70).length;
+  features['weak_categories'] = catScores.filter(s => s < 30).length;
+  features['strong_categories_count'] = features['strong_categories'];
+  features['weak_categories_count'] = features['weak_categories'];
 
   // Indicator features
   features['vix'] = data.indicators['vix'] ?? 0;
@@ -290,14 +308,20 @@ function extractMLFeatures(data: MLFeatures): Record<string, number> {
   features['pxi_std_20'] = data.pxi_std_20 ?? 10;
   features['pxi_vs_ma_20'] = data.pxi_score - features['pxi_ma_20'];
 
-  // Binary features
+  // Binary and bucket features
   features['above_50'] = data.pxi_score > 50 ? 1 : 0;
   features['extreme_low'] = data.pxi_score < 25 ? 1 : 0;
-  features['extreme_high'] = data.pxi_score > 75 ? 1 : 0;
+
+  // PXI bucket (numeric: 0=very_low, 1=low, 2=neutral, 3=high, 4=very_high)
+  features['pxi_bucket'] = data.pxi_score < 20 ? 0 : data.pxi_score < 40 ? 1 : data.pxi_score < 60 ? 2 : data.pxi_score < 80 ? 3 : 4;
 
   // VIX features
-  features['vix_ma_20'] = features['vix']; // Approximate
+  const vix = features['vix'];
+  features['vix_high'] = vix > 25 ? 1 : 0;
+  features['vix_low'] = vix < 15 ? 1 : 0;
+  features['vix_ma_20'] = vix; // Approximate
   features['vix_vs_ma'] = 0;
+  features['extreme_high'] = data.pxi_score > 75 ? 1 : 0;
 
   return features;
 }
@@ -3732,8 +3756,8 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         });
 
         // Run predictions
-        const prediction_7d = model.m['7d'] ? xgbPredict(model.m['7d'], features) : null;
-        const prediction_30d = model.m['30d'] ? xgbPredict(model.m['30d'], features) : null;
+        const prediction_7d = model.m['7d'] ? xgbPredict(model.m['7d'], features, model.f) : null;
+        const prediction_30d = model.m['30d'] ? xgbPredict(model.m['30d'], features, model.f) : null;
 
         // Interpret predictions
         const interpret = (pred: number | null) => {
@@ -3946,8 +3970,8 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
             pxi_std_20,
           });
 
-          const pred_7d = xgboostModel.m['7d'] ? xgbPredict(xgboostModel.m['7d'], features) : null;
-          const pred_30d = xgboostModel.m['30d'] ? xgbPredict(xgboostModel.m['30d'], features) : null;
+          const pred_7d = xgboostModel.m['7d'] ? xgbPredict(xgboostModel.m['7d'], features, xgboostModel.f) : null;
+          const pred_30d = xgboostModel.m['30d'] ? xgbPredict(xgboostModel.m['30d'], features, xgboostModel.f) : null;
 
           const interpretDir = (p: number | null) => {
             if (p === null) return null;
@@ -4476,6 +4500,310 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
             ensemble: formatMetrics(metrics.ensemble),
           },
           recent_predictions: recentPredictions,
+        }, { headers: corsHeaders });
+      }
+
+      // ML Backtest: Run models against historical data
+      if (url.pathname === '/api/ml/backtest' && request.method === 'GET') {
+        const limit = parseInt(url.searchParams.get('limit') || '500');
+        const offset = parseInt(url.searchParams.get('offset') || '0');
+
+        // Load models
+        const [xgboostModel, lstmModel] = await Promise.all([
+          loadMLModel(env.ML_MODELS),
+          loadLSTMModel(env.ML_MODELS),
+        ]);
+
+        if (!xgboostModel && !lstmModel) {
+          return Response.json({
+            error: 'No models available for backtesting',
+          }, { status: 503, headers: corsHeaders });
+        }
+
+        // Get historical PXI scores with forward returns
+        const pxiHistory = await env.DB.prepare(`
+          SELECT
+            p.date, p.score, p.delta_1d, p.delta_7d, p.delta_30d,
+            (SELECT score FROM pxi_scores p2 WHERE p2.date > p.date ORDER BY p2.date LIMIT 1 OFFSET 6) as actual_score_7d,
+            (SELECT score FROM pxi_scores p2 WHERE p2.date > p.date ORDER BY p2.date LIMIT 1 OFFSET 29) as actual_score_30d
+          FROM pxi_scores p
+          WHERE p.date <= date('now', '-37 days')
+          ORDER BY p.date DESC
+          LIMIT ? OFFSET ?
+        `).bind(limit, offset).all<{
+          date: string;
+          score: number;
+          delta_1d: number | null;
+          delta_7d: number | null;
+          delta_30d: number | null;
+          actual_score_7d: number | null;
+          actual_score_30d: number | null;
+        }>();
+
+        if (!pxiHistory.results || pxiHistory.results.length === 0) {
+          return Response.json({
+            error: 'No historical data available for backtesting',
+            hint: 'Need at least 37 days of historical PXI scores',
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        // Get all dates for batch queries
+        const dates = pxiHistory.results.map(r => r.date);
+
+        // Batch fetch category scores
+        const categoryData = await env.DB.prepare(`
+          SELECT date, category, score FROM category_scores
+          WHERE date IN (${dates.map(() => '?').join(',')})
+        `).bind(...dates).all<{ date: string; category: string; score: number }>();
+
+        // Batch fetch indicator values
+        const indicatorData = await env.DB.prepare(`
+          SELECT date, indicator_id, value FROM indicator_values
+          WHERE date IN (${dates.map(() => '?').join(',')})
+        `).bind(...dates).all<{ date: string; indicator_id: string; value: number }>();
+
+        // Build lookup maps
+        const categoryMap = new Map<string, Record<string, number>>();
+        for (const c of categoryData.results || []) {
+          if (!categoryMap.has(c.date)) categoryMap.set(c.date, {});
+          categoryMap.get(c.date)![c.category] = c.score;
+        }
+
+        const indicatorMap = new Map<string, Record<string, number>>();
+        for (const i of indicatorData.results || []) {
+          if (!indicatorMap.has(i.date)) indicatorMap.set(i.date, {});
+          indicatorMap.get(i.date)![i.indicator_id] = i.value;
+        }
+
+        // Compute rolling averages for each date (need surrounding data)
+        const sortedHistory = [...pxiHistory.results].sort((a, b) => a.date.localeCompare(b.date));
+        const rollingStats = new Map<string, { ma5: number; ma20: number; std20: number }>();
+
+        for (let i = 0; i < sortedHistory.length; i++) {
+          const recent5 = sortedHistory.slice(Math.max(0, i - 4), i + 1).map(r => r.score);
+          const recent20 = sortedHistory.slice(Math.max(0, i - 19), i + 1).map(r => r.score);
+
+          const ma5 = recent5.reduce((a, b) => a + b, 0) / recent5.length;
+          const ma20 = recent20.reduce((a, b) => a + b, 0) / recent20.length;
+          const std20 = Math.sqrt(recent20.reduce((sum, s) => sum + Math.pow(s - ma20, 2), 0) / recent20.length);
+
+          rollingStats.set(sortedHistory[i].date, { ma5, ma20, std20 });
+        }
+
+        // Run predictions and calculate metrics
+        const results: {
+          date: string;
+          pxi_score: number;
+          xgboost_7d: number | null;
+          xgboost_30d: number | null;
+          lstm_7d: number | null;
+          lstm_30d: number | null;
+          ensemble_7d: number | null;
+          ensemble_30d: number | null;
+          actual_7d: number | null;
+          actual_30d: number | null;
+        }[] = [];
+
+        const metrics = {
+          xgboost: { d7_mae: 0, d7_correct: 0, d7_total: 0, d30_mae: 0, d30_correct: 0, d30_total: 0 },
+          lstm: { d7_mae: 0, d7_correct: 0, d7_total: 0, d30_mae: 0, d30_correct: 0, d30_total: 0 },
+          ensemble: { d7_mae: 0, d7_correct: 0, d7_total: 0, d30_mae: 0, d30_correct: 0, d30_total: 0 },
+        };
+
+        const XGBOOST_WEIGHT = 0.6;
+        const LSTM_WEIGHT = 0.4;
+
+        for (const row of pxiHistory.results) {
+          const categories = categoryMap.get(row.date) || {};
+          const indicators = indicatorMap.get(row.date) || {};
+          const rolling = rollingStats.get(row.date) || { ma5: row.score, ma20: row.score, std20: 10 };
+
+          // Calculate actual forward changes
+          const actual_7d = row.actual_score_7d !== null ? row.actual_score_7d - row.score : null;
+          const actual_30d = row.actual_score_30d !== null ? row.actual_score_30d - row.score : null;
+
+          let xg7d: number | null = null;
+          let xg30d: number | null = null;
+          let lstm7d: number | null = null;
+          let lstm30d: number | null = null;
+
+          // XGBoost prediction
+          if (xgboostModel) {
+            const features = extractMLFeatures({
+              pxi_score: row.score,
+              pxi_delta_1d: row.delta_1d,
+              pxi_delta_7d: row.delta_7d,
+              pxi_delta_30d: row.delta_30d,
+              categories,
+              indicators,
+              pxi_ma_5: rolling.ma5,
+              pxi_ma_20: rolling.ma20,
+              pxi_std_20: rolling.std20,
+            });
+
+            xg7d = xgboostModel.m['7d'] ? xgbPredict(xgboostModel.m['7d'], features, xgboostModel.f) : null;
+            xg30d = xgboostModel.m['30d'] ? xgbPredict(xgboostModel.m['30d'], features, xgboostModel.f) : null;
+          }
+
+          // LSTM prediction (simplified - uses single row features, not full sequence)
+          // For proper LSTM backtest, we'd need sequence history which is computationally expensive
+          if (lstmModel && categories && Object.keys(categories).length > 0) {
+            const vix = indicators['vix'] ?? 20;
+            const lstmFeatures = extractLSTMFeatures(
+              { score: row.score, delta_7d: row.delta_7d, categories, vix },
+              lstmModel.n,
+              lstmModel.c.f
+            );
+            // Note: This is a simplified single-step LSTM, not a proper sequence prediction
+            // Real LSTM backtest would require sequence data for each historical date
+          }
+
+          // Ensemble (XGBoost only for now, LSTM requires sequence data)
+          const ens7d = xg7d;
+          const ens30d = xg30d;
+
+          // Track metrics for 7-day
+          if (actual_7d !== null) {
+            if (xg7d !== null) {
+              metrics.xgboost.d7_mae += Math.abs(xg7d - actual_7d);
+              metrics.xgboost.d7_total++;
+              if ((xg7d > 0 && actual_7d > 0) || (xg7d < 0 && actual_7d < 0) || (xg7d === 0 && actual_7d === 0)) {
+                metrics.xgboost.d7_correct++;
+              }
+            }
+            if (ens7d !== null) {
+              metrics.ensemble.d7_mae += Math.abs(ens7d - actual_7d);
+              metrics.ensemble.d7_total++;
+              if ((ens7d > 0 && actual_7d > 0) || (ens7d < 0 && actual_7d < 0)) {
+                metrics.ensemble.d7_correct++;
+              }
+            }
+          }
+
+          // Track metrics for 30-day
+          if (actual_30d !== null) {
+            if (xg30d !== null) {
+              metrics.xgboost.d30_mae += Math.abs(xg30d - actual_30d);
+              metrics.xgboost.d30_total++;
+              if ((xg30d > 0 && actual_30d > 0) || (xg30d < 0 && actual_30d < 0)) {
+                metrics.xgboost.d30_correct++;
+              }
+            }
+            if (ens30d !== null) {
+              metrics.ensemble.d30_mae += Math.abs(ens30d - actual_30d);
+              metrics.ensemble.d30_total++;
+              if ((ens30d > 0 && actual_30d > 0) || (ens30d < 0 && actual_30d < 0)) {
+                metrics.ensemble.d30_correct++;
+              }
+            }
+          }
+
+          results.push({
+            date: row.date,
+            pxi_score: row.score,
+            xgboost_7d: xg7d,
+            xgboost_30d: xg30d,
+            lstm_7d: lstm7d,
+            lstm_30d: lstm30d,
+            ensemble_7d: ens7d,
+            ensemble_30d: ens30d,
+            actual_7d,
+            actual_30d,
+          });
+        }
+
+        const formatMetrics = (m: typeof metrics.xgboost) => ({
+          d7: m.d7_total > 0 ? {
+            direction_accuracy: ((m.d7_correct / m.d7_total) * 100).toFixed(1) + '%',
+            mean_absolute_error: (m.d7_mae / m.d7_total).toFixed(2),
+            sample_size: m.d7_total,
+          } : null,
+          d30: m.d30_total > 0 ? {
+            direction_accuracy: ((m.d30_correct / m.d30_total) * 100).toFixed(1) + '%',
+            mean_absolute_error: (m.d30_mae / m.d30_total).toFixed(2),
+            sample_size: m.d30_total,
+          } : null,
+        });
+
+        // Calculate additional stats
+        const validResults7d = results.filter(r => r.actual_7d !== null && r.xgboost_7d !== null);
+        const validResults30d = results.filter(r => r.actual_30d !== null && r.xgboost_30d !== null);
+
+        // Compute R² for XGBoost
+        const calcR2 = (predicted: number[], actual: number[]): number => {
+          if (predicted.length === 0) return 0;
+          const meanActual = actual.reduce((a, b) => a + b, 0) / actual.length;
+          const ssRes = predicted.reduce((sum, p, i) => sum + Math.pow(actual[i] - p, 2), 0);
+          const ssTot = actual.reduce((sum, a) => sum + Math.pow(a - meanActual, 2), 0);
+          return ssTot > 0 ? 1 - (ssRes / ssTot) : 0;
+        };
+
+        const r2_7d = calcR2(
+          validResults7d.map(r => r.xgboost_7d!),
+          validResults7d.map(r => r.actual_7d!)
+        );
+        const r2_30d = calcR2(
+          validResults30d.map(r => r.xgboost_30d!),
+          validResults30d.map(r => r.actual_30d!)
+        );
+
+        return Response.json({
+          summary: {
+            total_observations: results.length,
+            date_range: {
+              start: results[results.length - 1]?.date,
+              end: results[0]?.date,
+            },
+            models_tested: {
+              xgboost: !!xgboostModel,
+              lstm: false, // LSTM requires sequence data for proper backtest
+            },
+            note: 'This is IN-SAMPLE performance (models trained on this data). True OOS metrics come from live predictions.',
+          },
+          metrics: {
+            xgboost: {
+              ...formatMetrics(metrics.xgboost),
+              r2_7d: r2_7d.toFixed(4),
+              r2_30d: r2_30d.toFixed(4),
+            },
+            ensemble: formatMetrics(metrics.ensemble),
+          },
+          by_pxi_bucket: (() => {
+            const buckets = [
+              { name: '0-20', min: 0, max: 20 },
+              { name: '20-40', min: 20, max: 40 },
+              { name: '40-60', min: 40, max: 60 },
+              { name: '60-80', min: 60, max: 80 },
+              { name: '80-100', min: 80, max: 100 },
+            ];
+
+            return buckets.map(bucket => {
+              const bucketResults = validResults7d.filter(
+                r => r.pxi_score >= bucket.min && r.pxi_score < bucket.max
+              );
+              if (bucketResults.length === 0) return { bucket: bucket.name, count: 0 };
+
+              const correctDir = bucketResults.filter(
+                r => (r.xgboost_7d! > 0 && r.actual_7d! > 0) || (r.xgboost_7d! < 0 && r.actual_7d! < 0)
+              ).length;
+
+              return {
+                bucket: bucket.name,
+                count: bucketResults.length,
+                direction_accuracy_7d: ((correctDir / bucketResults.length) * 100).toFixed(1) + '%',
+                avg_predicted_7d: (bucketResults.reduce((s, r) => s + r.xgboost_7d!, 0) / bucketResults.length).toFixed(2),
+                avg_actual_7d: (bucketResults.reduce((s, r) => s + r.actual_7d!, 0) / bucketResults.length).toFixed(2),
+              };
+            });
+          })(),
+          recent_predictions: results.slice(0, 20).map(r => ({
+            date: r.date,
+            pxi: r.pxi_score.toFixed(1),
+            xgb_7d: r.xgboost_7d?.toFixed(2),
+            actual_7d: r.actual_7d?.toFixed(2),
+            xgb_30d: r.xgboost_30d?.toFixed(2),
+            actual_30d: r.actual_30d?.toFixed(2),
+          })),
         }, { headers: corsHeaders });
       }
 
