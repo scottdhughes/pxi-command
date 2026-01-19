@@ -1,14 +1,23 @@
 # PXI Signals
 
-A Cloudflare Workers-powered pipeline for detecting early sector rotation signals from Reddit investment discussions. Analyzes social sentiment, mention velocity, and dispersion patterns to identify emerging investment themes.
+[![Live](https://img.shields.io/badge/Live-pxicommand.com/signals-00a3ff)](https://pxicommand.com/signals)
+[![Tests](https://img.shields.io/badge/Tests-258%20passing-10b981)](tests/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178C6)](https://www.typescriptlang.org/)
+
+Weekly sector rotation signals from Reddit investment discussions. Analyzes social sentiment, mention velocity, and dispersion patterns to identify emerging investment themes.
+
+**Live:** [pxicommand.com/signals](https://pxicommand.com/signals)
 
 ## Features
 
+- **Weekly Analysis**: Runs every Monday (or Tuesday if Monday is a US market holiday)
 - **Mention Velocity Tracking**: Detects accelerating discussion around investment themes
 - **Sentiment Analysis**: VADER-based sentiment scoring with shift detection
 - **Multi-Subreddit Dispersion**: Identifies themes spreading across communities
 - **Automated Classification**: Categorizes signals by confidence, timing, and type
-- **HTML/JSON Reports**: Generates both human-readable and machine-parseable outputs
+- **20 Sector Themes**: Nuclear, Automation, Defense, Copper, Financials, and more
+- **SEO Optimized**: Open Graph, Twitter Cards, JSON-LD structured data
+- **Dynamic OG Image**: Auto-generated social preview showing top signal
 
 ## Quick Start
 
@@ -59,14 +68,16 @@ See [docs/API.md](docs/API.md) for detailed API documentation.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `REDDIT_CLIENT_ID` | Yes | - | Reddit API client ID |
-| `REDDIT_CLIENT_SECRET` | Yes | - | Reddit API client secret |
-| `REDDIT_USER_AGENT` | Yes | - | User agent for Reddit requests |
-| `ADMIN_RUN_TOKEN` | Yes | - | Token for admin endpoints |
+| `ADMIN_RUN_TOKEN` | Yes | - | Token for manual run endpoint |
+| `REDDIT_CLIENT_ID` | No | - | Reddit API client ID (falls back to public endpoints) |
+| `REDDIT_CLIENT_SECRET` | No | - | Reddit API client secret |
+| `REDDIT_USER_AGENT` | No | - | User agent for Reddit requests |
 | `DEFAULT_LOOKBACK_DAYS` | No | 7 | Days for recent activity window |
 | `DEFAULT_BASELINE_DAYS` | No | 30 | Days for baseline comparison |
 | `DEFAULT_TOP_N` | No | 10 | Number of themes in report |
 | `PUBLIC_BASE_PATH` | No | /signals | Base path for all routes |
+
+> **Note:** Reddit API credentials are optional. Without them, the system falls back to public Reddit endpoints (`old.reddit.com/.json`) which don't require authentication.
 
 ### Cloudflare Bindings
 
