@@ -20,6 +20,16 @@ function escapeHtml(str: string): string {
 }
 
 /**
+ * Safely stringify JSON for embedding in script tags.
+ * Escapes </script> and <!-- to prevent breaking out of the tag.
+ */
+function safeJsonStringify(obj: unknown): string {
+  return JSON.stringify(obj)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+}
+
+/**
  * Validates and sanitizes URLs for use in href attributes.
  * Only allows https:// URLs to Reddit domains.
  */
@@ -617,7 +627,7 @@ export function renderHtml(
   <meta name="twitter:image" content="${ogImage}" />
 
   <!-- Structured Data -->
-  <script type="application/ld+json">${JSON.stringify(structuredData)}</script>
+  <script type="application/ld+json">${safeJsonStringify(structuredData)}</script>
 
   <style>${REPORT_CSS}</style>
 </head>

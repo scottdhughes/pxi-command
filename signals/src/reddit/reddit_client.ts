@@ -55,7 +55,11 @@ async function getOAuthToken(env: Env): Promise<string | null> {
   const json = await res.json()
   const parsed = parseOAuthResponse(json)
   if (!parsed) {
-    logWarn("OAuth response validation failed", { response: json })
+    // Log only non-sensitive fields - never log tokens or full OAuth responses
+    logWarn("OAuth response validation failed", {
+      hasAccessToken: typeof json === "object" && json !== null && "access_token" in json,
+      responseKeys: typeof json === "object" && json !== null ? Object.keys(json) : [],
+    })
     return null
   }
 
