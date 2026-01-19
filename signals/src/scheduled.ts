@@ -9,10 +9,12 @@ import { classifyTheme } from "./analysis/classify"
 import { buildTakeaways } from "./analysis/takeaways"
 import { renderJson, type ThemeReportItem } from "./report/render_json"
 import { renderHtml } from "./report/render_html"
-import { insertRun } from "./db"
+import { insertRun, getAccuracyStats } from "./db"
 import { putObject, setLatestRun } from "./storage"
 import { nowUtcIso } from "./utils/time"
 import { ulid } from "ulidx"
+import { evaluatePendingPredictions, storePredictions } from "./evaluation"
+import { logInfo, logWarn } from "./utils/logger"
 
 const DEFAULT_SUBREDDITS = [
   "stocks",
@@ -33,6 +35,14 @@ export async function runPipeline(env: Env, opts: { dataset?: RedditDataset } = 
   const cfg = getConfig(env)
   const runId = `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${ulid()}`
   const generatedAt = nowUtcIso()
+
+  // Phase 1: Evaluate pending predictions from previous runs
+  try {
+    const evalResult = await evaluatePendingPredictions(env)
+    logInfo(`Evaluation phase: ${evalResult.evaluated} predictions evaluated, ${evalResult.hits} hits`)
+  } catch (err) {
+    logWarn(`Evaluation phase error (non-fatal): ${err}`)
+  }
 
   let dataset: RedditDataset
   if (opts.dataset) {
@@ -71,6 +81,15 @@ export async function runPipeline(env: Env, opts: { dataset?: RedditDataset } = 
     })
 
   const takeaways = buildTakeaways(ranked.map((r) => ({ metrics: r.metrics, score: r.scoring, classification: r.classification })))
+
+  // Fetch accuracy stats for the report
+  let accuracyStats = null
+  try {
+    accuracyStats = await getAccuracyStats(env)
+  } catch (err) {
+    logWarn(`Failed to fetch accuracy stats (non-fatal): ${err}`)
+  }
+
   const reportJson = renderJson(
     runId,
     generatedAt,
@@ -85,7 +104,7 @@ export async function runPipeline(env: Env, opts: { dataset?: RedditDataset } = 
     metricResult.docs.length,
     ranked
   )
-  const reportHtml = renderHtml(reportJson, takeaways)
+  const reportHtml = renderHtml(reportJson, takeaways, accuracyStats)
 
   const reportKey = `reports/${runId}/report.html`
   const resultsKey = `reports/${runId}/results.json`
@@ -115,6 +134,14 @@ export async function runPipeline(env: Env, opts: { dataset?: RedditDataset } = 
   })
 
   await setLatestRun(env, runId, generatedAt)
+
+  // Phase 3: Store new predictions for future evaluation
+  try {
+    const storedCount = await storePredictions(env, runId, ranked)
+    logInfo(`Storage phase: ${storedCount} predictions stored for future evaluation`)
+  } catch (err) {
+    logWarn(`Storage phase error (non-fatal): ${err}`)
+  }
 
   return { runId, reportHtml, resultsJson, rawJson }
 }

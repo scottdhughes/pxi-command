@@ -1,5 +1,6 @@
 import type { ReportJson, ThemeReportItem } from "./render_json"
 import { REPORT_CSS } from "./css"
+import type { AccuracyStats } from "../db"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Security Utilities
@@ -179,11 +180,9 @@ function renderDistributionBar(themes: ThemeReportItem[]): string {
     else distribution["Rotation"]++ // default
   })
 
-  const total = themes.length
   const segments = Object.entries(distribution)
     .filter(([_, count]) => count > 0)
     .map(([type, count]) => {
-      const pct = (count / total) * 100
       const cssClass = type.toLowerCase().replace(/\s+/g, "").replace("mean", "")
       return `<div class="dist-segment ${cssClass}" style="flex: ${count}">${count > 1 ? `${count}` : ""}</div>`
     })
@@ -431,6 +430,92 @@ function renderTakeaways(takeaways: {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Accuracy Track Record Card
+// ─────────────────────────────────────────────────────────────────────────────
+
+function renderAccuracyCard(accuracy: AccuracyStats | null): string {
+  // No data state - minimal design
+  if (!accuracy || accuracy.overall.total === 0) {
+    return `
+      <div class="accuracy-card">
+        <div class="accuracy-header">
+          <div class="accuracy-title">Signal Performance</div>
+        </div>
+        <div class="accuracy-no-data">
+          <div class="accuracy-no-data-text">Performance data collecting...</div>
+          <div class="accuracy-no-data-sub">First accuracy report available after 7 days of predictions</div>
+        </div>
+      </div>
+    `
+  }
+
+  const hitRate = Math.round(accuracy.overall.hit_rate)
+  const avgReturn = accuracy.overall.avg_return
+  const avgReturnClass = avgReturn >= 0 ? "positive" : "negative"
+  const avgReturnSign = avgReturn >= 0 ? "+" : ""
+
+  // Get timing breakdown
+  const timingEntries = Object.entries(accuracy.by_timing)
+  const getTimingData = (key: string) => {
+    const found = timingEntries.find(([k]) => k.toLowerCase().includes(key.toLowerCase()))
+    return found ? found[1] : null
+  }
+
+  const nowData = getTimingData("now")
+  const buildingData = getTimingData("building")
+  const earlyData = getTimingData("early") || getTimingData("ongoing")
+
+  // Render a row in the breakdown
+  const renderTimingRow = (
+    label: string,
+    cssClass: string,
+    data: { total: number; hit_rate: number; avg_return: number } | null
+  ) => {
+    if (!data || data.total === 0) return ""
+
+    const rate = Math.round(data.hit_rate)
+    return `
+      <div class="accuracy-row">
+        <div class="accuracy-row-label">${escapeHtml(label)}</div>
+        <div class="accuracy-row-bar">
+          <div class="accuracy-row-fill ${cssClass}" style="width: ${rate}%"></div>
+        </div>
+        <div class="accuracy-row-values">
+          <div class="accuracy-row-rate">${rate}%</div>
+          <div class="accuracy-row-count">${data.total}</div>
+        </div>
+      </div>
+    `
+  }
+
+  return `
+    <div class="accuracy-card">
+      <div class="accuracy-header">
+        <div class="accuracy-title">Signal Performance</div>
+        <div class="accuracy-sample">
+          <span class="accuracy-sample-dot"></span>
+          <span>${accuracy.overall.total} evaluated</span>
+        </div>
+      </div>
+      <div class="accuracy-body">
+        <div class="accuracy-main">
+          <div class="accuracy-hero-value">${hitRate}<span class="unit">%</span></div>
+          <div class="accuracy-hero-label">Hit Rate</div>
+          <div class="accuracy-hero-sub">
+            Avg Return: <span class="value ${avgReturnClass}">${avgReturnSign}${avgReturn.toFixed(1)}%</span>
+          </div>
+        </div>
+        <div class="accuracy-breakdown">
+          ${renderTimingRow("now", "now", nowData)}
+          ${renderTimingRow("building", "building", buildingData)}
+          ${renderTimingRow("early", "early", earlyData)}
+        </div>
+      </div>
+    </div>
+  `
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Calculate Next Update Date
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -455,7 +540,8 @@ function getNextUpdateDate(): string {
 
 export function renderHtml(
   report: ReportJson,
-  takeaways: { data_shows: string[]; actionable_signals: string[]; risk_factors: string[] }
+  takeaways: { data_shows: string[]; actionable_signals: string[]; risk_factors: string[] },
+  accuracy: AccuracyStats | null = null
 ): string {
   const themeCards = report.themes.map(renderThemeCard).join("")
   const analysisDate = report.generated_at_utc.split("T")[0]
@@ -536,6 +622,14 @@ export function renderHtml(
   <style>${REPORT_CSS}</style>
 </head>
 <body>
+  <!-- Site Navigation - Matching pxicommand.com -->
+  <nav class="site-nav">
+    <a href="/" class="site-nav-brand">PXI<span class="brand-slash">/</span>COMMAND<span class="brand-caret">▼</span></a>
+    <div class="site-nav-links">
+      <a href="/signals" class="nav-link">Signals</a>
+    </div>
+  </nav>
+
   <div class="container">
     <!-- Hero Header -->
     <header class="hero">
@@ -558,6 +652,9 @@ export function renderHtml(
 
     <!-- Summary Dashboard -->
     ${renderSummaryDashboard(report.themes, report.summary.total_docs)}
+
+    <!-- Accuracy Track Record -->
+    ${renderAccuracyCard(accuracy)}
 
     <!-- Signal Distribution -->
     ${renderDistributionBar(report.themes)}

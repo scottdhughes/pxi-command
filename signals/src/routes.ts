@@ -1,6 +1,6 @@
 import type { Env } from "./config"
 import { getConfig } from "./config"
-import { listRuns, getRun, insertRun } from "./db"
+import { listRuns, getRun, insertRun, getAccuracyStats, listPredictions } from "./db"
 import { getObjectText, getLatestRunId } from "./storage"
 import { runPipeline } from "./scheduled"
 import sampleData from "../data/sample_reddit.json" assert { type: "json" }
@@ -154,7 +154,7 @@ async function buildStubReport(env: Env) {
     metricResult.docs.length,
     ranked
   )
-  return renderHtml(reportJson, takeaways)
+  return renderHtml(reportJson, takeaways, null)
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
@@ -253,6 +253,84 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         error_message: error.message || "admin_run_failed",
       })
       return jsonResponse({ ok: false, error: error.message || "run_failed" }, 500)
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Signal Accuracy and Predictions API
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  if (request.method === "GET" && path === "/api/accuracy") {
+    try {
+      const stats = await getAccuracyStats(env)
+      return jsonResponse({
+        generated_at: nowUtcIso(),
+        sample_size: stats.overall.total,
+        overall: {
+          hit_rate: `${stats.overall.hit_rate.toFixed(1)}%`,
+          avg_return: `${stats.overall.avg_return >= 0 ? "+" : ""}${stats.overall.avg_return.toFixed(1)}%`,
+        },
+        by_timing: Object.fromEntries(
+          Object.entries(stats.by_timing).map(([timing, data]) => [
+            timing,
+            {
+              hit_rate: `${data.hit_rate.toFixed(1)}%`,
+              count: data.total,
+              avg_return: `${data.avg_return >= 0 ? "+" : ""}${data.avg_return.toFixed(1)}%`,
+            },
+          ])
+        ),
+        by_confidence: Object.fromEntries(
+          Object.entries(stats.by_confidence).map(([confidence, data]) => [
+            confidence,
+            {
+              hit_rate: `${data.hit_rate.toFixed(1)}%`,
+              count: data.total,
+              avg_return: `${data.avg_return >= 0 ? "+" : ""}${data.avg_return.toFixed(1)}%`,
+            },
+          ])
+        ),
+      })
+    } catch {
+      return jsonResponse({ error: "Failed to fetch accuracy stats" }, 500)
+    }
+  }
+
+  if (request.method === "GET" && path === "/api/predictions") {
+    try {
+      const evaluatedParam = url.searchParams.get("evaluated")
+      const limitParam = url.searchParams.get("limit")
+      const limit = limitParam ? Math.min(parseInt(limitParam, 10), 100) : 50
+
+      const opts: { limit: number; evaluated?: boolean } = { limit }
+      if (evaluatedParam === "true") opts.evaluated = true
+      else if (evaluatedParam === "false") opts.evaluated = false
+
+      const predictions = await listPredictions(env, opts)
+
+      return jsonResponse({
+        predictions: predictions.map((p) => ({
+          signal_date: p.signal_date,
+          target_date: p.target_date,
+          theme_id: p.theme_id,
+          theme_name: p.theme_name,
+          rank: p.rank,
+          score: Math.round(p.score * 100) / 100,
+          signal_type: p.signal_type,
+          confidence: p.confidence,
+          timing: p.timing,
+          stars: p.stars,
+          proxy_etf: p.proxy_etf,
+          entry_price: p.entry_price,
+          exit_price: p.exit_price,
+          return_pct: p.return_pct,
+          hit: p.hit === 1 ? true : p.hit === 0 ? false : null,
+          status: p.evaluated_at ? "evaluated" : "pending",
+          evaluated_at: p.evaluated_at,
+        })),
+      })
+    } catch {
+      return jsonResponse({ error: "Failed to fetch predictions" }, 500)
     }
   }
 

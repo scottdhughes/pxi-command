@@ -113,6 +113,80 @@ body::before {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   SITE NAVIGATION - Matching pxicommand.com main page
+   ═══════════════════════════════════════════════════════════════════════════ */
+.site-nav {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-md) var(--space-lg);
+  background: var(--bg);
+}
+
+.site-nav-brand {
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.6);
+  text-transform: uppercase;
+  transition: color 0.15s;
+  padding: 8px 0;
+}
+
+.site-nav-brand:hover {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.brand-slash {
+  margin: 0;
+}
+
+.brand-caret {
+  margin-left: 6px;
+  font-size: 8px;
+  opacity: 0.7;
+}
+
+.site-nav-date {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.site-nav-links {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.nav-link {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  text-decoration: none;
+  padding: 8px 16px;
+  border: 1px solid var(--accent);
+  border-radius: 0;
+  transition: all 0.15s;
+}
+
+.nav-link:hover {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    LAYOUT
    ═══════════════════════════════════════════════════════════════════════════ */
 .container {
@@ -968,4 +1042,216 @@ body::before {
 .text-warning { color: var(--warning); }
 .text-danger { color: var(--danger); }
 .text-muted { color: var(--muted); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ACCURACY TRACK RECORD - Matching pxicommand.com minimal style
+   ═══════════════════════════════════════════════════════════════════════════ */
+.accuracy-card {
+  margin-bottom: var(--space-xl);
+  animation: fadeInUp 0.4s ease forwards;
+  animation-delay: 0.3s;
+  opacity: 0;
+}
+
+.accuracy-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-lg);
+  padding-bottom: var(--space-md);
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.1);
+}
+
+.accuracy-title {
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.accuracy-sample {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.accuracy-sample-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 2s infinite;
+}
+
+.accuracy-body {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: var(--space-xl);
+  align-items: start;
+}
+
+.accuracy-main {
+  text-align: center;
+}
+
+.accuracy-hero-value {
+  font-family: var(--font-display);
+  font-size: 72px;
+  font-weight: 300;
+  color: var(--text);
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+.accuracy-hero-value .unit {
+  font-size: 32px;
+  color: rgba(255, 255, 255, 0.4);
+  font-weight: 300;
+}
+
+.accuracy-hero-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: rgba(255, 255, 255, 0.35);
+  margin-top: var(--space-sm);
+}
+
+.accuracy-hero-sub {
+  margin-top: var(--space-md);
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.accuracy-hero-sub .value {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.accuracy-hero-sub .value.positive {
+  color: var(--success);
+}
+
+.accuracy-hero-sub .value.negative {
+  color: var(--danger);
+}
+
+.accuracy-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.accuracy-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-sm) 0;
+}
+
+.accuracy-row-label {
+  font-size: 12px;
+  text-transform: lowercase;
+  color: rgba(255, 255, 255, 0.5);
+  letter-spacing: 0.02em;
+}
+
+.accuracy-row-bar {
+  flex: 1;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 0 var(--space-lg);
+  position: relative;
+  overflow: hidden;
+}
+
+.accuracy-row-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  transition: width 0.6s ease;
+}
+
+.accuracy-row-fill.now {
+  background: var(--accent);
+}
+
+.accuracy-row-fill.building {
+  background: var(--timing-building);
+}
+
+.accuracy-row-fill.early {
+  background: var(--timing-early);
+}
+
+.accuracy-row-values {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-md);
+  min-width: 120px;
+  justify-content: flex-end;
+}
+
+.accuracy-row-rate {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 400;
+  color: var(--text);
+}
+
+.accuracy-row-count {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.35);
+}
+
+/* No data state */
+.accuracy-no-data {
+  padding: var(--space-2xl) var(--space-xl);
+  text-align: center;
+  border: 1px dashed rgba(255, 255, 255, 0.1);
+}
+
+.accuracy-no-data-text {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.5);
+  margin-bottom: var(--space-xs);
+}
+
+.accuracy-no-data-sub {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.3);
+}
+
+/* Responsive for accuracy card */
+@media (max-width: 768px) {
+  .accuracy-body {
+    grid-template-columns: 1fr;
+    gap: var(--space-lg);
+  }
+
+  .accuracy-hero-value {
+    font-size: 56px;
+  }
+
+  .accuracy-row-bar {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .accuracy-header {
+    flex-direction: column;
+    gap: var(--space-sm);
+    text-align: center;
+  }
+
+  .accuracy-hero-value {
+    font-size: 48px;
+  }
+}
 `
