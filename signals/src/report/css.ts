@@ -146,6 +146,7 @@ body::before {
 
 .brand-slash {
   margin: 0;
+  color: var(--accent);
 }
 
 .brand-caret {
