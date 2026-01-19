@@ -5,9 +5,11 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 
-A real-time macro market strength index that aggregates 28 indicators across 7 categories to provide a single composite score (0-100) for market conditions, with ML-powered similar period detection and prediction tracking.
+A suite of quantitative market tools:
+- **PXI Index** - Real-time macro market strength (28 indicators → single 0-100 score)
+- **Sector Signals** - Weekly sector rotation signals from Reddit discussion analysis
 
-**Live:** [pxicommand.com](https://pxicommand.com)
+**Live:** [pxicommand.com](https://pxicommand.com) · [/signals](https://pxicommand.com/signals)
 
 ## What is PXI?
 
@@ -47,6 +49,13 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 - **7 Tools** - get_pxi, get_predictions, get_similar_periods, get_signal, get_regime, get_market_context, get_history
 - **Agent-Optimized** - Structured responses with suggested actions and risk assessments
 
+### Sector Rotation Signals (`/signals`)
+- **Weekly Analysis** - Runs every Monday (or Tuesday if Monday is a US market holiday)
+- **Reddit Sentiment** - Analyzes 750+ posts from investing subreddits
+- **20 Sector Themes** - Nuclear, Automation, Defense, Copper, Financials, and more
+- **Classification System** - Signal type (Rotation/Momentum/Divergence/Reversion), confidence, timing
+- **Evidence-Based** - Links to source discussions for each theme
+
 ## Categories & Weights
 
 | Category | Weight | Key Indicators |
@@ -62,36 +71,54 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 ## Architecture
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Data Sources  │────▶│  GitHub Actions  │────▶│  Cloudflare D1  │
-│  FRED, Yahoo,   │     │   (Daily Cron)   │     │   (SQLite)      │
-│  DeFiLlama...   │     └──────────────────┘     └────────┬────────┘
-└─────────────────┘                                       │
-                                                          ▼
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  React Frontend │◀────│ Cloudflare Worker│◀────│  Workers AI     │
-│  (CF Pages)     │     │    (Edge API)    │     │  + Vectorize    │
-└─────────────────┘     └────────┬─────────┘     └─────────────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    ▼            ▼            ▼
-           ┌──────────────┐ ┌─────────┐ ┌─────────────┐
-           │ Cloudflare KV│ │   MCP   │ │  AI Agents  │
-           │ (ML Models)  │ │ Server  │ │  (Claude)   │
-           └──────────────┘ └─────────┘ └─────────────┘
+                              PXI INDEX                                    SIGNALS
+                    ┌─────────────────────────┐                 ┌─────────────────────────┐
+                    │                         │                 │                         │
+┌─────────────────┐ │  ┌──────────────────┐   │  ┌───────────┐  │  ┌──────────────────┐   │
+│   Data Sources  │───▶│  GitHub Actions  │   │  │  Reddit   │────▶│  Cloudflare Cron │   │
+│  FRED, Yahoo,   │ │  │   (Daily Cron)   │   │  │   API     │  │  │   (Weekly)       │   │
+│  DeFiLlama...   │ │  └────────┬─────────┘   │  └───────────┘  │  └────────┬─────────┘   │
+└─────────────────┘ │           │             │                 │           │             │
+                    │           ▼             │                 │           ▼             │
+                    │  ┌──────────────────┐   │                 │  ┌──────────────────┐   │
+                    │  │  Cloudflare D1   │   │                 │  │  Cloudflare D1   │   │
+                    │  │   (SQLite)       │   │                 │  │  + R2 Storage    │   │
+                    │  └────────┬─────────┘   │                 │  └────────┬─────────┘   │
+                    │           │             │                 │           │             │
+                    └───────────┼─────────────┘                 └───────────┼─────────────┘
+                                │                                           │
+                                ▼                                           ▼
+                    ┌──────────────────────────────────────────────────────────────────┐
+                    │                     React Frontend (CF Pages)                     │
+                    │                        pxicommand.com                             │
+                    └──────────────────────────────────────────────────────────────────┘
+```
+
+## Project Structure
+
+```
+pxi-command/
+├── frontend/        # React app (pxicommand.com)
+├── worker/          # Main PXI API worker
+├── signals/         # Sector rotation signals worker (/signals)
+├── ml/              # ML model training (XGBoost, LSTM)
+├── mcp-server/      # MCP server for AI agents
+├── src/             # Shared data collection scripts
+└── ai/              # AI analysis prompts
 ```
 
 ## Tech Stack
 
 - **Backend:** TypeScript, Node.js
 - **Database:** Cloudflare D1 (SQLite at edge)
+- **Storage:** Cloudflare R2 (report storage for signals)
 - **Vector Store:** Cloudflare Vectorize (768-dim embeddings)
 - **ML Models:** XGBoost + LSTM (trained locally, inference at edge via KV)
 - **AI:** Cloudflare Workers AI (BGE embeddings, Llama analysis)
 - **API:** Cloudflare Workers
 - **Frontend:** React 19, Vite, Tailwind CSS
 - **Hosting:** Cloudflare Pages
-- **Scheduler:** GitHub Actions (4x daily cron)
+- **Scheduler:** GitHub Actions (PXI daily) + Cloudflare Cron (Signals weekly)
 - **Agent Integration:** MCP Server (Model Context Protocol)
 
 ## API Endpoints
@@ -131,6 +158,16 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 | `/api/retrain` | POST | Retrain adaptive bucket thresholds |
 | `/api/export/training-data` | GET | Export data for ML model training |
 
+### Signals (`/signals/*`)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/signals/latest` | GET | Latest weekly report (HTML) |
+| `/signals/run/{id}` | GET | Specific report by run ID |
+| `/signals/api/runs` | GET | List all runs with metadata |
+| `/signals/api/runs/{id}` | GET | Run details as JSON |
+| `/signals/api/run` | POST | Trigger manual run (requires X-Admin-Token) |
+| `/signals/og-image.png` | GET | Dynamic OG image for social sharing |
+
 ## Development
 
 ```bash
@@ -147,8 +184,29 @@ npm run cron:daily
 # Start frontend dev server
 cd frontend && npm run dev
 
-# Deploy worker
+# Deploy main worker
 cd worker && npx wrangler deploy
+
+# Deploy signals worker
+cd signals && npm install && npx wrangler deploy
+```
+
+### Signals Development
+
+```bash
+cd signals
+
+# Run tests (258 tests)
+npm test
+
+# Generate offline report (uses sample data)
+npm run offline
+
+# Deploy to Cloudflare
+npx wrangler deploy
+
+# Set admin token for manual runs
+npx wrangler secret put ADMIN_RUN_TOKEN
 ```
 
 ### ML Model Training
