@@ -1,0 +1,7 @@
+node_modules
+wrangler.toml.*.backup
+.dev.vars
+.env
+out
+.wrangler
+.DS_Store

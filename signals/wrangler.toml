@@ -1,0 +1,34 @@
+name = "pxi-signals"
+main = "src/worker.ts"
+compatibility_date = "2024-10-01"
+
+routes = [
+  { pattern = "pxicommand.com/signals*", zone_name = "pxicommand.com" }
+]
+
+[triggers]
+# Weekly schedule: Monday & Tuesday at 15:00 UTC (10:00 AM EST / 11:00 AM EDT)
+# Monday runs normally; Tuesday runs only if Monday was a US market holiday
+crons = ["0 15 * * 1", "0 15 * * 2"]
+
+[[d1_databases]]
+binding = "SIGNALS_DB"
+database_name = "pxi_signals"
+database_id = "9d480cf6-3dc6-4e1f-b5d1-8e774a0e5105"
+
+[[r2_buckets]]
+binding = "SIGNALS_BUCKET"
+bucket_name = "pxi-signals"
+
+[[kv_namespaces]]
+binding = "SIGNALS_KV"
+id = "13003f5f87b144e1842f96b31a5ace61"
+
+[vars]
+PUBLIC_BASE_PATH = "/signals"
+DEFAULT_LOOKBACK_DAYS = 7
+DEFAULT_BASELINE_DAYS = 30
+DEFAULT_TOP_N = 10
+ENABLE_COMMENTS = 0
+ENABLE_RSS = 0
+PRICE_PROVIDER = "none"
