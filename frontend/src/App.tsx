@@ -1095,6 +1095,12 @@ function App() {
               >
                 /spec
               </button>
+              <a
+                href="/signals"
+                className="block w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
+              >
+                /signals
+              </a>
             </div>
           )}
         </div>
