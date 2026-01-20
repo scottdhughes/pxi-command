@@ -126,21 +126,28 @@ body::before {
   background: var(--bg);
 }
 
-.site-nav-brand {
+/* Dropdown Navigation - Matching pxicommand.com */
+.nav-dropdown {
+  position: relative;
+}
+
+.nav-dropdown-btn {
   display: flex;
   align-items: center;
-  text-decoration: none;
+  background: none;
+  border: none;
   font-family: var(--font-display);
   font-size: 13px;
   font-weight: 400;
   letter-spacing: 0.08em;
   color: rgba(255, 255, 255, 0.6);
   text-transform: uppercase;
-  transition: color 0.15s;
+  cursor: pointer;
   padding: 8px 0;
+  transition: color 0.15s;
 }
 
-.site-nav-brand:hover {
+.nav-dropdown-btn:hover {
   color: rgba(255, 255, 255, 0.85);
 }
 
@@ -153,6 +160,51 @@ body::before {
   margin-left: 6px;
   font-size: 8px;
   opacity: 0.7;
+}
+
+.brand-caret::after {
+  content: '▼';
+}
+
+.nav-dropdown.open .brand-caret::after {
+  content: '▲';
+}
+
+.nav-dropdown-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  min-width: 160px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: var(--space-sm) 0;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-4px);
+  transition: all 0.15s ease;
+  z-index: 200;
+}
+
+.nav-dropdown.open .nav-dropdown-menu {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+
+.nav-dropdown-item {
+  display: block;
+  padding: var(--space-sm) var(--space-md);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  text-decoration: none;
+  transition: background 0.15s;
+}
+
+.nav-dropdown-item:hover {
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .site-nav-date {

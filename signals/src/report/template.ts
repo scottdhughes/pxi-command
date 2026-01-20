@@ -634,7 +634,15 @@ export function renderHtml(
 <body>
   <!-- Site Navigation - Matching pxicommand.com -->
   <nav class="site-nav">
-    <a href="/" class="site-nav-brand">PXI<span class="brand-slash">/</span>COMMAND<span class="brand-caret">▼</span></a>
+    <div class="nav-dropdown">
+      <button class="nav-dropdown-btn" onclick="this.parentElement.classList.toggle('open')">
+        PXI<span class="brand-slash">/</span>COMMAND<span class="brand-caret"></span>
+      </button>
+      <div class="nav-dropdown-menu">
+        <a href="/spec" class="nav-dropdown-item">/SPEC</a>
+        <a href="/signals" class="nav-dropdown-item">/SIGNALS</a>
+      </div>
+    </div>
     <div class="site-nav-links">
       <a href="/signals" class="nav-link">Signals</a>
     </div>
