@@ -368,6 +368,10 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
 
   const biasColor = bias === 'BULLISH' ? 'text-[#00a3ff]' : bias === 'BEARISH' ? 'text-[#ff6b6b]' : 'text-[#949ba5]'
 
+  // Map technical bias terms to clearer outlook labels
+  const outlookLabel = bias === 'BULLISH' ? 'Favorable' : bias === 'BEARISH' ? 'Unfavorable' : 'Mixed'
+  const extremeLabel = (signal: string) => signal === 'BULLISH' ? 'Favorable Setup' : 'Caution'
+
   return (
     <div className="w-full mt-6 sm:mt-10">
       {/* Extreme reading alert */}
@@ -378,7 +382,7 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
           <div className={`text-[11px] font-medium uppercase tracking-wider ${
             extreme.signal === 'BULLISH' ? 'text-[#00a3ff]' : 'text-[#ff6b6b]'
           }`}>
-            {extreme.type} — {extreme.signal}
+            {extreme.type} — {extremeLabel(extreme.signal)}
           </div>
           <div className="text-[9px] text-[#949ba5]/50 mt-1">
             {extreme.historical_count} similar readings → {formatWinRate(extreme.win_rate_30d)} win rate
@@ -431,14 +435,17 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
 
       {/* Interpretation */}
       <div className="mt-6 text-center">
-        <div className={`text-[11px] font-medium uppercase tracking-wider ${biasColor}`}>
-          {bias}
+        <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-widest mb-1">
+          Forward Outlook
         </div>
-        <div className="text-[9px] text-[#949ba5]/40 mt-1">
+        <div className={`text-[11px] font-medium uppercase tracking-wider ${biasColor}`}>
+          {outlookLabel}
+        </div>
+        <div className="text-[9px] text-[#949ba5]/40 mt-2">
           {note}
         </div>
-        <div className="text-[8px] text-[#949ba5]/30 mt-2">
-          Based on {d7.sample_size} observations • {confidence.toLowerCase()} confidence
+        <div className="text-[8px] text-[#949ba5]/30 mt-1">
+          {d7.sample_size} observations at similar levels • {confidence.toLowerCase()} confidence
         </div>
       </div>
     </div>

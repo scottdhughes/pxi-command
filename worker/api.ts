@@ -3621,10 +3621,14 @@ export default {
             confidence: bucketReturns7d.length >= 50 ? 'HIGH' : bucketReturns7d.length >= 20 ? 'MEDIUM' : 'LOW',
             ml_confidence: mlPrediction ? getConfidenceLabel(mlPrediction.confidence_7d) : null,
             note: isExtremeLow
-              ? 'PXI in oversold territory - historically bullish setup'
+              ? 'Oversold readings have historically preceded rallies'
               : isExtremeHigh
-              ? 'PXI in overbought territory - expect mean reversion'
-              : `PXI in ${bucket} range - typical market conditions`,
+              ? 'Extended readings often see mean reversion'
+              : (winRate(bucketReturns7d) || 50) > 55
+              ? `At this level, markets rose ${Math.round(winRate(bucketReturns7d) || 0)}% of the time`
+              : (winRate(bucketReturns7d) || 50) < 45
+              ? `At this level, markets fell ${Math.round(100 - (winRate(bucketReturns7d) || 0))}% of the time`
+              : 'Mixed historical outcomes at this level',
           },
         }, { headers: corsHeaders });
       }
