@@ -2,6 +2,12 @@ import axios from 'axios';
 import { format, subDays, fromUnixTime } from 'date-fns';
 import { query } from '../db/connection.js';
 import type { IndicatorValue } from '../types/indicators.js';
+import {
+  resilientFetch,
+  isCircuitOpen,
+  createFetchSummary,
+  type FetchSummary,
+} from '../utils/resilience.js';
 
 // ============== DeFiLlama ==============
 
@@ -11,32 +17,49 @@ interface DefiLlamaStablecoin {
 }
 
 export async function fetchStablecoinMcap(): Promise<IndicatorValue[]> {
-  try {
-    // Get total stablecoin market cap over time
-    const response = await axios.get(
-      'https://stablecoins.llama.fi/stablecoincharts/all',
-      { params: { stablecoin: 'USDT,USDC,DAI,BUSD,TUSD,USDP,GUSD,FRAX' } }
-    );
+  const SOURCE_NAME = 'defillama';
 
-    // Alternative: get aggregated data
-    const aggResponse = await axios.get(
-      'https://stablecoins.llama.fi/stablecoincharts/all'
-    );
-
-    if (!Array.isArray(aggResponse.data)) {
-      console.warn('Unexpected DeFiLlama response format');
-      return [];
-    }
-
-    return aggResponse.data.map((d: DefiLlamaStablecoin) => ({
-      indicatorId: 'stablecoin_mcap',
-      date: fromUnixTime(d.date),
-      value: d.totalCirculating?.peggedUSD || 0,
-    }));
-  } catch (err: any) {
-    console.error('DeFiLlama fetch error:', err.message);
-    throw err;
+  // Check circuit breaker
+  if (isCircuitOpen(SOURCE_NAME)) {
+    console.log('  ⚡ Circuit open for DeFiLlama, skipping');
+    return [];
   }
+
+  return resilientFetch(
+    async () => {
+      // Get total stablecoin market cap over time
+      const response = await axios.get(
+        'https://stablecoins.llama.fi/stablecoincharts/all',
+        {
+          params: { stablecoin: 'USDT,USDC,DAI,BUSD,TUSD,USDP,GUSD,FRAX' },
+          timeout: 30000,
+        }
+      );
+
+      // Alternative: get aggregated data
+      const aggResponse = await axios.get(
+        'https://stablecoins.llama.fi/stablecoincharts/all',
+        { timeout: 30000 }
+      );
+
+      if (!Array.isArray(aggResponse.data)) {
+        console.warn('Unexpected DeFiLlama response format');
+        return [];
+      }
+
+      return aggResponse.data.map((d: DefiLlamaStablecoin) => ({
+        indicatorId: 'stablecoin_mcap',
+        date: fromUnixTime(d.date),
+        value: d.totalCirculating?.peggedUSD || 0,
+      }));
+    },
+    {
+      sourceName: SOURCE_NAME,
+      maxAttempts: 3,
+      baseDelayMs: 2000,  // DeFiLlama may rate limit
+      timeoutMs: 60000,   // Large dataset
+    }
+  );
 }
 
 // Calculate 30-day rate of change for stablecoin mcap
@@ -76,64 +99,79 @@ interface CoinGlassFundingRate {
 }
 
 export async function fetchBtcFundingRate(): Promise<IndicatorValue[]> {
-  try {
-    // CoinGlass public API for funding rates
-    const response = await axios.get(
-      'https://open-api.coinglass.com/public/v2/funding',
-      {
-        params: { symbol: 'BTC' },
-        headers: {
-          accept: 'application/json',
-        },
-      }
-    );
+  const SOURCE_NAME = 'coinglass';
 
-    if (!response.data?.data) {
-      // Try alternative endpoint
-      const altResponse = await axios.get(
-        'https://fapi.coinglass.com/api/fundingRate/v2/home'
+  // Check circuit breaker
+  if (isCircuitOpen(SOURCE_NAME)) {
+    console.log('  ⚡ Circuit open for CoinGlass, skipping');
+    return [];
+  }
+
+  return resilientFetch(
+    async () => {
+      // CoinGlass public API for funding rates
+      const response = await axios.get(
+        'https://open-api.coinglass.com/public/v2/funding',
+        {
+          params: { symbol: 'BTC' },
+          headers: {
+            accept: 'application/json',
+          },
+          timeout: 15000,
+        }
       );
 
-      if (altResponse.data?.data) {
-        const btcData = altResponse.data.data.find(
-          (d: any) => d.symbol === 'BTC'
+      if (!response.data?.data) {
+        // Try alternative endpoint
+        const altResponse = await axios.get(
+          'https://fapi.coinglass.com/api/fundingRate/v2/home',
+          { timeout: 15000 }
         );
-        if (btcData) {
-          // Average funding rate across exchanges
-          const rates = btcData.uMarginList || [];
-          const avgRate =
-            rates.reduce((sum: number, r: any) => sum + (r.rate || 0), 0) /
-            Math.max(rates.length, 1);
 
-          return [
-            {
-              indicatorId: 'btc_funding_rate',
-              date: new Date(),
-              value: avgRate * 100, // Convert to percentage
-            },
-          ];
+        if (altResponse.data?.data) {
+          const btcData = altResponse.data.data.find(
+            (d: any) => d.symbol === 'BTC'
+          );
+          if (btcData) {
+            // Average funding rate across exchanges
+            const rates = btcData.uMarginList || [];
+            const avgRate =
+              rates.reduce((sum: number, r: any) => sum + (r.rate || 0), 0) /
+              Math.max(rates.length, 1);
+
+            return [
+              {
+                indicatorId: 'btc_funding_rate',
+                date: new Date(),
+                value: avgRate * 100, // Convert to percentage
+              },
+            ];
+          }
         }
+        return [];
       }
-      return [];
+
+      const data = response.data.data as CoinGlassFundingRate;
+      const rates = data.uMarginList || [];
+      const avgRate =
+        rates.reduce((sum, r) => sum + (r.rate || 0), 0) /
+        Math.max(rates.length, 1);
+
+      return [
+        {
+          indicatorId: 'btc_funding_rate',
+          date: new Date(),
+          value: avgRate * 100,
+        },
+      ];
+    },
+    {
+      sourceName: SOURCE_NAME,
+      maxAttempts: 3,
+      baseDelayMs: 1000,
+      timeoutMs: 30000,
     }
-
-    const data = response.data.data as CoinGlassFundingRate;
-    const rates = data.uMarginList || [];
-    const avgRate =
-      rates.reduce((sum, r) => sum + (r.rate || 0), 0) /
-      Math.max(rates.length, 1);
-
-    return [
-      {
-        indicatorId: 'btc_funding_rate',
-        date: new Date(),
-        value: avgRate * 100,
-      },
-    ];
-  } catch (err: any) {
-    console.error('CoinGlass fetch error:', err.message);
-    throw err;
-  }
+  );
 }
 
 // Normalize funding rate using bell curve (optimal range 0.01-0.03%)
@@ -192,9 +230,13 @@ export async function saveCryptoData(
 export async function fetchAllCryptoIndicators(): Promise<{
   success: string[];
   failed: string[];
+  skipped: string[];
+  summaries: FetchSummary[];
 }> {
   const success: string[] = [];
   const failed: string[] = [];
+  const skipped: string[] = [];
+  const summaries: FetchSummary[] = [];
 
   console.log('\n🪙 Fetching crypto indicators...\n');
 
@@ -202,25 +244,45 @@ export async function fetchAllCryptoIndicators(): Promise<{
   try {
     console.log('  Fetching stablecoin market cap...');
     const stableData = await calculateStablecoinRoc();
-    const saved = await saveCryptoData('stablecoin_mcap', stableData, 'defillama');
-    console.log(`  ✓ stablecoin_mcap: ${saved} records saved`);
-    success.push('stablecoin_mcap');
+    if (stableData.length === 0 && isCircuitOpen('defillama')) {
+      skipped.push('stablecoin_mcap');
+      summaries.push(createFetchSummary('defillama', false, 0, 'Circuit breaker open'));
+    } else {
+      const saved = await saveCryptoData('stablecoin_mcap', stableData, 'defillama');
+      console.log(`  ✓ stablecoin_mcap: ${saved} records saved`);
+      success.push('stablecoin_mcap');
+      summaries.push(createFetchSummary('defillama', true, saved));
+    }
   } catch (err: any) {
     console.error(`  ✗ stablecoin_mcap: ${err.message}`);
     failed.push('stablecoin_mcap');
+    summaries.push(createFetchSummary('defillama', false, 0, err.message));
   }
 
   // BTC funding rate
   try {
     console.log('  Fetching BTC funding rate...');
     const fundingData = await fetchBtcFundingRate();
-    const saved = await saveCryptoData('btc_funding_rate', fundingData, 'coinglass');
-    console.log(`  ✓ btc_funding_rate: ${saved} records saved`);
-    success.push('btc_funding_rate');
+    if (fundingData.length === 0 && isCircuitOpen('coinglass')) {
+      skipped.push('btc_funding_rate');
+      summaries.push(createFetchSummary('coinglass', false, 0, 'Circuit breaker open'));
+    } else {
+      const saved = await saveCryptoData('btc_funding_rate', fundingData, 'coinglass');
+      console.log(`  ✓ btc_funding_rate: ${saved} records saved`);
+      success.push('btc_funding_rate');
+      summaries.push(createFetchSummary('coinglass', true, saved));
+    }
   } catch (err: any) {
     console.error(`  ✗ btc_funding_rate: ${err.message}`);
     failed.push('btc_funding_rate');
+    summaries.push(createFetchSummary('coinglass', false, 0, err.message));
   }
 
-  return { success, failed };
+  // Log summary
+  console.log('\n📊 Crypto Fetch Summary:');
+  console.log(`  ✓ Success: ${success.length} indicators`);
+  console.log(`  ✗ Failed: ${failed.length} indicators`);
+  console.log(`  ⚡ Skipped (circuit open): ${skipped.length} indicators`);
+
+  return { success, failed, skipped, summaries };
 }

@@ -1,9 +1,30 @@
-import { format, subDays } from 'date-fns';
+import { format, subDays, differenceInDays, isWeekend, addDays } from 'date-fns';
 import { query } from '../db/connection.js';
 import { INDICATORS, getIndicatorById } from '../config/indicators.js';
 import { CATEGORY_WEIGHTS, type Category } from '../types/indicators.js';
 
 const LOOKBACK_DAYS = 504; // ~2 years of trading days
+const STALENESS_THRESHOLD_DAYS = 5; // Exclude indicator if data is older than this
+const GAP_FILL_MAX_DAYS = 3; // Forward-fill for up to 3 business days
+
+// ============== Staleness & Gap Detection ==============
+
+export interface StalenessReport {
+  indicatorId: string;
+  lastDataDate: string | null;
+  daysSinceUpdate: number;
+  isStale: boolean;
+  wasForwardFilled: boolean;
+}
+
+export interface DataQualityReport {
+  targetDate: string;
+  totalIndicators: number;
+  validIndicators: number;
+  staleIndicators: StalenessReport[];
+  forwardFilledIndicators: StalenessReport[];
+  excludedIndicators: StalenessReport[];
+}
 
 interface HistoricalData {
   values: number[];
@@ -11,6 +32,97 @@ interface HistoricalData {
   max: number;
   mean: number;
   stdDev: number;
+}
+
+// Check if we should exclude indicator due to staleness
+function checkIndicatorStaleness(
+  indicatorDate: string,
+  targetDate: Date
+): { daysSinceUpdate: number; isStale: boolean; shouldExclude: boolean } {
+  const dataDate = new Date(indicatorDate);
+  const daysSinceUpdate = differenceInDays(targetDate, dataDate);
+
+  // Account for weekends - if data is from Friday and today is Monday, that's OK
+  const businessDaysSince = countBusinessDays(dataDate, targetDate);
+
+  return {
+    daysSinceUpdate,
+    isStale: businessDaysSince > 2, // Warn if older than 2 business days
+    shouldExclude: businessDaysSince > STALENESS_THRESHOLD_DAYS,
+  };
+}
+
+// Count business days between two dates
+function countBusinessDays(startDate: Date, endDate: Date): number {
+  let count = 0;
+  let current = addDays(startDate, 1);
+
+  while (current <= endDate) {
+    if (!isWeekend(current)) {
+      count++;
+    }
+    current = addDays(current, 1);
+  }
+
+  return count;
+}
+
+// Get indicator value with forward-fill logic
+async function getIndicatorValueWithGapFill(
+  indicatorId: string,
+  targetDateStr: string,
+  targetDate: Date
+): Promise<{
+  value: number | null;
+  date: string | null;
+  wasForwardFilled: boolean;
+  staleness: StalenessReport;
+}> {
+  // Get the most recent value on or before target date
+  const result = await query(
+    `SELECT value, date FROM indicator_values
+     WHERE indicator_id = $1 AND date <= $2
+     ORDER BY date DESC
+     LIMIT 1`,
+    [indicatorId, targetDateStr]
+  );
+
+  if (result.rows.length === 0) {
+    return {
+      value: null,
+      date: null,
+      wasForwardFilled: false,
+      staleness: {
+        indicatorId,
+        lastDataDate: null,
+        daysSinceUpdate: Infinity,
+        isStale: true,
+        wasForwardFilled: false,
+      },
+    };
+  }
+
+  const dataDate = result.rows[0].date as string;
+  const rawValue = parseFloat(result.rows[0].value);
+  const { daysSinceUpdate, isStale, shouldExclude } = checkIndicatorStaleness(
+    dataDate,
+    targetDate
+  );
+
+  const wasForwardFilled = dataDate !== targetDateStr;
+
+  return {
+    value: shouldExclude ? null : rawValue,
+    date: dataDate,
+    wasForwardFilled,
+    staleness: {
+      indicatorId,
+      lastDataDate: dataDate,
+      daysSinceUpdate,
+      isStale: shouldExclude,
+      wasForwardFilled,
+    },
+  };
 }
 
 // Get historical data for percentile calculations
@@ -161,33 +273,51 @@ export async function normalizeIndicator(
   return Math.max(0, Math.min(100, normalized));
 }
 
-// Calculate all indicator scores for a given date
+// Calculate all indicator scores for a given date (with data quality tracking)
 export async function calculateIndicatorScores(
   targetDate: Date
-): Promise<Map<string, { raw: number; normalized: number }>> {
+): Promise<{
+  scores: Map<string, { raw: number; normalized: number }>;
+  qualityReport: DataQualityReport;
+}> {
   const scores = new Map<string, { raw: number; normalized: number }>();
   const dateStr = format(targetDate, 'yyyy-MM-dd');
 
+  const staleIndicators: StalenessReport[] = [];
+  const forwardFilledIndicators: StalenessReport[] = [];
+  const excludedIndicators: StalenessReport[] = [];
+
   for (const indicator of INDICATORS) {
     try {
-      // Get the most recent value on or before target date
-      const result = await query(
-        `SELECT value, date FROM indicator_values
-         WHERE indicator_id = $1 AND date <= $2
-         ORDER BY date DESC
-         LIMIT 1`,
-        [indicator.id, dateStr]
-      );
+      // Get value with gap-fill and staleness tracking
+      const { value, date, wasForwardFilled, staleness } =
+        await getIndicatorValueWithGapFill(indicator.id, dateStr, targetDate);
 
-      if (result.rows.length === 0) {
-        console.warn(`No data for ${indicator.id} on or before ${dateStr}`);
+      // Track data quality
+      if (staleness.isStale) {
+        excludedIndicators.push(staleness);
+        console.warn(
+          `⚠️ Excluding ${indicator.id}: data is ${staleness.daysSinceUpdate} days old (last: ${staleness.lastDataDate})`
+        );
         continue;
       }
 
-      const rawValue = parseFloat(result.rows[0].value);
-      const normalized = await normalizeIndicator(indicator.id, rawValue, targetDate);
+      if (wasForwardFilled) {
+        forwardFilledIndicators.push(staleness);
+        console.log(
+          `📋 Forward-filled ${indicator.id}: using data from ${date} (${staleness.daysSinceUpdate}d ago)`
+        );
+      }
 
-      scores.set(indicator.id, { raw: rawValue, normalized });
+      if (value === null) {
+        console.warn(`No data for ${indicator.id} on or before ${dateStr}`);
+        staleIndicators.push(staleness);
+        continue;
+      }
+
+      const normalized = await normalizeIndicator(indicator.id, value, targetDate);
+
+      scores.set(indicator.id, { raw: value, normalized });
 
       // Save to indicator_scores table
       await query(
@@ -197,13 +327,42 @@ export async function calculateIndicatorScores(
          DO UPDATE SET raw_value = EXCLUDED.raw_value,
                        normalized_value = EXCLUDED.normalized_value,
                        calculated_at = NOW()`,
-        [indicator.id, dateStr, rawValue, normalized, LOOKBACK_DAYS]
+        [indicator.id, dateStr, value, normalized, LOOKBACK_DAYS]
       );
     } catch (err) {
       console.error(`Error processing ${indicator.id}:`, err);
     }
   }
 
+  const qualityReport: DataQualityReport = {
+    targetDate: dateStr,
+    totalIndicators: INDICATORS.length,
+    validIndicators: scores.size,
+    staleIndicators,
+    forwardFilledIndicators,
+    excludedIndicators,
+  };
+
+  // Log summary
+  if (excludedIndicators.length > 0 || forwardFilledIndicators.length > 0) {
+    console.log('\n📊 Data Quality Summary:');
+    console.log(`  ✓ Valid: ${scores.size}/${INDICATORS.length} indicators`);
+    if (forwardFilledIndicators.length > 0) {
+      console.log(`  📋 Forward-filled: ${forwardFilledIndicators.length} indicators`);
+    }
+    if (excludedIndicators.length > 0) {
+      console.log(`  ⚠️ Excluded (stale): ${excludedIndicators.length} indicators`);
+    }
+  }
+
+  return { scores, qualityReport };
+}
+
+// Legacy wrapper for backward compatibility
+export async function calculateIndicatorScoresLegacy(
+  targetDate: Date
+): Promise<Map<string, { raw: number; normalized: number }>> {
+  const { scores } = await calculateIndicatorScores(targetDate);
   return scores;
 }
 
@@ -269,11 +428,12 @@ export async function calculatePXI(targetDate: Date): Promise<{
   score: number;
   label: string;
   status: string;
+  dataQuality?: DataQualityReport;
 }> {
   const dateStr = format(targetDate, 'yyyy-MM-dd');
 
-  // Get indicator scores
-  const indicatorScores = await calculateIndicatorScores(targetDate);
+  // Get indicator scores with quality report
+  const { scores: indicatorScores, qualityReport } = await calculateIndicatorScores(targetDate);
 
   // Get category scores
   const categoryScores = await calculateCategoryScores(targetDate, indicatorScores);
@@ -325,7 +485,7 @@ export async function calculatePXI(targetDate: Date): Promise<{
     [dateStr, totalScore, label, status, delta1d, delta7d, delta30d]
   );
 
-  return { score: totalScore, label, status };
+  return { score: totalScore, label, status, dataQuality: qualityReport };
 }
 
 async function getDelta(

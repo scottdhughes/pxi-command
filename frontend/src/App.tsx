@@ -1,5 +1,190 @@
 import { useEffect, useState, useRef } from 'react'
 
+// ============== ML Accuracy Data Interface ==============
+// Matches the /api/ml/accuracy response format
+interface MLAccuracyApiResponse {
+  total_predictions: number
+  evaluated_count: number
+  pending_count: number
+  error?: string
+  metrics: {
+    ensemble: {
+      d7: { direction_accuracy: string; mean_absolute_error: string; sample_size: number } | null
+      d30: { direction_accuracy: string; mean_absolute_error: string; sample_size: number } | null
+    } | null
+  } | null
+}
+
+// Parsed format for display
+interface MLAccuracyData {
+  rolling_7d: {
+    direction_accuracy: number
+    sample_size: number
+    mae: number | null
+  }
+  rolling_30d: {
+    direction_accuracy: number
+    sample_size: number
+    mae: number | null
+  }
+  all_time: {
+    direction_accuracy_7d: number
+    direction_accuracy_30d: number
+    total_predictions: number
+  }
+}
+
+// Parse API response to display format
+function parseMLAccuracy(api: MLAccuracyApiResponse): MLAccuracyData | null {
+  if (!api.metrics?.ensemble) return null
+
+  const d7 = api.metrics.ensemble.d7
+  const d30 = api.metrics.ensemble.d30
+
+  return {
+    rolling_7d: {
+      direction_accuracy: d7 ? parseFloat(d7.direction_accuracy.replace('%', '')) : 50,
+      sample_size: d7?.sample_size || 0,
+      mae: d7 ? parseFloat(d7.mean_absolute_error) : null
+    },
+    rolling_30d: {
+      direction_accuracy: d30 ? parseFloat(d30.direction_accuracy.replace('%', '')) : 50,
+      sample_size: d30?.sample_size || 0,
+      mae: d30 ? parseFloat(d30.mean_absolute_error) : null
+    },
+    all_time: {
+      direction_accuracy_7d: d7 ? parseFloat(d7.direction_accuracy.replace('%', '')) : 50,
+      direction_accuracy_30d: d30 ? parseFloat(d30.direction_accuracy.replace('%', '')) : 50,
+      total_predictions: api.total_predictions
+    }
+  }
+}
+
+// ============== History Data Interface ==============
+interface HistoryDataPoint {
+  date: string
+  score: number
+  regime?: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
+}
+
+// ============== Alerts Interface ==============
+interface AlertData {
+  id: number
+  date: string
+  alert_type: string
+  message: string
+  severity: 'info' | 'warning' | 'critical'
+  acknowledged: boolean
+  pxi_score: number | null
+  forward_return_7d: number | null
+  forward_return_30d: number | null
+}
+
+interface AlertsApiResponse {
+  alerts: AlertData[]
+  count: number
+  filters: {
+    types: { type: string; count: number }[]
+  }
+  accuracy: Record<string, {
+    total: number
+    accuracy_7d: number | null
+    avg_return_7d: number
+  }>
+}
+
+// ============== Category Details Interface ==============
+interface CategoryDetailData {
+  category: string
+  date: string
+  score: number
+  weight: number
+  percentile_rank: number
+  indicators: {
+    id: string
+    name: string
+    raw_value: number
+    normalized_value: number
+  }[]
+  history: {
+    date: string
+    score: number
+  }[]
+}
+
+// ============== Signals Theme Interface ==============
+interface SignalTheme {
+  rank: number
+  theme_id: string
+  theme_name: string
+  score: number
+  classification: {
+    regime: 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+    strength: 'STRONG' | 'MODERATE' | 'WEAK'
+    trend: 'RISING' | 'FALLING' | 'FLAT'
+  }
+  key_tickers: string[]
+}
+
+interface SignalsData {
+  run_id: string
+  generated_at_utc: string
+  themes: SignalTheme[]
+}
+
+// ============== Similar Periods Interface ==============
+interface SimilarPeriod {
+  date: string
+  similarity: number
+  weights: {
+    combined: number
+    similarity: number
+    recency: number
+    accuracy: number
+    accuracy_sample: number
+  }
+  pxi: {
+    date: string
+    score: number
+    label: string
+    status: string
+  } | null
+  forward_returns: {
+    d7: number | null
+    d30: number | null
+  } | null
+}
+
+interface SimilarPeriodsData {
+  current_date: string
+  similar_periods: SimilarPeriod[]
+}
+
+// ============== Backtest Data Interface ==============
+interface BacktestData {
+  summary: {
+    total_observations: number
+    with_7d_return: number
+    with_30d_return: number
+    date_range: {
+      start: string
+      end: string
+    }
+  }
+  bucket_analysis: {
+    bucket: string
+    count: number
+    avg_return_7d: number | null
+    avg_return_30d: number | null
+    win_rate_7d: number | null
+    win_rate_30d: number | null
+  }[]
+  extreme_readings?: {
+    low_pxi: { count: number; avg_return_30d: number | null; win_rate_30d: number | null }
+    high_pxi: { count: number; avg_return_30d: number | null; win_rate_30d: number | null }
+  }
+}
+
 interface PXIData {
   date: string
   score: number
@@ -39,6 +224,16 @@ interface PXIData {
       }
     }[]
   } | null
+  // v1.4: Data freshness info
+  dataFreshness?: {
+    hasStaleData: boolean
+    staleCount: number
+    staleIndicators: {
+      id: string
+      lastUpdate: string
+      daysOld: number
+    }[]
+  }
 }
 
 // v1.1: Signal layer data
@@ -327,13 +522,24 @@ function DivergenceAlerts({ divergence }: { divergence: PXIData['divergence'] })
   )
 }
 
-function CategoryBar({ name, score }: { name: string; score: number }) {
+function CategoryBar({
+  name,
+  score,
+  onClick
+}: {
+  name: string
+  score: number
+  onClick?: () => void
+}) {
   const isHigh = score >= 70
   const displayName = name.replace(/_/g, ' ')
 
   return (
-    <div className="flex items-center gap-2 sm:gap-4">
-      <span className="w-20 sm:w-28 text-right text-[#949ba5] text-[11px] sm:text-[13px] tracking-wide capitalize">
+    <button
+      onClick={onClick}
+      className="flex items-center gap-2 sm:gap-4 w-full text-left hover:bg-[#0a0a0a]/40 rounded px-1 py-0.5 -mx-1 transition-colors group"
+    >
+      <span className="w-20 sm:w-28 text-right text-[#949ba5] text-[11px] sm:text-[13px] tracking-wide capitalize group-hover:text-[#f3f3f3] transition-colors">
         {displayName}
       </span>
       <div className="flex-1 h-[3px] bg-[#26272b] rounded-full overflow-hidden">
@@ -347,7 +553,10 @@ function CategoryBar({ name, score }: { name: string; score: number }) {
       <span className="w-6 sm:w-8 text-right font-mono text-[11px] sm:text-[12px] text-[#949ba5]">
         {Math.round(score)}
       </span>
-    </div>
+      <span className="text-[#949ba5]/30 text-[10px] opacity-0 group-hover:opacity-100 transition-opacity">
+        ›
+      </span>
+    </button>
   )
 }
 
@@ -452,7 +661,1218 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
   )
 }
 
-function MLPredictionsCard({ ensemble }: { ensemble: EnsembleData | null }) {
+// ============== Onboarding Modal ==============
+function OnboardingModal({ onClose }: { onClose: () => void }) {
+  const [step, setStep] = useState(0)
+
+  const steps = [
+    {
+      title: 'Welcome to PXI',
+      content: (
+        <div className="space-y-4">
+          <p className="text-[13px] text-[#949ba5] leading-relaxed">
+            PXI (Pamp Index) is a composite indicator measuring <span className="text-[#f3f3f3]">macro market strength</span> across seven dimensions.
+          </p>
+          <div className="bg-[#0a0a0a] rounded-lg p-4 border border-[#26272b]">
+            <div className="text-center">
+              <div className="text-6xl font-extralight text-[#f3f3f3] mb-2">53</div>
+              <div className="text-[10px] text-[#949ba5]/60 uppercase tracking-widest">Example Score</div>
+            </div>
+          </div>
+          <p className="text-[11px] text-[#949ba5]/70">
+            The score ranges from 0-100, synthesizing volatility, credit, breadth, positioning, macro, global, and crypto signals.
+          </p>
+        </div>
+      )
+    },
+    {
+      title: 'Score Interpretation',
+      content: (
+        <div className="space-y-3">
+          <p className="text-[12px] text-[#949ba5] mb-4">
+            Higher scores indicate stronger risk-on conditions. Lower scores suggest caution.
+          </p>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#ff6b6b]">
+              <div className="w-16 text-[11px] font-mono text-[#ff6b6b]">0–30</div>
+              <div className="flex-1">
+                <div className="text-[11px] text-[#f3f3f3]">Weak / Dumping</div>
+                <div className="text-[9px] text-[#949ba5]/60">Historically favorable for forward returns (mean reversion)</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#949ba5]">
+              <div className="w-16 text-[11px] font-mono text-[#949ba5]">30–60</div>
+              <div className="flex-1">
+                <div className="text-[11px] text-[#f3f3f3]">Neutral / Soft</div>
+                <div className="text-[9px] text-[#949ba5]/60">Typical market conditions, no strong directional bias</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#00a3ff]">
+              <div className="w-16 text-[11px] font-mono text-[#00a3ff]">60–80</div>
+              <div className="flex-1">
+                <div className="text-[11px] text-[#f3f3f3]">Strong / Pamping</div>
+                <div className="text-[9px] text-[#949ba5]/60">Risk-on conditions, favorable environment</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#f59e0b]">
+              <div className="w-16 text-[11px] font-mono text-[#f59e0b]">80–100</div>
+              <div className="flex-1">
+                <div className="text-[11px] text-[#f3f3f3]">Extended / Max Pamp</div>
+                <div className="text-[9px] text-[#949ba5]/60">Historically poor forward returns, elevated reversal risk</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )
+    },
+    {
+      title: 'Market Regimes',
+      content: (
+        <div className="space-y-4">
+          <p className="text-[12px] text-[#949ba5]">
+            Market regime is classified using a voting system across key indicators.
+          </p>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 bg-[#00a3ff]/10 border border-[#00a3ff]/30 rounded px-3 py-2">
+              <span className="text-[#00a3ff] text-lg">↗</span>
+              <div>
+                <div className="text-[11px] text-[#00a3ff] uppercase tracking-wide">Risk On</div>
+                <div className="text-[9px] text-[#949ba5]/60">Favorable for equities, credit tight, volatility low</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 bg-[#f59e0b]/10 border border-[#f59e0b]/30 rounded px-3 py-2">
+              <span className="text-[#f59e0b] text-lg">↔</span>
+              <div>
+                <div className="text-[11px] text-[#f59e0b] uppercase tracking-wide">Transition</div>
+                <div className="text-[9px] text-[#949ba5]/60">Mixed signals, regime unclear or shifting</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 bg-[#ff6b6b]/10 border border-[#ff6b6b]/30 rounded px-3 py-2">
+              <span className="text-[#ff6b6b] text-lg">↘</span>
+              <div>
+                <div className="text-[11px] text-[#ff6b6b] uppercase tracking-wide">Risk Off</div>
+                <div className="text-[9px] text-[#949ba5]/60">Defensive positioning recommended, stress signals</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )
+    },
+    {
+      title: 'Categories & Signals',
+      content: (
+        <div className="space-y-4">
+          <p className="text-[12px] text-[#949ba5]">
+            PXI aggregates 7 category scores, each with specific weights:
+          </p>
+          <div className="grid grid-cols-2 gap-2 text-[10px]">
+            {[
+              { name: 'Credit', weight: '20%', desc: 'HY/IG spreads, curve' },
+              { name: 'Volatility', weight: '20%', desc: 'VIX, term structure' },
+              { name: 'Breadth', weight: '15%', desc: 'RSP/SPY, sectors' },
+              { name: 'Positioning', weight: '15%', desc: 'Fed, TGA, RRP' },
+              { name: 'Macro', weight: '10%', desc: 'ISM, claims' },
+              { name: 'Global', weight: '10%', desc: 'DXY, EM spreads' },
+              { name: 'Crypto', weight: '10%', desc: 'BTC, stables' },
+            ].map(cat => (
+              <div key={cat.name} className="bg-[#0a0a0a] rounded px-2 py-1.5">
+                <div className="flex justify-between">
+                  <span className="text-[#f3f3f3]">{cat.name}</span>
+                  <span className="text-[#00a3ff]">{cat.weight}</span>
+                </div>
+                <div className="text-[8px] text-[#949ba5]/50">{cat.desc}</div>
+              </div>
+            ))}
+          </div>
+          <p className="text-[9px] text-[#949ba5]/50 text-center">
+            See /spec for full methodology and backtest results
+          </p>
+        </div>
+      )
+    }
+  ]
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+      {/* Backdrop */}
+      <div
+        className="absolute inset-0 bg-black/90 backdrop-blur-sm"
+        onClick={onClose}
+      />
+
+      {/* Modal */}
+      <div className="relative bg-[#0a0a0a] border border-[#26272b] rounded-lg max-w-md w-full overflow-hidden shadow-2xl">
+        {/* Progress dots */}
+        <div className="flex justify-center gap-2 pt-6 pb-2">
+          {steps.map((_, i) => (
+            <button
+              key={i}
+              onClick={() => setStep(i)}
+              className={`w-1.5 h-1.5 rounded-full transition-all ${
+                i === step ? 'bg-[#00a3ff] w-4' : 'bg-[#26272b] hover:bg-[#949ba5]/30'
+              }`}
+            />
+          ))}
+        </div>
+
+        {/* Content */}
+        <div className="px-6 py-4">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-3">
+            {steps[step].title}
+          </h2>
+          <div className="min-h-[280px]">
+            {steps[step].content}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex justify-between items-center px-6 py-4 border-t border-[#26272b]">
+          <button
+            onClick={() => step > 0 && setStep(step - 1)}
+            className={`text-[10px] uppercase tracking-widest transition-colors ${
+              step > 0 ? 'text-[#949ba5] hover:text-[#f3f3f3]' : 'text-transparent pointer-events-none'
+            }`}
+          >
+            Back
+          </button>
+
+          {step < steps.length - 1 ? (
+            <button
+              onClick={() => setStep(step + 1)}
+              className="text-[10px] uppercase tracking-widest text-[#00a3ff] hover:text-[#f3f3f3] transition-colors"
+            >
+              Next
+            </button>
+          ) : (
+            <button
+              onClick={onClose}
+              className="text-[10px] uppercase tracking-widest bg-[#00a3ff] text-black px-4 py-1.5 rounded hover:bg-[#00a3ff]/80 transition-colors"
+            >
+              Get Started
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============== Tooltip Component ==============
+function Tooltip({ children, content }: { children: React.ReactNode; content: string }) {
+  const [show, setShow] = useState(false)
+
+  return (
+    <span
+      className="relative inline-flex items-center cursor-help"
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+    >
+      {children}
+      <span className="ml-1 text-[#949ba5]/40 text-[8px]">ⓘ</span>
+      {show && (
+        <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-[#1a1a1a] border border-[#26272b] rounded text-[10px] text-[#949ba5] whitespace-nowrap z-50 shadow-lg">
+          {content}
+          <span className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-[#1a1a1a]" />
+        </span>
+      )}
+    </span>
+  )
+}
+
+// ============== Historical Chart Component ==============
+function HistoricalChart({
+  data,
+  range,
+  onRangeChange
+}: {
+  data: HistoryDataPoint[]
+  range: '7d' | '30d' | '90d'
+  onRangeChange: (range: '7d' | '30d' | '90d') => void
+}) {
+  const [hoveredPoint, setHoveredPoint] = useState<HistoryDataPoint | null>(null)
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
+
+  if (!data || data.length === 0) return null
+
+  const rangeMap = { '7d': 7, '30d': 30, '90d': 90 }
+  const displayData = data.slice(-rangeMap[range])
+
+  const min = Math.min(...displayData.map(d => d.score))
+  const max = Math.max(...displayData.map(d => d.score))
+  const range_ = max - min || 1
+
+  const width = 100
+  const height = 100
+  const padding = { top: 8, right: 4, bottom: 20, left: 4 }
+  const chartWidth = width - padding.left - padding.right
+  const chartHeight = height - padding.top - padding.bottom
+
+  const getRegimeColor = (regime?: string) => {
+    switch(regime) {
+      case 'RISK_ON': return '#00a3ff'
+      case 'RISK_OFF': return '#ff6b6b'
+      case 'TRANSITION': return '#f59e0b'
+      default: return '#949ba5'
+    }
+  }
+
+  // Create path with gradient stops
+  const points = displayData.map((d, i) => {
+    const x = padding.left + (i / (displayData.length - 1)) * chartWidth
+    const y = padding.top + chartHeight - ((d.score - min) / range_) * chartHeight
+    return { x, y, data: d }
+  })
+
+  const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`).join(' ')
+
+  // Area path for gradient fill
+  const areaD = `${pathD} L${points[points.length - 1].x},${height - padding.bottom} L${points[0].x},${height - padding.bottom} Z`
+
+  return (
+    <div className="w-full mt-8">
+      <div className="flex justify-between items-center mb-4">
+        <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-widest">
+          Historical Trend
+        </div>
+        <div className="flex gap-1">
+          {(['7d', '30d', '90d'] as const).map(r => (
+            <button
+              key={r}
+              onClick={() => onRangeChange(r)}
+              className={`px-2 py-0.5 text-[9px] uppercase tracking-wider rounded transition-all ${
+                range === r
+                  ? 'bg-[#00a3ff]/20 text-[#00a3ff] border border-[#00a3ff]/30'
+                  : 'text-[#949ba5]/50 hover:text-[#949ba5] border border-transparent'
+              }`}
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="relative bg-[#0a0a0a]/50 rounded-lg border border-[#1a1a1a] p-3">
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          className="w-full h-32"
+          preserveAspectRatio="none"
+          onMouseLeave={() => {
+            setHoveredPoint(null)
+            setHoveredIndex(null)
+          }}
+        >
+          <defs>
+            {/* Gradient for line */}
+            <linearGradient id="historyGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+              {displayData.map((d, i) => (
+                <stop
+                  key={i}
+                  offset={`${(i / (displayData.length - 1)) * 100}%`}
+                  stopColor={getRegimeColor(d.regime)}
+                />
+              ))}
+            </linearGradient>
+
+            {/* Area fill gradient */}
+            <linearGradient id="areaGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+              <stop offset="0%" stopColor="#00a3ff" stopOpacity="0.15" />
+              <stop offset="100%" stopColor="#00a3ff" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+
+          {/* Grid lines */}
+          {[25, 50, 75].map(v => {
+            const y = padding.top + chartHeight - ((v - min) / range_) * chartHeight
+            if (y < padding.top || y > height - padding.bottom) return null
+            return (
+              <line
+                key={v}
+                x1={padding.left}
+                y1={y}
+                x2={width - padding.right}
+                y2={y}
+                stroke="#26272b"
+                strokeWidth="0.5"
+                strokeDasharray="2,2"
+              />
+            )
+          })}
+
+          {/* Area fill */}
+          <path
+            d={areaD}
+            fill="url(#areaGradient)"
+          />
+
+          {/* Main line */}
+          <path
+            d={pathD}
+            fill="none"
+            stroke="url(#historyGradient)"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+
+          {/* Interactive points */}
+          {points.map((p, i) => (
+            <g key={i}>
+              {/* Invisible hitbox */}
+              <rect
+                x={p.x - chartWidth / displayData.length / 2}
+                y={padding.top}
+                width={chartWidth / displayData.length}
+                height={chartHeight}
+                fill="transparent"
+                onMouseEnter={() => {
+                  setHoveredPoint(p.data)
+                  setHoveredIndex(i)
+                }}
+              />
+              {/* Visible dot on hover */}
+              {hoveredIndex === i && (
+                <>
+                  <line
+                    x1={p.x}
+                    y1={padding.top}
+                    x2={p.x}
+                    y2={height - padding.bottom}
+                    stroke="#26272b"
+                    strokeWidth="1"
+                  />
+                  <circle
+                    cx={p.x}
+                    cy={p.y}
+                    r="3"
+                    fill={getRegimeColor(p.data.regime)}
+                    stroke="#0a0a0a"
+                    strokeWidth="1.5"
+                  />
+                </>
+              )}
+            </g>
+          ))}
+        </svg>
+
+        {/* Hover tooltip */}
+        {hoveredPoint && hoveredIndex !== null && (
+          <div
+            className="absolute top-2 left-1/2 -translate-x-1/2 bg-[#1a1a1a] border border-[#26272b] rounded px-3 py-2 text-center shadow-lg pointer-events-none z-10"
+          >
+            <div className="text-[9px] text-[#949ba5]/60 mb-1">
+              {new Date(hoveredPoint.date + 'T12:00:00').toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                year: displayData.length > 60 ? '2-digit' : undefined
+              })}
+            </div>
+            <div className="text-lg font-light text-[#f3f3f3]">
+              {Math.round(hoveredPoint.score)}
+            </div>
+            {hoveredPoint.regime && (
+              <div
+                className="text-[8px] uppercase tracking-wider mt-1"
+                style={{ color: getRegimeColor(hoveredPoint.regime) }}
+              >
+                {hoveredPoint.regime.replace('_', ' ')}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Stats bar */}
+        <div className="flex justify-between mt-3 pt-3 border-t border-[#1a1a1a]">
+          <div className="text-center">
+            <div className="text-[9px] text-[#949ba5]/40 uppercase tracking-wider">Low</div>
+            <div className="text-[11px] font-mono text-[#949ba5]">{Math.round(min)}</div>
+          </div>
+          <div className="text-center">
+            <div className="text-[9px] text-[#949ba5]/40 uppercase tracking-wider">Avg</div>
+            <div className="text-[11px] font-mono text-[#949ba5]">
+              {Math.round(displayData.reduce((a, b) => a + b.score, 0) / displayData.length)}
+            </div>
+          </div>
+          <div className="text-center">
+            <div className="text-[9px] text-[#949ba5]/40 uppercase tracking-wider">High</div>
+            <div className="text-[11px] font-mono text-[#949ba5]">{Math.round(max)}</div>
+          </div>
+          <div className="text-center">
+            <div className="text-[9px] text-[#949ba5]/40 uppercase tracking-wider">Change</div>
+            <div className={`text-[11px] font-mono ${
+              displayData[displayData.length - 1].score >= displayData[0].score
+                ? 'text-[#00a3ff]'
+                : 'text-[#ff6b6b]'
+            }`}>
+              {displayData[displayData.length - 1].score >= displayData[0].score ? '+' : ''}
+              {(displayData[displayData.length - 1].score - displayData[0].score).toFixed(1)}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============== Stale Data Warning ==============
+function StaleDataWarning({ freshness }: { freshness: PXIData['dataFreshness'] }) {
+  const [expanded, setExpanded] = useState(false)
+
+  if (!freshness?.hasStaleData) return null
+
+  return (
+    <div className="w-full mt-4">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center justify-center gap-2 py-2 px-4 bg-[#f59e0b]/10 border border-[#f59e0b]/30 rounded text-[10px] text-[#f59e0b] uppercase tracking-wider hover:bg-[#f59e0b]/20 transition-colors"
+      >
+        <span>⚠</span>
+        <span>{freshness.staleCount} indicator{freshness.staleCount > 1 ? 's' : ''} may be stale</span>
+        <span className="text-[#f59e0b]/50">{expanded ? '▲' : '▼'}</span>
+      </button>
+      {expanded && freshness.staleIndicators.length > 0 && (
+        <div className="mt-2 p-3 bg-[#0a0a0a]/60 border border-[#26272b] rounded">
+          <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-2">
+            Last updated more than 2 days ago
+          </div>
+          <div className="space-y-1">
+            {freshness.staleIndicators.map(ind => (
+              <div key={ind.id} className="flex justify-between text-[10px]">
+                <span className="text-[#949ba5]">{ind.id.replace(/_/g, ' ')}</span>
+                <span className="text-[#f59e0b]/70">{ind.daysOld}d ago</span>
+              </div>
+            ))}
+          </div>
+          {freshness.staleCount > 5 && (
+            <div className="text-[8px] text-[#949ba5]/40 mt-2">
+              +{freshness.staleCount - 5} more
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ============== ML Accuracy Display ==============
+function MLAccuracyBadge({ accuracy }: { accuracy: MLAccuracyData | null }) {
+  if (!accuracy) return null
+
+  const acc7d = accuracy.rolling_7d.direction_accuracy
+  const acc30d = accuracy.rolling_30d.direction_accuracy
+
+  const getColor = (acc: number) => {
+    if (acc >= 70) return 'text-[#00c896]'
+    if (acc >= 55) return 'text-[#f59e0b]'
+    return 'text-[#ff6b6b]'
+  }
+
+  return (
+    <div className="flex justify-center gap-4 mt-3 mb-2">
+      <Tooltip content="Rolling 30-day directional accuracy of ML predictions">
+        <div className="flex items-center gap-2 bg-[#0a0a0a]/60 rounded px-2.5 py-1 border border-[#1a1a1a]">
+          <span className="text-[8px] text-[#949ba5]/50 uppercase tracking-wider">7d Acc</span>
+          <span className={`text-[10px] font-mono ${getColor(acc7d)}`}>
+            {Math.round(acc7d)}%
+          </span>
+        </div>
+      </Tooltip>
+      <Tooltip content="Rolling 90-day directional accuracy of ML predictions">
+        <div className="flex items-center gap-2 bg-[#0a0a0a]/60 rounded px-2.5 py-1 border border-[#1a1a1a]">
+          <span className="text-[8px] text-[#949ba5]/50 uppercase tracking-wider">30d Acc</span>
+          <span className={`text-[10px] font-mono ${getColor(acc30d)}`}>
+            {Math.round(acc30d)}%
+          </span>
+        </div>
+      </Tooltip>
+    </div>
+  )
+}
+
+// ============== Category Modal Component ==============
+function CategoryModal({
+  category,
+  onClose
+}: {
+  category: string
+  onClose: () => void
+}) {
+  const [data, setData] = useState<CategoryDetailData | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
+        const res = await fetch(`${apiUrl}/api/category/${category}`)
+        if (res.ok) {
+          const json = await res.json()
+          setData(json)
+        }
+      } catch (err) {
+        console.error('Failed to fetch category details:', err)
+      } finally {
+        setLoading(false)
+      }
+    }
+    fetchData()
+  }, [category])
+
+  const formatDisplayName = (name: string) =>
+    name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+
+  // Category sparkline
+  const renderSparkline = () => {
+    if (!data || data.history.length === 0) return null
+
+    const values = data.history.map(h => h.score)
+    const min = Math.min(...values)
+    const max = Math.max(...values)
+    const range = max - min || 1
+    const width = 320
+    const height = 80
+
+    const points = data.history.map((h, i) => {
+      const x = (i / (data.history.length - 1)) * width
+      const y = height - ((h.score - min) / range) * (height - 10) - 5
+      return `${x},${y}`
+    }).join(' ')
+
+    const currentScore = data.score
+    const avgScore = values.reduce((a, b) => a + b, 0) / values.length
+
+    return (
+      <div className="mb-6">
+        <div className="flex justify-between items-center mb-2">
+          <span className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider">90-Day History</span>
+          <span className="text-[10px] text-[#949ba5]/60">
+            Avg: <span className="font-mono text-[#f3f3f3]">{avgScore.toFixed(1)}</span>
+          </span>
+        </div>
+        <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-20">
+          <defs>
+            <linearGradient id={`gradient-${category}`} x1="0%" y1="0%" x2="0%" y2="100%">
+              <stop offset="0%" stopColor="#00a3ff" stopOpacity="0.2" />
+              <stop offset="100%" stopColor="#00a3ff" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          {/* Fill area */}
+          <polygon
+            points={`0,${height} ${points} ${width},${height}`}
+            fill={`url(#gradient-${category})`}
+          />
+          {/* Line */}
+          <polyline
+            fill="none"
+            stroke="#00a3ff"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            points={points}
+          />
+          {/* Current value dot */}
+          {data.history.length > 0 && (
+            <circle
+              cx={width}
+              cy={height - ((currentScore - min) / range) * (height - 10) - 5}
+              r="4"
+              fill="#00a3ff"
+            />
+          )}
+        </svg>
+        <div className="flex justify-between text-[9px] text-[#949ba5]/40 mt-1">
+          <span>{data.history[0]?.date}</span>
+          <span>{data.history[data.history.length - 1]?.date}</span>
+        </div>
+      </div>
+    )
+  }
+
+  const getScoreColor = (normalized: number) => {
+    if (normalized >= 70) return 'text-[#00a3ff]'
+    if (normalized >= 50) return 'text-[#f3f3f3]'
+    if (normalized >= 30) return 'text-[#f59e0b]'
+    return 'text-[#ff6b6b]'
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+      <div className="bg-[#0a0a0a] border border-[#26272b] rounded-lg max-w-md w-full max-h-[90vh] overflow-y-auto">
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b border-[#26272b]">
+          <div>
+            <h2 className="text-[#f3f3f3] text-lg font-light tracking-wider uppercase">
+              {formatDisplayName(category)}
+            </h2>
+            <p className="text-[#949ba5]/60 text-[10px] tracking-wide mt-0.5">
+              Category Deep Dive
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-[#949ba5] hover:text-[#f3f3f3] transition-colors p-2"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-4">
+          {loading ? (
+            <div className="text-center py-8 text-[#949ba5]/50 text-sm">Loading...</div>
+          ) : data ? (
+            <>
+              {/* Score Overview */}
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <div className="text-4xl font-light text-[#f3f3f3]">{Math.round(data.score)}</div>
+                  <div className="text-[10px] text-[#949ba5]/60 mt-1">
+                    Weight: {(data.weight * 100).toFixed(0)}%
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className={`text-2xl font-mono ${data.percentile_rank >= 70 ? 'text-[#00a3ff]' : data.percentile_rank <= 30 ? 'text-[#ff6b6b]' : 'text-[#949ba5]'}`}>
+                    {data.percentile_rank}<span className="text-sm">th</span>
+                  </div>
+                  <div className="text-[10px] text-[#949ba5]/60 mt-1">
+                    90-day percentile
+                  </div>
+                </div>
+              </div>
+
+              {/* Sparkline */}
+              {renderSparkline()}
+
+              {/* Indicators */}
+              <div>
+                <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-3">
+                  Component Indicators
+                </div>
+                <div className="space-y-2">
+                  {data.indicators.map(ind => (
+                    <div key={ind.id} className="flex items-center justify-between py-2 border-b border-[#1a1a1a]">
+                      <div>
+                        <div className="text-[11px] text-[#f3f3f3]">{ind.name}</div>
+                        <div className="text-[9px] text-[#949ba5]/50 font-mono mt-0.5">
+                          Raw: {typeof ind.raw_value === 'number' ? ind.raw_value.toFixed(2) : '—'}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className={`text-lg font-mono ${getScoreColor(ind.normalized_value)}`}>
+                          {Math.round(ind.normalized_value)}
+                        </div>
+                        <div className="w-12 h-1 bg-[#26272b] rounded-full overflow-hidden mt-1">
+                          <div
+                            className="h-full bg-[#00a3ff]/60 rounded-full"
+                            style={{ width: `${ind.normalized_value}%` }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Percentile Context */}
+              <div className="mt-6 p-3 bg-[#0f0f0f] border border-[#1a1a1a] rounded">
+                <div className="text-[10px] text-[#949ba5]">
+                  <span className="text-[#00a3ff]">{formatDisplayName(category)}</span> at{' '}
+                  <span className="font-mono text-[#f3f3f3]">{Math.round(data.score)}</span> is in the{' '}
+                  <span className={`font-mono ${data.percentile_rank >= 70 ? 'text-[#00a3ff]' : data.percentile_rank <= 30 ? 'text-[#ff6b6b]' : 'text-[#f3f3f3]'}`}>
+                    {data.percentile_rank}th percentile
+                  </span>{' '}
+                  of the last 90 days.
+                  {data.percentile_rank >= 80 && ' This is an elevated reading.'}
+                  {data.percentile_rank <= 20 && ' This is a depressed reading.'}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="text-center py-8 text-[#949ba5]/50 text-sm">Failed to load data</div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============== Top Themes Widget ==============
+function TopThemesWidget({ data, regime }: { data: SignalsData | null; regime?: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION' }) {
+  if (!data || !data.themes || data.themes.length === 0) return null
+
+  const topThemes = data.themes.slice(0, 3)
+
+  const getRegimeColor = (themeRegime: string) => {
+    if (themeRegime === 'BULLISH') return 'text-[#00c896]'
+    if (themeRegime === 'BEARISH') return 'text-[#ff6b6b]'
+    return 'text-[#949ba5]'
+  }
+
+  const getTrendIcon = (trend: string) => {
+    if (trend === 'RISING') return '↑'
+    if (trend === 'FALLING') return '↓'
+    return '→'
+  }
+
+  // Check if top theme aligns with current regime
+  const isAligned = regime && topThemes[0] &&
+    ((regime === 'RISK_ON' && topThemes[0].classification.regime === 'BULLISH') ||
+     (regime === 'RISK_OFF' && topThemes[0].classification.regime === 'BEARISH'))
+
+  return (
+    <div className="w-full mt-6 sm:mt-8 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider">
+          Trending Themes
+        </div>
+        <a
+          href="/signals"
+          className="text-[9px] text-[#00a3ff] hover:text-[#00a3ff]/80 transition-colors uppercase tracking-wider"
+        >
+          View All →
+        </a>
+      </div>
+
+      {isAligned && (
+        <div className="mb-3 px-3 py-1.5 bg-[#00a3ff]/10 border border-[#00a3ff]/20 rounded text-center">
+          <span className="text-[9px] text-[#00a3ff]">
+            {regime?.replace('_', ' ')} regime + {topThemes[0].theme_name} trending = Aligned signal
+          </span>
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {topThemes.map((theme, idx) => (
+          <div
+            key={theme.theme_id}
+            className="flex items-center justify-between py-2 border-b border-[#1a1a1a] last:border-0"
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-[#949ba5]/40 w-4">#{idx + 1}</span>
+              <div>
+                <div className="text-[11px] text-[#f3f3f3]">{theme.theme_name}</div>
+                <div className="text-[9px] text-[#949ba5]/50 font-mono mt-0.5">
+                  {theme.key_tickers.slice(0, 3).join(', ')}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className={`text-[10px] ${getRegimeColor(theme.classification.regime)}`}>
+                {getTrendIcon(theme.classification.trend)}
+              </span>
+              <span className="text-[11px] font-mono text-[#f3f3f3]">
+                {theme.score.toFixed(1)}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 text-[8px] text-[#949ba5]/30 text-center">
+        Updated: {new Date(data.generated_at_utc).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+      </div>
+    </div>
+  )
+}
+
+// ============== Similar Periods Card ==============
+function SimilarPeriodsCard({ data }: { data: SimilarPeriodsData | null }) {
+  if (!data || !data.similar_periods || data.similar_periods.length === 0) return null
+
+  const formatReturn = (val: number | null) => {
+    if (val === null) return '—'
+    const color = val >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'
+    return <span className={color}>{val >= 0 ? '+' : ''}{val.toFixed(2)}%</span>
+  }
+
+  // Calculate probability-weighted outlook
+  const totalWeight = data.similar_periods.reduce((sum, p) => sum + p.weights.combined, 0)
+  const weightedReturn7d = data.similar_periods.reduce((sum, p) => {
+    const ret = p.forward_returns?.d7 ?? 0
+    return sum + ret * p.weights.combined
+  }, 0) / totalWeight
+
+  const weightedReturn30d = data.similar_periods.reduce((sum, p) => {
+    const ret = p.forward_returns?.d30 ?? 0
+    return sum + ret * p.weights.combined
+  }, 0) / totalWeight
+
+  const positiveCount = data.similar_periods.filter(p => (p.forward_returns?.d30 ?? 0) > 0).length
+  const winRate = (positiveCount / data.similar_periods.length) * 100
+
+  return (
+    <div className="w-full mt-6 sm:mt-8 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+      <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-4">
+        Similar Historical Periods
+      </div>
+
+      {/* Probability-Weighted Outlook */}
+      <div className="mb-4 p-3 bg-[#0f0f0f] border border-[#1a1a1a] rounded">
+        <div className="text-[8px] text-[#949ba5]/40 uppercase tracking-wider mb-2">
+          Probability-Weighted Outlook
+        </div>
+        <div className="flex justify-between items-center">
+          <div className="text-center">
+            <div className="text-[10px] text-[#949ba5]/60">7d</div>
+            <div className={`text-lg font-mono ${weightedReturn7d >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
+              {weightedReturn7d >= 0 ? '+' : ''}{weightedReturn7d.toFixed(2)}%
+            </div>
+          </div>
+          <div className="text-center">
+            <div className="text-[10px] text-[#949ba5]/60">30d</div>
+            <div className={`text-lg font-mono ${weightedReturn30d >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
+              {weightedReturn30d >= 0 ? '+' : ''}{weightedReturn30d.toFixed(2)}%
+            </div>
+          </div>
+          <div className="text-center">
+            <div className="text-[10px] text-[#949ba5]/60">Win Rate</div>
+            <div className={`text-lg font-mono ${winRate >= 50 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
+              {Math.round(winRate)}%
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Similar Periods List */}
+      <div className="space-y-2">
+        {data.similar_periods.map((period, idx) => (
+          <div
+            key={period.date}
+            className="flex items-center justify-between py-2 border-b border-[#1a1a1a] last:border-0"
+          >
+            <div className="flex items-center gap-3">
+              <span className="text-[10px] text-[#949ba5]/40 w-4">#{idx + 1}</span>
+              <div>
+                <div className="text-[11px] text-[#f3f3f3]">
+                  {new Date(period.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                </div>
+                <div className="text-[9px] text-[#949ba5]/50">
+                  PXI: <span className="font-mono">{period.pxi?.score?.toFixed(0) ?? '—'}</span>
+                  <span className="mx-1">•</span>
+                  {Math.round(period.similarity * 100)}% similar
+                </div>
+              </div>
+            </div>
+            <div className="text-right text-[10px]">
+              <div>7d: {formatReturn(period.forward_returns?.d7 ?? null)}</div>
+              <div>30d: {formatReturn(period.forward_returns?.d30 ?? null)}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ============== Backtest Performance Card ==============
+function BacktestCard({ data }: { data: BacktestData | null }) {
+  if (!data || !data.bucket_analysis || data.bucket_analysis.length === 0) return null
+
+  const formatPercent = (val: number | null) => {
+    if (val === null) return '—'
+    return `${val >= 0 ? '+' : ''}${val.toFixed(1)}%`
+  }
+
+  return (
+    <div className="w-full mt-6 sm:mt-8 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+      <div className="flex items-center justify-between mb-4">
+        <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider">
+          Historical Backtest
+        </div>
+        <div className="text-[8px] text-[#949ba5]/30">
+          {data.summary.date_range?.start} → {data.summary.date_range?.end}
+        </div>
+      </div>
+
+      {/* Extreme Readings Summary */}
+      {data.extreme_readings && (
+        <div className="mb-4 grid grid-cols-2 gap-3">
+          <div className="p-2 bg-[#0f0f0f] rounded border border-[#1a1a1a]">
+            <div className="text-[8px] text-[#00c896]/60 uppercase tracking-wider mb-1">Low PXI (&lt;25)</div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-mono text-[#00c896]">
+                {formatPercent(data.extreme_readings.low_pxi.avg_return_30d)}
+              </span>
+              <span className="text-[9px] text-[#949ba5]/40">
+                n={data.extreme_readings.low_pxi.count}
+              </span>
+            </div>
+          </div>
+          <div className="p-2 bg-[#0f0f0f] rounded border border-[#1a1a1a]">
+            <div className="text-[8px] text-[#ff6b6b]/60 uppercase tracking-wider mb-1">High PXI (&gt;75)</div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-mono text-[#ff6b6b]">
+                {formatPercent(data.extreme_readings.high_pxi.avg_return_30d)}
+              </span>
+              <span className="text-[9px] text-[#949ba5]/40">
+                n={data.extreme_readings.high_pxi.count}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bucket Performance */}
+      <div className="text-[8px] text-[#949ba5]/40 uppercase tracking-wider mb-2">
+        30-Day Returns by PXI Bucket
+      </div>
+      <div className="space-y-1.5">
+        {data.bucket_analysis.map(bucket => (
+          <div key={bucket.bucket} className="flex items-center gap-2">
+            <span className="text-[10px] text-[#949ba5] w-16 text-right font-mono">
+              {bucket.bucket}
+            </span>
+            <div className="flex-1 h-2 bg-[#1a1a1a] rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full ${(bucket.avg_return_30d ?? 0) >= 0 ? 'bg-[#00c896]' : 'bg-[#ff6b6b]'}`}
+                style={{ width: `${Math.min(100, Math.abs(bucket.avg_return_30d ?? 0) * 10)}%` }}
+              />
+            </div>
+            <span className={`text-[10px] font-mono w-14 text-right ${(bucket.avg_return_30d ?? 0) >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
+              {formatPercent(bucket.avg_return_30d)}
+            </span>
+            <span className="text-[9px] text-[#949ba5]/40 w-10 text-right">
+              n={bucket.count}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-4 text-center">
+        <span className="text-[9px] text-[#949ba5]/40">
+          Why trust PXI? {data.summary.total_observations.toLocaleString()} observations backtested
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// ============== CSV Export Button ==============
+function ExportButton() {
+  const [exporting, setExporting] = useState(false)
+
+  const handleExport = async () => {
+    setExporting(true)
+    try {
+      const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
+      const response = await fetch(`${apiUrl}/api/export/history?format=csv&days=365`)
+      if (!response.ok) throw new Error('Export failed')
+
+      const blob = await response.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `pxi-history-${new Date().toISOString().split('T')[0]}.csv`
+      document.body.appendChild(a)
+      a.click()
+      window.URL.revokeObjectURL(url)
+      document.body.removeChild(a)
+    } catch (err) {
+      console.error('Export failed:', err)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  return (
+    <button
+      onClick={handleExport}
+      disabled={exporting}
+      className="px-3 py-1.5 bg-[#0a0a0a] border border-[#26272b] rounded text-[10px] text-[#949ba5] uppercase tracking-wider hover:border-[#949ba5]/50 hover:text-[#f3f3f3] transition-colors disabled:opacity-50"
+    >
+      {exporting ? 'Exporting...' : 'Export CSV'}
+    </button>
+  )
+}
+
+// ============== Alert History Component ==============
+function AlertHistoryPanel({
+  alerts,
+  accuracy,
+  onClose
+}: {
+  alerts: AlertData[]
+  accuracy: Record<string, { total: number; accuracy_7d: number | null; avg_return_7d: number }>
+  onClose: () => void
+}) {
+  const [filterType, setFilterType] = useState<string | null>(null)
+
+  const filteredAlerts = filterType
+    ? alerts.filter(a => a.alert_type === filterType)
+    : alerts
+
+  const alertTypes = [...new Set(alerts.map(a => a.alert_type))]
+
+  const getSeverityStyles = (severity: string) => {
+    switch (severity) {
+      case 'critical': return 'border-[#ff6b6b]/40 bg-[#ff6b6b]/5'
+      case 'warning': return 'border-[#f59e0b]/40 bg-[#f59e0b]/5'
+      default: return 'border-[#00a3ff]/20 bg-[#00a3ff]/5'
+    }
+  }
+
+  const getSeverityDot = (severity: string) => {
+    switch (severity) {
+      case 'critical': return 'bg-[#ff6b6b]'
+      case 'warning': return 'bg-[#f59e0b]'
+      default: return 'bg-[#00a3ff]'
+    }
+  }
+
+  const formatReturn = (val: number | null) => {
+    if (val === null) return '—'
+    const color = val >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'
+    return <span className={color}>{val >= 0 ? '+' : ''}{val.toFixed(2)}%</span>
+  }
+
+  const formatType = (type: string) =>
+    type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+
+  return (
+    <div className="fixed inset-0 bg-black/90 z-50 overflow-y-auto">
+      <div className="min-h-screen px-4 py-8 max-w-4xl mx-auto">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h2 className="text-[#f3f3f3] text-lg font-light tracking-wider">ALERT HISTORY</h2>
+            <p className="text-[#949ba5]/60 text-[10px] tracking-wide mt-1">
+              Historical alerts with forward return analysis
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-[#949ba5] hover:text-[#f3f3f3] transition-colors p-2"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Alert Type Accuracy Summary */}
+        {Object.keys(accuracy).length > 0 && (
+          <div className="mb-6 p-4 bg-[#0a0a0a]/80 border border-[#1a1a1a] rounded-lg">
+            <h3 className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-3">
+              Alert Accuracy by Type
+            </h3>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              {Object.entries(accuracy).map(([type, stats]) => (
+                <div key={type} className="bg-[#0f0f0f] rounded px-3 py-2 border border-[#1a1a1a]">
+                  <div className="text-[10px] text-[#949ba5] mb-1">{formatType(type)}</div>
+                  <div className="flex items-center gap-2">
+                    {stats.accuracy_7d !== null ? (
+                      <span className={`text-sm font-mono ${stats.accuracy_7d >= 60 ? 'text-[#00c896]' : stats.accuracy_7d >= 50 ? 'text-[#f59e0b]' : 'text-[#ff6b6b]'}`}>
+                        {Math.round(stats.accuracy_7d)}%
+                      </span>
+                    ) : (
+                      <span className="text-sm font-mono text-[#949ba5]/50">—</span>
+                    )}
+                    <span className="text-[8px] text-[#949ba5]/40">n={stats.total}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Filters */}
+        <div className="flex flex-wrap gap-2 mb-4">
+          <button
+            onClick={() => setFilterType(null)}
+            className={`px-3 py-1 text-[10px] uppercase tracking-wider rounded transition-colors ${
+              !filterType
+                ? 'bg-[#00a3ff]/20 text-[#00a3ff] border border-[#00a3ff]/30'
+                : 'bg-[#1a1a1a] text-[#949ba5] border border-[#26272b] hover:border-[#949ba5]/30'
+            }`}
+          >
+            All
+          </button>
+          {alertTypes.map(type => (
+            <button
+              key={type}
+              onClick={() => setFilterType(type)}
+              className={`px-3 py-1 text-[10px] uppercase tracking-wider rounded transition-colors ${
+                filterType === type
+                  ? 'bg-[#00a3ff]/20 text-[#00a3ff] border border-[#00a3ff]/30'
+                  : 'bg-[#1a1a1a] text-[#949ba5] border border-[#26272b] hover:border-[#949ba5]/30'
+              }`}
+            >
+              {formatType(type)}
+            </button>
+          ))}
+        </div>
+
+        {/* Alerts List */}
+        <div className="space-y-2">
+          {filteredAlerts.length === 0 ? (
+            <div className="text-center py-12 text-[#949ba5]/50 text-sm">
+              No alerts found
+            </div>
+          ) : (
+            filteredAlerts.map(alert => (
+              <div
+                key={alert.id}
+                className={`p-4 border rounded-lg ${getSeverityStyles(alert.severity)}`}
+              >
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className={`w-2 h-2 rounded-full ${getSeverityDot(alert.severity)}`} />
+                      <span className="text-[10px] text-[#949ba5]/60 uppercase tracking-wider">
+                        {formatType(alert.alert_type)}
+                      </span>
+                      <span className="text-[9px] text-[#949ba5]/40">
+                        {new Date(alert.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                      </span>
+                    </div>
+                    <p className="text-[#f3f3f3] text-sm leading-relaxed">
+                      {alert.message}
+                    </p>
+                    {alert.pxi_score !== null && (
+                      <div className="mt-2 text-[10px] text-[#949ba5]/60">
+                        PXI at alert: <span className="text-[#00a3ff] font-mono">{alert.pxi_score.toFixed(1)}</span>
+                      </div>
+                    )}
+                  </div>
+                  {(alert.forward_return_7d !== null || alert.forward_return_30d !== null) && (
+                    <div className="flex-shrink-0 text-right">
+                      <div className="text-[8px] text-[#949ba5]/40 uppercase tracking-wider mb-1">
+                        Forward Returns
+                      </div>
+                      {alert.forward_return_7d !== null && (
+                        <div className="text-[10px]">
+                          <span className="text-[#949ba5]/50">7d:</span> {formatReturn(alert.forward_return_7d)}
+                        </div>
+                      )}
+                      {alert.forward_return_30d !== null && (
+                        <div className="text-[10px]">
+                          <span className="text-[#949ba5]/50">30d:</span> {formatReturn(alert.forward_return_30d)}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Subscribe CTA */}
+        <div className="mt-8 p-4 border border-dashed border-[#26272b] rounded-lg text-center">
+          <p className="text-[#949ba5]/60 text-sm mb-2">
+            Get alerts delivered to your inbox
+          </p>
+          <button className="px-4 py-2 bg-[#00a3ff]/10 border border-[#00a3ff]/30 rounded text-[10px] text-[#00a3ff] uppercase tracking-wider hover:bg-[#00a3ff]/20 transition-colors">
+            Coming Soon
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function MLPredictionsCard({ ensemble, accuracy }: { ensemble: EnsembleData | null; accuracy?: MLAccuracyData | null }) {
   if (!ensemble) return null
 
   const formatChange = (val: number | null) => {
@@ -550,7 +1970,10 @@ function MLPredictionsCard({ ensemble }: { ensemble: EnsembleData | null }) {
         </div>
       </div>
 
-      <div className="text-[8px] text-[#949ba5]/20 text-center mt-3">
+      {/* Accuracy display */}
+      <MLAccuracyBadge accuracy={accuracy ?? null} />
+
+      <div className="text-[8px] text-[#949ba5]/20 text-center mt-1">
         Weighted ensemble • {ensemble.interpretation.d7.note}
       </div>
     </div>
@@ -977,11 +2400,29 @@ function App() {
   const [prediction, setPrediction] = useState<PredictionData | null>(null)
   const [signal, setSignal] = useState<SignalData | null>(null)  // v1.1
   const [ensemble, setEnsemble] = useState<EnsembleData | null>(null)  // ML ensemble
+  const [mlAccuracy, setMlAccuracy] = useState<MLAccuracyData | null>(null)  // v1.4: ML accuracy tracking
+  const [historyData, setHistoryData] = useState<HistoryDataPoint[]>([])  // v1.4: Historical chart data
+  const [historyRange, setHistoryRange] = useState<'7d' | '30d' | '90d'>('30d')  // v1.4: Chart range
+  const [showOnboarding, setShowOnboarding] = useState(false)  // v1.4: Onboarding modal
+  const [alertsData, setAlertsData] = useState<AlertsApiResponse | null>(null)  // v1.5: Alert history
+  const [showAlerts, setShowAlerts] = useState(false)  // v1.5: Alert panel visibility
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null)  // v1.5: Category deep-dive
+  const [signalsData, setSignalsData] = useState<SignalsData | null>(null)  // v1.5: PXI + Signals integration
+  const [similarData, setSimilarData] = useState<SimilarPeriodsData | null>(null)  // v1.6: Similar periods
+  const [backtestData, setBacktestData] = useState<BacktestData | null>(null)  // v1.6: Backtest performance
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSpec, setShowSpec] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+
+  // v1.4: Check for first visit on mount
+  useEffect(() => {
+    const hasSeenOnboarding = localStorage.getItem('pxi_onboarding_complete')
+    if (!hasSeenOnboarding) {
+      setShowOnboarding(true)
+    }
+  }, [])
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -999,12 +2440,15 @@ function App() {
       try {
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
 
-        // Fetch PXI data, signal data, predictions, and ML ensemble in parallel
-        const [pxiRes, signalRes, predRes, ensembleRes] = await Promise.all([
+        // Fetch PXI data, signal data, predictions, ML ensemble, accuracy, history, and alerts in parallel
+        const [pxiRes, signalRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes] = await Promise.all([
           fetch(`${apiUrl}/api/pxi`),
           fetch(`${apiUrl}/api/signal`).catch(() => null),  // v1.1
           fetch(`${apiUrl}/api/predict`).catch(() => null),
-          fetch(`${apiUrl}/api/ml/ensemble`).catch(() => null)  // Ensemble
+          fetch(`${apiUrl}/api/ml/ensemble`).catch(() => null),  // Ensemble
+          fetch(`${apiUrl}/api/ml/accuracy`).catch(() => null),  // v1.4: ML accuracy
+          fetch(`${apiUrl}/api/history?days=90`).catch(() => null),  // v1.4: Historical data
+          fetch(`${apiUrl}/api/alerts?limit=50`).catch(() => null)  // v1.5: Alert history
         ])
 
         if (!pxiRes.ok) throw new Error('Failed to fetch')
@@ -1033,6 +2477,78 @@ function App() {
           if (!ensembleJson.error) {
             setEnsemble(ensembleJson)
           }
+        }
+
+        // v1.4: ML accuracy data - parse API response to display format
+        if (accuracyRes?.ok) {
+          const accuracyJson = await accuracyRes.json() as MLAccuracyApiResponse
+          if (!accuracyJson.error && accuracyJson.metrics) {
+            const parsed = parseMLAccuracy(accuracyJson)
+            if (parsed) {
+              setMlAccuracy(parsed)
+            }
+          }
+        }
+
+        // v1.4: Historical data for chart - use sparkline as fallback
+        if (historyRes?.ok) {
+          const historyJson = await historyRes.json() as { data?: HistoryDataPoint[]; error?: string }
+          if (historyJson.data && Array.isArray(historyJson.data)) {
+            setHistoryData(historyJson.data)
+          }
+        }
+
+        // v1.5: Alert history data
+        if (alertsRes?.ok) {
+          const alertsJson = await alertsRes.json() as AlertsApiResponse
+          if (alertsJson.alerts) {
+            setAlertsData(alertsJson)
+          }
+        }
+
+        // v1.5: Signals data - fetch latest run from signals API
+        try {
+          const signalsApiUrl = '/signals/api/runs'
+          const signalsRunsRes = await fetch(signalsApiUrl)
+          if (signalsRunsRes.ok) {
+            const runsJson = await signalsRunsRes.json() as { runs: { run_id: string }[] }
+            if (runsJson.runs && runsJson.runs.length > 0) {
+              const latestRunId = runsJson.runs[0].run_id
+              const signalsDetailRes = await fetch(`${signalsApiUrl}/${latestRunId}`)
+              if (signalsDetailRes.ok) {
+                const signalsJson = await signalsDetailRes.json() as SignalsData
+                setSignalsData(signalsJson)
+              }
+            }
+          }
+        } catch {
+          // Signals are optional, don't fail
+        }
+
+        // v1.6: Similar periods data
+        try {
+          const similarRes = await fetch(`${apiUrl}/api/similar`)
+          if (similarRes.ok) {
+            const similarJson = await similarRes.json() as SimilarPeriodsData
+            if (similarJson.similar_periods) {
+              setSimilarData(similarJson)
+            }
+          }
+        } catch {
+          // Similar periods are optional
+        }
+
+        // v1.6: Backtest data
+        try {
+          const backtestRes = await fetch(`${apiUrl}/api/backtest`)
+          if (backtestRes.ok) {
+            const backtestJson = await backtestRes.json() as BacktestData
+            if (backtestJson.bucket_analysis) {
+              setBacktestData(backtestJson)
+            }
+          }
+        } catch {
+          // Backtest is optional
         }
 
         setError(null)
@@ -1074,6 +2590,21 @@ function App() {
     return <SpecPage onClose={() => setShowSpec(false)} />
   }
 
+  // v1.4: Handler to close onboarding and persist preference
+  const handleCloseOnboarding = () => {
+    setShowOnboarding(false)
+    localStorage.setItem('pxi_onboarding_complete', 'true')
+  }
+
+  // v1.4: Prepare history data - use sparkline as fallback if no dedicated history endpoint
+  const chartData: HistoryDataPoint[] = historyData.length > 0
+    ? historyData
+    : data.sparkline.map(s => ({
+        date: s.date || data.date,
+        score: s.score,
+        regime: data.regime?.type
+      }))
+
   const delta7d = data.delta.d7
   const deltaDisplay = delta7d !== null
     ? `${delta7d >= 0 ? '+' : ''}${delta7d.toFixed(1)}`
@@ -1081,6 +2612,26 @@ function App() {
 
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] flex flex-col items-center justify-center px-4 sm:px-8 py-12 sm:py-16">
+      {/* v1.4: Onboarding Modal */}
+      {showOnboarding && <OnboardingModal onClose={handleCloseOnboarding} />}
+
+      {/* v1.5: Alert History Panel */}
+      {showAlerts && alertsData && (
+        <AlertHistoryPanel
+          alerts={alertsData.alerts}
+          accuracy={alertsData.accuracy}
+          onClose={() => setShowAlerts(false)}
+        />
+      )}
+
+      {/* v1.5: Category Deep-Dive Modal */}
+      {selectedCategory && (
+        <CategoryModal
+          category={selectedCategory}
+          onClose={() => setSelectedCategory(null)}
+        />
+      )}
+
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 p-4 sm:p-6 flex justify-between items-center z-50">
         <div className="relative" ref={menuRef}>
@@ -1108,6 +2659,27 @@ function App() {
               >
                 /signals
               </a>
+              <button
+                onClick={() => {
+                  setShowAlerts(true)
+                  setMenuOpen(false)
+                }}
+                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
+              >
+                /alerts
+                {alertsData && alertsData.count > 0 && (
+                  <span className="ml-2 text-[8px] text-[#00a3ff]">({alertsData.count})</span>
+                )}
+              </button>
+              <button
+                onClick={() => {
+                  setShowOnboarding(true)
+                  setMenuOpen(false)
+                }}
+                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors border-t border-[#26272b]"
+              >
+                /guide
+              </button>
             </div>
           )}
         </div>
@@ -1161,9 +2733,23 @@ function App() {
           {data.categories
             .sort((a, b) => b.score - a.score)
             .map((cat) => (
-              <CategoryBar key={cat.name} name={cat.name} score={cat.score} />
+              <CategoryBar
+                key={cat.name}
+                name={cat.name}
+                score={cat.score}
+                onClick={() => setSelectedCategory(cat.name)}
+              />
             ))}
         </div>
+
+        {/* v1.4: Historical Chart */}
+        {chartData.length > 0 && (
+          <HistoricalChart
+            data={chartData}
+            range={historyRange}
+            onRangeChange={setHistoryRange}
+          />
+        )}
 
         {/* v1.1: Signal Indicator */}
         {signal && <SignalIndicator signal={signal.signal} />}
@@ -1175,7 +2761,24 @@ function App() {
         {prediction && <PredictionCard prediction={prediction} />}
 
         {/* ML Ensemble Predictions */}
-        <MLPredictionsCard ensemble={ensemble} />
+        <MLPredictionsCard ensemble={ensemble} accuracy={mlAccuracy} />
+
+        {/* v1.5: Top Themes from Signals */}
+        <TopThemesWidget data={signalsData} regime={data.regime?.type} />
+
+        {/* v1.6: Similar Periods */}
+        <SimilarPeriodsCard data={similarData} />
+
+        {/* v1.6: Backtest Performance */}
+        <BacktestCard data={backtestData} />
+
+        {/* v1.4: Stale Data Warning */}
+        <StaleDataWarning freshness={data.dataFreshness} />
+
+        {/* v1.6: Export Button */}
+        <div className="w-full mt-6 flex justify-center">
+          <ExportButton />
+        </div>
       </main>
 
       {/* Footer */}
