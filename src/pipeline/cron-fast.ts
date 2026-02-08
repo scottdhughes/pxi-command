@@ -289,6 +289,29 @@ async function fetchCrypto(): Promise<void> {
 
 // ============== BTC ETF Flows ==============
 
+async function fetchWithRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelayMs: number = 2000
+): Promise<T> {
+  let lastError: any;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      if (err.message?.includes('Too Many Requests') || err.message?.includes('429')) {
+        const delay = baseDelayMs * Math.pow(2, attempt);
+        console.log(`    ⏳ Rate limited, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw err; // Non-rate-limit errors fail immediately
+      }
+    }
+  }
+  throw lastError;
+}
+
 async function fetchBtcEtfFlows(): Promise<void> {
   console.log('\n━━━ BTC ETF Flows ━━━');
 
@@ -302,16 +325,17 @@ async function fetchBtcEtfFlows(): Promise<void> {
   ];
 
   try {
-    let totalFlowProxy = 0;
     let successCount = 0;
 
     for (const { symbol, weight } of etfs) {
       try {
-        const result = await yahooFinance.chart(symbol, {
-          period1: subYears(new Date(), 1),
-          period2: new Date(),
-          interval: '1d',
-        });
+        const result = await fetchWithRetry(async () => {
+          return await yahooFinance.chart(symbol, {
+            period1: subYears(new Date(), 1),
+            period2: new Date(),
+            interval: '1d',
+          });
+        }, 3, 3000);
 
         const quotes = result.quotes || [];
         if (quotes.length >= 2) {
@@ -354,8 +378,8 @@ async function fetchBtcEtfFlows(): Promise<void> {
         console.error(`  ✗ ${symbol}: ${err.message}`);
       }
 
-      // Rate limit between ETFs
-      await new Promise(r => setTimeout(r, 500));
+      // Longer delay between ETFs to avoid rate limiting
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     if (successCount > 0) {
@@ -532,10 +556,11 @@ async function main(): Promise<void> {
 
   try {
     // Fetch all data sources
+    // BTC ETF flows first - it's been stale and is rate-limit sensitive
+    await fetchBtcEtfFlows();
     await fetchAllFred();
     await fetchAllYahoo();
     await fetchCrypto();
-    await fetchBtcEtfFlows();
     await fetchAlternative();
 
     // Post to Worker API
