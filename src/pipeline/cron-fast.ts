@@ -287,6 +287,88 @@ async function fetchCrypto(): Promise<void> {
   }
 }
 
+// ============== BTC ETF Flows ==============
+
+async function fetchBtcEtfFlows(): Promise<void> {
+  console.log('\n━━━ BTC ETF Flows ━━━');
+
+  // Major BTC ETFs with approximate AUM weights
+  const etfs = [
+    { symbol: 'IBIT', weight: 0.45 },   // BlackRock - largest
+    { symbol: 'FBTC', weight: 0.25 },   // Fidelity
+    { symbol: 'GBTC', weight: 0.15 },   // Grayscale
+    { symbol: 'ARKB', weight: 0.08 },   // ARK
+    { symbol: 'BITB', weight: 0.07 },   // Bitwise
+  ];
+
+  try {
+    let totalFlowProxy = 0;
+    let successCount = 0;
+
+    for (const { symbol, weight } of etfs) {
+      try {
+        const result = await yahooFinance.chart(symbol, {
+          period1: subYears(new Date(), 1),
+          period2: new Date(),
+          interval: '1d',
+        });
+
+        const quotes = result.quotes || [];
+        if (quotes.length >= 2) {
+          // Calculate daily percentage change for flow proxy
+          for (let i = 1; i < quotes.length; i++) {
+            const current = quotes[i];
+            const prev = quotes[i - 1];
+
+            if (current.close && prev.close && current.date) {
+              // Use volume-weighted price change as flow proxy
+              const priceChange = (current.close - prev.close) / prev.close;
+              const volume = current.volume || 0;
+
+              // Flow proxy: price change * volume * weight
+              const flowProxy = priceChange * Math.log1p(volume) * weight * 100;
+
+              const dateStr = format(current.date, 'yyyy-MM-dd');
+
+              // Find existing entry for this date or create new
+              const existing = allIndicators.find(
+                i => i.indicator_id === 'btc_etf_flows' && i.date === dateStr
+              );
+
+              if (existing) {
+                existing.value += flowProxy;
+              } else {
+                allIndicators.push({
+                  indicator_id: 'btc_etf_flows',
+                  date: dateStr,
+                  value: flowProxy,
+                  source: 'yahoo_etf',
+                });
+              }
+            }
+          }
+          console.log(`  ✓ ${symbol}: ${quotes.length} days`);
+          successCount++;
+        }
+      } catch (err: any) {
+        console.error(`  ✗ ${symbol}: ${err.message}`);
+      }
+
+      // Rate limit between ETFs
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (successCount > 0) {
+      const flowEntries = allIndicators.filter(i => i.indicator_id === 'btc_etf_flows');
+      console.log(`  ✓ btc_etf_flows: ${flowEntries.length} days from ${successCount}/${etfs.length} ETFs`);
+    } else {
+      console.error('  ✗ btc_etf_flows: all ETF fetches failed');
+    }
+  } catch (err: any) {
+    console.error(`  ✗ btc_etf_flows: ${err.message}`);
+  }
+}
+
 // ============== Alternative Indicators ==============
 
 async function fetchAlternative(): Promise<void> {
@@ -453,6 +535,7 @@ async function main(): Promise<void> {
     await fetchAllFred();
     await fetchAllYahoo();
     await fetchCrypto();
+    await fetchBtcEtfFlows();
     await fetchAlternative();
 
     // Post to Worker API
