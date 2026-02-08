@@ -113,17 +113,10 @@ async function migrate() {
     await query(`CREATE INDEX IF NOT EXISTS idx_alerts_date ON alerts(date DESC)`);
     console.log('✓ Created alerts indexes');
 
-    // Add missing columns to existing alerts table (idempotent)
-    await query(`
-      DO $$
-      BEGIN
-        ALTER TABLE alerts ADD COLUMN IF NOT EXISTS pxi_score REAL;
-        ALTER TABLE alerts ADD COLUMN IF NOT EXISTS forward_return_7d REAL;
-        ALTER TABLE alerts ADD COLUMN IF NOT EXISTS forward_return_30d REAL;
-      EXCEPTION
-        WHEN duplicate_column THEN NULL;
-      END $$;
-    `);
+    // Add missing columns to existing alerts table (idempotent - PostgreSQL 9.6+)
+    await query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS pxi_score REAL`);
+    await query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS forward_return_7d REAL`);
+    await query(`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS forward_return_30d REAL`);
     console.log('✓ Ensured alerts table has tracking columns');
 
     // Create views

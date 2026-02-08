@@ -329,7 +329,7 @@ interface EnsembleData {
 }
 
 function Sparkline({ data }: { data: { score: number }[] }) {
-  if (data.length === 0) return null
+  if (data.length < 2) return null  // Need at least 2 points to draw a line
 
   const min = Math.min(...data.map(d => d.score))
   const max = Math.max(...data.map(d => d.score))
@@ -893,10 +893,12 @@ function HistoricalChart({
   const [hoveredPoint, setHoveredPoint] = useState<HistoryDataPoint | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
 
-  if (!data || data.length === 0) return null
+  if (!data || data.length < 2) return null  // Need at least 2 points
 
   const rangeMap = { '7d': 7, '30d': 30, '90d': 90 }
   const displayData = data.slice(-rangeMap[range])
+
+  if (displayData.length < 2) return null  // Guard after slicing
 
   const min = Math.min(...displayData.map(d => d.score))
   const max = Math.max(...displayData.map(d => d.score))
@@ -1223,7 +1225,7 @@ function CategoryModal({
 
   // Category sparkline
   const renderSparkline = () => {
-    if (!data || data.history.length === 0) return null
+    if (!data || data.history.length < 2) return null  // Need at least 2 points
 
     const values = data.history.map(h => h.score)
     const min = Math.min(...values)
@@ -1509,20 +1511,24 @@ function SimilarPeriodsCard({ data }: { data: SimilarPeriodsData | null }) {
     return <span className={color}>{val >= 0 ? '+' : ''}{val.toFixed(2)}%</span>
   }
 
-  // Calculate probability-weighted outlook
+  // Calculate probability-weighted outlook (guard against division by zero)
   const totalWeight = data.similar_periods.reduce((sum, p) => sum + p.weights.combined, 0)
+  const safeWeight = totalWeight || 1  // Prevent division by zero
+
   const weightedReturn7d = data.similar_periods.reduce((sum, p) => {
     const ret = p.forward_returns?.d7 ?? 0
     return sum + ret * p.weights.combined
-  }, 0) / totalWeight
+  }, 0) / safeWeight
 
   const weightedReturn30d = data.similar_periods.reduce((sum, p) => {
     const ret = p.forward_returns?.d30 ?? 0
     return sum + ret * p.weights.combined
-  }, 0) / totalWeight
+  }, 0) / safeWeight
 
   const positiveCount = data.similar_periods.filter(p => (p.forward_returns?.d30 ?? 0) > 0).length
-  const winRate = (positiveCount / data.similar_periods.length) * 100
+  const winRate = data.similar_periods.length > 0
+    ? (positiveCount / data.similar_periods.length) * 100
+    : 0
 
   return (
     <div className="w-full mt-6 sm:mt-8 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
