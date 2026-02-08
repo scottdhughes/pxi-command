@@ -100,8 +100,11 @@ async function migrate() {
         date DATE NOT NULL,
         alert_type VARCHAR(50) NOT NULL,
         message TEXT NOT NULL,
-        severity VARCHAR(20) NOT NULL,
+        severity VARCHAR(20) NOT NULL DEFAULT 'info',
         acknowledged BOOLEAN DEFAULT FALSE,
+        pxi_score REAL,
+        forward_return_7d REAL,
+        forward_return_30d REAL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       )
     `);
@@ -109,6 +112,19 @@ async function migrate() {
 
     await query(`CREATE INDEX IF NOT EXISTS idx_alerts_date ON alerts(date DESC)`);
     console.log('✓ Created alerts indexes');
+
+    // Add missing columns to existing alerts table (idempotent)
+    await query(`
+      DO $$
+      BEGIN
+        ALTER TABLE alerts ADD COLUMN IF NOT EXISTS pxi_score REAL;
+        ALTER TABLE alerts ADD COLUMN IF NOT EXISTS forward_return_7d REAL;
+        ALTER TABLE alerts ADD COLUMN IF NOT EXISTS forward_return_30d REAL;
+      EXCEPTION
+        WHEN duplicate_column THEN NULL;
+      END $$;
+    `);
+    console.log('✓ Ensured alerts table has tracking columns');
 
     // Create views
     await query(`

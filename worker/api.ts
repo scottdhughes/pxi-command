@@ -2507,6 +2507,18 @@ export default {
           `).run();
           await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_alerts_date ON alerts(date DESC)`).run();
           await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts(alert_type)`).run();
+
+          // Add columns to existing table if they don't exist (SQLite doesn't have IF NOT EXISTS for columns)
+          try {
+            await env.DB.prepare(`ALTER TABLE alerts ADD COLUMN pxi_score REAL`).run();
+          } catch (e) { /* Column already exists */ }
+          try {
+            await env.DB.prepare(`ALTER TABLE alerts ADD COLUMN forward_return_7d REAL`).run();
+          } catch (e) { /* Column already exists */ }
+          try {
+            await env.DB.prepare(`ALTER TABLE alerts ADD COLUMN forward_return_30d REAL`).run();
+          } catch (e) { /* Column already exists */ }
+
           migrations.push('alerts');
         } catch (e) {
           console.error('alerts migration failed:', e);

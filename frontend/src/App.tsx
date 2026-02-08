@@ -119,9 +119,10 @@ interface SignalTheme {
   theme_name: string
   score: number
   classification: {
-    regime: 'BULLISH' | 'BEARISH' | 'NEUTRAL'
-    strength: 'STRONG' | 'MODERATE' | 'WEAK'
-    trend: 'RISING' | 'FALLING' | 'FLAT'
+    signal_type: string  // 'Rotation' | 'Momentum' | 'Divergence' | 'Mean Reversion'
+    confidence: string   // 'Very High' | 'High' | 'Medium-High' | 'Medium' | 'Medium-Low'
+    timing: string       // 'Now' | 'Building' | 'Ongoing' | 'Early'
+    stars: number        // 1-5
   }
   key_tickers: string[]
 }
@@ -1403,22 +1404,34 @@ function TopThemesWidget({ data, regime }: { data: SignalsData | null; regime?: 
 
   const topThemes = data.themes.slice(0, 3)
 
-  const getRegimeColor = (themeRegime: string) => {
-    if (themeRegime === 'BULLISH') return 'text-[#00c896]'
-    if (themeRegime === 'BEARISH') return 'text-[#ff6b6b]'
-    return 'text-[#949ba5]'
+  const getConfidenceColor = (confidence: string) => {
+    if (confidence === 'Very High' || confidence === 'High') return 'text-[#00c896]'
+    if (confidence === 'Medium-Low' || confidence === 'Low') return 'text-[#ff6b6b]'
+    return 'text-[#f5a524]' // Medium-High, Medium
   }
 
-  const getTrendIcon = (trend: string) => {
-    if (trend === 'RISING') return '↑'
-    if (trend === 'FALLING') return '↓'
-    return '→'
+  const getTimingIcon = (timing: string) => {
+    if (timing === 'Now') return '↑'
+    if (timing === 'Building') return '→'
+    if (timing === 'Ongoing') return '◆'
+    return '○' // Early
   }
 
-  // Check if top theme aligns with current regime
+  const getSignalTypeColor = (signalType: string) => {
+    if (signalType === 'Momentum') return 'bg-[#00c896]/20 text-[#00c896]'
+    if (signalType === 'Rotation') return 'bg-[#00a3ff]/20 text-[#00a3ff]'
+    if (signalType === 'Divergence') return 'bg-[#f5a524]/20 text-[#f5a524]'
+    return 'bg-[#949ba5]/20 text-[#949ba5]' // Mean Reversion
+  }
+
+  const renderStars = (stars: number) => {
+    return '★'.repeat(stars) + '☆'.repeat(5 - stars)
+  }
+
+  // Check if top theme aligns with current regime based on signal type
   const isAligned = regime && topThemes[0] &&
-    ((regime === 'RISK_ON' && topThemes[0].classification.regime === 'BULLISH') ||
-     (regime === 'RISK_OFF' && topThemes[0].classification.regime === 'BEARISH'))
+    ((regime === 'RISK_ON' && topThemes[0].classification.signal_type === 'Momentum') ||
+     (regime === 'RISK_OFF' && topThemes[0].classification.signal_type === 'Mean Reversion'))
 
   return (
     <div className="w-full mt-6 sm:mt-8 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
@@ -1451,18 +1464,28 @@ function TopThemesWidget({ data, regime }: { data: SignalsData | null; regime?: 
             <div className="flex items-center gap-2">
               <span className="text-[10px] text-[#949ba5]/40 w-4">#{idx + 1}</span>
               <div>
-                <div className="text-[11px] text-[#f3f3f3]">{theme.theme_name}</div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-[#f3f3f3]">{theme.theme_name}</span>
+                  <span className={`text-[8px] px-1.5 py-0.5 rounded ${getSignalTypeColor(theme.classification.signal_type)}`}>
+                    {theme.classification.signal_type}
+                  </span>
+                </div>
                 <div className="text-[9px] text-[#949ba5]/50 font-mono mt-0.5">
                   {theme.key_tickers.slice(0, 3).join(', ')}
                 </div>
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <span className={`text-[10px] ${getRegimeColor(theme.classification.regime)}`}>
-                {getTrendIcon(theme.classification.trend)}
-              </span>
-              <span className="text-[11px] font-mono text-[#f3f3f3]">
-                {theme.score.toFixed(1)}
+            <div className="flex flex-col items-end gap-0.5">
+              <div className="flex items-center gap-2">
+                <span className={`text-[10px] ${getConfidenceColor(theme.classification.confidence)}`}>
+                  {getTimingIcon(theme.classification.timing)}
+                </span>
+                <span className="text-[11px] font-mono text-[#f3f3f3]">
+                  {theme.score.toFixed(1)}
+                </span>
+              </div>
+              <span className="text-[9px] text-[#f5a524]/80">
+                {renderStars(theme.classification.stars)}
               </span>
             </div>
           </div>
