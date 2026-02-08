@@ -289,108 +289,103 @@ async function fetchCrypto(): Promise<void> {
 
 // ============== BTC ETF Flows ==============
 
-async function fetchWithRetry<T>(
-  fn: () => Promise<T>,
-  maxRetries: number = 3,
-  baseDelayMs: number = 2000
-): Promise<T> {
-  let lastError: any;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      lastError = err;
-      if (err.message?.includes('Too Many Requests') || err.message?.includes('429')) {
-        const delay = baseDelayMs * Math.pow(2, attempt);
-        console.log(`    ⏳ Rate limited, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
-        await new Promise(r => setTimeout(r, delay));
-      } else {
-        throw err; // Non-rate-limit errors fail immediately
-      }
-    }
-  }
-  throw lastError;
-}
-
 async function fetchBtcEtfFlows(): Promise<void> {
   console.log('\n━━━ BTC ETF Flows ━━━');
 
-  // Major BTC ETFs with approximate AUM weights
-  const etfs = [
-    { symbol: 'IBIT', weight: 0.45 },   // BlackRock - largest
-    { symbol: 'FBTC', weight: 0.25 },   // Fidelity
-    { symbol: 'GBTC', weight: 0.15 },   // Grayscale
-    { symbol: 'ARKB', weight: 0.08 },   // ARK
-    { symbol: 'BITB', weight: 0.07 },   // Bitwise
-  ];
-
+  // Try CoinGlass ETF data first (more reliable than Yahoo Finance from CI)
   try {
-    let successCount = 0;
+    // CoinGlass public ETF endpoint
+    const response = await axios.get('https://open-api-v3.coinglass.com/api/index/bitcoin-etf-list', {
+      timeout: 15000,
+      headers: {
+        'accept': 'application/json',
+        'User-Agent': 'PXI/1.0',
+      },
+    });
 
-    for (const { symbol, weight } of etfs) {
-      try {
-        const result = await fetchWithRetry(async () => {
-          return await yahooFinance.chart(symbol, {
-            period1: subYears(new Date(), 1),
-            period2: new Date(),
-            interval: '1d',
-          });
-        }, 3, 3000);
+    if (response.data?.data) {
+      // CoinGlass returns ETF list with daily flows
+      const etfData = response.data.data;
+      let totalFlow = 0;
 
-        const quotes = result.quotes || [];
-        if (quotes.length >= 2) {
-          // Calculate daily percentage change for flow proxy
-          for (let i = 1; i < quotes.length; i++) {
-            const current = quotes[i];
-            const prev = quotes[i - 1];
-
-            if (current.close && prev.close && current.date) {
-              // Use volume-weighted price change as flow proxy
-              const priceChange = (current.close - prev.close) / prev.close;
-              const volume = current.volume || 0;
-
-              // Flow proxy: price change * volume * weight
-              const flowProxy = priceChange * Math.log1p(volume) * weight * 100;
-
-              const dateStr = format(current.date, 'yyyy-MM-dd');
-
-              // Find existing entry for this date or create new
-              const existing = allIndicators.find(
-                i => i.indicator_id === 'btc_etf_flows' && i.date === dateStr
-              );
-
-              if (existing) {
-                existing.value += flowProxy;
-              } else {
-                allIndicators.push({
-                  indicator_id: 'btc_etf_flows',
-                  date: dateStr,
-                  value: flowProxy,
-                  source: 'yahoo_etf',
-                });
-              }
-            }
-          }
-          console.log(`  ✓ ${symbol}: ${quotes.length} days`);
-          successCount++;
+      for (const etf of etfData) {
+        if (etf.netAsset) {
+          totalFlow += etf.netAsset; // Sum of net flows
         }
-      } catch (err: any) {
-        console.error(`  ✗ ${symbol}: ${err.message}`);
       }
 
-      // Longer delay between ETFs to avoid rate limiting
-      await new Promise(r => setTimeout(r, 2000));
-    }
-
-    if (successCount > 0) {
-      const flowEntries = allIndicators.filter(i => i.indicator_id === 'btc_etf_flows');
-      console.log(`  ✓ btc_etf_flows: ${flowEntries.length} days from ${successCount}/${etfs.length} ETFs`);
-    } else {
-      console.error('  ✗ btc_etf_flows: all ETF fetches failed');
+      if (totalFlow !== 0) {
+        allIndicators.push({
+          indicator_id: 'btc_etf_flows',
+          date: format(new Date(), 'yyyy-MM-dd'),
+          value: totalFlow / 1e6, // Convert to millions
+          source: 'coinglass',
+        });
+        console.log(`  ✓ btc_etf_flows: ${(totalFlow / 1e6).toFixed(2)}M (CoinGlass)`);
+        return;
+      }
     }
   } catch (err: any) {
-    console.error(`  ✗ btc_etf_flows: ${err.message}`);
+    console.log(`  ⚠ CoinGlass ETF API: ${err.message}`);
   }
+
+  // Fallback: Try TheBlock data
+  try {
+    const response = await axios.get('https://api.theblock.co/api/v1/analytics/btc-spot-etf-flows', {
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'PXI/1.0',
+      },
+    });
+
+    if (response.data?.data) {
+      const flows = response.data.data;
+      const today = format(new Date(), 'yyyy-MM-dd');
+
+      for (const flow of flows.slice(-30)) { // Last 30 days
+        allIndicators.push({
+          indicator_id: 'btc_etf_flows',
+          date: flow.date || today,
+          value: flow.netFlow || flow.flow || 0,
+          source: 'theblock',
+        });
+      }
+      console.log(`  ✓ btc_etf_flows: ${flows.length} days (TheBlock)`);
+      return;
+    }
+  } catch (err: any) {
+    console.log(`  ⚠ TheBlock API: ${err.message}`);
+  }
+
+  // Final fallback: use BTC price momentum as proxy
+  try {
+    const btcData = allIndicators.filter(i => i.indicator_id === 'btc_price');
+    if (btcData.length >= 2) {
+      // Use 7-day BTC momentum as ETF flow proxy
+      const sorted = btcData.sort((a, b) => b.date.localeCompare(a.date));
+
+      for (let i = 0; i < Math.min(30, sorted.length - 7); i++) {
+        const current = sorted[i];
+        const week_ago = sorted[i + 7];
+        if (current && week_ago) {
+          const momentum = ((current.value - week_ago.value) / week_ago.value) * 100;
+
+          allIndicators.push({
+            indicator_id: 'btc_etf_flows',
+            date: current.date,
+            value: momentum, // 7-day % change as proxy
+            source: 'btc_momentum_proxy',
+          });
+        }
+      }
+      console.log(`  ✓ btc_etf_flows: using BTC momentum proxy`);
+      return;
+    }
+  } catch (err: any) {
+    console.log(`  ⚠ BTC momentum fallback: ${err.message}`);
+  }
+
+  console.error('  ✗ btc_etf_flows: all sources failed');
 }
 
 // ============== Alternative Indicators ==============
@@ -556,11 +551,11 @@ async function main(): Promise<void> {
 
   try {
     // Fetch all data sources
-    // BTC ETF flows first - it's been stale and is rate-limit sensitive
-    await fetchBtcEtfFlows();
     await fetchAllFred();
     await fetchAllYahoo();
     await fetchCrypto();
+    // BTC ETF flows after Yahoo (needs btc_price for fallback)
+    await fetchBtcEtfFlows();
     await fetchAlternative();
 
     // Post to Worker API
