@@ -98,86 +98,187 @@ interface FarsideFlow {
   totalFlow: number;
 }
 
+// Primary: Try Farside scraper
+async function fetchBtcEtfFlowsFromFarside(): Promise<IndicatorValue[]> {
+  // Farside publishes daily ETF flow data
+  const response = await axios.get(
+    'https://farside.co.uk/bitcoin-etf-flow-all-data/',
+    {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0',
+      },
+      timeout: 15000,
+    }
+  );
+
+  // Check for Cloudflare challenge
+  if (response.data.includes('challenge-platform') || response.data.includes('Just a moment')) {
+    throw new Error('Cloudflare challenge detected');
+  }
+
+  const $ = cheerio.load(response.data);
+  const dailyFlows: Map<string, number> = new Map();
+
+  // Parse the flow table
+  $('table tbody tr').each((_, row) => {
+    const cols = $(row).find('td');
+    if (cols.length >= 2) {
+      const dateStr = $(cols[0]).text().trim();
+      const totalCol = $(cols).last().text().trim();
+
+      // Parse total flow (last column usually)
+      const flowMatch = totalCol.match(/-?[\d.]+/);
+      if (flowMatch && dateStr) {
+        try {
+          // Try different date formats
+          let date: Date;
+          if (dateStr.includes('/')) {
+            date = parse(dateStr, 'dd/MM/yyyy', new Date());
+          } else {
+            date = parse(dateStr, 'd MMM yyyy', new Date());
+          }
+
+          const flow = parseFloat(flowMatch[0]);
+          if (!isNaN(flow)) {
+            dailyFlows.set(format(date, 'yyyy-MM-dd'), flow);
+          }
+        } catch {
+          // Skip invalid dates
+        }
+      }
+    }
+  });
+
+  // Calculate 7-day rolling sum
+  const sortedDates = Array.from(dailyFlows.keys()).sort();
+  const results: IndicatorValue[] = [];
+
+  for (let i = 6; i < sortedDates.length; i++) {
+    let sum = 0;
+    for (let j = i - 6; j <= i; j++) {
+      sum += dailyFlows.get(sortedDates[j]) || 0;
+    }
+
+    results.push({
+      indicatorId: 'btc_etf_flows',
+      date: new Date(sortedDates[i]),
+      value: sum,
+    });
+  }
+
+  return results;
+}
+
+// Fallback: Calculate implied flows from Yahoo Finance BTC ETF data
+async function fetchBtcEtfFlowsFromYahoo(): Promise<IndicatorValue[]> {
+  // Import yahoo-finance2 dynamically to avoid issues if not installed
+  const yahooFinance = await import('yahoo-finance2').then(m => m.default);
+
+  // Major BTC ETFs
+  const etfSymbols = ['IBIT', 'FBTC', 'GBTC', 'ARKB', 'BITB'];
+  const endDate = new Date();
+  const startDate = subDays(endDate, 45); // Get ~45 days of data
+
+  const dailyVolumes: Map<string, number> = new Map();
+
+  for (const symbol of etfSymbols) {
+    try {
+      const history = await yahooFinance.historical(symbol, {
+        period1: startDate,
+        period2: endDate,
+        interval: '1d',
+      });
+
+      for (const day of history) {
+        const dateStr = format(day.date, 'yyyy-MM-dd');
+        // Use volume * close price as a proxy for dollar flow
+        // Positive volume = inflow approximation
+        const dollarVolume = (day.volume || 0) * (day.close || 0);
+        const priceChange = day.close - day.open;
+        // If price went up with volume, likely inflow; if down, likely outflow
+        const impliedFlow = priceChange >= 0 ? dollarVolume / 1e6 : -dollarVolume / 1e6;
+
+        const existing = dailyVolumes.get(dateStr) || 0;
+        dailyVolumes.set(dateStr, existing + impliedFlow);
+      }
+    } catch (err) {
+      console.warn(`  Warning: Could not fetch ${symbol} ETF data`);
+    }
+  }
+
+  // Calculate 7-day rolling sum
+  const sortedDates = Array.from(dailyVolumes.keys()).sort();
+  const results: IndicatorValue[] = [];
+
+  for (let i = 6; i < sortedDates.length; i++) {
+    let sum = 0;
+    for (let j = i - 6; j <= i; j++) {
+      sum += dailyVolumes.get(sortedDates[j]) || 0;
+    }
+
+    results.push({
+      indicatorId: 'btc_etf_flows',
+      date: new Date(sortedDates[i]),
+      value: sum,
+    });
+  }
+
+  return results;
+}
+
 export async function fetchBtcEtfFlows(): Promise<IndicatorValue[]> {
   const SOURCE_NAME = 'farside';
 
   // Check circuit breaker
   if (isCircuitOpen(SOURCE_NAME)) {
-    console.log('  ⚡ Circuit open for Farside, skipping');
-    return [];
+    console.log('  ⚡ Circuit open for Farside, trying Yahoo fallback');
+    try {
+      return await fetchBtcEtfFlowsFromYahoo();
+    } catch (yahooErr: any) {
+      console.error('  ✗ Yahoo fallback failed:', yahooErr.message);
+      return [];
+    }
   }
 
   return resilientFetch(
     async () => {
-      // Farside publishes daily ETF flow data
-      const response = await axios.get(
-        'https://farside.co.uk/bitcoin-etf-flow-all-data/',
-        {
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          },
-          timeout: 15000,
+      try {
+        // Try Farside first
+        const farsideData = await fetchBtcEtfFlowsFromFarside();
+        if (farsideData.length > 0) {
+          console.log('  ✓ Farside scraper succeeded');
+          return farsideData;
         }
-      );
+        throw new Error('No data from Farside');
+      } catch (farsideErr: any) {
+        console.warn(`  ⚠ Farside failed (${farsideErr.message}), trying Yahoo fallback...`);
 
-      const $ = cheerio.load(response.data);
-      const results: IndicatorValue[] = [];
-      const dailyFlows: Map<string, number> = new Map();
-
-      // Parse the flow table
-      $('table tbody tr').each((_, row) => {
-        const cols = $(row).find('td');
-        if (cols.length >= 2) {
-          const dateStr = $(cols[0]).text().trim();
-          const totalCol = $(cols).last().text().trim();
-
-          // Parse total flow (last column usually)
-          const flowMatch = totalCol.match(/-?[\d.]+/);
-          if (flowMatch && dateStr) {
-            try {
-              // Try different date formats
-              let date: Date;
-              if (dateStr.includes('/')) {
-                date = parse(dateStr, 'dd/MM/yyyy', new Date());
-              } else {
-                date = parse(dateStr, 'd MMM yyyy', new Date());
-              }
-
-              const flow = parseFloat(flowMatch[0]);
-              if (!isNaN(flow)) {
-                dailyFlows.set(format(date, 'yyyy-MM-dd'), flow);
-              }
-            } catch {
-              // Skip invalid dates
-            }
+        // Fallback to Yahoo Finance implied flows
+        try {
+          const yahooData = await fetchBtcEtfFlowsFromYahoo();
+          if (yahooData.length > 0) {
+            console.log('  ✓ Yahoo fallback succeeded');
+            return yahooData;
           }
-        }
-      });
-
-      // Calculate 7-day rolling sum
-      const sortedDates = Array.from(dailyFlows.keys()).sort();
-
-      for (let i = 6; i < sortedDates.length; i++) {
-        let sum = 0;
-        for (let j = i - 6; j <= i; j++) {
-          sum += dailyFlows.get(sortedDates[j]) || 0;
+        } catch (yahooErr: any) {
+          console.error('  ✗ Yahoo fallback also failed:', yahooErr.message);
         }
 
-        results.push({
-          indicatorId: 'btc_etf_flows',
-          date: new Date(sortedDates[i]),
-          value: sum,
-        });
+        // Re-throw original error if both fail
+        throw farsideErr;
       }
-
-      return results;
     },
     {
       sourceName: SOURCE_NAME,
-      maxAttempts: 3,
+      maxAttempts: 2,
       baseDelayMs: 1000,
-      timeoutMs: 30000,
+      timeoutMs: 60000,  // Longer timeout for Yahoo fallback
     }
   );
 }
