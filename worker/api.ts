@@ -2775,7 +2775,7 @@ export default {
       if (url.pathname === '/api/history') {
         const days = Math.min(365, Math.max(7, parseInt(url.searchParams.get('days') || '90')));
 
-        // Get historical PXI scores with regime data
+        // Get historical PXI scores
         const historyResult = await env.DB.prepare(`
           SELECT p.date, p.score, p.label, p.status
           FROM pxi_scores p
@@ -2792,19 +2792,15 @@ export default {
           return Response.json({ error: 'No historical data' }, { status: 404, headers: corsHeaders });
         }
 
-        // Detect regime for each date (batch fetch to reduce queries)
-        const dataWithRegimes = await Promise.all(
-          historyResult.results.map(async (row) => {
-            const regime = await detectRegime(env.DB, row.date);
-            return {
-              date: row.date,
-              score: row.score,
-              label: row.label,
-              status: row.status,
-              regime: regime?.regime || null,
-            };
-          })
-        );
+        // Derive regime from score (fast heuristic to avoid N+1 queries)
+        // Score >= 60: RISK_ON, Score <= 40: RISK_OFF, otherwise: TRANSITION
+        const dataWithRegimes = historyResult.results.map((row) => ({
+          date: row.date,
+          score: row.score,
+          label: row.label,
+          status: row.status,
+          regime: row.score >= 60 ? 'RISK_ON' : row.score <= 40 ? 'RISK_OFF' : 'TRANSITION',
+        }));
 
         return Response.json({
           data: dataWithRegimes.reverse(),  // Chronological order

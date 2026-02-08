@@ -2511,9 +2511,9 @@ function App() {
           const signalsApiUrl = '/signals/api/runs'
           const signalsRunsRes = await fetch(signalsApiUrl)
           if (signalsRunsRes.ok) {
-            const runsJson = await signalsRunsRes.json() as { runs: { run_id: string }[] }
+            const runsJson = await signalsRunsRes.json() as { runs: { id: string }[] }
             if (runsJson.runs && runsJson.runs.length > 0) {
-              const latestRunId = runsJson.runs[0].run_id
+              const latestRunId = runsJson.runs[0].id
               const signalsDetailRes = await fetch(`${signalsApiUrl}/${latestRunId}`)
               if (signalsDetailRes.ok) {
                 const signalsJson = await signalsDetailRes.json() as SignalsData
