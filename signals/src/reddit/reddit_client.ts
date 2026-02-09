@@ -8,8 +8,37 @@ import { logWarn } from "../utils/logger"
 const REDDIT_BASE = "https://oauth.reddit.com"
 const REDDIT_PUBLIC = "https://www.reddit.com"
 
+// Reddit-compliant User-Agent format: <platform>:<app_id>:<version> (by /u/<username>)
+const DEFAULT_USER_AGENT = "web:pxi-signals:1.0.0 (by /u/pxi_command)"
+
+// Browser-like headers to avoid bot detection (Reddit 2026 requirements)
+function getBrowserHeaders(userAgent: string): Record<string, string> {
+  return {
+    "User-Agent": userAgent,
+    "Accept": "application/json, text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-CH-UA": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"macOS"',
+    "Upgrade-Insecure-Requests": "1",
+  }
+}
+
 async function sleep(ms: number) {
   await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Add jitter to delays to appear more human-like
+function sleepWithJitter(baseMs: number): Promise<void> {
+  const jitter = Math.random() * baseMs * 0.5 // 0-50% jitter
+  return sleep(baseMs + jitter)
 }
 
 async function fetchWithBackoff(input: RequestInfo, init: RequestInit, maxRetries = 3) {
@@ -29,19 +58,23 @@ async function fetchWithBackoff(input: RequestInfo, init: RequestInit, maxRetrie
 async function getOAuthToken(env: Env): Promise<string | null> {
   const id = env.REDDIT_CLIENT_ID
   const secret = env.REDDIT_CLIENT_SECRET
-  const ua = env.REDDIT_USER_AGENT
-  if (!id || !secret || !ua) return null
+  const ua = env.REDDIT_USER_AGENT || DEFAULT_USER_AGENT
+  if (!id || !secret) {
+    logWarn("Reddit OAuth credentials not configured, will use public API with browser headers")
+    return null
+  }
 
   const body = new URLSearchParams({
     grant_type: "client_credentials",
   })
 
   const basic = btoa(`${id}:${secret}`)
+  const browserHeaders = getBrowserHeaders(ua)
   const res = await fetch("https://www.reddit.com/api/v1/access_token", {
     method: "POST",
     headers: {
+      ...browserHeaders,
       Authorization: `Basic ${basic}`,
-      "User-Agent": ua,
       "Content-Type": "application/x-www-form-urlencoded",
     },
     body: body.toString(),
@@ -129,11 +162,12 @@ async function fetchComments(permalink: string, headers: Record<string, string>,
 
 export async function fetchRedditDataset(env: Env, subreddits: string[]): Promise<RedditDataset> {
   const cfg = getConfig(env)
-  const ua = env.REDDIT_USER_AGENT || "pxi-signals/0.1"
+  const ua = env.REDDIT_USER_AGENT || DEFAULT_USER_AGENT
   const token = await getOAuthToken(env)
-  const headers: Record<string, string> = {
-    "User-Agent": ua,
-  }
+
+  // Use browser-like headers to avoid Reddit's bot detection
+  const headers: Record<string, string> = getBrowserHeaders(ua)
+
   const base = token ? REDDIT_BASE : REDDIT_PUBLIC
   if (token) headers.Authorization = `Bearer ${token}`
 
@@ -153,14 +187,14 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
       fetched += children.length
       after = json?.data?.after || null
       if (!after || children.length === 0) break
-      await sleep(250)
+      await sleepWithJitter(500) // Increased delay with jitter to avoid detection
     }
   }
 
   if (cfg.enableComments) {
     for (const post of posts) {
       post.comments = await fetchComments(post.permalink, headers, cfg.maxCommentsPerPost)
-      await sleep(200)
+      await sleepWithJitter(400) // Increased delay with jitter
     }
   }
 
