@@ -46,7 +46,7 @@ Returns a list of pipeline runs with metadata.
       "created_at_utc": "2025-01-18T15:30:00Z",
       "lookback_days": 7,
       "baseline_days": 30,
-      "status": "success",
+      "status": "ok",
       "summary_json": null,
       "report_html_key": "reports/20250118-.../report.html",
       "results_json_key": "reports/20250118-.../results.json",
@@ -57,8 +57,11 @@ Returns a list of pipeline runs with metadata.
 }
 ```
 
-**Parameters**
-- Limit: Returns up to 50 most recent runs
+Optional query parameters:
+
+- `status=ok` to return only successful runs
+- `status=error` to return only failed runs
+- Without status, returns mixed runs (most recent first)
 
 **Example**
 ```bash

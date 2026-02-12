@@ -204,7 +204,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   if (request.method === "GET" && path === "/api/runs") {
-    const runs = await listRuns(env, 50)
+    const status = url.searchParams.get("status")
+    if (status && status !== "ok" && status !== "error") {
+      return jsonResponse({ error: "Invalid status filter" }, 400)
+    }
+
+    const runs = await listRuns(env, 50, status)
     return jsonResponse({ runs })
   }
 

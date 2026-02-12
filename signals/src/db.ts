@@ -33,7 +33,20 @@ export async function insertRun(env: Env, row: RunRow) {
     .run()
 }
 
-export async function listRuns(env: Env, limit = 20): Promise<RunRow[]> {
+export async function listRuns(
+  env: Env,
+  limit = 20,
+  status?: string
+): Promise<RunRow[]> {
+  if (status) {
+    const res = await env.SIGNALS_DB.prepare(
+      `SELECT * FROM runs WHERE status = ? ORDER BY created_at_utc DESC LIMIT ?`
+    )
+      .bind(status, limit)
+      .all<RunRow>()
+    return res.results || []
+  }
+
   const res = await env.SIGNALS_DB.prepare(
     `SELECT * FROM runs ORDER BY created_at_utc DESC LIMIT ?`
   )

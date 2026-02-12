@@ -6,7 +6,7 @@ import { parseRedditListing, parseOAuthResponse } from "./schemas"
 import { logWarn } from "../utils/logger"
 
 const REDDIT_BASE = "https://oauth.reddit.com"
-const REDDIT_PUBLIC = "https://www.reddit.com"
+const REDDIT_PUBLIC_BASES = ["https://www.reddit.com", "https://old.reddit.com"]
 
 // Reddit-compliant User-Agent format: <platform>:<app_id>:<version> (by /u/<username>)
 const DEFAULT_USER_AGENT = "web:pxi-signals:1.0.0 (by /u/pxi_command)"
@@ -99,18 +99,126 @@ async function getOAuthToken(env: Env): Promise<string | null> {
   return parsed.access_token
 }
 
-async function fetchListing(url: string, headers: Record<string, string>) {
-  const res = await fetchWithBackoff(url, { headers })
-  if (!res.ok) {
-    throw new Error(`Reddit fetch failed: ${res.status}`)
+function getRedditPathFromPermalink(permalink: string): string {
+  try {
+    return new URL(permalink).pathname
+  } catch {
+    return permalink.startsWith("/") ? permalink : `/${permalink}`
   }
-  const json = await res.json()
-  const parsed = parseRedditListing(json)
-  if (!parsed) {
-    logWarn("Reddit listing validation failed, returning empty result", { url })
-    return { data: { children: [], after: null } }
+}
+
+function getAuthHeaders(base: string, ua: string, token?: string | null): Record<string, string> {
+  const headers = getBrowserHeaders(ua)
+  if (token && base === REDDIT_BASE) {
+    headers.Authorization = `Bearer ${token}`
   }
-  return parsed
+  return headers
+}
+
+function resolveListingUrl(base: string, sub: string, limit: number, after: string | null): string {
+  return `${base}/r/${sub}/new.json?limit=${limit}${after ? `&after=${after}` : ""}`
+}
+
+function resolveCommentUrl(base: string, permalink: string, maxComments: number): string {
+  const path = getRedditPathFromPermalink(permalink)
+  return `${base}${path}.json?limit=${maxComments}`
+}
+
+async function fetchListingWithFallback(
+  sub: string,
+  limit: number,
+  after: string | null,
+  ua: string,
+  token: string | null,
+  publicBases: string[]
+) {
+  let lastStatus: string | number = "unknown"
+  const baseCandidates = token ? [REDDIT_BASE, ...publicBases] : [...publicBases]
+  for (const base of baseCandidates) {
+    const headers = getAuthHeaders(base, ua, token)
+    const url = resolveListingUrl(base, sub, limit, after)
+    const res = await fetchWithBackoff(url, { headers })
+    if (!res.ok) {
+      lastStatus = res.status
+      logWarn(`Reddit listing request failed`, { base, status: res.status, sub })
+      continue
+    }
+
+    let json: unknown
+    try {
+      json = await res.json()
+    } catch {
+      lastStatus = "invalid-json"
+      logWarn("Reddit listing response body parse failed", { base, sub })
+      continue
+    }
+
+    const parsed = parseRedditListing(json)
+    if (!parsed) {
+      lastStatus = "invalid-schema"
+      logWarn("Reddit listing validation failed, trying next source", { base, sub })
+      continue
+    }
+
+    return parsed
+  }
+
+  throw new Error(`Reddit fetch failed: ${lastStatus}`)
+}
+
+async function fetchCommentsWithFallback(
+  permalink: string,
+  maxComments: number,
+  ua: string,
+  token: string | null,
+  publicBases: string[]
+) {
+  const errors: string[] = []
+  const baseCandidates = token ? [REDDIT_BASE, ...publicBases] : [...publicBases]
+  for (const base of baseCandidates) {
+    const headers = getAuthHeaders(base, ua, token)
+    const url = resolveCommentUrl(base, permalink, maxComments)
+    const res = await fetchWithBackoff(url, { headers })
+    if (!res.ok) {
+      const error = `${base}:${res.status}`
+      errors.push(error)
+      continue
+    }
+
+    let json: unknown
+    try {
+      json = await res.json()
+    } catch {
+      errors.push(`${base}:invalid-json`)
+      continue
+    }
+
+    if (!Array.isArray(json) || json.length < 2) {
+      errors.push(`${base}:unexpected-comment-format`)
+      logWarn("Unexpected comment response format", { base, permalink })
+      continue
+    }
+
+    const comments: RedditComment[] = []
+    const listing = (json[1] as { data?: { children?: unknown[] } })?.data?.children || []
+    for (const child of listing) {
+      const c = (child as { data?: { id?: string; created_utc?: number; body?: string; permalink?: string } })?.data
+      if (!c || !c.body || !c.id || !c.created_utc || !c.permalink) continue
+      comments.push({
+        id: c.id,
+        created_utc: c.created_utc,
+        body: c.body,
+        permalink: `https://reddit.com${c.permalink}`,
+      })
+      if (comments.length >= maxComments) break
+    }
+    return comments
+  }
+
+  if (errors.length > 0) {
+    logWarn("Failed to fetch comments", { permalink, errors })
+  }
+  return []
 }
 
 function mapPost(child: any, subreddit: string): RedditPost | null {
@@ -128,48 +236,12 @@ function mapPost(child: any, subreddit: string): RedditPost | null {
   }
 }
 
-async function fetchComments(permalink: string, headers: Record<string, string>, maxComments: number): Promise<RedditComment[]> {
-  const url = `${permalink}.json?limit=${maxComments}`
-  const res = await fetchWithBackoff(url, { headers })
-  if (!res.ok) {
-    logWarn("Failed to fetch comments", {
-      permalink,
-      status: res.status,
-      statusText: res.statusText,
-    })
-    return []
-  }
-  const json = (await res.json()) as unknown[]
-  if (!Array.isArray(json) || json.length < 2) {
-    logWarn("Unexpected comment response format", { permalink })
-    return []
-  }
-  const comments: RedditComment[] = []
-  const listing = (json[1] as { data?: { children?: unknown[] } })?.data?.children || []
-  for (const child of listing) {
-    const c = (child as { data?: { id?: string; created_utc?: number; body?: string; permalink?: string } })?.data
-    if (!c || !c.body || !c.id || !c.created_utc || !c.permalink) continue
-    comments.push({
-      id: c.id,
-      created_utc: c.created_utc,
-      body: c.body,
-      permalink: `https://reddit.com${c.permalink}`,
-    })
-    if (comments.length >= maxComments) break
-  }
-  return comments
-}
-
 export async function fetchRedditDataset(env: Env, subreddits: string[]): Promise<RedditDataset> {
   const cfg = getConfig(env)
   const ua = env.REDDIT_USER_AGENT || DEFAULT_USER_AGENT
   const token = await getOAuthToken(env)
 
-  // Use browser-like headers to avoid Reddit's bot detection
-  const headers: Record<string, string> = getBrowserHeaders(ua)
-
-  const base = token ? REDDIT_BASE : REDDIT_PUBLIC
-  if (token) headers.Authorization = `Bearer ${token}`
+  const publicBases = REDDIT_PUBLIC_BASES
 
   const posts: RedditPost[] = []
   for (const sub of subreddits) {
@@ -177,8 +249,7 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
     let fetched = 0
     while (fetched < cfg.maxPostsPerSubreddit) {
       const limit = Math.min(100, cfg.maxPostsPerSubreddit - fetched)
-      const url = `${base}/r/${sub}/new.json?limit=${limit}${after ? `&after=${after}` : ""}`
-      const json = await fetchListing(url, headers)
+      const json = await fetchListingWithFallback(sub, limit, after, ua, token, publicBases)
       const children = json?.data?.children || []
       for (const child of children) {
         const post = mapPost(child, sub)
@@ -193,7 +264,7 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
 
   if (cfg.enableComments) {
     for (const post of posts) {
-      post.comments = await fetchComments(post.permalink, headers, cfg.maxCommentsPerPost)
+      post.comments = await fetchCommentsWithFallback(post.permalink, cfg.maxCommentsPerPost, ua, token, publicBases)
       await sleepWithJitter(400) // Increased delay with jitter
     }
   }

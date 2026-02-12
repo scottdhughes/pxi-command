@@ -54,10 +54,9 @@ npm run format
 | Route | Method | Description |
 |-------|--------|-------------|
 | `/signals/latest` | GET | Latest report (HTML) |
-| `/signals/latest.json` | GET | Latest report (JSON) |
-| `/signals/runs` | GET | List of all pipeline runs |
-| `/signals/runs/:id` | GET | Specific run report (HTML) |
-| `/signals/runs/:id.json` | GET | Specific run report (JSON) |
+| `/signals/api/runs` | GET | List pipeline runs |
+| `/signals/run/:id` | GET | Specific run report (HTML) |
+| `/signals/api/runs/:id` | GET | Specific run report (JSON) |
 | `/signals/api/run` | POST | Trigger pipeline run (requires `X-Admin-Token`) |
 
 See [docs/API.md](docs/API.md) for detailed API documentation.

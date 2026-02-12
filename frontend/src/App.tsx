@@ -133,6 +133,11 @@ interface SignalsData {
   themes: SignalTheme[]
 }
 
+interface SignalsRunSummary {
+  id: string
+  status?: "ok" | "error"
+}
+
 // ============== Similar Periods Interface ==============
 interface SimilarPeriod {
   date: string
@@ -2538,9 +2543,9 @@ function App() {
         // v1.5: Signals data - fetch latest run from signals API
         try {
           const signalsApiUrl = '/signals/api/runs'
-          const signalsRunsRes = await fetch(signalsApiUrl)
+          const signalsRunsRes = await fetch(`${signalsApiUrl}?status=ok`)
           if (signalsRunsRes.ok) {
-            const runsJson = await signalsRunsRes.json() as { runs: { id: string }[] }
+            const runsJson = await signalsRunsRes.json() as { runs: SignalsRunSummary[] }
             if (runsJson.runs && runsJson.runs.length > 0) {
               const latestRunId = runsJson.runs[0].id
               const signalsDetailRes = await fetch(`${signalsApiUrl}/${latestRunId}`)
