@@ -875,7 +875,10 @@ async function postToWorkerAPI(): Promise<void> {
   console.log('\n━━━ Posting to Worker API ━━━');
   console.log(`  Total indicator values: ${allIndicators.length}`);
 
-  const batchSize = 500;
+  const requestedBatchSize = Number.parseInt(process.env.CRON_WRITE_BATCH_SIZE ?? '1000', 10);
+  const batchSize = Number.isFinite(requestedBatchSize)
+    ? Math.min(5000, Math.max(100, requestedBatchSize))
+    : 1000;
   let totalWritten = 0;
   let failedBatches = 0;
 
