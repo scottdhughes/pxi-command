@@ -23,6 +23,10 @@ binding = "AI"
 binding = "ML_MODELS"
 id = "88901ff0216a484eb81b8004be0f5aea"
 
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "e9d69a554ea44727b185127ea67e6932"
+
 # Cron Triggers - Disabled (using GitHub Actions instead due to Yahoo API blocking Workers)
 # [triggers]
 # crons = ["0 6 * * *"]

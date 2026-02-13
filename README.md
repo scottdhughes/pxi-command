@@ -191,6 +191,53 @@ cd worker && npx wrangler deploy
 cd signals && npm install && npx wrangler deploy
 ```
 
+### Launch Readiness Smoke Checks
+
+Use these checks after deployment or before releases:
+
+```bash
+# Frontend route checks
+curl -I https://pxicommand.com/
+curl -I https://pxicommand.com/spec
+curl -I https://pxicommand.com/alerts
+curl -I https://pxicommand.com/guide
+curl -I https://pxicommand.com/signals
+curl -I https://pxicommand.com/signals/latest
+
+# API checks
+curl -I https://pxi-api.novoamorx1.workers.dev/health
+curl -I https://pxi-api.novoamorx1.workers.dev/api/pxi
+curl -I https://pxi-api.novoamorx1.workers.dev/api/alerts
+curl -I https://pxi-api.novoamorx1.workers.dev/api/signal
+
+# CORS preflight check
+curl -X OPTIONS https://pxi-api.novoamorx1.workers.dev/api/refresh \
+  -H "Origin: https://pxicommand.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: Content-Type, Authorization, X-Admin-Token"
+
+# Backfill validation check (expect 400/401 depending on auth mode)
+curl -X POST https://pxi-api.novoamorx1.workers.dev/api/backfill \
+  -H "Content-Type: application/json" \
+  -d '{"start":"invalid-date","limit":"bad"}'
+```
+
+### Signals Worker Route Check
+
+Confirm the route is attached and active:
+
+```bash
+cd /Users/scott/pxi-signals
+npx wrangler whoami
+npx wrangler deployments list --name pxi-signals
+```
+
+If `/signals` is unreachable (404), verify:
+
+1. `signals/wrangler.toml` has `pxicommand.com/signals` and `pxicommand.com/signals/*` route entries.
+2. The worker deploy succeeds after route changes.
+3. The `pxi-signals` worker has active production bindings (`d1`, `r2`, `kv`) for `pxicommand.com`.
+
 ### Signals Development
 
 ```bash

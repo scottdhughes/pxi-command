@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  frontend:
+    name: Frontend Lint + Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+
+  worker:
+    name: Worker Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run build
+
+  signals:
+    name: Signals Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: signals
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm test
+
+  smoke:
+    name: Route + API Smoke
+    runs-on: ubuntu-latest
+    needs:
+      - frontend
+      - worker
+      - signals
+    env:
+      SITE_URL: https://pxicommand.com
+      API_URL: https://pxi-api.novoamorx1.workers.dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify route pages
+        run: |
+          set -euo pipefail
+
+          check_html_status() {
+            local path="$1"
+            local expected="$2"
+            local code
+            code=$(curl -sS -o /tmp/page.out -w "%{http_code}" --max-time 20 "$SITE_URL$path")
+            if [[ "$code" != "$expected" ]]; then
+              echo "Expected $expected for $path but got $code"
+              exit 1
+            fi
+          }
+
+          check_api_status() {
+            local path="$1"
+            local expected="$2"
+            local code
+            code=$(curl -sS -o /tmp/api.out -w "%{http_code}" --max-time 20 "$API_URL$path")
+            if [[ "$code" != "$expected" ]]; then
+              echo "Expected $expected for API $path but got $code"
+              exit 1
+            fi
+          }
+
+          check_html_status "/" 200
+          check_html_status "/spec" 200
+          check_html_status "/alerts" 200
+          check_html_status "/guide" 200
+
+          signals_code=$(curl -sS -o /tmp/signals.out -w "%{http_code}" --max-time 20 "$SITE_URL/signals")
+          signals_followed_code=$(curl -Ls -o /tmp/signals_followed.out -w "%{http_code}" --max-time 20 "$SITE_URL/signals")
+          if [[ "$signals_code" != "200" && "$signals_code" != "301" && "$signals_code" != "302" ]]; then
+            echo "Expected 200/301/302 for /signals but got $signals_code"
+            exit 1
+          fi
+          if [[ "$signals_followed_code" != "200" ]]; then
+            echo "Expected /signals to eventually resolve to 200, got $signals_followed_code"
+            exit 1
+          fi
+
+          check_html_status "/signals/latest" 200
+          check_api_status "/health" 200
+          check_api_status "/api/pxi" 200
+          check_api_status "/api/alerts?limit=5" 200
+          check_api_status "/api/signal" 200
+
+          # CORS preflight for admin endpoint (no auth check expected, only CORS response)
+          code=$(curl -sS -o /tmp/preflight.out -w "%{http_code}" --max-time 20 -X OPTIONS \
+            -H "Origin: https://pxicommand.com" \
+            -H "Access-Control-Request-Method: POST" \
+            -H "Access-Control-Request-Headers: Content-Type, Authorization, X-Admin-Token" \
+            "$API_URL/api/refresh")
+          if [[ "$code" != "204" && "$code" != "200" ]]; then
+            echo "Expected CORS preflight 200/204 but got $code"
+            exit 1
+          fi
+
+          # Backfill validation path (should fail validation without valid credentials)
+          code=$(curl -sS -o /tmp/backfill.out -w "%{http_code}" --max-time 20 -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"start":"not-a-date","end":"also-bad","limit":"bad"}' \
+            "$API_URL/api/backfill")
+          if [[ "$code" != "400" && "$code" != "401" ]]; then
+            echo "Expected 400 or 401 for invalid backfill payload but got $code"
+            exit 1
+          fi

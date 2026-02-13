@@ -1,5 +1,135 @@
 import { useEffect, useState, useRef } from 'react'
 
+type AppRoute = '/' | '/spec' | '/alerts' | '/guide'
+
+interface RouteMeta {
+  title: string
+  description: string
+  canonical: string
+  ogTitle: string
+  ogDescription: string
+  jsonLd: Record<string, unknown>
+}
+
+const ROUTE_META: Record<AppRoute, RouteMeta> = {
+  '/': {
+    title: 'PXI /COMMAND - Macro Market Strength Index',
+    description: 'Real-time composite macro indicator synthesizing volatility, credit spreads, market breadth, positioning, and global risk signals into a single 0-100 score.',
+    canonical: 'https://pxicommand.com/',
+    ogTitle: 'PXI /COMMAND - Macro Market Strength Index',
+    ogDescription: 'Real-time composite macro indicator: volatility, credit, breadth, positioning, and global risk signals in a single 0-100 score.',
+    jsonLd: {
+      '@context': 'https://schema.org',
+      '@type': 'WebSite',
+      name: 'PXI /COMMAND',
+      url: 'https://pxicommand.com/',
+      description: 'Real-time macro market strength index',
+      potentialAction: {
+        '@type': 'SearchAction',
+        target: 'https://pxicommand.com/?q={search_term_string}',
+        'query-input': 'required name=search_term_string',
+      },
+    },
+  },
+  '/spec': {
+    title: 'PXI /COMMAND Protocol Specification',
+    description: 'PXI methodology, indicators, and risk architecture. Learn the full framework behind the macro market strength index.',
+    canonical: 'https://pxicommand.com/spec',
+    ogTitle: 'PXI /COMMAND Protocol Specification',
+    ogDescription: 'Detailed PXI methodology, category weights, and modeling assumptions for transparency.',
+    jsonLd: {
+      '@context': 'https://schema.org',
+      '@type': 'WebPage',
+      name: 'PXI /COMMAND Protocol Specification',
+      url: 'https://pxicommand.com/spec',
+      description: 'Detailed explanation of PXI indicators, methodology, and backtest assumptions.',
+    },
+  },
+  '/alerts': {
+    title: 'PXI /COMMAND Alert History',
+    description: 'Historical alert signal log for PXI with forward return attribution and regime-specific accuracy context.',
+    canonical: 'https://pxicommand.com/alerts',
+    ogTitle: 'PXI /COMMAND Alert History',
+    ogDescription: 'Review historical divergence alerts and outcome attribution from the PXI /COMMAND index.',
+    jsonLd: {
+      '@context': 'https://schema.org',
+      '@type': 'WebPage',
+      name: 'PXI /COMMAND Alert History',
+      url: 'https://pxicommand.com/alerts',
+      description: 'Historical divergence alerts and regime-based risk signal archive.',
+    },
+  },
+  '/guide': {
+    title: 'PXI /COMMAND Guide',
+    description: 'How to interpret PXI score levels, regimes, and allocation guidance for macro and risk environments.',
+    canonical: 'https://pxicommand.com/guide',
+    ogTitle: 'PXI /COMMAND Guide',
+    ogDescription: 'A practical guide to reading PXI scores and regime signals.',
+    jsonLd: {
+      '@context': 'https://schema.org',
+      '@type': 'HowTo',
+      name: 'PXI /COMMAND Guide',
+      url: 'https://pxicommand.com/guide',
+      description: 'How to interpret PXI scores, regimes, and risk guidance.',
+      step: [],
+    },
+  },
+}
+
+function normalizeRoute(pathname: string): AppRoute {
+  const path = (pathname || '/').replace(/\/+$/, '')
+  if (path === '/spec') return '/spec'
+  if (path === '/alerts') return '/alerts'
+  if (path === '/guide') return '/guide'
+  return '/'
+}
+
+function setMeta(name: string, content: string, attr: 'name' | 'property' = 'name') {
+  const selector = attr === 'name' ? `meta[name="${name}"]` : `meta[property="${name}"]`
+  let tag = document.querySelector(selector) as HTMLMetaElement | null
+  if (!tag) {
+    tag = document.createElement('meta')
+    tag.setAttribute(attr, name)
+    document.head.appendChild(tag)
+  }
+  tag.setAttribute('content', content)
+}
+
+function setJsonLd(meta: Record<string, unknown>) {
+  let tag = document.getElementById('route-jsonld') as HTMLScriptElement | null
+  if (!tag) {
+    tag = document.createElement('script')
+    tag.setAttribute('type', 'application/ld+json')
+    tag.id = 'route-jsonld'
+    document.head.appendChild(tag)
+  }
+  tag.text = JSON.stringify(meta, null, 2)
+}
+
+function applyRouteMetadata(route: AppRoute) {
+  const meta = ROUTE_META[route]
+  document.title = meta.title
+
+  const setCanonical = (href: string) => {
+    let tag = document.querySelector('link[rel="canonical"]') as HTMLLinkElement | null
+    if (!tag) {
+      tag = document.createElement('link')
+      tag.setAttribute('rel', 'canonical')
+      document.head.appendChild(tag)
+    }
+    tag.setAttribute('href', href)
+  }
+
+  setMeta('description', meta.description, 'name')
+  setMeta('og:title', meta.ogTitle, 'property')
+  setMeta('og:description', meta.ogDescription, 'property')
+  setMeta('og:url', meta.canonical, 'property')
+  setMeta('twitter:title', meta.ogTitle, 'name')
+  setMeta('twitter:description', meta.ogDescription, 'name')
+  setCanonical(meta.canonical)
+  setJsonLd(meta.jsonLd)
+}
+
 // ============== ML Accuracy Data Interface ==============
 // Matches the /api/ml/accuracy response format
 interface MLAccuracyApiResponse {
@@ -667,8 +797,8 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
   )
 }
 
-// ============== Onboarding Modal ==============
-function OnboardingModal({ onClose }: { onClose: () => void }) {
+// ============== Onboarding / Guide ==============
+function OnboardingModal({ onClose, inPage = false }: { onClose: () => void; inPage?: boolean }) {
   const [step, setStep] = useState(0)
 
   const steps = [
@@ -798,66 +928,112 @@ function OnboardingModal({ onClose }: { onClose: () => void }) {
     }
   ]
 
+  const header = inPage ? (
+    <div className="sticky top-0 bg-black/95 backdrop-blur border-b border-[#26272b]">
+      <div className="max-w-2xl mx-auto px-4 py-4 flex justify-between items-center">
+        <h1 className="text-[10px] sm:text-[11px] text-[#949ba5] font-mono uppercase tracking-[0.3em]">PXI/guide</h1>
+        <button onClick={onClose} className="text-[#949ba5] text-[10px] uppercase tracking-widest">
+          Exit
+        </button>
+      </div>
+    </div>
+  ) : null
+
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-      {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/90 backdrop-blur-sm"
-        onClick={onClose}
-      />
+    <div className={inPage ? 'min-h-screen bg-black text-[#f3f3f3] overflow-y-auto' : 'fixed inset-0 z-[100] flex items-center justify-center p-4'}>
+      {!inPage ? (
+        <>
+          {/* Backdrop */}
+          <div
+            className="absolute inset-0 bg-black/90 backdrop-blur-sm"
+            onClick={onClose}
+          />
 
-      {/* Modal */}
-      <div className="relative bg-[#0a0a0a] border border-[#26272b] rounded-lg max-w-md w-full overflow-hidden shadow-2xl">
-        {/* Progress dots */}
-        <div className="flex justify-center gap-2 pt-6 pb-2">
-          {steps.map((_, i) => (
-            <button
-              key={i}
-              onClick={() => setStep(i)}
-              className={`w-1.5 h-1.5 rounded-full transition-all ${
-                i === step ? 'bg-[#00a3ff] w-4' : 'bg-[#26272b] hover:bg-[#949ba5]/30'
-              }`}
-            />
-          ))}
-        </div>
+          {/* Modal */}
+          <div className="relative bg-[#0a0a0a] border border-[#26272b] rounded-lg max-w-md w-full overflow-hidden shadow-2xl">
+            {header}
+            <div className="px-6 py-4">
+              <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-3">
+                {steps[step].title}
+              </h2>
+              <div className="min-h-[280px]">{steps[step].content}</div>
+            </div>
 
-        {/* Content */}
-        <div className="px-6 py-4">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-3">
-            {steps[step].title}
-          </h2>
-          <div className="min-h-[280px]">
-            {steps[step].content}
+            <div className="flex justify-between items-center px-6 py-4 border-t border-[#26272b]">
+              <button
+                onClick={() => step > 0 && setStep(step - 1)}
+                className={`text-[10px] uppercase tracking-widest transition-colors ${
+                  step > 0 ? 'text-[#949ba5] hover:text-[#f3f3f3]' : 'text-transparent pointer-events-none'
+                }`}
+              >
+                Back
+              </button>
+              {step < steps.length - 1 ? (
+                <button
+                  onClick={() => setStep(step + 1)}
+                  className="text-[10px] uppercase tracking-widest text-[#00a3ff] hover:text-[#f3f3f3] transition-colors"
+                >
+                  Next
+                </button>
+              ) : (
+                <button
+                  onClick={onClose}
+                  className="text-[10px] uppercase tracking-widest bg-[#00a3ff] text-black px-4 py-1.5 rounded hover:bg-[#00a3ff]/80 transition-colors"
+                >
+                  Get Started
+                </button>
+              )}
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="min-h-screen bg-black/95">
+          {header}
+          <div className="max-w-2xl mx-auto px-4 py-8 sm:py-12">
+            <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">
+              {steps[step].title}
+            </h2>
+            <div className="min-h-[300px]">{steps[step].content}</div>
+
+            <div className="mt-8 flex justify-between items-center border-t border-[#26272b] pt-4">
+              <button
+                onClick={() => step > 0 && setStep(step - 1)}
+                className={`text-[10px] uppercase tracking-widest transition-colors ${
+                  step > 0 ? 'text-[#949ba5] hover:text-[#f3f3f3]' : 'text-transparent pointer-events-none'
+                }`}
+              >
+                Back
+              </button>
+              {step < steps.length - 1 ? (
+                <button
+                  onClick={() => setStep(step + 1)}
+                  className="text-[10px] uppercase tracking-widest text-[#00a3ff] hover:text-[#f3f3f3] transition-colors"
+                >
+                  Next
+                </button>
+              ) : (
+                <button
+                  onClick={onClose}
+                  className="text-[10px] uppercase tracking-widest bg-[#00a3ff] text-black px-4 py-1.5 rounded hover:bg-[#00a3ff]/80 transition-colors"
+                >
+                  Exit
+                </button>
+              )}
+            </div>
           </div>
         </div>
-
-        {/* Footer */}
-        <div className="flex justify-between items-center px-6 py-4 border-t border-[#26272b]">
+      )}
+      {/* Progress dots */}
+      <div className={inPage ? 'max-w-2xl mx-auto px-4 pb-4 flex justify-center gap-2' : 'absolute top-6 left-1/2 -translate-x-1/2 flex justify-center gap-2 pt-4'}>
+        {steps.map((_, i) => (
           <button
-            onClick={() => step > 0 && setStep(step - 1)}
-            className={`text-[10px] uppercase tracking-widest transition-colors ${
-              step > 0 ? 'text-[#949ba5] hover:text-[#f3f3f3]' : 'text-transparent pointer-events-none'
+            key={i}
+            onClick={() => setStep(i)}
+            className={`w-1.5 h-1.5 rounded-full transition-all ${
+              i === step ? 'bg-[#00a3ff] w-4' : 'bg-[#26272b] hover:bg-[#949ba5]/30'
             }`}
-          >
-            Back
-          </button>
-
-          {step < steps.length - 1 ? (
-            <button
-              onClick={() => setStep(step + 1)}
-              className="text-[10px] uppercase tracking-widest text-[#00a3ff] hover:text-[#f3f3f3] transition-colors"
-            >
-              Next
-            </button>
-          ) : (
-            <button
-              onClick={onClose}
-              className="text-[10px] uppercase tracking-widest bg-[#00a3ff] text-black px-4 py-1.5 rounded hover:bg-[#00a3ff]/80 transition-colors"
-            >
-              Get Started
-            </button>
-          )}
-        </div>
+          />
+        ))}
       </div>
     </div>
   )
@@ -1724,11 +1900,13 @@ function ExportButton() {
 function AlertHistoryPanel({
   alerts,
   accuracy,
-  onClose
+  onClose,
+  inPage = false
 }: {
   alerts: AlertData[]
   accuracy: Record<string, { total: number; accuracy_7d: number | null; avg_return_7d: number }>
   onClose: () => void
+  inPage?: boolean
 }) {
   const [filterType, setFilterType] = useState<string | null>(null)
 
@@ -1763,9 +1941,13 @@ function AlertHistoryPanel({
   const formatType = (type: string) =>
     type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
 
+  const containerClass = inPage
+    ? 'min-h-screen bg-black text-[#f3f3f3] px-4 pt-8 pb-10'
+    : 'fixed inset-0 bg-black/90 z-50 overflow-y-auto'
+
   return (
-    <div className="fixed inset-0 bg-black/90 z-50 overflow-y-auto">
-      <div className="min-h-screen px-4 py-8 max-w-4xl mx-auto">
+    <div className={containerClass}>
+      <div className={inPage ? 'max-w-4xl mx-auto' : 'min-h-screen px-4 py-8 max-w-4xl mx-auto'}>
         {/* Header */}
         <div className="flex items-center justify-between mb-6">
           <div>
@@ -2014,9 +2196,13 @@ function MLPredictionsCard({ ensemble, accuracy }: { ensemble: EnsembleData | nu
   )
 }
 
-function SpecPage({ onClose }: { onClose: () => void }) {
+function SpecPage({ onClose, inPage = false }: { onClose: () => void; inPage?: boolean }) {
+  const wrapperClass = inPage
+    ? 'min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-16 overflow-auto'
+    : 'min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-16 overflow-auto'
+
   return (
-    <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-16 overflow-auto">
+    <div className={wrapperClass}>
       <div className="max-w-2xl mx-auto">
         {/* Header */}
         <div className="flex justify-between items-center mb-12">
@@ -2430,6 +2616,11 @@ function SpecPage({ onClose }: { onClose: () => void }) {
 }
 
 function App() {
+  const [route, setRoute] = useState<AppRoute>(() => {
+    if (typeof window === 'undefined') return '/'
+    return normalizeRoute(window.location.pathname)
+  })
+
   const [data, setData] = useState<PXIData | null>(null)
   const [prediction, setPrediction] = useState<PredictionData | null>(null)
   const [signal, setSignal] = useState<SignalData | null>(null)  // v1.1
@@ -2439,16 +2630,29 @@ function App() {
   const [historyRange, setHistoryRange] = useState<'7d' | '30d' | '90d'>('30d')  // v1.4: Chart range
   const [showOnboarding, setShowOnboarding] = useState(false)  // v1.4: Onboarding modal
   const [alertsData, setAlertsData] = useState<AlertsApiResponse | null>(null)  // v1.5: Alert history
-  const [showAlerts, setShowAlerts] = useState(false)  // v1.5: Alert panel visibility
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null)  // v1.5: Category deep-dive
   const [signalsData, setSignalsData] = useState<SignalsData | null>(null)  // v1.5: PXI + Signals integration
   const [similarData, setSimilarData] = useState<SimilarPeriodsData | null>(null)  // v1.6: Similar periods
   const [backtestData, setBacktestData] = useState<BacktestData | null>(null)  // v1.6: Backtest performance
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [showSpec, setShowSpec] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+
+  const navigateTo = (nextRoute: AppRoute) => {
+    const path = normalizeRoute(nextRoute)
+    if (typeof window !== 'undefined') {
+      if (normalizeRoute(window.location.pathname) !== path) {
+        window.history.pushState({}, '', path)
+      }
+      setRoute(path)
+    }
+    setMenuOpen(false)
+  }
+
+  useEffect(() => {
+    applyRouteMetadata(route)
+  }, [route])
 
   // v1.4: Check for first visit on mount
   useEffect(() => {
@@ -2467,6 +2671,13 @@ function App() {
     }
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
+  // Support browser back/forward for route-based rendering
+  useEffect(() => {
+    const syncRoute = () => setRoute(normalizeRoute(window.location.pathname))
+    window.addEventListener('popstate', syncRoute)
+    return () => window.removeEventListener('popstate', syncRoute)
   }, [])
 
   useEffect(() => {
@@ -2619,9 +2830,34 @@ function App() {
     )
   }
 
-  // Show spec page
-  if (showSpec) {
-    return <SpecPage onClose={() => setShowSpec(false)} />
+  if (route === '/spec') {
+    return <SpecPage onClose={() => navigateTo('/')} inPage />
+  }
+
+  // Show alerts page
+  if (route === '/alerts') {
+    return alertsData ? (
+      <AlertHistoryPanel
+        alerts={alertsData.alerts}
+        accuracy={alertsData.accuracy}
+        inPage
+        onClose={() => navigateTo('/')}
+      />
+    ) : (
+      <div className="min-h-screen bg-black text-[#949ba5] flex flex-col items-center justify-center px-4">
+        <p className="text-sm uppercase tracking-widest">No alert history available yet.</p>
+        <button
+          onClick={() => navigateTo('/')}
+          className="mt-4 text-[10px] uppercase tracking-[0.25em] border border-[#26272b] px-4 py-2 rounded"
+        >
+          Return Home
+        </button>
+      </div>
+    )
+  }
+
+  if (route === '/guide') {
+    return <OnboardingModal onClose={() => navigateTo('/')} inPage />
   }
 
   // v1.4: Handler to close onboarding and persist preference
@@ -2649,15 +2885,6 @@ function App() {
       {/* v1.4: Onboarding Modal */}
       {showOnboarding && <OnboardingModal onClose={handleCloseOnboarding} />}
 
-      {/* v1.5: Alert History Panel */}
-      {showAlerts && alertsData && (
-        <AlertHistoryPanel
-          alerts={alertsData.alerts}
-          accuracy={alertsData.accuracy}
-          onClose={() => setShowAlerts(false)}
-        />
-      )}
-
       {/* v1.5: Category Deep-Dive Modal */}
       {selectedCategory && (
         <CategoryModal
@@ -2668,19 +2895,26 @@ function App() {
 
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 p-4 sm:p-6 flex justify-between items-center z-50">
-        <div className="relative" ref={menuRef}>
+        <div className="relative flex items-center gap-2 sm:gap-3" ref={menuRef}>
+          <button
+            onClick={() => navigateTo('/')}
+            className="text-[9px] sm:text-[10px] font-mono tracking-[0.3em] text-[#949ba5] uppercase hover:text-[#f3f3f3] transition-colors"
+          >
+            PXI<span className="text-[#00a3ff]">/</span>COMMAND
+          </button>
+
           <button
             onClick={() => setMenuOpen(!menuOpen)}
             className="text-[10px] sm:text-[11px] font-mono tracking-[0.2em] text-[#949ba5] uppercase hover:text-[#f3f3f3] transition-colors"
+            aria-label="Open navigation menu"
           >
-            PXI<span className="text-[#00a3ff]">/</span>command
-            <span className="ml-2 text-[#949ba5]/50">{menuOpen ? '▲' : '▼'}</span>
+            {menuOpen ? '▲' : '▼'}
           </button>
           {menuOpen && (
-            <div className="absolute top-full left-0 mt-2 bg-[#0a0a0a] border border-[#26272b] rounded shadow-lg min-w-[120px]">
+            <div className="absolute top-full left-0 mt-2 bg-[#0a0a0a] border border-[#26272b] rounded shadow-lg min-w-[130px]">
               <button
                 onClick={() => {
-                  setShowSpec(true)
+                  navigateTo('/spec')
                   setMenuOpen(false)
                 }}
                 className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
@@ -2695,7 +2929,7 @@ function App() {
               </a>
               <button
                 onClick={() => {
-                  setShowAlerts(true)
+                  navigateTo('/alerts')
                   setMenuOpen(false)
                 }}
                 className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
@@ -2707,7 +2941,7 @@ function App() {
               </button>
               <button
                 onClick={() => {
-                  setShowOnboarding(true)
+                  navigateTo('/guide')
                   setMenuOpen(false)
                 }}
                 className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors border-t border-[#26272b]"

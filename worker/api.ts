@@ -7,6 +7,7 @@ interface Env {
   VECTORIZE: VectorizeIndex;
   AI: Ai;
   ML_MODELS: KVNamespace;
+  RATE_LIMIT_KV?: KVNamespace;
   FRED_API_KEY?: string;
   WRITE_API_KEY?: string;
 }
@@ -1010,22 +1011,32 @@ const ALLOWED_ORIGINS = [
   'https://pxi-command.pages.dev',
   'https://pxi-frontend.pages.dev',
 ];
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // Rate limiting: simple in-memory store
-const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+const publicRateLimitStore = new Map<string, { count: number; resetTime: number }>();
+const adminRateLimitStore = new Map<string, { count: number; resetTime: number }>();
 const RATE_LIMIT = 100;
 const RATE_WINDOW = 60 * 1000;
+const ADMIN_RATE_LIMIT = 20;
+const ADMIN_RATE_WINDOW = 60 * 1000;
+const MAX_BACKFILL_LIMIT = 365;
 
-function checkRateLimit(ip: string): boolean {
+function checkRateLimitStore(
+  ip: string,
+  limit: number,
+  windowMs: number,
+  store: Map<string, { count: number; resetTime: number }>
+): boolean {
   const now = Date.now();
-  const record = rateLimitStore.get(ip);
+  const record = store.get(ip);
 
   if (!record || now > record.resetTime) {
-    rateLimitStore.set(ip, { count: 1, resetTime: now + RATE_WINDOW });
+    store.set(ip, { count: 1, resetTime: now + windowMs });
     return true;
   }
 
-  if (record.count >= RATE_LIMIT) {
+  if (record.count >= limit) {
     return false;
   }
 
@@ -1033,18 +1044,177 @@ function checkRateLimit(ip: string): boolean {
   return true;
 }
 
+async function checkRateLimitKV(
+  ip: string,
+  limit: number,
+  windowMs: number,
+  kv?: KVNamespace
+): Promise<boolean> {
+  if (!kv) {
+    return true;
+  }
+
+  const now = Date.now();
+  const key = `admin_rate_limit:${ip}`;
+  let count = 1;
+  let resetTime = now + windowMs;
+
+  const raw = await kv.get(key);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as { count: number; resetTime: number };
+      if (Number.isFinite(parsed.count) && Number.isFinite(parsed.resetTime)) {
+        count = parsed.count;
+        resetTime = parsed.resetTime;
+      }
+    } catch (err) {
+      console.error('Failed to parse admin rate limit KV record', err);
+    }
+  }
+
+  if (count >= limit && resetTime > now) {
+    return false;
+  }
+
+  const nextResetTime = resetTime > now ? resetTime : now + windowMs;
+  const nextTtl = Math.max(1, Math.ceil((nextResetTime - now) / 1000));
+  const nextCount = count >= limit ? 1 : count + 1;
+
+  await kv.put(key, JSON.stringify({ count: nextCount, resetTime: nextResetTime }), {
+    expirationTtl: nextTtl,
+  });
+
+  return true;
+}
+
+function checkPublicRateLimit(ip: string): boolean {
+  return checkRateLimitStore(ip, RATE_LIMIT, RATE_WINDOW, publicRateLimitStore);
+}
+
+async function checkAdminRateLimit(ip: string, env: Env): Promise<boolean> {
+  const nowOk = checkRateLimitStore(ip, ADMIN_RATE_LIMIT, ADMIN_RATE_WINDOW, adminRateLimitStore);
+  if (!nowOk) {
+    return false;
+  }
+
+  if (!env.RATE_LIMIT_KV) {
+    return true;
+  }
+
+  try {
+    return await checkRateLimitKV(ip, ADMIN_RATE_LIMIT, ADMIN_RATE_WINDOW, env.RATE_LIMIT_KV);
+  } catch (err) {
+    console.error('Admin KV rate limit check failed, using in-memory fallback', err);
+    return true;
+  }
+}
+
 function getCorsHeaders(origin: string | null): Record<string, string> {
   const allowedOrigin = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
 
   return {
     'Access-Control-Allow-Origin': allowedOrigin,
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, HEAD',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token',
     'Access-Control-Max-Age': '86400',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
     'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+  };
+}
+
+function getRequestToken(request: Request): string {
+  const authHeader = request.headers.get('Authorization');
+  if (authHeader?.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+
+  const adminToken = request.headers.get('X-Admin-Token');
+  return adminToken?.trim() || '';
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const left = new TextEncoder().encode(a || '');
+  const right = new TextEncoder().encode(b || '');
+  const maxLen = Math.max(left.length, right.length);
+  let diff = left.length ^ right.length;
+
+  for (let i = 0; i < maxLen; i += 1) {
+    const lv = left[i] ?? 0;
+    const rv = right[i] ?? 0;
+    diff |= lv ^ rv;
+  }
+
+  return diff === 0;
+}
+
+function hasWriteAccess(request: Request, env: Env): boolean {
+  const expected = env.WRITE_API_KEY || '';
+  const token = getRequestToken(request);
+  if (!expected || token.length === 0) return false;
+  return constantTimeEquals(token, expected);
+}
+
+function unauthorizedResponse(corsHeaders: Record<string, string>) {
+  return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+}
+
+async function enforceAdminAuth(
+  request: Request,
+  env: Env,
+  corsHeaders: Record<string, string>,
+  clientIP: string
+): Promise<Response | null> {
+  if (!(await checkAdminRateLimit(clientIP, env))) {
+    return Response.json(
+      { error: 'Too many requests' },
+      { status: 429, headers: { ...corsHeaders, 'Retry-After': '60' } }
+    );
+  }
+
+  if (!hasWriteAccess(request, env)) {
+    return unauthorizedResponse(corsHeaders);
+  }
+
+  return null;
+}
+
+function parseIsoDate(value: string): string | null {
+  if (!ISO_DATE_RE.test(value)) return null;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+function parseBackfillLimit(rawLimit: unknown): number {
+  const candidate = Number(rawLimit);
+  if (!Number.isFinite(candidate)) {
+    return 50;
+  }
+  return Math.max(1, Math.min(MAX_BACKFILL_LIMIT, Math.floor(candidate)));
+}
+
+function parseBackfillDateRange(start?: string, end?: string): {
+  start: string | null;
+  end: string | null;
+} {
+  const parsedStart = start ? parseIsoDate(start) : null;
+  const parsedEnd = end ? parseIsoDate(end) : null;
+
+  if (start && !parsedStart) {
+    throw new Error('Invalid start date. Use YYYY-MM-DD format.');
+  }
+  if (end && !parsedEnd) {
+    throw new Error('Invalid end date. Use YYYY-MM-DD format.');
+  }
+  if (parsedStart && parsedEnd && parsedStart > parsedEnd) {
+    throw new Error('Invalid date range. start must be <= end.');
+  }
+
+  return {
+    start: parsedStart,
+    end: parsedEnd,
   };
 }
 
@@ -2355,18 +2525,19 @@ export default {
     const url = new URL(request.url);
     const origin = request.headers.get('Origin');
     const corsHeaders = getCorsHeaders(origin);
+    const method = request.method === 'HEAD' ? 'GET' : request.method;
 
     // Rate limiting
     const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-    if (!checkRateLimit(clientIP)) {
+    if (!checkPublicRateLimit(clientIP)) {
       return Response.json(
         { error: 'Too many requests' },
         { status: 429, headers: { ...corsHeaders, 'Retry-After': '60' } }
       );
     }
 
-    // Only allow GET, POST, and OPTIONS
-    if (!['GET', 'POST', 'OPTIONS'].includes(request.method)) {
+    // Only allow GET, POST, and OPTIONS (+HEAD mapped to GET for compatibility)
+    if (!['GET', 'POST', 'OPTIONS', 'HEAD'].includes(request.method)) {
       return Response.json(
         { error: 'Method not allowed' },
         { status: 405, headers: corsHeaders }
@@ -2389,10 +2560,10 @@ export default {
       }
 
       // Database migration - create any missing tables (requires auth)
-      if (url.pathname === '/api/migrate' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        if (!authHeader || authHeader !== `Bearer ${env.WRITE_API_KEY}`) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/migrate' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
         const migrations: string[] = [];
@@ -3096,7 +3267,7 @@ export default {
       }
 
       // AI: Find similar market regimes
-      if (url.pathname === '/api/similar' && request.method === 'GET') {
+      if (url.pathname === '/api/similar' && method === 'GET') {
         try {
           // Get today's PXI data including deltas
           const latestPxi = await env.DB.prepare(
@@ -3265,7 +3436,7 @@ export default {
       }
 
       // AI: Generate embeddings for historical data
-      if (url.pathname === '/api/embed' && request.method === 'POST') {
+      if (url.pathname === '/api/embed' && method === 'POST') {
         const dates = await env.DB.prepare(
           'SELECT DISTINCT date FROM indicator_values ORDER BY date'
         ).all<{ date: string }>();
@@ -3309,13 +3480,10 @@ export default {
       }
 
       // Write endpoint for fetchers (requires API key) - supports batch writes
-      if (url.pathname === '/api/write' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        const apiKey = authHeader?.replace('Bearer ', '');
-
-        // Simple API key check (set via wrangler secret)
-        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/write' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
         const body = await request.json() as {
@@ -3421,10 +3589,10 @@ export default {
       }
 
       // Manual refresh - fetch fresh data and recalculate (requires auth)
-      if (url.pathname === '/api/refresh' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        if (!authHeader || authHeader !== `Bearer ${env.WRITE_API_KEY}`) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/refresh' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
         if (!env.FRED_API_KEY) {
@@ -3482,12 +3650,10 @@ export default {
       }
 
       // Recalculate PXI for a given date (requires auth)
-      if (url.pathname === '/api/recalculate' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        const apiKey = authHeader?.replace('Bearer ', '');
-
-        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/recalculate' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
         const body = await request.json() as { date?: string };
@@ -3642,28 +3808,60 @@ export default {
       }
 
       // Backfill historical PXI scores and embeddings (requires auth)
-      if (url.pathname === '/api/backfill' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        const apiKey = authHeader?.replace('Bearer ', '');
-
-        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/backfill' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
-        const body = await request.json() as { start?: string; end?: string; limit?: number };
-        const limit = body.limit || 50; // Process 50 dates per request to avoid timeout
+        let body: { start?: string; end?: string; limit?: number };
+        try {
+          body = await request.json() as { start?: string; end?: string; limit?: number };
+        } catch {
+          return Response.json(
+            { error: 'Invalid JSON body' },
+            { status: 400, headers: corsHeaders }
+          );
+        }
+        const limit = parseBackfillLimit(body.limit);
+        let dateFilter: ReturnType<typeof parseBackfillDateRange>;
+        try {
+          dateFilter = parseBackfillDateRange(body.start, body.end);
+        } catch (err) {
+          return Response.json({
+            error: err instanceof Error ? err.message : 'Invalid date range',
+          }, { status: 400, headers: corsHeaders });
+        }
 
         // Get all unique dates with indicator data that don't have PXI scores yet
+        const dateClauses: string[] = [];
+        const dateParams: string[] = [];
+
+        if (dateFilter.start) {
+          dateClauses.push('iv.date >= ?');
+          dateParams.push(dateFilter.start);
+        }
+
+        if (dateFilter.end) {
+          dateClauses.push('iv.date <= ?');
+          dateParams.push(dateFilter.end);
+        }
+
+        const remainingFilterClause = dateClauses.length > 0
+          ? `AND ${dateClauses.join(' AND ')}`
+          : '';
+
+        const remainingParams = [...dateParams];
+
         const datesResult = await env.DB.prepare(`
           SELECT DISTINCT iv.date
           FROM indicator_values iv
           LEFT JOIN pxi_scores ps ON iv.date = ps.date
           WHERE ps.date IS NULL
-          ${body.start ? `AND iv.date >= '${body.start}'` : ''}
-          ${body.end ? `AND iv.date <= '${body.end}'` : ''}
+          ${remainingFilterClause}
           ORDER BY iv.date DESC
           LIMIT ?
-        `).bind(limit).all<{ date: string }>();
+        `).bind(...remainingParams, limit).all<{ date: string }>();
 
         const dates = datesResult.results || [];
         let processed = 0;
@@ -3753,7 +3951,8 @@ export default {
           FROM indicator_values iv
           LEFT JOIN pxi_scores ps ON iv.date = ps.date
           WHERE ps.date IS NULL
-        `).first<{ cnt: number }>();
+          ${remainingFilterClause}
+        `).bind(...remainingParams).first<{ cnt: number }>();
 
         return Response.json({
           success: true,
@@ -3766,7 +3965,7 @@ export default {
       }
 
       // Predict SPY returns based on empirical backtest data
-      if (url.pathname === '/api/predict' && request.method === 'GET') {
+      if (url.pathname === '/api/predict' && method === 'GET') {
         // Get current PXI score
         const currentPxi = await env.DB.prepare(
           'SELECT date, score, label FROM pxi_scores ORDER BY date DESC LIMIT 1'
@@ -3999,7 +4198,7 @@ export default {
       }
 
       // AI: Analyze current regime
-      if (url.pathname === '/api/analyze' && request.method === 'GET') {
+      if (url.pathname === '/api/analyze' && method === 'GET') {
         // Get latest PXI and categories
         const pxi = await env.DB.prepare(
           'SELECT date, score, label, status FROM pxi_scores ORDER BY date DESC LIMIT 1'
@@ -4038,10 +4237,10 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Evaluate past predictions against actual results
-      if (url.pathname === '/api/evaluate' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        if (!authHeader || authHeader !== `Bearer ${env.WRITE_API_KEY}`) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/evaluate' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
         // Get all predictions that haven't been evaluated yet
@@ -4122,7 +4321,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // XGBoost ML prediction endpoint
-      if (url.pathname === '/api/ml/predict' && request.method === 'GET') {
+      if (url.pathname === '/api/ml/predict' && method === 'GET') {
         // Load ML model from KV
         const model = await loadMLModel(env.ML_MODELS);
         if (!model) {
@@ -4233,7 +4432,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // LSTM sequence model prediction endpoint
-      if (url.pathname === '/api/ml/lstm' && request.method === 'GET') {
+      if (url.pathname === '/api/ml/lstm' && method === 'GET') {
         // Get recent PXI scores using a fresh prepare
         const pxiHistory = await env.DB.prepare(
           'SELECT date, score, delta_7d FROM pxi_scores ORDER BY date DESC LIMIT 20'
@@ -4356,7 +4555,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // SPY Return Prediction endpoint - predicts actual market returns (ALPHA model)
-      if (url.pathname === '/api/predict/returns' && request.method === 'GET') {
+      if (url.pathname === '/api/predict/returns' && method === 'GET') {
         const model = await loadSPYReturnModel(env.ML_MODELS);
         if (!model) {
           return Response.json({
@@ -4531,7 +4730,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Ensemble prediction endpoint - combines XGBoost and LSTM
-      if (url.pathname === '/api/ml/ensemble' && request.method === 'GET') {
+      if (url.pathname === '/api/ml/ensemble' && method === 'GET') {
         // Load both models
         const [xgboostModel, lstmModel] = await Promise.all([
           loadMLModel(env.ML_MODELS),
@@ -4828,7 +5027,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Get prediction accuracy metrics
-      if (url.pathname === '/api/accuracy' && request.method === 'GET') {
+      if (url.pathname === '/api/accuracy' && method === 'GET') {
         const includePending = url.searchParams.get('include_pending') === 'true';
 
         // Get all predictions (optionally including pending)
@@ -4943,7 +5142,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Get ML ensemble prediction accuracy metrics
-      if (url.pathname === '/api/ml/accuracy' && request.method === 'GET') {
+      if (url.pathname === '/api/ml/accuracy' && method === 'GET') {
         const includePending = url.searchParams.get('include_pending') === 'true';
 
         // Get all ensemble predictions
@@ -5116,7 +5315,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // ML Backtest: Run models against historical data
-      if (url.pathname === '/api/ml/backtest' && request.method === 'GET') {
+      if (url.pathname === '/api/ml/backtest' && method === 'GET') {
         const limit = parseInt(url.searchParams.get('limit') || '500');
         const offset = parseInt(url.searchParams.get('offset') || '0');
 
@@ -5420,10 +5619,10 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Retrain: Update period accuracy scores and tune model parameters
-      if (url.pathname === '/api/retrain' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        if (!authHeader || authHeader !== `Bearer ${env.WRITE_API_KEY}`) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/retrain' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
         // Get all evaluated predictions with their similar periods
@@ -5704,7 +5903,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Get model parameters (for debugging/monitoring)
-      if (url.pathname === '/api/model' && request.method === 'GET') {
+      if (url.pathname === '/api/model' && method === 'GET') {
         const params = await env.DB.prepare(
           'SELECT param_key, param_value, updated_at, notes FROM model_params ORDER BY param_key'
         ).all<{ param_key: string; param_value: number; updated_at: string; notes: string }>();
@@ -5724,7 +5923,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Backtest endpoint - calculate conditional return distributions
-      if (url.pathname === '/api/backtest' && request.method === 'GET') {
+      if (url.pathname === '/api/backtest' && method === 'GET') {
         // Get all PXI scores with their dates
         const pxiScores = await env.DB.prepare(`
           SELECT date, score FROM pxi_scores ORDER BY date ASC
@@ -5928,7 +6127,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
 
       // ============== v1.1: Walk-Forward Signal Backtest ==============
       // Compares PXI-Signal strategy vs baselines (200DMA, buy-and-hold)
-      if (url.pathname === '/api/backtest/signal' && request.method === 'GET') {
+      if (url.pathname === '/api/backtest/signal' && method === 'GET') {
         // Get all historical signal data
         const signals = await env.DB.prepare(`
           SELECT date, pxi_level, risk_allocation, signal_type, regime
@@ -6155,12 +6354,10 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
 
       // ============== v1.1: Historical Signal Recalculation ==============
       // Generates signal layer data for all historical PXI scores
-      if (url.pathname === '/api/recalculate-all-signals' && request.method === 'POST') {
-        const authHeader = request.headers.get('Authorization');
-        const apiKey = authHeader?.replace('Bearer ', '');
-
-        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/recalculate-all-signals' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
         try {
@@ -6308,7 +6505,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Get backtest history
-      if (url.pathname === '/api/backtest/history' && request.method === 'GET') {
+      if (url.pathname === '/api/backtest/history' && method === 'GET') {
         const results = await env.DB.prepare(`
           SELECT * FROM backtest_results ORDER BY run_date DESC LIMIT 10
         `).all();
@@ -6319,7 +6516,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // v1.6: Export PXI history as CSV
-      if (url.pathname === '/api/export/history' && request.method === 'GET') {
+      if (url.pathname === '/api/export/history' && method === 'GET') {
         const days = Math.min(730, Math.max(7, parseInt(url.searchParams.get('days') || '365')));
         const format = url.searchParams.get('format') || 'csv';
 
@@ -6385,11 +6582,10 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
       }
 
       // Export training data for ML model (requires auth)
-      if (url.pathname === '/api/export/training-data' && request.method === 'GET') {
-        const authHeader = request.headers.get('Authorization');
-        const apiKey = authHeader?.replace('Bearer ', '');
-        if (!apiKey || apiKey !== (env as any).WRITE_API_KEY) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders });
+      if (url.pathname === '/api/export/training-data' && method === 'GET') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
         }
 
         // Get all PXI scores with deltas

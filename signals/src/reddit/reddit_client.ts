@@ -6,7 +6,7 @@ import { parseRedditListing, parseOAuthResponse } from "./schemas"
 import { logWarn } from "../utils/logger"
 
 const REDDIT_BASE = "https://oauth.reddit.com"
-const REDDIT_PUBLIC_BASES = ["https://www.reddit.com", "https://old.reddit.com"]
+const REDDIT_PUBLIC_BASES = ["https://api.reddit.com", "https://www.reddit.com", "https://old.reddit.com"]
 
 // Reddit-compliant User-Agent format: <platform>:<app_id>:<version> (by /u/<username>)
 const DEFAULT_USER_AGENT = "web:pxi-signals:1.0.0 (by /u/pxi_command)"

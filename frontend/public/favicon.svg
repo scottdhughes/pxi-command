@@ -1,4 +1,85 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <rect width="100" height="100" fill="#000"/>
-  <text x="50" y="68" font-family="system-ui" font-size="48" font-weight="300" fill="#fff" text-anchor="middle">PXI</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="rocketBody" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6ef0ff" />
+      <stop offset="100%" stop-color="#0ca5ff" />
+    </linearGradient>
+    <linearGradient id="rocketFlame" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffd26a" />
+      <stop offset="50%" stop-color="#ff6f3f" />
+      <stop offset="100%" stop-color="#ff2f2f" />
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.2" flood-color="#00a3ff" flood-opacity="0.35" />
+    </filter>
+  </defs>
+
+  <rect x="2" y="2" width="124" height="124" rx="20" fill="#020202"/>
+  <g filter="url(#shadow)">
+    <path
+      d="M44 78 L32 88 28 76 42 70Z"
+      fill="#1a1a1a"
+      stroke="#5f5f5f"
+      stroke-width="2"
+      stroke-linejoin="round"/>
+
+    <path
+      d="M50 17 C53 28 53 52 50 63H35L18 50L18 25L35 17H50Z"
+      fill="url(#rocketBody)"
+      stroke="#ffffff"
+      stroke-opacity="0.35"
+      stroke-width="2"
+      stroke-linejoin="round"/>
+
+    <path
+      d="M78 78 C75 89 75 58 78 35 82 35 86 35 90 35 93 58 93 89 90 78 84 76 82 76 78 78Z"
+      fill="url(#rocketBody)"
+      stroke="#ffffff"
+      stroke-opacity="0.35"
+      stroke-width="2"
+      stroke-linejoin="round"/>
+
+    <path
+      d="M50 17L64 17L70 27L64 37L50 37 44 27Z"
+      fill="url(#rocketBody)"
+      stroke="#ffffff"
+      stroke-opacity="0.25"
+      stroke-width="2"
+      stroke-linejoin="round"/>
+
+    <path
+      d="M90 43L64 45C64 45 63 32 72 22C76 16.7 90 11 90 11C90 11 87 23 87 31C87 35 87 43 90 43Z"
+      fill="#111111"
+      stroke="#2c2c2c"
+      stroke-width="2"
+      stroke-linejoin="round"/>
+
+    <ellipse cx="64" cy="83" rx="15" ry="4" fill="#f8fbff" opacity="0.18"/>
+
+    <path
+      d="M47 95C49 102 55 110 64 114C73 110 79 102 81 95Z"
+      fill="url(#rocketFlame)"
+      opacity="0.95"/>
+
+    <path
+      d="M50 70L58 87L64 72 70 87 78 70C68 69 58 69 50 70Z"
+      fill="#ffffff"
+      opacity="0.12"/>
+
+    <path
+      d="M36 66Q28 70 32 78Q40 75 44 70Z"
+      fill="#6ef0ff"
+      opacity="0.6"/>
+    <path
+      d="M82 66Q90 70 86 78Q78 75 74 70Z"
+      fill="#6ef0ff"
+      opacity="0.6"/>
+
+    <path
+      d="M53 23L64 38L75 23"
+      stroke="#effbff"
+      stroke-opacity="0.85"
+      stroke-width="2"
+      stroke-linecap="round"/>
+  </g>
 </svg>
