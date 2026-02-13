@@ -1,0 +1,18 @@
+PXI /COMMAND
+Primary site: https://pxicommand.com
+Canonical API host: api.pxicommand.com
+
+Agent docs:
+- https://pxicommand.com/agent.md
+- https://pxicommand.com/signals/agent.md
+
+Read endpoints:
+- https://api.pxicommand.com/health
+- https://api.pxicommand.com/api/pxi
+- https://pxicommand.com/signals/api/runs
+- https://pxicommand.com/signals/api/accuracy
+- https://pxicommand.com/signals/api/predictions
+
+Auth boundary:
+- Admin/write endpoints require a valid auth token.
+- Do not call write/admin endpoints unless explicitly authorized by an operator.
