@@ -1,5 +1,9 @@
 name: Daily PXI Refresh
 
+concurrency:
+  group: pxi-daily-refresh-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
 on:
   schedule:
     # Run 4x daily to capture market movements
@@ -31,7 +35,27 @@ jobs:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
           WRITE_API_URL: ${{ secrets.WRITE_API_URL }}
+          SLA_SUMMARY_PATH: /tmp/pxi-sla-summary.json
         run: npm run cron:daily
+
+      - name: Append SLA summary
+        if: always()
+        run: |
+          if [[ -f /tmp/pxi-sla-summary.json ]]; then
+            {
+              echo "### PXI SLA Summary"
+              echo ""
+              echo "| Indicator | Latest Date | Days Old | Threshold | Class | Critical | Status |"
+              echo "|---|---|---:|---:|---|---|---|"
+              jq -r '.checks[] | "| \(.indicator_id) | \(.latest_date // "missing") | \((.days_old // "n/a") | tostring) | \(.max_age_days) | \(.sla_class) | \(.critical) | \(.status) |"' /tmp/pxi-sla-summary.json
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### PXI SLA Summary"
+              echo ""
+              echo "No SLA summary file produced by cron run."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Log result
         if: always()

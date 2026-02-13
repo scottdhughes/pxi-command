@@ -2,6 +2,8 @@
 // Uses D1 (SQLite), Vectorize, and Workers AI
 // Includes scheduled cron handler for daily data refresh
 
+import { getStaleThresholdDays } from '../src/config/indicator-sla';
+
 interface Env {
   DB: D1Database;
   VECTORIZE: VectorizeIndex;
@@ -1011,6 +1013,7 @@ const ALLOWED_ORIGINS = [
   'https://pxi-command.pages.dev',
   'https://pxi-frontend.pages.dev',
 ];
+
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // Rate limiting: simple in-memory store
@@ -2523,6 +2526,11 @@ async function calculatePXISignal(
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    if (url.hostname === 'www.pxicommand.com') {
+      return Response.redirect(`https://pxicommand.com${url.pathname}${url.search}`, 301);
+    }
+
     const origin = request.headers.get('Origin');
     const corsHeaders = getCorsHeaders(origin);
     const method = request.method === 'HEAD' ? 'GET' : request.method;
@@ -2900,11 +2908,13 @@ export default {
                  julianday('now') - julianday(MAX(date)) as days_old
           FROM indicator_values
           GROUP BY indicator_id
-          HAVING days_old > 2
           ORDER BY days_old DESC
         `).all<{ indicator_id: string; last_date: string; days_old: number }>();
 
-        const staleIndicators = (freshnessResult.results || []).filter(r => r.days_old > 2);
+        const staleIndicators = (freshnessResult.results || []).filter((r) => {
+          const threshold = getStaleThresholdDays(r.indicator_id);
+          return r.days_old > threshold;
+        });
         const hasStaleData = staleIndicators.length > 0;
 
         const response = {
@@ -3367,14 +3377,63 @@ export default {
             }, { headers: corsHeaders });
           }
 
-          // Get PXI scores and forward returns for similar dates
+          // Get PXI scores for similar dates
           const historicalScores = await env.DB.prepare(`
-            SELECT p.date, p.score, p.label, p.status,
-                   me.forward_return_7d, me.forward_return_30d
-            FROM pxi_scores p
-            LEFT JOIN market_embeddings me ON p.date = me.date
-            WHERE p.date IN (${similarDates.map(() => '?').join(',')})
-          `).bind(...similarDates).all<PXIRow & { forward_return_7d: number | null; forward_return_30d: number | null }>();
+            SELECT date, score, label, status
+            FROM pxi_scores
+            WHERE date IN (${similarDates.map(() => '?').join(',')})
+          `).bind(...similarDates).all<PXIRow>();
+
+          // Embedding-era forward returns may be missing for recent dates.
+          // Keep them as a secondary fallback only.
+          const embeddingReturns = await env.DB.prepare(`
+            SELECT date, forward_return_7d, forward_return_30d
+            FROM market_embeddings
+            WHERE date IN (${similarDates.map(() => '?').join(',')})
+          `).bind(...similarDates).all<{ date: string; forward_return_7d: number | null; forward_return_30d: number | null }>();
+
+          const embeddingReturnMap = new Map(
+            (embeddingReturns.results || []).map((r) => [r.date, r])
+          );
+
+          // Build SPY price lookup for on-demand forward return calculation.
+          const spyPrices = await env.DB.prepare(`
+            SELECT date, value FROM indicator_values
+            WHERE indicator_id = 'spy_close'
+            ORDER BY date ASC
+          `).all<{ date: string; value: number }>();
+
+          const spyMap = new Map<string, number>();
+          for (const p of spyPrices.results || []) {
+            spyMap.set(p.date, p.value);
+          }
+
+          const getSpyPrice = (dateStr: string, maxDaysForward: number = 5): number | null => {
+            const date = new Date(dateStr);
+            for (let i = 0; i <= maxDaysForward; i++) {
+              const checkDate = new Date(date);
+              checkDate.setDate(checkDate.getDate() + i);
+              const checkStr = checkDate.toISOString().split('T')[0];
+              const price = spyMap.get(checkStr);
+              if (price !== undefined) {
+                return price;
+              }
+            }
+            return null;
+          };
+
+          const calculateForwardReturn = (startDate: string, horizonDays: number): number | null => {
+            const start = getSpyPrice(startDate);
+            if (start === null) return null;
+
+            const target = new Date(startDate);
+            target.setDate(target.getDate() + horizonDays);
+            const targetStr = target.toISOString().split('T')[0];
+            const end = getSpyPrice(targetStr);
+            if (end === null) return null;
+
+            return ((end - start) / start) * 100;
+          };
 
           // Get accuracy scores for similar periods
           const accuracyScores = await env.DB.prepare(`
@@ -3403,6 +3462,10 @@ export default {
               const accuracyWeight = periodAccuracy && periodAccuracy.used >= 2 ? periodAccuracy.score : 0.5;
               const combinedWeight = similarityWeight * (0.4 + 0.3 * recencyWeight + 0.3 * accuracyWeight);
 
+              const embeddingReturn = matchDate ? embeddingReturnMap.get(matchDate) : null;
+              const computed7d = matchDate ? calculateForwardReturn(matchDate, 7) : null;
+              const computed30d = matchDate ? calculateForwardReturn(matchDate, 30) : null;
+
               return {
                 date: matchDate,
                 similarity: m.score,
@@ -3420,8 +3483,8 @@ export default {
                   status: hist.status,
                 } : null,
                 forward_returns: hist ? {
-                  d7: hist.forward_return_7d,
-                  d30: hist.forward_return_30d,
+                  d7: computed7d ?? embeddingReturn?.forward_return_7d ?? null,
+                  d30: computed30d ?? embeddingReturn?.forward_return_30d ?? null,
                 } : null,
               };
             }),

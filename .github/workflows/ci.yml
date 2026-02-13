@@ -44,6 +44,8 @@ jobs:
         run: npm ci
       - name: Typecheck
         run: npm run build
+      - name: Unit tests
+        run: node --test dist/config/indicator-sla.test.js dist/pipeline/cron-fast.test.js
 
   signals:
     name: Signals Tests
@@ -73,7 +75,7 @@ jobs:
       - signals
     env:
       SITE_URL: https://pxicommand.com
-      API_URL: https://pxi-api.novoamorx1.workers.dev
+      API_URL: https://api.pxicommand.com
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -104,6 +106,39 @@ jobs:
             fi
           }
 
+          check_site_json_status() {
+            local path="$1"
+            local expected="$2"
+            local code
+            code=$(curl -sS -D /tmp/site-json.headers -o /tmp/site-json.out -w "%{http_code}" --max-time 20 "$SITE_URL$path")
+            if [[ "$code" != "$expected" ]]; then
+              echo "Expected $expected for $path but got $code"
+              exit 1
+            fi
+            if ! grep -qi "^content-type: application/json" /tmp/site-json.headers; then
+              echo "Expected application/json content type for $path"
+              cat /tmp/site-json.headers
+              exit 1
+            fi
+          }
+
+          check_site_content_type() {
+            local path="$1"
+            local expected="$2"
+            local expected_prefix="$3"
+            local code
+            code=$(curl -sS -D /tmp/site-content.headers -o /tmp/site-content.out -w "%{http_code}" --max-time 20 "$SITE_URL$path")
+            if [[ "$code" != "$expected" ]]; then
+              echo "Expected $expected for $path but got $code"
+              exit 1
+            fi
+            if ! grep -qi "^content-type: ${expected_prefix}" /tmp/site-content.headers; then
+              echo "Expected content-type starting with '${expected_prefix}' for $path"
+              cat /tmp/site-content.headers
+              exit 1
+            fi
+          }
+
           check_html_status "/" 200
           check_html_status "/spec" 200
           check_html_status "/alerts" 200
@@ -121,6 +156,13 @@ jobs:
           fi
 
           check_html_status "/signals/latest" 200
+          check_site_content_type "/llms.txt" 200 "text/plain"
+          check_site_content_type "/agent.md" 200 "text/markdown"
+          check_site_content_type "/signals/agent.md" 200 "text/markdown"
+          check_site_json_status "/signals/api/runs" 200
+          check_site_json_status "/signals/api/accuracy" 200
+          check_site_json_status "/signals/api/predictions" 200
+          check_site_json_status "/signals/api/runs?status=foo" 400
           check_api_status "/health" 200
           check_api_status "/api/pxi" 200
           check_api_status "/api/alerts?limit=5" 200

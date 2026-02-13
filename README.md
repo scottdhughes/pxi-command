@@ -168,6 +168,78 @@ pxi-command/
 | `/signals/api/run` | POST | Trigger manual run (requires X-Admin-Token) |
 | `/signals/og-image.png` | GET | Dynamic OG image for social sharing |
 
+## Agent Docs
+
+Agent-discovery and markdown docs are published as static frontend endpoints:
+
+- `https://pxicommand.com/llms.txt`
+- `https://pxicommand.com/agent.md`
+- `https://pxicommand.com/signals/agent.md`
+
+Canonical read endpoints referenced by `llms.txt`:
+
+- `https://api.pxicommand.com/health`
+- `https://api.pxicommand.com/api/pxi`
+- `https://pxicommand.com/signals/api/runs`
+- `https://pxicommand.com/signals/api/accuracy`
+- `https://pxicommand.com/signals/api/predictions`
+
+Write/admin endpoints remain auth-protected and are not intended for autonomous agent writes.
+
+## Data Freshness SLA
+
+`npm run cron:daily` enforces per-indicator freshness SLAs before any write/recalculate calls.
+
+### SLA Classes
+
+| Class | Max age (days) |
+|---|---:|
+| daily | 4 |
+| realtime | 4 |
+| weekly | 10 |
+| monthly | 45 |
+| source-lagged (`wti_crude`) | 7 |
+| source-lagged (`dollar_index`) | 10 |
+
+### Explicit Threshold Overrides
+
+| Indicator | Max age (days) |
+|---|---:|
+| `cfnai` | 120 |
+| `m2_yoy` | 120 |
+| `fed_balance_sheet` | 14 |
+| `treasury_general_account` | 14 |
+| `reverse_repo` | 14 |
+| `net_liquidity` | 14 |
+
+### Critical SLA Gate
+
+The daily refresh fails if any of these are stale or missing after fetch stage:
+
+- `aaii_sentiment`
+- `copper_gold_ratio`
+- `vix`
+- `spy_close`
+- `dxy`
+- `hyg`
+- `lqd`
+- `fear_greed`
+
+Run summary output is written to `/tmp/pxi-sla-summary.json` and published to GitHub Actions step summary.
+
+## Scheduler Ownership Runbook
+
+Target ownership is GitHub Actions (`Daily PXI Refresh`) only. Keep Cloudflare cron enabled during hardening, then cut over after stability validation.
+
+### 72-hour Shadow Procedure
+
+1. Keep Cloudflare and GitHub schedulers active.
+2. Require 12 consecutive successful scheduled GitHub runs (4/day over 72 hours) with zero critical SLA violations.
+3. Disable Cloudflare cron triggers for:
+   - `pxi-api-production`
+   - `pxi-api`
+4. Re-verify Cloudflare schedules are empty and GitHub continues refreshing data.
+
 ## Development
 
 ```bash
@@ -185,10 +257,10 @@ npm run cron:daily
 cd frontend && npm run dev
 
 # Deploy main worker
-cd worker && npx wrangler deploy
+cd worker && npx wrangler deploy --env production
 
 # Deploy signals worker
-cd signals && npm install && npx wrangler deploy
+cd signals && npm install && npx wrangler deploy --env production
 ```
 
 ### Launch Readiness Smoke Checks
@@ -204,32 +276,34 @@ curl -I https://pxicommand.com/guide
 curl -I https://pxicommand.com/signals
 curl -I https://pxicommand.com/signals/latest
 
-# API checks
-curl -I https://pxi-api.novoamorx1.workers.dev/health
-curl -I https://pxi-api.novoamorx1.workers.dev/api/pxi
-curl -I https://pxi-api.novoamorx1.workers.dev/api/alerts
-curl -I https://pxi-api.novoamorx1.workers.dev/api/signal
+# API checks (canonical host)
+curl -I https://api.pxicommand.com/health
+curl -I https://api.pxicommand.com/api/pxi
+curl -I https://api.pxicommand.com/api/alerts
+curl -I https://api.pxicommand.com/api/signal
 
 # CORS preflight check
-curl -X OPTIONS https://pxi-api.novoamorx1.workers.dev/api/refresh \
+curl -X OPTIONS https://api.pxicommand.com/api/refresh \
   -H "Origin: https://pxicommand.com" \
   -H "Access-Control-Request-Method: POST" \
   -H "Access-Control-Request-Headers: Content-Type, Authorization, X-Admin-Token"
 
 # Backfill validation check (expect 400/401 depending on auth mode)
-curl -X POST https://pxi-api.novoamorx1.workers.dev/api/backfill \
+curl -X POST https://api.pxicommand.com/api/backfill \
   -H "Content-Type: application/json" \
   -d '{"start":"invalid-date","limit":"bad"}'
 ```
+
+Temporary rollback path remains available via `https://pxi-api.novoamorx1.workers.dev` during cutover.
 
 ### Signals Worker Route Check
 
 Confirm the route is attached and active:
 
 ```bash
-cd /Users/scott/pxi-signals
+cd /Users/scott/pxi/signals
 npx wrangler whoami
-npx wrangler deployments list --name pxi-signals
+npx wrangler deployments list --name pxi-signals --env production
 ```
 
 If `/signals` is unreachable (404), verify:
@@ -250,7 +324,7 @@ npm test
 npm run offline
 
 # Deploy to Cloudflare
-npx wrangler deploy
+npx wrangler deploy --env production
 
 # Set admin token for manual runs
 npx wrangler secret put ADMIN_RUN_TOKEN

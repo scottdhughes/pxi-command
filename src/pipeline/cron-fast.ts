@@ -1,21 +1,31 @@
-// Fast cron pipeline that uses Worker API instead of wrangler CLI
-// Fetches all indicator data → posts to Worker API in batch
+// Fast cron pipeline that uses Worker API instead of wrangler CLI.
+// Fetches all indicator data, validates SLA, and only then writes to Worker API.
 
 import dotenv from 'dotenv';
 dotenv.config();
 
-import { format, subYears } from 'date-fns';
+import { writeFile } from 'node:fs/promises';
+import { basename } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
 import axios from 'axios';
+import { format, subYears } from 'date-fns';
 import yahooFinance from 'yahoo-finance2';
-import { fetchSentimentFromFearGreed } from '../fetchers/alternative-sources.js';
+
+import { INDICATORS } from '../config/indicators.js';
+import {
+  CRITICAL_INDICATORS,
+  MONITORED_SLA_INDICATORS,
+  evaluateSla,
+  resolveIndicatorSla,
+  type IndicatorSlaEvaluation,
+} from '../config/indicator-sla.js';
 import { fetchGEX } from '../fetchers/gex.js';
 
-const WRITE_API_URL = process.env.WRITE_API_URL!;
-if (!WRITE_API_URL) {
-  throw new Error('WRITE_API_URL environment variable is required');
-}
-const WRITE_API_KEY = process.env.WRITE_API_KEY;
-const FRED_API_KEY = process.env.FRED_API_KEY;
+const WRITE_API_URL = process.env.WRITE_API_URL ?? '';
+const WRITE_API_KEY = process.env.WRITE_API_KEY ?? '';
+const FRED_API_KEY = process.env.FRED_API_KEY ?? '';
+const SLA_SUMMARY_PATH = process.env.SLA_SUMMARY_PATH ?? '/tmp/pxi-sla-summary.json';
 
 interface IndicatorValue {
   indicator_id: string;
@@ -24,44 +34,216 @@ interface IndicatorValue {
   source: string;
 }
 
-// Collected indicator values
+interface RetryBackoffOptions {
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  shouldRetry?: (error: unknown) => boolean;
+}
+
+interface SlaCheck extends IndicatorSlaEvaluation {
+  indicator_id: string;
+  frequency: string | null;
+  status: 'ok' | 'stale' | 'missing';
+}
+
+interface SlaSummary {
+  generated_at_utc: string;
+  summary: {
+    checked: number;
+    critical_failures: number;
+    non_critical_failures: number;
+  };
+  checks: SlaCheck[];
+}
+
+interface YahooChartPayload {
+  chart?: {
+    result?: Array<{
+      timestamp?: number[];
+      indicators?: {
+        quote?: Array<{ close?: Array<number | null> }>;
+        adjclose?: Array<{ adjclose?: Array<number | null> }>;
+      };
+    }>;
+    error?: { description?: string } | null;
+  };
+}
+
+const indicatorFrequencyMap = new Map<string, string>(
+  INDICATORS.map((indicator) => [indicator.id, indicator.frequency])
+);
+const monitoredIndicators = new Set<string>([
+  ...INDICATORS.map((indicator) => indicator.id),
+  ...MONITORED_SLA_INDICATORS,
+]);
+
+// Collected indicator values for this run.
 const allIndicators: IndicatorValue[] = [];
 
-// ============== FRED Fetchers ==============
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-async function fetchFredSeries(seriesId: string, indicatorId: string): Promise<void> {
+export function isRetryableYahooError(error: unknown): boolean {
+  if (!error) return false;
+
+  if (axios.isAxiosError(error)) {
+    const status = error.response?.status;
+    if (status === 429) return true;
+    if (status !== undefined && status >= 500) return true;
+    if (!status) return true;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('too many requests') ||
+    normalized.includes('429') ||
+    normalized.includes('timeout') ||
+    normalized.includes('econnreset') ||
+    normalized.includes('enotfound') ||
+    normalized.includes('network')
+  );
+}
+
+export async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  options: RetryBackoffOptions = {}
+): Promise<T> {
+  const maxAttempts = options.maxAttempts ?? 4;
+  const baseDelayMs = options.baseDelayMs ?? 300;
+  const maxDelayMs = options.maxDelayMs ?? 5000;
+  const shouldRetry = options.shouldRetry ?? (() => true);
+
+  let attempt = 0;
+  let lastError: unknown;
+
+  while (attempt < maxAttempts) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      attempt += 1;
+
+      if (attempt >= maxAttempts || !shouldRetry(error)) {
+        throw error;
+      }
+
+      const exponentialDelay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
+      const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(exponentialDelay * 0.2)));
+      await sleep(exponentialDelay + jitter);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('Retry exhausted');
+}
+
+export function parseYahooChartResponse(
+  payload: unknown,
+  indicatorId: string,
+  source: string = 'yahoo_direct'
+): IndicatorValue[] {
+  const parsed = payload as YahooChartPayload;
+  const result = parsed?.chart?.result?.[0];
+  if (!result || !Array.isArray(result.timestamp)) {
+    return [];
+  }
+
+  const timestamps = result.timestamp;
+  const adjustedSeries = result.indicators?.adjclose?.[0]?.adjclose;
+  const closeSeries = result.indicators?.quote?.[0]?.close;
+
+  const values: IndicatorValue[] = [];
+  for (let i = 0; i < timestamps.length; i += 1) {
+    const ts = timestamps[i];
+    if (!Number.isFinite(ts)) continue;
+
+    const adj = Array.isArray(adjustedSeries) ? adjustedSeries[i] : null;
+    const close = Array.isArray(closeSeries) ? closeSeries[i] : null;
+    const value = Number.isFinite(adj as number) ? (adj as number) : (close as number);
+
+    if (!Number.isFinite(value)) continue;
+
+    values.push({
+      indicator_id: indicatorId,
+      date: format(new Date(ts * 1000), 'yyyy-MM-dd'),
+      value,
+      source,
+    });
+  }
+
+  return values;
+}
+
+function recordIndicatorValues(values: IndicatorValue[]): number {
+  let written = 0;
+  for (const value of values) {
+    if (!Number.isFinite(value.value)) continue;
+    allIndicators.push(value);
+    written += 1;
+  }
+  return written;
+}
+
+async function fetchSentimentProxy(): Promise<number | null> {
+  const { fetchSentimentFromFearGreed } = await import('../fetchers/alternative-sources.js');
+  return fetchSentimentFromFearGreed();
+}
+
+async function fetchAaiiPrimary(): Promise<Array<{ date: Date; value: number }>> {
+  const { fetchAAIISentiment } = await import('../fetchers/scrapers.js');
+  return fetchAAIISentiment();
+}
+
+function getWriteConfig(): { writeApiUrl: string; writeApiKey: string; baseUrl: string } {
+  if (!WRITE_API_URL) {
+    throw new Error('WRITE_API_URL environment variable is required');
+  }
+  if (!WRITE_API_KEY) {
+    throw new Error('WRITE_API_KEY environment variable is required');
+  }
+
+  return {
+    writeApiUrl: WRITE_API_URL,
+    writeApiKey: WRITE_API_KEY,
+    baseUrl: WRITE_API_URL.replace('/api/write', ''),
+  };
+}
+
+async function fetchFredSeries(seriesId: string, indicatorId: string): Promise<IndicatorValue[]> {
   if (!FRED_API_KEY) {
     console.warn('FRED_API_KEY not set, skipping FRED data');
-    return;
+    return [];
   }
 
-  try {
-    const response = await axios.get('https://api.stlouisfed.org/fred/series/observations', {
-      params: {
-        series_id: seriesId,
-        api_key: FRED_API_KEY,
-        file_type: 'json',
-        observation_start: format(subYears(new Date(), 3), 'yyyy-MM-dd'),
-        observation_end: format(new Date(), 'yyyy-MM-dd'),
-        sort_order: 'desc',
-        limit: 100, // Only recent data for daily refresh
-      },
+  const response = await axios.get('https://api.stlouisfed.org/fred/series/observations', {
+    params: {
+      series_id: seriesId,
+      api_key: FRED_API_KEY,
+      file_type: 'json',
+      observation_start: format(subYears(new Date(), 3), 'yyyy-MM-dd'),
+      observation_end: format(new Date(), 'yyyy-MM-dd'),
+      sort_order: 'desc',
+      limit: 120,
+    },
+    timeout: 20000,
+  });
+
+  const values: IndicatorValue[] = [];
+  for (const obs of response.data.observations || []) {
+    if (obs.value === '.') continue;
+    const numericValue = Number.parseFloat(obs.value);
+    if (!Number.isFinite(numericValue)) continue;
+
+    values.push({
+      indicator_id: indicatorId,
+      date: obs.date,
+      value: numericValue,
+      source: 'fred',
     });
-
-    for (const obs of response.data.observations || []) {
-      if (obs.value !== '.') {
-        allIndicators.push({
-          indicator_id: indicatorId,
-          date: obs.date,
-          value: parseFloat(obs.value),
-          source: 'fred',
-        });
-      }
-    }
-    console.log(`  ✓ ${indicatorId}: ${response.data.observations?.length || 0} values`);
-  } catch (err: any) {
-    console.error(`  ✗ ${indicatorId}: ${err.message}`);
   }
+  return values;
 }
 
 async function fetchAllFred(): Promise<void> {
@@ -77,60 +259,172 @@ async function fetchAllFred(): Promise<void> {
     { ticker: 'DGS10', id: 'ten_year_yield' },
     { ticker: 'DCOILWTICO', id: 'wti_crude' },
     { ticker: 'DTWEXBGS', id: 'dollar_index' },
+    { ticker: 'IC4WSA', id: 'jobless_claims' },
+    { ticker: 'CFNAI', id: 'cfnai' },
+    { ticker: 'MANEMP', id: 'ism_manufacturing' },
   ];
 
   for (const { ticker, id } of fredIndicators) {
-    await fetchFredSeries(ticker, id);
-    await new Promise(r => setTimeout(r, 200)); // Rate limit
+    try {
+      const values = await fetchFredSeries(ticker, id);
+      const written = recordIndicatorValues(values);
+      console.log(`  ✓ ${id}: ${written} values`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`  ✗ ${id}: ${message}`);
+    }
+    await sleep(200);
   }
 
-  // Calculate net liquidity
-  const walcl = allIndicators.filter(i => i.indicator_id === 'fed_balance_sheet');
-  const tga = allIndicators.filter(i => i.indicator_id === 'treasury_general_account');
-  const rrp = allIndicators.filter(i => i.indicator_id === 'reverse_repo');
+  // Derive M2 YoY from M2SL series.
+  try {
+    const m2Series = await fetchFredSeries('M2SL', 'm2_raw');
+    const sorted = [...m2Series].sort((a, b) => a.date.localeCompare(b.date));
+    const m2Yoy: IndicatorValue[] = [];
 
-  const tgaMap = new Map(tga.map(t => [t.date, t.value]));
-  const rrpMap = new Map(rrp.map(r => [r.date, r.value]));
+    for (let i = 12; i < sorted.length; i += 1) {
+      const current = sorted[i];
+      const prior = sorted[i - 12];
+      if (!prior || prior.value === 0) continue;
 
-  for (const w of walcl) {
-    const t = tgaMap.get(w.date);
-    const r = rrpMap.get(w.date);
-    if (t !== undefined && r !== undefined) {
-      allIndicators.push({
-        indicator_id: 'net_liquidity',
-        date: w.date,
-        value: w.value - t - r,
+      const yoy = ((current.value - prior.value) / prior.value) * 100;
+      if (!Number.isFinite(yoy)) continue;
+
+      m2Yoy.push({
+        indicator_id: 'm2_yoy',
+        date: current.date,
+        value: yoy,
         source: 'fred',
       });
     }
+
+    const written = recordIndicatorValues(m2Yoy);
+    console.log(`  ✓ m2_yoy: ${written} values`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ m2_yoy: ${message}`);
   }
-  console.log(`  ✓ net_liquidity: calculated from components`);
+
+  // Derive net liquidity from core components.
+  const walcl = allIndicators.filter((i) => i.indicator_id === 'fed_balance_sheet');
+  const tga = allIndicators.filter((i) => i.indicator_id === 'treasury_general_account');
+  const rrp = allIndicators.filter((i) => i.indicator_id === 'reverse_repo');
+
+  const tgaByDate = new Map(tga.map((item) => [item.date, item.value]));
+  const rrpByDate = new Map(rrp.map((item) => [item.date, item.value]));
+
+  const netLiquidity: IndicatorValue[] = [];
+  for (const row of walcl) {
+    const tgaValue = tgaByDate.get(row.date);
+    const rrpValue = rrpByDate.get(row.date);
+    if (tgaValue === undefined || rrpValue === undefined) continue;
+
+    netLiquidity.push({
+      indicator_id: 'net_liquidity',
+      date: row.date,
+      value: row.value - tgaValue - rrpValue,
+      source: 'fred',
+    });
+  }
+
+  const written = recordIndicatorValues(netLiquidity);
+  console.log(`  ✓ net_liquidity: ${written} values`);
 }
 
-// ============== Yahoo Finance Fetchers ==============
+async function fetchYahooSeriesViaLibrary(symbol: string, indicatorId: string): Promise<IndicatorValue[]> {
+  const chart = await yahooFinance.chart(symbol, {
+    period1: subYears(new Date(), 3),
+    period2: new Date(),
+    interval: '1d',
+  });
 
-async function fetchYahooSeries(symbol: string, indicatorId: string): Promise<void> {
-  try {
-    const result = await yahooFinance.chart(symbol, {
-      period1: subYears(new Date(), 3),
-      period2: new Date(),
-      interval: '1d',
+  const values: IndicatorValue[] = [];
+  for (const quote of chart.quotes || []) {
+    if (!quote.date) continue;
+    const value = quote.adjclose ?? quote.close;
+    if (!Number.isFinite(value as number)) continue;
+
+    values.push({
+      indicator_id: indicatorId,
+      date: format(quote.date, 'yyyy-MM-dd'),
+      value: value as number,
+      source: 'yahoo',
     });
-
-    for (const q of result.quotes || []) {
-      if (q.close !== null && q.date) {
-        allIndicators.push({
-          indicator_id: indicatorId,
-          date: format(q.date, 'yyyy-MM-dd'),
-          value: q.adjclose ?? q.close!,
-          source: 'yahoo',
-        });
-      }
-    }
-    console.log(`  ✓ ${indicatorId}: ${result.quotes?.length || 0} values`);
-  } catch (err: any) {
-    console.error(`  ✗ ${indicatorId}: ${err.message}`);
   }
+
+  return values;
+}
+
+async function fetchYahooSeriesViaDirectApi(symbol: string, indicatorId: string): Promise<IndicatorValue[]> {
+  const response = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`, {
+    params: {
+      range: '3y',
+      interval: '1d',
+    },
+    timeout: 20000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Accept': 'application/json',
+    },
+    validateStatus: () => true,
+  });
+
+  if (response.status === 429) {
+    throw new Error('Yahoo direct API rate limited (429)');
+  }
+  if (response.status >= 400) {
+    throw new Error(`Yahoo direct API error ${response.status}`);
+  }
+
+  const values = parseYahooChartResponse(response.data, indicatorId, 'yahoo_direct');
+  if (values.length === 0) {
+    const errorText = (response.data as YahooChartPayload)?.chart?.error?.description;
+    throw new Error(errorText || `No chart data for ${symbol}`);
+  }
+
+  return values;
+}
+
+async function fetchYahooSeriesWithFallback(symbol: string, indicatorId: string): Promise<IndicatorValue[]> {
+  try {
+    const values = await retryWithBackoff(
+      () => fetchYahooSeriesViaLibrary(symbol, indicatorId),
+      {
+        maxAttempts: 3,
+        baseDelayMs: 250,
+        maxDelayMs: 2000,
+        shouldRetry: isRetryableYahooError,
+      }
+    );
+
+    if (values.length > 0) {
+      return values;
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`  ⚠ ${indicatorId}: yahoo-finance2 failed (${message}), trying direct API`);
+  }
+
+  return retryWithBackoff(
+    () => fetchYahooSeriesViaDirectApi(symbol, indicatorId),
+    {
+      maxAttempts: 4,
+      baseDelayMs: 300,
+      maxDelayMs: 3000,
+      shouldRetry: isRetryableYahooError,
+    }
+  );
+}
+
+function toDateSourceMap(values: IndicatorValue[]): Map<string, { value: number; source: string }> {
+  const map = new Map<string, { value: number; source: string }>();
+  for (const value of values) {
+    const current = map.get(value.date);
+    if (!current || (current.source !== 'yahoo_direct' && value.source === 'yahoo_direct')) {
+      map.set(value.date, { value: value.value, source: value.source });
+    }
+  }
+  return map;
 }
 
 async function fetchAllYahoo(): Promise<void> {
@@ -143,156 +437,173 @@ async function fetchAllYahoo(): Promise<void> {
     { ticker: 'TLT', id: 'tlt' },
     { ticker: 'GLD', id: 'gold' },
     { ticker: 'BTC-USD', id: 'btc_price' },
+    { ticker: 'SPY', id: 'spy_close' },
+    { ticker: 'DX-Y.NYB', id: 'dxy' },
+    { ticker: 'AUDJPY=X', id: 'audjpy' },
   ];
 
   for (const { ticker, id } of yahooIndicators) {
-    await fetchYahooSeries(ticker, id);
-    await new Promise(r => setTimeout(r, 300)); // Rate limit
+    try {
+      const values = await fetchYahooSeriesWithFallback(ticker, id);
+      const written = recordIndicatorValues(values);
+      const source = values.some((v) => v.source === 'yahoo_direct') ? 'yahoo_direct' : 'yahoo';
+      console.log(`  ✓ ${id}: ${written} values (${source})`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`  ✗ ${id}: ${message}`);
+    }
+    await sleep(250);
   }
 
-  // VIX term structure
+  // VIX term structure.
   try {
     const [vix, vix3m] = await Promise.all([
-      yahooFinance.chart('^VIX', { period1: subYears(new Date(), 3), period2: new Date(), interval: '1d' }),
-      yahooFinance.chart('^VIX3M', { period1: subYears(new Date(), 3), period2: new Date(), interval: '1d' }),
+      Promise.resolve(allIndicators.filter((v) => v.indicator_id === 'vix')),
+      fetchYahooSeriesWithFallback('^VIX3M', 'vix3m_temp'),
     ]);
 
-    const vix3mMap = new Map((vix3m.quotes || []).map(q => [format(q.date!, 'yyyy-MM-dd'), q.close!]));
+    const vix3mMap = toDateSourceMap(vix3m);
+    const derived: IndicatorValue[] = [];
 
-    for (const q of vix.quotes || []) {
-      if (q.close && q.date) {
-        const dateStr = format(q.date, 'yyyy-MM-dd');
-        const v3m = vix3mMap.get(dateStr);
-        if (v3m) {
-          allIndicators.push({
-            indicator_id: 'vix_term_structure',
-            date: dateStr,
-            value: q.close - v3m,
-            source: 'yahoo',
-          });
-        }
-      }
+    for (const row of vix) {
+      const secondLeg = vix3mMap.get(row.date);
+      if (!secondLeg) continue;
+      derived.push({
+        indicator_id: 'vix_term_structure',
+        date: row.date,
+        value: row.value - secondLeg.value,
+        source: row.source === 'yahoo_direct' || secondLeg.source === 'yahoo_direct' ? 'yahoo_direct' : 'yahoo',
+      });
     }
-    console.log(`  ✓ vix_term_structure: calculated`);
-  } catch (err: any) {
-    console.error(`  ✗ vix_term_structure: ${err.message}`);
+
+    const written = recordIndicatorValues(derived);
+    console.log(`  ✓ vix_term_structure: ${written} values`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ vix_term_structure: ${message}`);
   }
 
-  // RSP/SPY ratio
+  // RSP/SPY ratio.
   try {
     const [rsp, spy] = await Promise.all([
-      yahooFinance.chart('RSP', { period1: subYears(new Date(), 3), period2: new Date(), interval: '1d' }),
-      yahooFinance.chart('SPY', { period1: subYears(new Date(), 3), period2: new Date(), interval: '1d' }),
+      fetchYahooSeriesWithFallback('RSP', 'rsp_temp'),
+      Promise.resolve(allIndicators.filter((v) => v.indicator_id === 'spy_close')),
     ]);
 
-    const spyMap = new Map((spy.quotes || []).map(q => [format(q.date!, 'yyyy-MM-dd'), q.close!]));
+    const spyMap = toDateSourceMap(spy);
+    const derived: IndicatorValue[] = [];
 
-    for (const q of rsp.quotes || []) {
-      if (q.close && q.date) {
-        const dateStr = format(q.date, 'yyyy-MM-dd');
-        const s = spyMap.get(dateStr);
-        if (s) {
-          allIndicators.push({
-            indicator_id: 'rsp_spy_ratio',
-            date: dateStr,
-            value: q.close / s,
-            source: 'yahoo',
-          });
-        }
-      }
+    for (const row of rsp) {
+      const spyValue = spyMap.get(row.date);
+      if (!spyValue || spyValue.value === 0) continue;
+      derived.push({
+        indicator_id: 'rsp_spy_ratio',
+        date: row.date,
+        value: row.value / spyValue.value,
+        source: row.source === 'yahoo_direct' || spyValue.source === 'yahoo_direct' ? 'yahoo_direct' : 'yahoo',
+      });
     }
-    console.log(`  ✓ rsp_spy_ratio: calculated`);
-  } catch (err: any) {
-    console.error(`  ✗ rsp_spy_ratio: ${err.message}`);
+
+    const written = recordIndicatorValues(derived);
+    console.log(`  ✓ rsp_spy_ratio: ${written} values`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ rsp_spy_ratio: ${message}`);
   }
 
-  // Copper/Gold ratio
+  // Copper/Gold ratio.
   try {
     const [copper, gold] = await Promise.all([
-      yahooFinance.chart('HG=F', { period1: subYears(new Date(), 3), period2: new Date(), interval: '1d' }),
-      yahooFinance.chart('GC=F', { period1: subYears(new Date(), 3), period2: new Date(), interval: '1d' }),
+      fetchYahooSeriesWithFallback('HG=F', 'copper_temp'),
+      fetchYahooSeriesWithFallback('GC=F', 'gold_temp'),
     ]);
 
-    const goldMap = new Map((gold.quotes || []).map(q => [format(q.date!, 'yyyy-MM-dd'), q.close!]));
+    const goldMap = toDateSourceMap(gold);
+    const derived: IndicatorValue[] = [];
 
-    for (const q of copper.quotes || []) {
-      if (q.close && q.date) {
-        const dateStr = format(q.date, 'yyyy-MM-dd');
-        const g = goldMap.get(dateStr);
-        if (g) {
-          allIndicators.push({
-            indicator_id: 'copper_gold_ratio',
-            date: dateStr,
-            value: (q.close / g) * 1000,
-            source: 'yahoo',
-          });
-        }
-      }
+    for (const row of copper) {
+      const goldValue = goldMap.get(row.date);
+      if (!goldValue || goldValue.value === 0) continue;
+      derived.push({
+        indicator_id: 'copper_gold_ratio',
+        date: row.date,
+        value: (row.value / goldValue.value) * 1000,
+        source: row.source === 'yahoo_direct' || goldValue.source === 'yahoo_direct' ? 'yahoo_direct' : 'yahoo',
+      });
     }
-    console.log(`  ✓ copper_gold_ratio: calculated`);
-  } catch (err: any) {
-    console.error(`  ✗ copper_gold_ratio: ${err.message}`);
+
+    const written = recordIndicatorValues(derived);
+    const source = derived.some((v) => v.source === 'yahoo_direct') ? 'yahoo_direct' : 'yahoo';
+    console.log(`  ✓ copper_gold_ratio: ${written} values (${source})`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ copper_gold_ratio: ${message}`);
   }
 }
-
-// ============== Crypto Fetchers ==============
 
 async function fetchCrypto(): Promise<void> {
   console.log('\n━━━ Crypto Data ━━━');
 
-  // Stablecoin market cap from DeFiLlama
   try {
-    const response = await axios.get('https://stablecoins.llama.fi/stablecoincharts/all');
+    const response = await axios.get('https://stablecoins.llama.fi/stablecoincharts/all', { timeout: 20000 });
     const data = response.data;
 
     if (Array.isArray(data)) {
-      for (let i = 30; i < data.length; i++) {
+      const values: IndicatorValue[] = [];
+      for (let i = 30; i < data.length; i += 1) {
         const current = data[i];
         const past = data[i - 30];
-        const roc = ((current.totalCirculating?.peggedUSD - past.totalCirculating?.peggedUSD) / past.totalCirculating?.peggedUSD) * 100;
+        const currentValue = current.totalCirculating?.peggedUSD;
+        const pastValue = past.totalCirculating?.peggedUSD;
+        if (!currentValue || !pastValue) continue;
 
-        allIndicators.push({
+        const roc = ((currentValue - pastValue) / pastValue) * 100;
+        if (!Number.isFinite(roc)) continue;
+
+        values.push({
           indicator_id: 'stablecoin_mcap',
           date: format(new Date(current.date * 1000), 'yyyy-MM-dd'),
           value: roc,
           source: 'defillama',
         });
       }
-      console.log(`  ✓ stablecoin_mcap: ${data.length - 30} values`);
+
+      const written = recordIndicatorValues(values);
+      console.log(`  ✓ stablecoin_mcap: ${written} values`);
     }
-  } catch (err: any) {
-    console.error(`  ✗ stablecoin_mcap: ${err.message}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ stablecoin_mcap: ${message}`);
   }
 
-  // BTC funding rate from CoinGlass
   try {
     const response = await axios.get('https://open-api.coinglass.com/public/v2/funding', {
       params: { symbol: 'BTC' },
+      timeout: 20000,
     });
 
     if (response.data?.data?.uMarginList) {
       const rates = response.data.data.uMarginList;
-      const avgRate = rates.reduce((sum: number, r: any) => sum + (r.rate || 0), 0) / Math.max(rates.length, 1);
+      const avgRate = rates.reduce((sum: number, row: { rate?: number }) => sum + (row.rate || 0), 0) /
+        Math.max(rates.length, 1);
 
-      allIndicators.push({
+      const written = recordIndicatorValues([{
         indicator_id: 'btc_funding_rate',
         date: format(new Date(), 'yyyy-MM-dd'),
         value: avgRate * 100,
         source: 'coinglass',
-      });
-      console.log(`  ✓ btc_funding_rate: current value`);
+      }]);
+      console.log(`  ✓ btc_funding_rate: ${written} value`);
     }
-  } catch (err: any) {
-    console.error(`  ✗ btc_funding_rate: ${err.message}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ btc_funding_rate: ${message}`);
   }
 }
-
-// ============== BTC ETF Flows ==============
 
 async function fetchBtcEtfFlows(): Promise<void> {
   console.log('\n━━━ BTC ETF Flows ━━━');
 
-  // Try CoinGecko for BTC market data (no API key needed, CI-friendly)
   try {
     const response = await axios.get(
       'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart',
@@ -302,181 +613,281 @@ async function fetchBtcEtfFlows(): Promise<void> {
           days: 90,
           interval: 'daily',
         },
-        timeout: 15000,
+        timeout: 20000,
         headers: {
-          'accept': 'application/json',
+          accept: 'application/json',
         },
       }
     );
 
     if (response.data?.prices && response.data?.total_volumes) {
-      const prices = response.data.prices; // [[timestamp, price], ...]
-      const volumes = response.data.total_volumes; // [[timestamp, volume], ...]
+      const prices = response.data.prices as Array<[number, number]>;
+      const volumes = response.data.total_volumes as Array<[number, number]>;
 
-      // Create volume-weighted momentum as ETF flow proxy
-      // High volume + positive momentum = inflows, High volume + negative momentum = outflows
-      for (let i = 7; i < prices.length; i++) {
+      const values: IndicatorValue[] = [];
+      for (let i = 7; i < prices.length; i += 1) {
         const currentPrice = prices[i][1];
         const weekAgoPrice = prices[i - 7][1];
         const currentVolume = volumes[i]?.[1] || 0;
-        const avgVolume = volumes.slice(Math.max(0, i - 30), i)
-          .reduce((sum: number, v: number[]) => sum + (v[1] || 0), 0) / 30;
+        const avgVolume = volumes
+          .slice(Math.max(0, i - 30), i)
+          .reduce((sum: number, row: [number, number]) => sum + (row[1] || 0), 0) / 30;
 
-        // Momentum component (7-day price change %)
         const momentum = ((currentPrice - weekAgoPrice) / weekAgoPrice) * 100;
-
-        // Volume component (relative to 30-day average)
         const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 1;
-
-        // Flow proxy: momentum scaled by volume intensity
         const flowProxy = momentum * Math.log1p(volumeRatio);
 
-        const date = new Date(prices[i][0]);
-        allIndicators.push({
+        if (!Number.isFinite(flowProxy)) continue;
+
+        values.push({
           indicator_id: 'btc_etf_flows',
-          date: format(date, 'yyyy-MM-dd'),
+          date: format(new Date(prices[i][0]), 'yyyy-MM-dd'),
           value: flowProxy,
           source: 'coingecko_proxy',
         });
       }
 
-      console.log(`  ✓ btc_etf_flows: ${prices.length - 7} days (CoinGecko proxy)`);
+      const written = recordIndicatorValues(values);
+      console.log(`  ✓ btc_etf_flows: ${written} values (CoinGecko proxy)`);
       return;
     }
-  } catch (err: any) {
-    console.log(`  ⚠ CoinGecko API: ${err.message}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`  ⚠ CoinGecko API: ${message}`);
   }
 
-  // Fallback: Try CoinGlass v2 public endpoint
   try {
-    const response = await axios.get(
-      'https://open-api.coinglass.com/public/v2/index/bitcoin-etf',
-      {
-        timeout: 15000,
-        headers: {
-          'accept': 'application/json',
-        },
-      }
-    );
+    const btcData = allIndicators
+      .filter((i) => i.indicator_id === 'btc_price')
+      .sort((a, b) => b.date.localeCompare(a.date));
 
-    if (response.data?.data) {
-      const etfData = response.data.data;
-      let totalAum = 0;
-
-      for (const etf of etfData) {
-        if (etf.totalNetAsset) {
-          totalAum += etf.totalNetAsset;
-        }
-      }
-
-      if (totalAum !== 0) {
-        allIndicators.push({
-          indicator_id: 'btc_etf_flows',
-          date: format(new Date(), 'yyyy-MM-dd'),
-          value: totalAum / 1e9, // Convert to billions as relative value
-          source: 'coinglass',
-        });
-        console.log(`  ✓ btc_etf_flows: ${(totalAum / 1e9).toFixed(2)}B AUM (CoinGlass)`);
-        return;
-      }
-    }
-  } catch (err: any) {
-    console.log(`  ⚠ CoinGlass v2 API: ${err.message}`);
-  }
-
-  // Final fallback: use existing btc_price data for momentum
-  try {
-    const btcData = allIndicators.filter(i => i.indicator_id === 'btc_price');
     if (btcData.length >= 8) {
-      const sorted = btcData.sort((a, b) => b.date.localeCompare(a.date));
+      const values: IndicatorValue[] = [];
+      for (let i = 0; i < Math.min(30, btcData.length - 7); i += 1) {
+        const current = btcData[i];
+        const weekAgo = btcData[i + 7];
+        if (!current || !weekAgo || weekAgo.value === 0) continue;
 
-      for (let i = 0; i < Math.min(30, sorted.length - 7); i++) {
-        const current = sorted[i];
-        const week_ago = sorted[i + 7];
-        if (current && week_ago) {
-          const momentum = ((current.value - week_ago.value) / week_ago.value) * 100;
+        const momentum = ((current.value - weekAgo.value) / weekAgo.value) * 100;
+        if (!Number.isFinite(momentum)) continue;
 
-          allIndicators.push({
-            indicator_id: 'btc_etf_flows',
-            date: current.date,
-            value: momentum,
-            source: 'btc_momentum_proxy',
-          });
-        }
+        values.push({
+          indicator_id: 'btc_etf_flows',
+          date: current.date,
+          value: momentum,
+          source: 'btc_momentum_proxy',
+        });
       }
-      console.log(`  ✓ btc_etf_flows: ${sorted.length - 7} days (momentum proxy)`);
+
+      const written = recordIndicatorValues(values);
+      console.log(`  ✓ btc_etf_flows: ${written} values (momentum proxy)`);
       return;
     }
-  } catch (err: any) {
-    console.log(`  ⚠ BTC momentum fallback: ${err.message}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`  ⚠ BTC momentum fallback: ${message}`);
   }
 
   console.error('  ✗ btc_etf_flows: all sources failed');
 }
 
-// ============== Alternative Indicators ==============
+async function fetchAaiiSentimentWithFallback(): Promise<void> {
+  console.log('\n━━━ AAII Sentiment ━━━');
+
+  try {
+    const aaiiValues = await fetchAaiiPrimary();
+    if (aaiiValues.length > 0) {
+      const normalized: IndicatorValue[] = aaiiValues
+        .filter((value) => Number.isFinite(value.value) && value.date instanceof Date)
+        .map((value) => ({
+          indicator_id: 'aaii_sentiment',
+          date: format(value.date, 'yyyy-MM-dd'),
+          value: value.value,
+          source: 'aaii',
+        }));
+
+      const written = recordIndicatorValues(normalized);
+      if (written > 0) {
+        console.log(`  ✓ aaii_sentiment: ${written} values (AAII)`);
+        return;
+      }
+    }
+
+    console.log('  ⚠ AAII returned no values, using controlled proxy fallback');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`  ⚠ AAII scrape failed (${message}), using controlled proxy fallback`);
+  }
+
+  try {
+    const sentimentSpread = await fetchSentimentProxy();
+    if (sentimentSpread !== null) {
+      const written = recordIndicatorValues([{
+        indicator_id: 'aaii_sentiment',
+        date: format(new Date(), 'yyyy-MM-dd'),
+        value: sentimentSpread,
+        source: 'cnn_fg_proxy',
+      }]);
+
+      if (written > 0) {
+        console.log(`  ✓ aaii_sentiment: ${written} value (proxy)`);
+        return;
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ aaii_sentiment proxy fallback failed: ${message}`);
+    return;
+  }
+
+  console.error('  ✗ aaii_sentiment: unavailable from both real and proxy sources');
+}
 
 async function fetchAlternative(): Promise<void> {
   console.log('\n━━━ Alternative Data ━━━');
 
-  // Fear & Greed Index (CNN with Alternative.me fallback)
   try {
-    const sentiment = await fetchSentimentFromFearGreed();
-    if (sentiment !== null) {
-      // Convert back from bull-bear spread (-50 to +50) to raw score (0-100)
-      const rawScore = sentiment + 50;
-      allIndicators.push({
+    const sentimentSpread = await fetchSentimentProxy();
+    if (sentimentSpread !== null) {
+      const rawScore = sentimentSpread + 50;
+      const written = recordIndicatorValues([{
         indicator_id: 'fear_greed',
         date: format(new Date(), 'yyyy-MM-dd'),
         value: rawScore,
         source: 'cnn_or_alt',
-      });
-      console.log(`  ✓ fear_greed: ${rawScore.toFixed(0)}`);
+      }]);
+      console.log(`  ✓ fear_greed: ${written} value`);
     }
-  } catch (err: any) {
-    console.error(`  ✗ fear_greed: ${err.message}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ fear_greed: ${message}`);
   }
 
-  // GEX (Gamma Exposure) from CBOE options data
   try {
     const gex = await fetchGEX();
     if (gex !== null) {
-      allIndicators.push({
+      const written = recordIndicatorValues([{
         indicator_id: 'gex',
         date: format(new Date(), 'yyyy-MM-dd'),
         value: gex,
         source: 'cboe',
-      });
-      console.log(`  ✓ gex: ${gex.toFixed(2)}B`);
+      }]);
+      console.log(`  ✓ gex: ${written} value`);
     }
-  } catch (err: any) {
-    console.error(`  ✗ gex: ${err.message}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ gex: ${message}`);
   }
 }
 
-// ============== POST to Worker API ==============
+function buildLatestDateByIndicator(values: IndicatorValue[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const value of values) {
+    const current = map.get(value.indicator_id);
+    if (!current || value.date > current) {
+      map.set(value.indicator_id, value.date);
+    }
+  }
+  return map;
+}
 
-async function postToWorkerAPI(): Promise<void> {
-  if (!WRITE_API_KEY) {
-    throw new Error('WRITE_API_KEY not set in environment');
+function formatDays(daysOld: number | null): string {
+  if (daysOld === null) return '—';
+  return daysOld.toFixed(1);
+}
+
+function buildSlaChecks(now: Date): SlaCheck[] {
+  const latestDates = buildLatestDateByIndicator(allIndicators);
+  const checks: SlaCheck[] = [];
+
+  for (const indicatorId of [...monitoredIndicators].sort()) {
+    const frequency = indicatorFrequencyMap.get(indicatorId) ?? null;
+    const policy = resolveIndicatorSla(indicatorId, frequency);
+    const evaluation = evaluateSla(latestDates.get(indicatorId) ?? null, now, policy);
+
+    checks.push({
+      indicator_id: indicatorId,
+      frequency,
+      status: evaluation.missing ? 'missing' : evaluation.stale ? 'stale' : 'ok',
+      ...evaluation,
+    });
   }
 
-  console.log(`\n━━━ Posting to Worker API ━━━`);
+  return checks;
+}
+
+function logSlaChecks(checks: SlaCheck[]): void {
+  console.log('\n━━━ SLA Gate ━━━');
+  console.log('  indicator                 latest      days   max   class         critical  status');
+
+  for (const check of checks) {
+    const indicator = check.indicator_id.padEnd(24, ' ');
+    const latest = (check.latest_date ?? 'missing').padEnd(10, ' ');
+    const days = formatDays(check.days_old).padStart(5, ' ');
+    const max = String(check.max_age_days).padStart(3, ' ');
+    const slaClass = check.sla_class.padEnd(12, ' ');
+    const critical = String(check.critical).padEnd(8, ' ');
+
+    console.log(`  ${indicator} ${latest} ${days} ${max}   ${slaClass} ${critical} ${check.status}`);
+  }
+}
+
+async function writeSlaSummary(checks: SlaCheck[]): Promise<void> {
+  const criticalFailures = checks.filter(
+    (check) => check.critical && (check.status === 'stale' || check.status === 'missing')
+  ).length;
+  const nonCriticalFailures = checks.filter(
+    (check) => !check.critical && (check.status === 'stale' || check.status === 'missing')
+  ).length;
+
+  const summary: SlaSummary = {
+    generated_at_utc: new Date().toISOString(),
+    summary: {
+      checked: checks.length,
+      critical_failures: criticalFailures,
+      non_critical_failures: nonCriticalFailures,
+    },
+    checks,
+  };
+
+  await writeFile(SLA_SUMMARY_PATH, `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
+  console.log(`\n📝 SLA summary written to ${SLA_SUMMARY_PATH}`);
+}
+
+async function enforceSlaGate(now: Date): Promise<void> {
+  const checks = buildSlaChecks(now);
+  logSlaChecks(checks);
+  await writeSlaSummary(checks);
+
+  const criticalViolations = checks.filter(
+    (check) => check.critical && (check.status === 'stale' || check.status === 'missing')
+  );
+
+  if (criticalViolations.length > 0) {
+    const names = criticalViolations.map((check) => check.indicator_id).join(', ');
+    throw new Error(`Critical SLA violation(s): ${names}`);
+  }
+}
+
+async function postToWorkerAPI(): Promise<void> {
+  const { writeApiKey, writeApiUrl } = getWriteConfig();
+
+  console.log('\n━━━ Posting to Worker API ━━━');
   console.log(`  Total indicator values: ${allIndicators.length}`);
 
-  // Chunk into batches to avoid payload limits
-  const BATCH_SIZE = 500;
+  const batchSize = 500;
   let totalWritten = 0;
+  let failedBatches = 0;
 
-  for (let i = 0; i < allIndicators.length; i += BATCH_SIZE) {
-    const batch = allIndicators.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < allIndicators.length; i += batchSize) {
+    const batch = allIndicators.slice(i, i + batchSize);
 
     try {
-      const response = await fetch(WRITE_API_URL, {
+      const response = await fetch(writeApiUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${WRITE_API_KEY}`,
+          Authorization: `Bearer ${writeApiKey}`,
         },
         body: JSON.stringify({ indicators: batch }),
       });
@@ -486,89 +897,82 @@ async function postToWorkerAPI(): Promise<void> {
         throw new Error(`API error ${response.status}: ${errorText}`);
       }
 
-      const result = await response.json() as { success: boolean; written: number };
-      totalWritten += result.written;
-      console.log(`  Batch ${Math.floor(i / BATCH_SIZE) + 1}: wrote ${result.written} records`);
-    } catch (err: any) {
-      console.error(`  Batch ${Math.floor(i / BATCH_SIZE) + 1} failed: ${err.message}`);
+      const result = (await response.json()) as { written?: number };
+      const written = Number(result.written ?? 0);
+      totalWritten += written;
+      console.log(`  Batch ${Math.floor(i / batchSize) + 1}: wrote ${written} records`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failedBatches += 1;
+      console.error(`  Batch ${Math.floor(i / batchSize) + 1} failed: ${message}`);
     }
   }
 
   console.log(`\n✅ Total written: ${totalWritten} records`);
+  if (failedBatches > 0) {
+    throw new Error(`${failedBatches} batch(es) failed while writing indicator data`);
+  }
 }
 
-// ============== Trigger PXI Recalculation ==============
-
 async function triggerRecalculation(): Promise<void> {
-  if (!WRITE_API_KEY || !WRITE_API_URL) {
-    throw new Error('WRITE_API_KEY and WRITE_API_URL must be set');
-  }
+  const { writeApiKey, baseUrl } = getWriteConfig();
 
-  const baseUrl = WRITE_API_URL.replace('/api/write', '');
   const today = new Date().toISOString().split('T')[0];
-
-  console.log(`\n━━━ Recalculating PXI ━━━`);
+  console.log('\n━━━ Recalculating PXI ━━━');
   console.log(`  Date: ${today}`);
 
-  try {
-    const response = await fetch(`${baseUrl}/api/recalculate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${WRITE_API_KEY}`,
-      },
-      body: JSON.stringify({ date: today }),
-    });
+  const response = await fetch(`${baseUrl}/api/recalculate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${writeApiKey}`,
+    },
+    body: JSON.stringify({ date: today }),
+  });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Recalculate error ${response.status}: ${errorText}`);
-    }
-
-    const result = await response.json() as { success: boolean; score: number; label: string; categories: number; embedded?: boolean };
-    console.log(`  ✓ PXI: ${result.score.toFixed(1)} (${result.label})`);
-    console.log(`  ✓ Categories: ${result.categories}`);
-    console.log(`  ✓ Embedding: ${result.embedded ? 'generated' : 'skipped'}`);
-  } catch (err: any) {
-    console.error(`  ✗ Recalculation failed: ${err.message}`);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Recalculate error ${response.status}: ${errorText}`);
   }
+
+  const result = (await response.json()) as {
+    score: number;
+    label: string;
+    categories: number;
+    embedded?: boolean;
+  };
+
+  console.log(`  ✓ PXI: ${result.score.toFixed(1)} (${result.label})`);
+  console.log(`  ✓ Categories: ${result.categories}`);
+  console.log(`  ✓ Embedding: ${result.embedded ? 'generated' : 'skipped'}`);
 }
 
 async function evaluatePredictions(): Promise<void> {
-  if (!WRITE_API_KEY || !WRITE_API_URL) {
-    throw new Error('WRITE_API_KEY and WRITE_API_URL must be set');
+  const { writeApiKey, baseUrl } = getWriteConfig();
+
+  console.log('\n━━━ Evaluating Past Predictions ━━━');
+
+  const response = await fetch(`${baseUrl}/api/evaluate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${writeApiKey}`,
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Evaluate error ${response.status}: ${errorText}`);
   }
 
-  const baseUrl = WRITE_API_URL.replace('/api/write', '');
-
-  console.log(`\n━━━ Evaluating Past Predictions ━━━`);
-
-  try {
-    const response = await fetch(`${baseUrl}/api/evaluate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${WRITE_API_KEY}`,
-      },
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Evaluate error ${response.status}: ${errorText}`);
-    }
-
-    const result = await response.json() as { success: boolean; pending: number; evaluated: number };
-    console.log(`  ✓ Pending predictions: ${result.pending}`);
-    console.log(`  ✓ Evaluated: ${result.evaluated}`);
-  } catch (err: any) {
-    console.error(`  ✗ Evaluation failed: ${err.message}`);
-  }
+  const result = (await response.json()) as { pending: number; evaluated: number };
+  console.log(`  ✓ Pending predictions: ${result.pending}`);
+  console.log(`  ✓ Evaluated: ${result.evaluated}`);
 }
 
-// ============== Main ==============
-
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const startTime = Date.now();
+  allIndicators.length = 0;
 
   console.log('╔════════════════════════════════════════════════════════════╗');
   console.log('║                 PXI DAILY REFRESH (FAST)                   ║');
@@ -576,29 +980,43 @@ async function main(): Promise<void> {
   console.log(`\n📅 ${new Date().toISOString()}`);
 
   try {
-    // Fetch all data sources
     await fetchAllFred();
     await fetchAllYahoo();
     await fetchCrypto();
-    // BTC ETF flows after Yahoo (needs btc_price for fallback)
     await fetchBtcEtfFlows();
+    await fetchAaiiSentimentWithFallback();
     await fetchAlternative();
 
-    // Post to Worker API
+    await enforceSlaGate(new Date());
+
     await postToWorkerAPI();
-
-    // Trigger PXI recalculation (also logs predictions)
     await triggerRecalculation();
-
-    // Evaluate past predictions against actual outcomes
     await evaluatePredictions();
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`\n✅ Daily refresh complete in ${duration}s`);
-  } catch (err: any) {
-    console.error('\n❌ Daily refresh failed:', err.message);
-    process.exit(1);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`\n❌ Daily refresh failed: ${message}`);
+    process.exitCode = 1;
+    throw error;
   }
 }
 
-main();
+function isDirectExecution(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+
+  const entryBaseName = basename(entry);
+  if (entryBaseName !== 'cron-fast.ts' && entryBaseName !== 'cron-fast.js') {
+    return false;
+  }
+
+  return import.meta.url === pathToFileURL(entry).href;
+}
+
+if (isDirectExecution()) {
+  main().catch(() => {
+    process.exit(1);
+  });
+}
