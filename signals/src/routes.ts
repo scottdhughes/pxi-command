@@ -105,11 +105,58 @@ function htmlResponse(html: string, status = 200) {
   })
 }
 
+function markdownResponse(markdown: string, status = 200) {
+  return new Response(markdown, {
+    status,
+    headers: {
+      "Content-Type": "text/markdown; charset=utf-8",
+      "Cache-Control": "public, max-age=86400",
+    },
+  })
+}
+
 function fallbackHtml() {
   return `<!doctype html>
   <html lang="en">
   <head><meta charset="utf-8"/><title>Signals</title></head>
   <body><p>Signals report is temporarily unavailable.</p><p>Not investment advice.</p></body></html>`
+}
+
+function signalsAgentMarkdown(basePath: string) {
+  return `# PXI Signals Agent Spec
+
+## Purpose
+This document defines the stable read surface for PXI Signals report and prediction data.
+
+## Canonical Routes
+- Latest report HTML: https://pxicommand.com${basePath}/latest
+- Runs list: https://pxicommand.com${basePath}/api/runs
+- Accuracy: https://pxicommand.com${basePath}/api/accuracy
+- Predictions: https://pxicommand.com${basePath}/api/predictions
+
+## Report Flow
+1. GET ${basePath} responds with a redirect to ${basePath}/latest.
+2. GET ${basePath}/latest returns the latest report HTML.
+3. GET ${basePath}/api/runs returns run metadata JSON.
+4. GET ${basePath}/api/runs/{id} returns a specific run detail JSON.
+
+## Filtering Rules (${basePath}/api/runs)
+- Allowed status values: ok, error
+- Example valid filter: https://pxicommand.com${basePath}/api/runs?status=ok
+- Invalid filter behavior: https://pxicommand.com${basePath}/api/runs?status=foo returns 400 JSON
+
+## Accuracy and Predictions
+- GET ${basePath}/api/accuracy returns aggregate hit-rate and summary metrics (200 JSON).
+- GET ${basePath}/api/predictions returns prediction rows (200 JSON).
+
+## Cadence
+- Scheduler cadence: Monday and Tuesday at 15:00 UTC.
+- Tuesday run is a holiday fallback path for US market closures.
+
+## Safety Notes
+- The endpoints above are read-only.
+- Manual run triggering requires admin token and should not be called autonomously.
+`
 }
 
 async function buildStubReport(env: Env) {
@@ -167,15 +214,20 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   const path = url.pathname.slice(base.length) || "/"
+  const method = request.method === "HEAD" ? "GET" : request.method
 
-  if (request.method === "GET" && (path === "/" || path === "")) {
+  if (method === "GET" && (path === "/" || path === "")) {
     return new Response(null, {
       status: 302,
       headers: { Location: `${base}/latest` },
     })
   }
 
-  if (request.method === "GET" && path === "/latest") {
+  if (method === "GET" && path === "/agent.md") {
+    return markdownResponse(signalsAgentMarkdown(base))
+  }
+
+  if (method === "GET" && path === "/latest") {
     try {
       const latestId = await getLatestRunId(env)
       if (!latestId) {
@@ -191,7 +243,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
   }
 
-  if (request.method === "GET" && path.startsWith("/run/")) {
+  if (method === "GET" && path.startsWith("/run/")) {
     const runId = path.replace("/run/", "")
     if (!isValidRunId(runId)) {
       return new Response("Invalid run ID format", { status: 400 })
@@ -203,7 +255,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return htmlResponse(html)
   }
 
-  if (request.method === "GET" && path === "/api/runs") {
+  if (method === "GET" && path === "/api/runs") {
     const status = url.searchParams.get("status")
     if (status && status !== "ok" && status !== "error") {
       return jsonResponse({ error: "Invalid status filter" }, 400)
@@ -213,7 +265,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return jsonResponse({ runs })
   }
 
-  if (request.method === "GET" && path.startsWith("/api/runs/")) {
+  if (method === "GET" && path.startsWith("/api/runs/")) {
     const runId = path.replace("/api/runs/", "")
     if (!isValidRunId(runId)) {
       return jsonResponse({ error: "Invalid run ID format" }, 400)
@@ -265,7 +317,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   // Signal Accuracy and Predictions API
   // ─────────────────────────────────────────────────────────────────────────────
 
-  if (request.method === "GET" && path === "/api/accuracy") {
+  if (method === "GET" && path === "/api/accuracy") {
     try {
       const stats = await getAccuracyStats(env)
       return jsonResponse({
@@ -301,7 +353,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
   }
 
-  if (request.method === "GET" && path === "/api/predictions") {
+  if (method === "GET" && path === "/api/predictions") {
     try {
       const evaluatedParam = url.searchParams.get("evaluated")
       const limitParam = url.searchParams.get("limit")
@@ -340,7 +392,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   // OG Image for social sharing
-  if (request.method === "GET" && path === "/og-image.png") {
+  if (method === "GET" && path === "/og-image.png") {
     try {
       const latestId = await getLatestRunId(env)
       let topTheme = "Market Themes"
