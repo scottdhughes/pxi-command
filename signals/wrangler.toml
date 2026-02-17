@@ -15,16 +15,16 @@ routes = [
 ]
 [[env.staging.d1_databases]]
 binding = "SIGNALS_DB"
-database_name = "pxi_signals"
-database_id = "9d480cf6-3dc6-4e1f-b5d1-8e774a0e5105"
+database_name = "pxi_signals_staging"
+database_id = "469c71aa-ea36-42c2-8f86-02cd49f63c8d"
 
 [[env.staging.r2_buckets]]
 binding = "SIGNALS_BUCKET"
-bucket_name = "pxi-signals"
+bucket_name = "pxi-signals-staging"
 
 [[env.staging.kv_namespaces]]
 binding = "SIGNALS_KV"
-id = "13003f5f87b144e1842f96b31a5ace61"
+id = "76f4ecf359be409892d46cf97d7e338d"
 
 [env.staging.vars]
 PUBLIC_BASE_PATH = "/signals-staging"

@@ -2,11 +2,13 @@
 
 Do not run these commands unless you have Cloudflare credentials configured.
 
-## Create D1 Database + Migrations
+## Create D1 Databases + Migrations
 
 ```
 wrangler d1 create pxi_signals
+wrangler d1 create pxi_signals_staging
 wrangler d1 migrations apply SIGNALS_DB --remote --env production
+wrangler d1 migrations apply SIGNALS_DB --remote --env staging
 ```
 
 For local validation before deploy:
@@ -14,6 +16,7 @@ For local validation before deploy:
 ```bash
 cd /Users/scott/pxi/signals
 npx wrangler d1 migrations apply SIGNALS_DB --local --env production
+npx wrangler d1 migrations apply SIGNALS_DB --local --env staging
 ```
 
 This includes:
@@ -35,16 +38,18 @@ Expected results:
 - unique index query returns one row,
 - table info includes `exit_price_date` and `evaluation_note` columns.
 
-## Create R2 Bucket
+## Create R2 Buckets
 
 ```
 wrangler r2 bucket create pxi-signals
+wrangler r2 bucket create pxi-signals-staging
 ```
 
-## Create KV Namespace
+## Create KV Namespaces
 
 ```
 wrangler kv:namespace create SIGNALS_KV
+wrangler kv:namespace create SIGNALS_KV_STAGING
 ```
 
 ## Set Secrets
@@ -77,12 +82,11 @@ wrangler deploy --env production --var BUILD_SHA:${BUILD_SHA} --var BUILD_TIMEST
 
 ## Checklist
 
-- D1 database is bound as `SIGNALS_DB`.
-- R2 bucket is bound as `SIGNALS_BUCKET`.
-- KV namespace is bound as `SIGNALS_KV`.
+- Production and staging each bind `SIGNALS_DB`, `SIGNALS_BUCKET`, and `SIGNALS_KV` to separate resources.
 - Secrets are set.
 - `/signals-staging/latest` serves a staging report.
 - `/signals/latest` serves a production report.
+- `/signals-staging/api/version` and `/signals-staging/api/health` are healthy.
 - `/signals/api/version` returns build metadata (`build_sha`, `build_timestamp`, `worker_version`).
 - `/signals/api/health` returns freshness JSON with `status` and `is_stale`.
 
@@ -134,3 +138,15 @@ This check fails fast when:
 - `/api/health` is missing or malformed,
 - `/api/accuracy` does not expose required CI/completeness fields,
 - `/api/predictions` contains duplicate logical keys (`signal_date`, `theme_id`).
+
+Staging equivalent:
+
+```bash
+cd /Users/scott/pxi/signals
+npm run smoke:deploy -- \
+  https://pxicommand.com/signals-staging \
+  --strict-version \
+  --check-migrations \
+  --migration-env staging \
+  --migration-db SIGNALS_DB
+```

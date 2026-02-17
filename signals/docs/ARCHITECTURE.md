@@ -1,6 +1,10 @@
 # Architecture
 
-This worker is mounted only on the `pxicommand.com/signals` and `pxicommand.com/signals/*` routes and does not touch the rest of the site.
+This worker uses environment-specific routes:
+- production: `pxicommand.com/signals` and `pxicommand.com/signals/*`
+- staging: `pxicommand.com/signals-staging` and `pxicommand.com/signals-staging/*`
+
+Production and staging bind the same logical names (`SIGNALS_DB`, `SIGNALS_BUCKET`, `SIGNALS_KV`) to separate resources so pre-prod runs cannot mutate production state.
 
 ## Components
 
