@@ -233,3 +233,103 @@ CREATE TABLE IF NOT EXISTS ensemble_predictions (
 CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_date ON ensemble_predictions(prediction_date DESC);
 CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_target7d ON ensemble_predictions(target_date_7d);
 CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_target30d ON ensemble_predictions(target_date_30d);
+
+-- ============================================
+-- PXI Product Layer Tables (Brief/Opportunities/Alerts)
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS email_subscribers (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'unsubscribed', 'bounced')),
+    cadence TEXT NOT NULL DEFAULT 'daily_8am_et',
+    types_json TEXT NOT NULL,
+    timezone TEXT NOT NULL DEFAULT 'America/New_York',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_subscribers_status ON email_subscribers(status);
+CREATE INDEX IF NOT EXISTS idx_email_subscribers_updated ON email_subscribers(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_verification_email_expires ON email_verification_tokens(email, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_email_verification_hash ON email_verification_tokens(token_hash);
+
+CREATE TABLE IF NOT EXISTS email_unsubscribe_tokens (
+    subscriber_id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_unsubscribe_hash ON email_unsubscribe_tokens(token_hash);
+
+CREATE TABLE IF NOT EXISTS market_brief_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_brief_as_of ON market_brief_snapshots(as_of DESC);
+
+CREATE TABLE IF NOT EXISTS opportunity_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(as_of, horizon)
+);
+
+CREATE INDEX IF NOT EXISTS idx_opportunity_snapshots_lookup ON opportunity_snapshots(as_of DESC, horizon);
+
+CREATE TABLE IF NOT EXISTS market_calibration_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    horizon TEXT,
+    payload_json TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(as_of, metric, horizon)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_calibration_lookup ON market_calibration_snapshots(metric, horizon, as_of DESC);
+
+CREATE TABLE IF NOT EXISTS market_alert_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('info', 'warning', 'critical')),
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    entity_type TEXT NOT NULL CHECK(entity_type IN ('market', 'theme', 'indicator')),
+    entity_id TEXT,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    payload_json TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_alert_events_created ON market_alert_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_alert_events_type ON market_alert_events(event_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS market_alert_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    channel TEXT NOT NULL CHECK(channel IN ('in_app', 'email')),
+    subscriber_id TEXT,
+    status TEXT NOT NULL CHECK(status IN ('queued', 'sent', 'failed')),
+    provider_id TEXT,
+    error TEXT,
+    attempted_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_event ON market_alert_deliveries(event_id, attempted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_subscriber ON market_alert_deliveries(subscriber_id, attempted_at DESC);

@@ -167,6 +167,7 @@ jobs:
           check_api_status "/api/pxi" 200
           check_api_status "/api/alerts?limit=5" 200
           check_api_status "/api/signal" 200
+          bash scripts/api-product-contract-check.sh "$API_URL"
 
           # CORS preflight for admin endpoint (no auth check expected, only CORS response)
           code=$(curl -sS -o /tmp/preflight.out -w "%{http_code}" --max-time 20 -X OPTIONS \

@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import {
   CRITICAL_INDICATORS,
   evaluateSla,
+  isChronicStaleness,
   resolveIndicatorSla,
+  resolveStalePolicy,
 } from './indicator-sla.js';
 
 test('resolveIndicatorSla uses frequency defaults', () => {
@@ -59,4 +61,21 @@ test('evaluateSla detects stale and missing states', () => {
   const missingEval = evaluateSla(null, now, stalePolicy);
   assert.equal(missingEval.missing, true);
   assert.equal(missingEval.stale, true);
+});
+
+test('resolveStalePolicy applies class defaults and indicator overrides', () => {
+  const dailyPolicy = resolveStalePolicy('foo_daily', 'daily');
+  assert.equal(dailyPolicy.retry_attempts, 2);
+  assert.equal(dailyPolicy.escalation, 'retry_source');
+
+  const vixPolicy = resolveStalePolicy('vix', 'daily');
+  assert.equal(vixPolicy.retry_attempts, 3);
+  assert.equal(vixPolicy.escalation, 'escalate_ops');
+  assert.equal(vixPolicy.owner, 'risk_ops');
+});
+
+test('isChronicStaleness flags heavily stale or missing indicators', () => {
+  assert.equal(isChronicStaleness(null, 4), true);
+  assert.equal(isChronicStaleness(3.9, 4), false);
+  assert.equal(isChronicStaleness(8.1, 4), true);
 });

@@ -95,7 +95,7 @@ cd frontend && npm run dev
 cd frontend && VITE_API_URL=https://<your-worker>.workers.dev npm run build
 
 # Deploy Cloudflare Worker
-cd worker && npx wrangler deploy
+cd worker && npx wrangler deploy --env production
 
 # Deploy frontend to Cloudflare Pages
 npx wrangler pages deploy frontend/dist --project-name pxi-frontend

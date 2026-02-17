@@ -17,6 +17,8 @@ import {
   CRITICAL_INDICATORS,
   MONITORED_SLA_INDICATORS,
   evaluateSla,
+  isChronicStaleness,
+  resolveStalePolicy,
   resolveIndicatorSla,
   type IndicatorSlaEvaluation,
 } from '../config/indicator-sla.js';
@@ -26,6 +28,8 @@ const WRITE_API_URL = process.env.WRITE_API_URL ?? '';
 const WRITE_API_KEY = process.env.WRITE_API_KEY ?? '';
 const FRED_API_KEY = process.env.FRED_API_KEY ?? '';
 const SLA_SUMMARY_PATH = process.env.SLA_SUMMARY_PATH ?? '/tmp/pxi-sla-summary.json';
+const STALE_TOP_OFFENDERS_PATH = process.env.STALE_TOP_OFFENDERS_PATH ?? '/tmp/pxi-stale-top-offenders.json';
+const MARKET_SUMMARY_PATH = process.env.MARKET_SUMMARY_PATH ?? '/tmp/pxi-market-summary.json';
 
 interface IndicatorValue {
   indicator_id: string;
@@ -47,14 +51,45 @@ interface SlaCheck extends IndicatorSlaEvaluation {
   status: 'ok' | 'stale' | 'missing';
 }
 
+interface StaleTopOffender {
+  indicator_id: string;
+  status: 'stale' | 'missing';
+  days_old: number | null;
+  max_age_days: number;
+  critical: boolean;
+  chronic: boolean;
+  policy: {
+    retry_attempts: number;
+    retry_backoff_minutes: number;
+    escalation: 'observe' | 'retry_source' | 'escalate_ops';
+    owner: 'market_data' | 'macro_data' | 'risk_ops';
+  };
+}
+
 interface SlaSummary {
   generated_at_utc: string;
   summary: {
     checked: number;
     critical_failures: number;
     non_critical_failures: number;
+    stale_or_missing_total: number;
+    chronic_total: number;
   };
   checks: SlaCheck[];
+  top_offenders: StaleTopOffender[];
+}
+
+interface MarketRefreshSummary {
+  generated_at_utc: string;
+  result: {
+    ok?: boolean;
+    brief_generated?: number;
+    opportunities_generated?: number;
+    calibrations_generated?: number;
+    alerts_generated?: number;
+    as_of?: string | null;
+    [key: string]: unknown;
+  };
 }
 
 interface YahooChartPayload {
@@ -832,6 +867,34 @@ function logSlaChecks(checks: SlaCheck[]): void {
   }
 }
 
+function buildStaleTopOffenders(checks: SlaCheck[], limit = 10): StaleTopOffender[] {
+  return checks
+    .filter((check) => check.status === 'stale' || check.status === 'missing')
+    .map((check) => {
+      const status: 'stale' | 'missing' = check.status === 'missing' ? 'missing' : 'stale';
+      const policy = resolveStalePolicy(check.indicator_id, check.frequency);
+      const chronic = isChronicStaleness(check.days_old, check.max_age_days);
+      return {
+        indicator_id: check.indicator_id,
+        status,
+        days_old: check.days_old,
+        max_age_days: check.max_age_days,
+        critical: check.critical,
+        chronic,
+        policy,
+      };
+    })
+    .sort((a, b) => {
+      if (a.critical !== b.critical) return a.critical ? -1 : 1;
+      if (a.chronic !== b.chronic) return a.chronic ? -1 : 1;
+      if (a.status !== b.status) return a.status === 'missing' ? -1 : 1;
+      const aDays = a.days_old ?? Number.POSITIVE_INFINITY;
+      const bDays = b.days_old ?? Number.POSITIVE_INFINITY;
+      return bDays - aDays;
+    })
+    .slice(0, limit);
+}
+
 async function writeSlaSummary(checks: SlaCheck[]): Promise<void> {
   const criticalFailures = checks.filter(
     (check) => check.critical && (check.status === 'stale' || check.status === 'missing')
@@ -839,6 +902,8 @@ async function writeSlaSummary(checks: SlaCheck[]): Promise<void> {
   const nonCriticalFailures = checks.filter(
     (check) => !check.critical && (check.status === 'stale' || check.status === 'missing')
   ).length;
+  const topOffenders = buildStaleTopOffenders(checks);
+  const chronicTotal = topOffenders.filter((item) => item.chronic).length;
 
   const summary: SlaSummary = {
     generated_at_utc: new Date().toISOString(),
@@ -846,18 +911,38 @@ async function writeSlaSummary(checks: SlaCheck[]): Promise<void> {
       checked: checks.length,
       critical_failures: criticalFailures,
       non_critical_failures: nonCriticalFailures,
+      stale_or_missing_total: topOffenders.length,
+      chronic_total: chronicTotal,
     },
     checks,
+    top_offenders: topOffenders,
   };
 
   await writeFile(SLA_SUMMARY_PATH, `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
+  await writeFile(STALE_TOP_OFFENDERS_PATH, `${JSON.stringify({
+    generated_at_utc: summary.generated_at_utc,
+    top_offenders: topOffenders,
+  }, null, 2)}\n`, 'utf8');
   console.log(`\n📝 SLA summary written to ${SLA_SUMMARY_PATH}`);
+  console.log(`📝 Stale top offenders written to ${STALE_TOP_OFFENDERS_PATH}`);
 }
 
 async function enforceSlaGate(now: Date): Promise<void> {
   const checks = buildSlaChecks(now);
   logSlaChecks(checks);
   await writeSlaSummary(checks);
+  const topOffenders = buildStaleTopOffenders(checks, 5);
+
+  if (topOffenders.length > 0) {
+    console.log('\n━━━ Stale Top Offenders ━━━');
+    for (const offender of topOffenders) {
+      const days = offender.days_old === null ? 'n/a' : offender.days_old.toFixed(1);
+      console.log(
+        `  ${offender.indicator_id}: ${offender.status}, ${days}d old, ` +
+        `policy=${offender.policy.escalation} owner=${offender.policy.owner}`
+      );
+    }
+  }
 
   const criticalViolations = checks.filter(
     (check) => check.critical && (check.status === 'stale' || check.status === 'missing')
@@ -973,6 +1058,37 @@ async function evaluatePredictions(): Promise<void> {
   console.log(`  ✓ Evaluated: ${result.evaluated}`);
 }
 
+async function triggerMarketProductsRefresh(): Promise<void> {
+  const { writeApiKey, baseUrl } = getWriteConfig();
+  console.log('\n━━━ Refreshing Market Products ━━━');
+
+  const response = await fetch(`${baseUrl}/api/market/refresh-products`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${writeApiKey}`,
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Market refresh error ${response.status}: ${errorText}`);
+  }
+
+  const result = (await response.json()) as MarketRefreshSummary['result'];
+  const summary: MarketRefreshSummary = {
+    generated_at_utc: new Date().toISOString(),
+    result,
+  };
+
+  await writeFile(MARKET_SUMMARY_PATH, `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
+  console.log(`  ✓ Brief generated: ${result.brief_generated ?? 0}`);
+  console.log(`  ✓ Opportunities generated: ${result.opportunities_generated ?? 0}`);
+  console.log(`  ✓ Calibrations generated: ${result.calibrations_generated ?? 0}`);
+  console.log(`  ✓ Alerts generated: ${result.alerts_generated ?? 0}`);
+  console.log(`  ✓ Summary written: ${MARKET_SUMMARY_PATH}`);
+}
+
 export async function main(): Promise<void> {
   const startTime = Date.now();
   allIndicators.length = 0;
@@ -995,6 +1111,7 @@ export async function main(): Promise<void> {
     await postToWorkerAPI();
     await triggerRecalculation();
     await evaluatePredictions();
+    await triggerMarketProductsRefresh();
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`\n✅ Daily refresh complete in ${duration}s`);

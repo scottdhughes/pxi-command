@@ -36,6 +36,7 @@ jobs:
           WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
           WRITE_API_URL: ${{ secrets.WRITE_API_URL }}
           SLA_SUMMARY_PATH: /tmp/pxi-sla-summary.json
+          STALE_TOP_OFFENDERS_PATH: /tmp/pxi-stale-top-offenders.json
         run: npm run cron:daily
 
       - name: Generate market products and in-app alerts
@@ -64,6 +65,14 @@ jobs:
               echo "| Indicator | Latest Date | Days Old | Threshold | Class | Critical | Status |"
               echo "|---|---|---:|---:|---|---|---|"
               jq -r '.checks[] | "| \(.indicator_id) | \(.latest_date // "missing") | \((.days_old // "n/a") | tostring) | \(.max_age_days) | \(.sla_class) | \(.critical) | \(.status) |"' /tmp/pxi-sla-summary.json
+              if jq -e '.top_offenders | length > 0' /tmp/pxi-sla-summary.json >/dev/null 2>&1; then
+                echo ""
+                echo "#### Top stale offenders"
+                echo ""
+                echo "| Indicator | Status | Days Old | Chronic | Escalation | Owner | Retry Attempts |"
+                echo "|---|---|---:|---|---|---|---:|"
+                jq -r '.top_offenders[] | "| \(.indicator_id) | \(.status) | \((.days_old // "n/a") | tostring) | \(.chronic) | \(.policy.escalation) | \(.policy.owner) | \(.policy.retry_attempts) |"' /tmp/pxi-sla-summary.json
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
           else
             {
@@ -81,9 +90,9 @@ jobs:
               echo ""
               echo "### PXI Market Products Summary"
               echo ""
-              echo "| Brief generated | Opportunities generated | Alerts generated | As of |"
-              echo "|---:|---:|---:|---|"
-              jq -r '"| \(.result.brief_generated // 0) | \(.result.opportunities_generated // 0) | \(.result.alerts_generated // 0) | \(.result.as_of // "n/a") |"' /tmp/pxi-market-summary.json
+              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | As of |"
+              echo "|---:|---:|---:|---:|---|"
+              jq -r '"| \(.result.brief_generated // 0) | \(.result.opportunities_generated // 0) | \(.result.calibrations_generated // 0) | \(.result.alerts_generated // 0) | \(.result.as_of // "n/a") |"' /tmp/pxi-market-summary.json
             } >> "$GITHUB_STEP_SUMMARY"
           else
             {

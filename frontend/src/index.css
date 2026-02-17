@@ -7,6 +7,11 @@
   --color-border: #26272b;
   --color-surface: #0a0a0a;
   --color-accent: #00a3ff;
+  --color-accent-soft: #7ccfff;
+  --color-positive: #00c896;
+  --color-warning: #f59e0b;
+  --color-danger: #ff6b6b;
+  --color-surface-alt: #0f1116;
 
   --font-family-sans: 'Inter', system-ui, -apple-system, sans-serif;
   --font-family-mono: 'JetBrains Mono', 'Geist Mono', 'SF Mono', monospace;

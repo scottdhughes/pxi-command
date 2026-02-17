@@ -18,6 +18,15 @@ export interface IndicatorSlaEvaluation {
   sla_class: IndicatorSlaClass;
 }
 
+export type StaleEscalationTier = 'observe' | 'retry_source' | 'escalate_ops';
+
+export interface IndicatorStalePolicy {
+  retry_attempts: number;
+  retry_backoff_minutes: number;
+  escalation: StaleEscalationTier;
+  owner: 'market_data' | 'macro_data' | 'risk_ops';
+}
+
 const DAILY_MAX_AGE_DAYS = 4;
 const WEEKLY_MAX_AGE_DAYS = 10;
 const MONTHLY_MAX_AGE_DAYS = 45;
@@ -34,6 +43,60 @@ const MAX_AGE_OVERRIDE_BY_INDICATOR: Record<string, number> = {
   treasury_general_account: 14,
   reverse_repo: 14,
   net_liquidity: 14,
+};
+
+const DEFAULT_STALE_POLICY_BY_CLASS: Record<IndicatorSlaClass, IndicatorStalePolicy> = {
+  daily: {
+    retry_attempts: 2,
+    retry_backoff_minutes: 30,
+    escalation: 'retry_source',
+    owner: 'market_data',
+  },
+  weekly: {
+    retry_attempts: 1,
+    retry_backoff_minutes: 180,
+    escalation: 'observe',
+    owner: 'macro_data',
+  },
+  monthly: {
+    retry_attempts: 1,
+    retry_backoff_minutes: 720,
+    escalation: 'observe',
+    owner: 'macro_data',
+  },
+  source_lagged: {
+    retry_attempts: 0,
+    retry_backoff_minutes: 0,
+    escalation: 'observe',
+    owner: 'macro_data',
+  },
+};
+
+const INDICATOR_STALE_POLICY_OVERRIDES: Record<string, Partial<IndicatorStalePolicy>> = {
+  vix: {
+    retry_attempts: 3,
+    retry_backoff_minutes: 15,
+    escalation: 'escalate_ops',
+    owner: 'risk_ops',
+  },
+  spy_close: {
+    retry_attempts: 3,
+    retry_backoff_minutes: 15,
+    escalation: 'escalate_ops',
+    owner: 'risk_ops',
+  },
+  dxy: {
+    retry_attempts: 2,
+    retry_backoff_minutes: 30,
+    escalation: 'escalate_ops',
+    owner: 'risk_ops',
+  },
+  aaii_sentiment: {
+    retry_attempts: 1,
+    retry_backoff_minutes: 180,
+    escalation: 'retry_source',
+    owner: 'macro_data',
+  },
 };
 
 const INDICATOR_FREQUENCY_HINTS: Record<string, string> = Object.fromEntries(
@@ -132,6 +195,26 @@ export function getStaleThresholdDays(
   frequency?: string | null
 ): number {
   return resolveIndicatorSla(indicatorId, frequency).max_age_days;
+}
+
+export function resolveStalePolicy(
+  indicatorId: string,
+  frequency?: string | null
+): IndicatorStalePolicy {
+  const policy = resolveIndicatorSla(indicatorId, frequency);
+  const defaults = DEFAULT_STALE_POLICY_BY_CLASS[policy.class];
+  const override = INDICATOR_STALE_POLICY_OVERRIDES[indicatorId];
+  return {
+    retry_attempts: override?.retry_attempts ?? defaults.retry_attempts,
+    retry_backoff_minutes: override?.retry_backoff_minutes ?? defaults.retry_backoff_minutes,
+    escalation: override?.escalation ?? defaults.escalation,
+    owner: override?.owner ?? defaults.owner,
+  };
+}
+
+export function isChronicStaleness(daysOld: number | null, maxAgeDays: number): boolean {
+  if (daysOld === null) return true;
+  return daysOld >= Math.max(maxAgeDays + 1, maxAgeDays * 2);
 }
 
 export function evaluateSla(

@@ -340,6 +340,14 @@ interface OpportunityItem {
   supporting_factors: string[]
   historical_hit_rate: number
   sample_size: number
+  calibration?: {
+    probability_correct_direction: number | null
+    ci95_low: number | null
+    ci95_high: number | null
+    sample_size: number
+    quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+    basis: 'conviction_decile'
+  }
   updated_at: string
 }
 
@@ -385,6 +393,14 @@ interface PlanData {
     stale_count: number
     ml_sample_size: number
     conflict_state: 'ALIGNED' | 'MIXED' | 'CONFLICT'
+    calibration?: {
+      bin: string | null
+      probability_correct_7d: number | null
+      ci95_low_7d: number | null
+      ci95_high_7d: number | null
+      sample_size_7d: number
+      quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+    }
   }
   risk_band: {
     d7: { bear: number | null; base: number | null; bull: number | null; sample_size: number }
@@ -730,6 +746,42 @@ function formatBand(value: number | null): string {
   return value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`
 }
 
+function formatProbability(value: number | null, digits = 0): string {
+  if (value === null || Number.isNaN(value)) return '—'
+  return `${(value * 100).toFixed(digits)}%`
+}
+
+function calibrationQualityClass(quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'): string {
+  if (quality === 'ROBUST') return 'border-[#00c896]/40 text-[#00c896]'
+  if (quality === 'LIMITED') return 'border-[#f59e0b]/40 text-[#f59e0b]'
+  return 'border-[#ff6b6b]/40 text-[#ff6b6b]'
+}
+
+function fallbackEdgeCalibration(score: number): NonNullable<PlanData['edge_quality']['calibration']> {
+  const clampedScore = Math.max(0, Math.min(100, Math.round(score)))
+  const binStart = clampedScore === 100 ? 90 : Math.floor(clampedScore / 10) * 10
+  const binEnd = binStart === 90 ? 100 : binStart + 9
+  return {
+    bin: `${binStart}-${binEnd}`,
+    probability_correct_7d: null,
+    ci95_low_7d: null,
+    ci95_high_7d: null,
+    sample_size_7d: 0,
+    quality: 'INSUFFICIENT',
+  }
+}
+
+function fallbackOpportunityCalibration(): NonNullable<OpportunityItem['calibration']> {
+  return {
+    probability_correct_direction: null,
+    ci95_low: null,
+    ci95_high: null,
+    sample_size: 0,
+    quality: 'INSUFFICIENT',
+    basis: 'conviction_decile',
+  }
+}
+
 function TodayPlanCard({ plan }: { plan: PlanData | null }) {
   if (!plan) return null
 
@@ -748,6 +800,7 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
     { label: 'model', value: plan.edge_quality.breakdown.model_agreement },
     { label: 'regime', value: plan.edge_quality.breakdown.regime_stability },
   ]
+  const calibration = plan.edge_quality.calibration ?? fallbackEdgeCalibration(plan.edge_quality.score)
 
   return (
     <section className="w-full mb-6 rounded border border-[#26272b] bg-[#0a0a0a]/80 p-4">
@@ -776,6 +829,9 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
         </span>
         <span className={`rounded border border-[#26272b] px-2 py-1 ${conflictColor}`}>
           {plan.edge_quality.conflict_state.toLowerCase()}
+        </span>
+        <span className={`rounded border px-2 py-1 ${calibrationQualityClass(calibration.quality)}`}>
+          calibration {calibration.quality.toLowerCase()}
         </span>
       </div>
 
@@ -811,6 +867,27 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
           </p>
           <p className="text-[#949ba5]/70">n={plan.risk_band.d30.sample_size}</p>
         </div>
+      </div>
+
+      <div className="mt-3 rounded border border-[#26272b] px-2 py-2">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Edge Calibration (7d)</p>
+          <p className={`text-[9px] uppercase tracking-wide ${calibrationQualityClass(calibration.quality)}`}>
+            {calibration.quality}
+          </p>
+        </div>
+        <p className="mt-1 text-[10px] text-[#d7dbe1]">
+          p(correct) {formatProbability(calibration.probability_correct_7d)} ·
+          {' '}95% CI {formatProbability(calibration.ci95_low_7d)}-{formatProbability(calibration.ci95_high_7d)}
+        </p>
+        <p className="text-[9px] text-[#949ba5]/70">
+          bin {calibration.bin || 'n/a'} · n={calibration.sample_size_7d}
+        </p>
+        {calibration.quality !== 'ROBUST' && (
+          <p className="mt-1 text-[9px] text-[#f59e0b]">
+            Limited calibration sample; size down and prefer faster invalidation checks.
+          </p>
+        )}
       </div>
 
       {plan.invalidation_rules.length > 0 && (
@@ -2216,7 +2293,9 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
       </div>
 
       <div className="space-y-2">
-        {top.map((item) => (
+        {top.map((item) => {
+          const calibration = item.calibration ?? fallbackOpportunityCalibration()
+          return (
           <div key={item.id} className="p-3 bg-[#0f0f0f] border border-[#1a1a1a] rounded">
             <div className="flex items-start justify-between gap-2">
               <div>
@@ -2228,11 +2307,22 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
               <div className="text-right">
                 <div className="text-[18px] leading-none font-mono text-[#f3f3f3]">{item.conviction_score}</div>
                 <div className="text-[8px] text-[#949ba5]/50 uppercase tracking-wider">conviction</div>
+                <div className={`mt-1 inline-block rounded border px-1.5 py-0.5 text-[8px] uppercase tracking-wider ${calibrationQualityClass(calibration.quality)}`}>
+                  {calibration.quality.toLowerCase()}
+                </div>
               </div>
             </div>
             <p className="mt-2 text-[10px] text-[#b8bec8]">{item.rationale}</p>
+            <p className="mt-1 text-[9px] text-[#949ba5]/70">
+              calibrated hit {formatProbability(calibration.probability_correct_direction)} ·
+              {' '}95% CI {formatProbability(calibration.ci95_low)}-{formatProbability(calibration.ci95_high)} ·
+              {' '}n={calibration.sample_size}
+            </p>
+            {calibration.quality !== 'ROBUST' && (
+              <p className="mt-1 text-[9px] text-[#f59e0b]">Use reduced sizing until calibration quality improves.</p>
+            )}
           </div>
-        ))}
+        )})}
       </div>
     </div>
   )
@@ -2361,7 +2451,9 @@ function OpportunitiesPage({
           <div className="text-[#949ba5]">No opportunities available yet.</div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {data.items.map((item) => (
+            {data.items.map((item) => {
+              const calibration = item.calibration ?? fallbackOpportunityCalibration()
+              return (
               <div key={item.id} className="p-4 bg-[#0a0a0a]/65 border border-[#26272b] rounded-lg">
                 <div className="flex items-start justify-between gap-2">
                   <div>
@@ -2373,6 +2465,9 @@ function OpportunitiesPage({
                   <div className="px-2 py-1 rounded border border-[#1d2f3f] bg-[#081521]">
                     <div className="text-[16px] leading-none font-mono text-[#00a3ff]">{item.conviction_score}</div>
                     <div className="text-[8px] text-[#7fa8c7] uppercase tracking-wider">conviction</div>
+                    <div className={`mt-1 inline-block rounded border px-1.5 py-0.5 text-[8px] uppercase tracking-wider ${calibrationQualityClass(calibration.quality)}`}>
+                      {calibration.quality.toLowerCase()}
+                    </div>
                   </div>
                 </div>
                 <p className="mt-3 text-[11px] text-[#cfd5de] leading-relaxed">{item.rationale}</p>
@@ -2386,8 +2481,18 @@ function OpportunitiesPage({
                 <div className="mt-3 text-[9px] text-[#949ba5]/60">
                   Hit rate {(item.historical_hit_rate * 100).toFixed(0)}% · n={item.sample_size}
                 </div>
+                <div className="mt-2 text-[9px] text-[#949ba5]/70">
+                  Calibrated p(correct) {formatProbability(calibration.probability_correct_direction)} ·
+                  {' '}95% CI {formatProbability(calibration.ci95_low)}-{formatProbability(calibration.ci95_high)} ·
+                  {' '}n={calibration.sample_size}
+                </div>
+                {calibration.quality !== 'ROBUST' && (
+                  <div className="mt-1 text-[9px] text-[#f59e0b]">
+                    Limited calibration quality; treat this as exploratory risk.
+                  </div>
+                )}
               </div>
-            ))}
+            )})}
           </div>
         )}
       </div>

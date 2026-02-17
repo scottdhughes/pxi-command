@@ -1,10 +1,15 @@
 # SHIP QUEUE (Quant Review)
 
-Last updated: 2026-02-17 10:20 EST
+Last updated: 2026-02-17 12:35 EST
+
+## Queue Hygiene Sync (2026-02-17)
+- Marked `P0-ET1`, `P0-ET2`, `P0-ET3`, `P0-7`, `P0-8`, and `P0-9` as closed to reflect shipped production behavior.
+- Code references: `worker/api.ts` (`/api/plan`, `/api/signal`, `/api/brief`, `/api/opportunities`, `/api/alerts/feed`), `frontend/src/App.tsx` (Today Plan + opportunities rendering), `.github/workflows/ci.yml` + `scripts/api-product-contract-check.sh` (contract gates).
+- Run references: production endpoint checks on 2026-02-17 for `/api/plan`, `/api/brief?scope=market`, `/api/opportunities?horizon=7d&limit=5`, and `/api/alerts/feed?limit=10` returned HTTP 200 with JSON payloads.
 
 ## P0
 
-### P0-ET1 (OPEN) — Daily Decision Engine (`/api/plan`) + home "Today’s Plan" card
+### P0-ET1 (CLOSED 2026-02-17) — Daily Decision Engine (`/api/plan`) + home "Today’s Plan" card
 - **Impact / Confidence / Effort / Risk:** Very High / High / Medium / Low-Medium
 - **Scope (exact):**
   - `worker/api.ts`
@@ -28,7 +33,7 @@ Last updated: 2026-02-17 10:20 EST
 - **Rollback plan:**
   - remove `/api/plan` route and hide card behind feature flag fallback.
 
-### P0-ET2 (OPEN) — Confidence Quality Layer + explicit regime/signal conflict state
+### P0-ET2 (CLOSED 2026-02-17) — Confidence Quality Layer + explicit regime/signal conflict state
 - **Impact / Confidence / Effort / Risk:** Very High / High / Medium / Medium
 - **Scope (exact):**
   - `worker/api.ts`
@@ -54,7 +59,7 @@ Last updated: 2026-02-17 10:20 EST
 - **Rollback plan:**
   - disable confidence penalties/conflict field and fall back to legacy confidence labels.
 
-### P0-ET3 (OPEN) — Product surface consistency gate (`/api/brief`, `/api/opportunities`, `/api/alerts/feed`)
+### P0-ET3 (CLOSED 2026-02-17) — Product surface consistency gate (`/api/brief`, `/api/opportunities`, `/api/alerts/feed`)
 - **Impact / Confidence / Effort / Risk:** Very High / High / Medium / Medium
 - **Scope (exact):**
   - `.github/workflows/ci.yml`
@@ -79,6 +84,37 @@ Last updated: 2026-02-17 10:20 EST
   - CI blocks releases when product contracts drift.
 - **Rollback plan:**
   - revert CI gate and route-contract changes; preserve UI fallback warnings.
+
+### P0-10 (OPEN) — Calibration snapshots + confidence payload rollout
+- **Impact / Confidence / Effort / Risk:** Very High / Medium-High / Medium / Medium
+- **Scope (exact):**
+  - `worker/schema.sql`
+    - add `market_calibration_snapshots` table + lookup index.
+  - `worker/api.ts`
+    - build/store edge-quality and conviction calibration snapshots during `/api/market/refresh-products`.
+    - add calibration blocks to `/api/plan`, `/api/opportunities`, and `/api/signal`.
+  - `frontend/src/App.tsx`
+    - render calibration quality chips, CI bands, and warning state when quality is not robust.
+- **Validation commands:**
+  - `curl -sS https://api.pxicommand.com/api/plan | jq '.edge_quality.calibration'`
+  - `curl -sS "https://api.pxicommand.com/api/opportunities?horizon=7d&limit=3" | jq '.items[].calibration'`
+  - `curl -sS https://api.pxicommand.com/api/signal | jq '.edge_quality.calibration'`
+- **Expected pass criteria:**
+  - calibration blocks are always present and typed; null-safe when sample size is insufficient.
+  - product refresh stores calibration snapshots before opportunity generation.
+
+### P0-11 (OPEN) — Product API contract gate hardening in CI
+- **Impact / Confidence / Effort / Risk:** High / High / Low / Low
+- **Scope (exact):**
+  - `scripts/api-product-contract-check.sh`
+    - enforce required-field contracts for `/api/plan`, `/api/brief`, `/api/opportunities`, `/api/alerts/feed`.
+  - `.github/workflows/ci.yml`
+    - execute contract script in smoke job after route/status checks.
+- **Validation commands:**
+  - `cd /Users/scott/pxi && bash scripts/api-product-contract-check.sh https://api.pxicommand.com`
+- **Expected pass criteria:**
+  - CI fails on missing required fields or non-JSON responses for surfaced product routes.
+  - degraded responses remain typed JSON (`degraded_reason`) and do not regress to HTML/404.
 
 ### P0-5 (CLOSED this cycle) — Anchor evaluation exits to target-date historical close (eliminate delayed-run horizon drift)
 - **Impact / Confidence / Effort / Risk:** High / Medium-High / Medium-High / Medium
@@ -160,7 +196,7 @@ Last updated: 2026-02-17 10:20 EST
 - **Rollback plan:**
   - Redeploy previous worker revision and restore from backup/migration checkpoint if regression appears.
 
-### P0-7 (PREP ONLY) — Daily Trade Plan command center (`/api/plan` + first-screen card)
+### P0-7 (CLOSED 2026-02-17) — Daily Trade Plan command center (`/api/plan` + first-screen card)
 - **Impact / Confidence / Effort / Risk:** Very High / High / Medium / Medium
 - **Scope (exact):**
   - `worker/api.ts`
@@ -187,7 +223,7 @@ Last updated: 2026-02-17 10:20 EST
 - **Rollback plan:**
   - Revert `/api/plan` route and plan-card UI additions, then redeploy prior worker/frontend revisions.
 
-### P0-8 (PREP ONLY) — Edge Quality engine (freshness/conflict/sample penalties)
+### P0-8 (CLOSED 2026-02-17) — Edge Quality engine (freshness/conflict/sample penalties)
 - **Impact / Confidence / Effort / Risk:** Very High / Medium-High / Medium / Medium
 - **Scope (exact):**
   - `worker/api.ts`
@@ -214,7 +250,7 @@ Last updated: 2026-02-17 10:20 EST
 - **Rollback plan:**
   - Revert confidence-penalty and conflict-state fields and restore prior signal payload semantics.
 
-### P0-9 (PREP ONLY) — Route consistency hardening for brief/opportunities/alerts feed
+### P0-9 (CLOSED 2026-02-17) — Route consistency hardening for brief/opportunities/alerts feed
 - **Impact / Confidence / Effort / Risk:** High / High / Low-Medium / Low-Medium
 - **Scope (exact):**
   - `worker/api.ts`

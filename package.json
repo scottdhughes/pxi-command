@@ -15,7 +15,9 @@
     "refresh": "tsx src/pipeline/fetch-all.ts && tsx src/pipeline/calculate.ts",
     "cron:daily": "tsx src/pipeline/cron-fast.ts",
     "cron:daily:slow": "tsx src/pipeline/cron.ts",
-    "cron:intraday": "tsx src/pipeline/cron.ts --intraday"
+    "cron:intraday": "tsx src/pipeline/cron.ts --intraday",
+    "postrefresh:market": "tsx src/pipeline/postrefresh-market.ts",
+    "digest:send": "tsx src/pipeline/send-digest.ts"
   },
   "dependencies": {
     "axios": "^1.6.0",

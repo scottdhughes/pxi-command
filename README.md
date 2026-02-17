@@ -131,6 +131,16 @@ pxi-command/
 | `/api/regime` | GET | Current market regime detection |
 | `/api/signal` | GET | PXI-Signal layer with risk allocation |
 
+### Product Layer (Phase 1)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/brief` | GET | Daily market brief with explainability and freshness status |
+| `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon |
+| `/api/alerts/feed` | GET | In-app alert timeline (`regime_change`, `threshold_cross`, `opportunity_spike`, `freshness_warning`) |
+| `/api/alerts/subscribe/start` | POST | Start email digest subscription with verification token |
+| `/api/alerts/subscribe/verify` | POST | Verify subscription token and activate email digest |
+| `/api/alerts/unsubscribe` | POST | Unsubscribe via token |
+
 ### ML & Predictions
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -157,6 +167,8 @@ pxi-command/
 | `/api/evaluate` | POST | Evaluate past predictions |
 | `/api/retrain` | POST | Retrain adaptive bucket thresholds |
 | `/api/export/training-data` | GET | Export data for ML model training |
+| `/api/market/refresh-products` | POST | Generate/store latest brief, opportunities, and market alerts |
+| `/api/market/send-digest` | POST | Send daily digest to active subscribers |
 
 ### Signals (`/signals/*`)
 | Endpoint | Method | Description |
@@ -226,6 +238,13 @@ The daily refresh fails if any of these are stale or missing after fetch stage:
 - `fear_greed`
 
 Run summary output is written to `/tmp/pxi-sla-summary.json` and published to GitHub Actions step summary.
+
+## Market Product Automation
+
+- `Daily PXI Refresh` now runs ingestion + SLA gate + post-refresh product generation (`/api/market/refresh-products`).
+- Product summary output is written to `/tmp/pxi-market-summary.json` and appended to the Actions job summary.
+- A separate `Daily PXI Digest` workflow runs at `13:00 UTC` (8:00 AM ET standard) and calls `/api/market/send-digest`.
+- Digest summary output is written to `/tmp/pxi-digest-summary.json`.
 
 ## Scheduler Ownership Runbook
 

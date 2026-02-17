@@ -1026,6 +1026,43 @@ type MarketAlertType = 'regime_change' | 'threshold_cross' | 'opportunity_spike'
 type AlertSeverity = 'info' | 'warning' | 'critical';
 type ConflictState = 'ALIGNED' | 'MIXED' | 'CONFLICT';
 type EdgeQualityLabel = 'HIGH' | 'MEDIUM' | 'LOW';
+type CalibrationQuality = 'ROBUST' | 'LIMITED' | 'INSUFFICIENT';
+
+interface EdgeQualityCalibration {
+  bin: string | null;
+  probability_correct_7d: number | null;
+  ci95_low_7d: number | null;
+  ci95_high_7d: number | null;
+  sample_size_7d: number;
+  quality: CalibrationQuality;
+}
+
+interface OpportunityCalibration {
+  probability_correct_direction: number | null;
+  ci95_low: number | null;
+  ci95_high: number | null;
+  sample_size: number;
+  quality: CalibrationQuality;
+  basis: 'conviction_decile';
+}
+
+interface CalibrationBinSnapshot {
+  bin: string;
+  probability_correct: number;
+  ci95_low: number;
+  ci95_high: number;
+  sample_size: number;
+  quality: CalibrationQuality;
+}
+
+interface MarketCalibrationSnapshotPayload {
+  as_of: string;
+  metric: 'edge_quality' | 'conviction';
+  horizon: '7d' | '30d' | null;
+  basis: 'edge_quality_decile' | 'conviction_decile';
+  bins: CalibrationBinSnapshot[];
+  total_samples: number;
+}
 
 interface BriefSnapshot {
   as_of: string;
@@ -1055,6 +1092,7 @@ interface OpportunityItem {
   supporting_factors: string[];
   historical_hit_rate: number;
   sample_size: number;
+  calibration: OpportunityCalibration;
   updated_at: string;
 }
 
@@ -1100,6 +1138,7 @@ interface EdgeQualitySnapshot {
   stale_count: number;
   ml_sample_size: number;
   conflict_state: ConflictState;
+  calibration: EdgeQualityCalibration;
 }
 
 interface PlanRiskBand {
@@ -1410,6 +1449,20 @@ function parseSignalDirection(value: number): OpportunityDirection {
   return 'neutral';
 }
 
+function signalTypeFromValue(
+  rawSignalType: string | null | undefined,
+  predictedChange: number
+): 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE' {
+  const normalized = String(rawSignalType || '').toUpperCase();
+  if (normalized === 'FULL_RISK') return 'FULL_RISK';
+  if (normalized === 'REDUCED_RISK') return 'REDUCED_RISK';
+  if (normalized === 'RISK_OFF') return 'RISK_OFF';
+  if (normalized === 'DEFENSIVE') return 'DEFENSIVE';
+  if (predictedChange < -0.5) return 'RISK_OFF';
+  if (predictedChange > 0.5) return 'FULL_RISK';
+  return 'REDUCED_RISK';
+}
+
 function confidenceTextToScore(value: string | null | undefined): number {
   const normalized = String(value || '').toUpperCase();
   if (normalized === 'HIGH' || normalized === 'VERY HIGH') return 90;
@@ -1418,6 +1471,153 @@ function confidenceTextToScore(value: string | null | undefined): number {
   if (normalized === 'MEDIUM-LOW') return 55;
   if (normalized === 'LOW') return 45;
   return 50;
+}
+
+function buildDecileBinLabel(score: number): string {
+  const normalized = Math.round(clamp(0, 100, score));
+  const binStart = normalized === 100 ? 90 : Math.floor(normalized / 10) * 10;
+  const binEnd = binStart === 90 ? 100 : binStart + 9;
+  return `${binStart}-${binEnd}`;
+}
+
+function calibrationQualityForSampleSize(sampleSize: number): CalibrationQuality {
+  if (sampleSize >= 100) return 'ROBUST';
+  if (sampleSize >= 30) return 'LIMITED';
+  return 'INSUFFICIENT';
+}
+
+function computeWilson95(correct: number, sampleSize: number): {
+  probability: number;
+  ci95_low: number;
+  ci95_high: number;
+} {
+  if (sampleSize <= 0) {
+    return { probability: 0, ci95_low: 0, ci95_high: 0 };
+  }
+  const z = 1.96;
+  const p = correct / sampleSize;
+  const z2OverN = (z * z) / sampleSize;
+  const denom = 1 + z2OverN;
+  const center = (p + (z * z) / (2 * sampleSize)) / denom;
+  const spread = (z * Math.sqrt((p * (1 - p) + (z * z) / (4 * sampleSize)) / sampleSize)) / denom;
+  return {
+    probability: clamp(0, 1, p),
+    ci95_low: clamp(0, 1, center - spread),
+    ci95_high: clamp(0, 1, center + spread),
+  };
+}
+
+function buildEdgeCalibrationFallback(bin: string | null): EdgeQualityCalibration {
+  return {
+    bin,
+    probability_correct_7d: null,
+    ci95_low_7d: null,
+    ci95_high_7d: null,
+    sample_size_7d: 0,
+    quality: 'INSUFFICIENT',
+  };
+}
+
+function buildOpportunityCalibrationFallback(): OpportunityCalibration {
+  return {
+    probability_correct_direction: null,
+    ci95_low: null,
+    ci95_high: null,
+    sample_size: 0,
+    quality: 'INSUFFICIENT',
+    basis: 'conviction_decile',
+  };
+}
+
+function parseCalibrationSnapshotPayload(raw: string | null | undefined): MarketCalibrationSnapshotPayload | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<MarketCalibrationSnapshotPayload>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (!Array.isArray(parsed.bins)) return null;
+    const bins = parsed.bins
+      .map((bin): CalibrationBinSnapshot | null => {
+        if (!bin || typeof bin !== 'object') return null;
+        const candidate = bin as Partial<CalibrationBinSnapshot>;
+        if (typeof candidate.bin !== 'string') return null;
+        const sampleSize = toNumber(candidate.sample_size, 0);
+        const probability = toNumber(candidate.probability_correct, 0);
+        const ci95Low = toNumber(candidate.ci95_low, 0);
+        const ci95High = toNumber(candidate.ci95_high, 0);
+        return {
+          bin: candidate.bin,
+          probability_correct: clamp(0, 1, probability),
+          ci95_low: clamp(0, 1, ci95Low),
+          ci95_high: clamp(0, 1, ci95High),
+          sample_size: Math.max(0, Math.floor(sampleSize)),
+          quality: calibrationQualityForSampleSize(sampleSize),
+        };
+      })
+      .filter((value): value is CalibrationBinSnapshot => Boolean(value));
+    return {
+      as_of: String(parsed.as_of || ''),
+      metric: parsed.metric === 'conviction' ? 'conviction' : 'edge_quality',
+      horizon: parsed.horizon === '30d' ? '30d' : (parsed.horizon === '7d' ? '7d' : null),
+      basis: parsed.basis === 'conviction_decile' ? 'conviction_decile' : 'edge_quality_decile',
+      bins,
+      total_samples: Math.max(0, Math.floor(toNumber(parsed.total_samples, 0))),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function pickCalibrationBin(
+  snapshot: MarketCalibrationSnapshotPayload | null,
+  score: number
+): CalibrationBinSnapshot | null {
+  if (!snapshot || !Array.isArray(snapshot.bins) || snapshot.bins.length === 0) return null;
+  const bin = buildDecileBinLabel(score);
+  return snapshot.bins.find((entry) => entry.bin === bin) || null;
+}
+
+function buildEdgeQualityCalibrationFromSnapshot(
+  snapshot: MarketCalibrationSnapshotPayload | null,
+  edgeScore: number
+): EdgeQualityCalibration {
+  const binLabel = buildDecileBinLabel(edgeScore);
+  if (!snapshot) {
+    return buildEdgeCalibrationFallback(null);
+  }
+  const bin = pickCalibrationBin(snapshot, edgeScore);
+  if (!bin) {
+    return buildEdgeCalibrationFallback(binLabel);
+  }
+  return {
+    bin: bin.bin,
+    probability_correct_7d: bin.probability_correct,
+    ci95_low_7d: bin.ci95_low,
+    ci95_high_7d: bin.ci95_high,
+    sample_size_7d: bin.sample_size,
+    quality: bin.quality,
+  };
+}
+
+function buildOpportunityCalibrationFromSnapshot(
+  snapshot: MarketCalibrationSnapshotPayload | null,
+  convictionScore: number,
+  direction: OpportunityDirection
+): OpportunityCalibration {
+  if (direction === 'neutral') {
+    return buildOpportunityCalibrationFallback();
+  }
+  const bin = pickCalibrationBin(snapshot, convictionScore);
+  if (!bin) {
+    return buildOpportunityCalibrationFallback();
+  }
+  return {
+    probability_correct_direction: bin.probability_correct,
+    ci95_low: bin.ci95_low,
+    ci95_high: bin.ci95_high,
+    sample_size: bin.sample_size,
+    quality: bin.quality,
+    basis: 'conviction_decile',
+  };
 }
 
 function mapRiskPosture(regime: RegimeResult | null, score: number): RiskPosture {
@@ -1598,6 +1798,7 @@ function computeEdgeQualitySnapshot(params: {
     stale_count: staleCount,
     ml_sample_size: mlSampleSize,
     conflict_state: conflictState,
+    calibration: buildEdgeCalibrationFallback(buildDecileBinLabel(score)),
   };
 }
 
@@ -1796,6 +1997,7 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
       stale_count: 0,
       ml_sample_size: 0,
       conflict_state: 'MIXED',
+      calibration: buildEdgeCalibrationFallback('50-59'),
     },
     risk_band: {
       d7: { bear: null, base: null, bull: null, sample_size: 0 },
@@ -1845,6 +2047,19 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
       )
     `).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_opportunity_snapshots_lookup ON opportunity_snapshots(as_of DESC, horizon)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS market_calibration_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        as_of TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        horizon TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(as_of, metric, horizon)
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_calibration_lookup ON market_calibration_snapshots(metric, horizon, as_of DESC)`).run();
 
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS market_alert_events (
@@ -2029,6 +2244,306 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
   };
 }
 
+function addCalendarDays(isoDate: string, days: number): string {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return asIsoDate(d);
+}
+
+function allDecileLabels(): string[] {
+  const labels: string[] = [];
+  for (let binStart = 0; binStart <= 90; binStart += 10) {
+    const binEnd = binStart === 90 ? 100 : binStart + 9;
+    labels.push(`${binStart}-${binEnd}`);
+  }
+  return labels;
+}
+
+function baselineRiskAllocationForSignal(
+  signalType: 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE'
+): number {
+  if (signalType === 'FULL_RISK') return 0.9;
+  if (signalType === 'REDUCED_RISK') return 0.65;
+  if (signalType === 'RISK_OFF') return 0.35;
+  return 0.15;
+}
+
+async function resolveCalibrationAsOf(db: D1Database): Promise<string> {
+  const latest = await db.prepare(`
+    SELECT date
+    FROM pxi_scores
+    ORDER BY date DESC
+    LIMIT 1
+  `).first<{ date: string }>();
+  if (!latest?.date) {
+    return asIsoDateTime(new Date());
+  }
+  return `${latest.date}T00:00:00.000Z`;
+}
+
+async function fetchLatestCalibrationSnapshot(
+  db: D1Database,
+  metric: 'edge_quality' | 'conviction',
+  horizon: '7d' | '30d' | null
+): Promise<MarketCalibrationSnapshotPayload | null> {
+  try {
+    let row: { payload_json: string } | null = null;
+    if (horizon === null) {
+      row = await db.prepare(`
+        SELECT payload_json
+        FROM market_calibration_snapshots
+        WHERE metric = ?
+          AND horizon IS NULL
+        ORDER BY as_of DESC
+        LIMIT 1
+      `).bind(metric).first<{ payload_json: string }>();
+    } else {
+      row = await db.prepare(`
+        SELECT payload_json
+        FROM market_calibration_snapshots
+        WHERE metric = ?
+          AND horizon = ?
+        ORDER BY as_of DESC
+        LIMIT 1
+      `).bind(metric, horizon).first<{ payload_json: string }>();
+    }
+    return parseCalibrationSnapshotPayload(row?.payload_json) || null;
+  } catch (err) {
+    console.warn('Calibration snapshot lookup failed:', err);
+    return null;
+  }
+}
+
+async function storeCalibrationSnapshot(
+  db: D1Database,
+  snapshot: MarketCalibrationSnapshotPayload
+): Promise<void> {
+  if (snapshot.horizon === null) {
+    await db.prepare(`
+      DELETE FROM market_calibration_snapshots
+      WHERE as_of = ?
+        AND metric = ?
+        AND horizon IS NULL
+    `).bind(snapshot.as_of, snapshot.metric).run();
+  }
+  await db.prepare(`
+    INSERT OR REPLACE INTO market_calibration_snapshots
+      (as_of, metric, horizon, payload_json, created_at)
+    VALUES (?, ?, ?, ?, datetime('now'))
+  `).bind(
+    snapshot.as_of,
+    snapshot.metric,
+    snapshot.horizon,
+    JSON.stringify(snapshot),
+  ).run();
+}
+
+async function buildEdgeQualityCalibrationSnapshot(db: D1Database): Promise<MarketCalibrationSnapshotPayload> {
+  const asOf = await resolveCalibrationAsOf(db);
+  const rows = await db.prepare(`
+    SELECT
+      pl.prediction_date,
+      pl.predicted_change_7d,
+      pl.actual_change_7d,
+      ps.regime,
+      ps.signal_type,
+      ps.risk_allocation
+    FROM prediction_log pl
+    LEFT JOIN pxi_signal ps
+      ON ps.date = pl.prediction_date
+    WHERE pl.predicted_change_7d IS NOT NULL
+      AND pl.actual_change_7d IS NOT NULL
+    ORDER BY pl.prediction_date ASC
+    LIMIT 5000
+  `).all<{
+    prediction_date: string;
+    predicted_change_7d: number;
+    actual_change_7d: number;
+    regime: string | null;
+    signal_type: string | null;
+    risk_allocation: number | null;
+  }>();
+
+  const byBin = new Map<string, { correct: number; total: number }>();
+  let mlSampleSize = 0;
+
+  for (const row of rows.results || []) {
+    const predicted = toNumber(row.predicted_change_7d, 0);
+    const actual = toNumber(row.actual_change_7d, 0);
+    if (!Number.isFinite(predicted) || !Number.isFinite(actual) || predicted === 0) {
+      continue;
+    }
+
+    mlSampleSize += 1;
+    const regimeType = row.regime === 'RISK_ON' || row.regime === 'RISK_OFF' || row.regime === 'TRANSITION'
+      ? row.regime
+      : null;
+    const regime: RegimeResult | null = regimeType
+      ? {
+          regime: regimeType,
+          confidence: 0.5,
+          signals: [],
+          description: 'historical_reconstruction',
+          date: row.prediction_date,
+        }
+      : null;
+
+    const signalType = signalTypeFromValue(row.signal_type, predicted);
+    const riskAllocationRaw = row.risk_allocation !== null ? toNumber(row.risk_allocation, baselineRiskAllocationForSignal(signalType)) : baselineRiskAllocationForSignal(signalType);
+    const syntheticSignal: PXISignal = {
+      pxi_level: 50,
+      delta_pxi_7d: null,
+      delta_pxi_30d: null,
+      category_dispersion: 0,
+      regime: regime?.regime || 'TRANSITION',
+      volatility_percentile: null,
+      risk_allocation: clamp(0, 1, riskAllocationRaw),
+      signal_type: signalType,
+      adjustments: [],
+    };
+    const conflictState = resolveConflictState(regime, syntheticSignal);
+    const edgeQuality = computeEdgeQualitySnapshot({
+      staleCount: 0,
+      mlSampleSize,
+      regime,
+      conflictState,
+      divergenceCount: 0,
+    });
+
+    const bin = buildDecileBinLabel(edgeQuality.score);
+    const entry = byBin.get(bin) || { correct: 0, total: 0 };
+    entry.total += 1;
+    if ((predicted > 0 && actual > 0) || (predicted < 0 && actual < 0)) {
+      entry.correct += 1;
+    }
+    byBin.set(bin, entry);
+  }
+
+  const bins: CalibrationBinSnapshot[] = allDecileLabels().map((bin) => {
+    const entry = byBin.get(bin) || { correct: 0, total: 0 };
+    const interval = computeWilson95(entry.correct, entry.total);
+    return {
+      bin,
+      probability_correct: entry.total > 0 ? interval.probability : 0,
+      ci95_low: entry.total > 0 ? interval.ci95_low : 0,
+      ci95_high: entry.total > 0 ? interval.ci95_high : 0,
+      sample_size: entry.total,
+      quality: calibrationQualityForSampleSize(entry.total),
+    };
+  });
+
+  return {
+    as_of: asOf,
+    metric: 'edge_quality',
+    horizon: null,
+    basis: 'edge_quality_decile',
+    bins,
+    total_samples: bins.reduce((sum, bin) => sum + bin.sample_size, 0),
+  };
+}
+
+async function buildConvictionCalibrationSnapshot(
+  db: D1Database,
+  horizon: '7d' | '30d'
+): Promise<MarketCalibrationSnapshotPayload> {
+  const asOf = await resolveCalibrationAsOf(db);
+  const horizonDays = horizon === '7d' ? 7 : 30;
+  const [snapshots, spyRows] = await Promise.all([
+    db.prepare(`
+      SELECT as_of, payload_json
+      FROM opportunity_snapshots
+      WHERE horizon = ?
+      ORDER BY as_of DESC
+      LIMIT 730
+    `).bind(horizon).all<{ as_of: string; payload_json: string }>(),
+    db.prepare(`
+      SELECT date, value
+      FROM indicator_values
+      WHERE indicator_id = 'spy_close'
+      ORDER BY date ASC
+    `).all<{ date: string; value: number }>(),
+  ]);
+
+  const spyMap = new Map<string, number>();
+  for (const row of spyRows.results || []) {
+    spyMap.set(row.date, row.value);
+  }
+
+  const priceOnOrAfter = (date: string, toleranceDays = 3): number | null => {
+    for (let offset = 0; offset <= toleranceDays; offset += 1) {
+      const candidateDate = addCalendarDays(date, offset);
+      const price = spyMap.get(candidateDate);
+      if (price !== undefined) {
+        return price;
+      }
+    }
+    return null;
+  };
+
+  const byBin = new Map<string, { correct: number; total: number }>();
+  for (const row of snapshots.results || []) {
+    let payload: OpportunitySnapshot | null = null;
+    try {
+      payload = JSON.parse(row.payload_json) as OpportunitySnapshot;
+    } catch {
+      payload = null;
+    }
+    if (!payload?.items || payload.items.length === 0) continue;
+
+    const asOfDate = (payload.as_of || row.as_of).slice(0, 10);
+    const spot = priceOnOrAfter(asOfDate, 3);
+    const forward = priceOnOrAfter(addCalendarDays(asOfDate, horizonDays), 3);
+    if (spot === null || forward === null || spot === 0) continue;
+    const forwardReturn = (forward - spot) / spot;
+
+    for (const item of payload.items) {
+      if (item.direction !== 'bullish' && item.direction !== 'bearish') {
+        continue;
+      }
+      const conviction = clamp(0, 100, toNumber(item.conviction_score, 50));
+      const bin = buildDecileBinLabel(conviction);
+      const entry = byBin.get(bin) || { correct: 0, total: 0 };
+      entry.total += 1;
+      if ((item.direction === 'bullish' && forwardReturn > 0) || (item.direction === 'bearish' && forwardReturn < 0)) {
+        entry.correct += 1;
+      }
+      byBin.set(bin, entry);
+    }
+  }
+
+  const bins: CalibrationBinSnapshot[] = allDecileLabels().map((bin) => {
+    const entry = byBin.get(bin) || { correct: 0, total: 0 };
+    const interval = computeWilson95(entry.correct, entry.total);
+    return {
+      bin,
+      probability_correct: entry.total > 0 ? interval.probability : 0,
+      ci95_low: entry.total > 0 ? interval.ci95_low : 0,
+      ci95_high: entry.total > 0 ? interval.ci95_high : 0,
+      sample_size: entry.total,
+      quality: calibrationQualityForSampleSize(entry.total),
+    };
+  });
+
+  return {
+    as_of: asOf,
+    metric: 'conviction',
+    horizon,
+    basis: 'conviction_decile',
+    bins,
+    total_samples: bins.reduce((sum, bin) => sum + bin.sample_size, 0),
+  };
+}
+
+function applyOpportunityCalibration(
+  item: OpportunityItem,
+  snapshot: MarketCalibrationSnapshotPayload | null
+): OpportunityItem {
+  return {
+    ...item,
+    calibration: buildOpportunityCalibrationFromSnapshot(snapshot, item.conviction_score, item.direction),
+  };
+}
+
 async function computeHistoricalHitStats(
   db: D1Database,
   horizon: '7d' | '30d'
@@ -2071,7 +2586,8 @@ async function computeHistoricalHitStats(
 
 async function buildOpportunitySnapshot(
   db: D1Database,
-  horizon: '7d' | '30d'
+  horizon: '7d' | '30d',
+  calibrationSnapshot?: MarketCalibrationSnapshotPayload | null
 ): Promise<OpportunitySnapshot | null> {
   const latestPxi = await db.prepare(`
     SELECT date, score, delta_7d, delta_30d
@@ -2084,7 +2600,7 @@ async function buildOpportunitySnapshot(
     return null;
   }
 
-  const [latestSignal, latestEnsemble, hitStats, themes] = await Promise.all([
+  const [latestSignal, latestEnsemble, hitStats, themes, convictionCalibration] = await Promise.all([
     db.prepare(`
       SELECT date, risk_allocation, signal_type, regime
       FROM pxi_signal
@@ -2105,6 +2621,7 @@ async function buildOpportunitySnapshot(
     }>(),
     computeHistoricalHitStats(db, horizon),
     fetchLatestSignalsThemes(),
+    calibrationSnapshot ? Promise.resolve(calibrationSnapshot) : fetchLatestCalibrationSnapshot(db, 'conviction', horizon),
   ]);
 
   const themeSource = themes.length > 0
@@ -2163,6 +2680,7 @@ async function buildOpportunitySnapshot(
       supporting_factors: supportingFactors.slice(0, 6),
       historical_hit_rate: hitStats.hitRate,
       sample_size: hitStats.sampleSize,
+      calibration: buildOpportunityCalibrationFromSnapshot(convictionCalibration, conviction, directionalSignal),
       updated_at: asIsoDateTime(new Date()),
     };
   });
@@ -4013,6 +4531,24 @@ export default {
 
         try {
           await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS market_calibration_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              as_of TEXT NOT NULL,
+              metric TEXT NOT NULL,
+              horizon TEXT,
+              payload_json TEXT NOT NULL,
+              created_at TEXT DEFAULT (datetime('now')),
+              UNIQUE(as_of, metric, horizon)
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_calibration_lookup ON market_calibration_snapshots(metric, horizon, as_of DESC)`).run();
+          migrations.push('market_calibration_snapshots');
+        } catch (e) {
+          console.error('market_calibration_snapshots migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
             CREATE TABLE IF NOT EXISTS market_alert_events (
               id TEXT PRIMARY KEY,
               event_type TEXT NOT NULL,
@@ -4480,10 +5016,15 @@ export default {
           }
         }
 
+        const convictionCalibration = await fetchLatestCalibrationSnapshot(env.DB, 'conviction', horizon);
+        const calibratedItems = snapshot.items
+          .map((item) => applyOpportunityCalibration(item, convictionCalibration))
+          .slice(0, limit);
+
         return Response.json({
           as_of: snapshot.as_of,
           horizon: snapshot.horizon,
-          items: snapshot.items.slice(0, limit),
+          items: calibratedItems,
         }, {
           headers: {
             ...corsHeaders,
@@ -4780,6 +5321,40 @@ export default {
         const opportunitiesEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true);
         const inAppAlertsEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_IN_APP', 'ENABLE_ALERTS_IN_APP', true);
 
+        let edgeCalibrationSnapshot: MarketCalibrationSnapshotPayload | null = null;
+        let convictionCalibration7d: MarketCalibrationSnapshotPayload | null = null;
+        let convictionCalibration30d: MarketCalibrationSnapshotPayload | null = null;
+        let calibrationsGenerated = 0;
+
+        try {
+          edgeCalibrationSnapshot = await buildEdgeQualityCalibrationSnapshot(env.DB);
+          await storeCalibrationSnapshot(env.DB, edgeCalibrationSnapshot);
+          calibrationsGenerated += 1;
+        } catch (err) {
+          console.error('Edge calibration refresh failed:', err);
+          edgeCalibrationSnapshot = null;
+        }
+
+        if (opportunitiesEnabled) {
+          try {
+            convictionCalibration7d = await buildConvictionCalibrationSnapshot(env.DB, '7d');
+            await storeCalibrationSnapshot(env.DB, convictionCalibration7d);
+            calibrationsGenerated += 1;
+          } catch (err) {
+            console.error('7d conviction calibration refresh failed:', err);
+            convictionCalibration7d = null;
+          }
+
+          try {
+            convictionCalibration30d = await buildConvictionCalibrationSnapshot(env.DB, '30d');
+            await storeCalibrationSnapshot(env.DB, convictionCalibration30d);
+            calibrationsGenerated += 1;
+          } catch (err) {
+            console.error('30d conviction calibration refresh failed:', err);
+            convictionCalibration30d = null;
+          }
+        }
+
         let brief: BriefSnapshot | null = null;
         if (briefEnabled) {
           brief = await buildBriefSnapshot(env.DB);
@@ -4791,8 +5366,8 @@ export default {
         let opportunities7d: OpportunitySnapshot | null = null;
         let opportunities30d: OpportunitySnapshot | null = null;
         if (opportunitiesEnabled) {
-          opportunities7d = await buildOpportunitySnapshot(env.DB, '7d');
-          opportunities30d = await buildOpportunitySnapshot(env.DB, '30d');
+          opportunities7d = await buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d);
+          opportunities30d = await buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d);
           if (opportunities7d) await storeOpportunitySnapshot(env.DB, opportunities7d);
           if (opportunities30d) await storeOpportunitySnapshot(env.DB, opportunities30d);
         }
@@ -4807,6 +5382,7 @@ export default {
           ok: true,
           brief_generated: brief ? 1 : 0,
           opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
+          calibrations_generated: calibrationsGenerated,
           alerts_generated: alertsGenerated,
           as_of: brief?.as_of || opportunities7d?.as_of || null,
         }, { headers: corsHeaders });
@@ -5201,10 +5777,11 @@ export default {
           cats.results || []
         );
 
-        const [divergence, freshness, mlSampleSize] = await Promise.all([
+        const [divergence, freshness, mlSampleSize, edgeCalibrationSnapshot] = await Promise.all([
           detectDivergence(env.DB, pxi.score, regime),
           computeFreshnessStatus(env.DB),
           fetchPredictionEvaluationSampleSize(env.DB),
+          fetchLatestCalibrationSnapshot(env.DB, 'edge_quality', null),
         ]);
         const conflictState = resolveConflictState(regime, signal);
         const edgeQuality = computeEdgeQualitySnapshot({
@@ -5214,6 +5791,10 @@ export default {
           conflictState,
           divergenceCount: divergence.alerts.length,
         });
+        const edgeQualityWithCalibration: EdgeQualitySnapshot = {
+          ...edgeQuality,
+          calibration: buildEdgeQualityCalibrationFromSnapshot(edgeCalibrationSnapshot, edgeQuality.score),
+        };
 
         return Response.json({
           date: pxi.date,
@@ -5252,7 +5833,7 @@ export default {
           divergence: divergence.has_divergence ? {
             alerts: divergence.alerts,
           } : null,
-          edge_quality: edgeQuality,
+          edge_quality: edgeQualityWithCalibration,
           freshness_status: freshness,
         }, {
           headers: {
@@ -5308,11 +5889,12 @@ export default {
         }
 
         const categories = (catResult?.results || []).map((row) => ({ score: row.score }));
-        const [regime, freshness, mlSampleSize, riskBand] = await Promise.all([
+        const [regime, freshness, mlSampleSize, riskBand, edgeCalibrationSnapshot] = await Promise.all([
           detectRegime(env.DB, pxi.date),
           computeFreshnessStatus(env.DB),
           fetchPredictionEvaluationSampleSize(env.DB),
           buildCurrentBucketRiskBands(env.DB, pxi.score),
+          fetchLatestCalibrationSnapshot(env.DB, 'edge_quality', null),
         ]);
 
         const signal = await calculatePXISignal(
@@ -5330,6 +5912,10 @@ export default {
           conflictState,
           divergenceCount: divergence.alerts.length,
         });
+        const edgeQualityWithCalibration: EdgeQualitySnapshot = {
+          ...edgeQuality,
+          calibration: buildEdgeQualityCalibrationFromSnapshot(edgeCalibrationSnapshot, edgeQuality.score),
+        };
 
         const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${signal.signal_type.replace('_', ' ')} posture at ${Math.round(signal.risk_allocation * 100)}% risk budget.${
           freshness.stale_count > 0 ? ` ${freshness.stale_count} stale indicator(s) are penalizing confidence.` : ''
@@ -5340,7 +5926,8 @@ export default {
           degradedReasons.push('limited_scenario_sample');
         }
         if (freshness.stale_count > 0) degradedReasons.push('stale_inputs');
-        if (edgeQuality.label === 'LOW') degradedReasons.push('low_edge_quality');
+        if (edgeQualityWithCalibration.label === 'LOW') degradedReasons.push('low_edge_quality');
+        if (edgeQualityWithCalibration.calibration.quality !== 'ROBUST') degradedReasons.push('limited_calibration_sample');
 
         const payload: PlanPayload = {
           as_of: `${pxi.date}T00:00:00.000Z`,
@@ -5350,13 +5937,13 @@ export default {
             horizon_bias: resolveHorizonBias(signal, regime, edgeQuality.score),
             primary_signal: signal.signal_type,
           },
-          edge_quality: edgeQuality,
+          edge_quality: edgeQualityWithCalibration,
           risk_band: riskBand,
           invalidation_rules: buildInvalidationRules({
             pxi,
             freshness,
             regime,
-            edgeQuality,
+            edgeQuality: edgeQualityWithCalibration,
           }),
           degraded_reason: degradedReasons.length > 0 ? degradedReasons.join(',') : null,
         };

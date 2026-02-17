@@ -1,0 +1,53 @@
+name: Daily PXI Digest
+
+concurrency:
+  group: pxi-daily-digest-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: '0 13 * * *' # 8:00 AM ET (standard time)
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dispatch daily digest
+        env:
+          WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+          WRITE_API_URL: ${{ secrets.WRITE_API_URL }}
+          DIGEST_SUMMARY_PATH: /tmp/pxi-digest-summary.json
+        run: npm run digest:send
+
+      - name: Append digest summary
+        if: always()
+        run: |
+          if [[ -f /tmp/pxi-digest-summary.json ]]; then
+            {
+              echo "### PXI Daily Digest Summary"
+              echo ""
+              echo "| Sent | Failed | Bounced | Active subscribers |"
+              echo "|---:|---:|---:|---:|"
+              jq -r '"| \(.result.sent_count // 0) | \(.result.fail_count // 0) | \(.result.bounce_count // 0) | \(.result.active_subscribers // 0) |"' /tmp/pxi-digest-summary.json
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### PXI Daily Digest Summary"
+              echo ""
+              echo "No digest summary file produced."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
