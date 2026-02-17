@@ -160,6 +160,87 @@ Last updated: 2026-02-17 10:20 EST
 - **Rollback plan:**
   - Redeploy previous worker revision and restore from backup/migration checkpoint if regression appears.
 
+### P0-7 (PREP ONLY) — Daily Trade Plan command center (`/api/plan` + first-screen card)
+- **Impact / Confidence / Effort / Risk:** Very High / High / Medium / Medium
+- **Scope (exact):**
+  - `worker/api.ts`
+    - add `GET /api/plan` endpoint that consolidates PXI state, signal allocation, prediction context, and invalidation rules.
+    - return typed fallback payload when one upstream component is unavailable.
+  - `frontend/src/App.tsx`
+    - add a top-of-screen "Today Plan" card (setup summary, risk budget, invalidation rules, horizon split).
+  - `frontend/src/App.css`
+    - add compact mobile-friendly styling for plan card and confidence chips.
+- **Implementation steps (ship plan):**
+  1. Compose deterministic plan payload from existing `/api/pxi`, `/api/signal`, and `/api/predict` internals.
+  2. Add explicit `action_now` and `invalidation_rules` fields so the trader knows what changes posture.
+  3. Render plan card in first viewport on both mobile and desktop.
+  4. Gate behind `FEATURE_ENABLE_PLAN` while preserving backward compatibility.
+- **Validation commands:**
+  - `curl -sS https://api.pxicommand.com/api/plan | jq '{as_of, setup_summary, action_now, edge_quality, invalidation_rules}'`
+  - `curl -sS https://api.pxicommand.com/api/plan | jq '.invalidation_rules | length'`
+  - `cd /Users/scott/pxi && npm run build`
+- **Expected pass criteria:**
+  - `/api/plan` returns non-null `setup_summary`, `action_now`, and `edge_quality`.
+  - Plan card is visible by default in the first viewport.
+  - Existing endpoint contracts remain additive-only.
+- **Confidence:** High.
+- **Rollback plan:**
+  - Revert `/api/plan` route and plan-card UI additions, then redeploy prior worker/frontend revisions.
+
+### P0-8 (PREP ONLY) — Edge Quality engine (freshness/conflict/sample penalties)
+- **Impact / Confidence / Effort / Risk:** Very High / Medium-High / Medium / Medium
+- **Scope (exact):**
+  - `worker/api.ts`
+    - add `edge_quality` and `confidence_breakdown` fields to signal/plan responses.
+    - add explicit `conflict_state` when regime posture and signal posture disagree.
+  - `src/config/indicator-sla.ts`
+    - define stale-data penalty thresholds and weights.
+  - `frontend/src/App.tsx`
+    - add confidence decomposition view (`data_quality`, `model_agreement`, `regime_stability`).
+- **Implementation steps (ship plan):**
+  1. Define baseline confidence and deterministic penalties (stale count/age, disagreement, tiny sample sizes).
+  2. Compute normalized `edge_quality` in `[0, 1]` and expose decomposition fields.
+  3. Add UI semantics for low edge quality even when directional signal is present.
+  4. Add guardrails to avoid increasing risk budget when edge quality is below threshold.
+- **Validation commands:**
+  - `curl -sS https://api.pxicommand.com/api/pxi | jq '.dataFreshness.staleCount'`
+  - `curl -sS https://api.pxicommand.com/api/signal | jq '{signal: .signal, regime: .regime, edge_quality, confidence_breakdown, conflict_state}'`
+  - `cd /Users/scott/pxi && npm run build`
+- **Expected pass criteria:**
+  - `edge_quality` moves monotonically down under higher stale-data conditions.
+  - `conflict_state` is explicit for disagreement states instead of inferred by users.
+  - UI presents decomposed confidence, not a single opaque confidence label.
+- **Confidence:** Medium-High.
+- **Rollback plan:**
+  - Revert confidence-penalty and conflict-state fields and restore prior signal payload semantics.
+
+### P0-9 (PREP ONLY) — Route consistency hardening for brief/opportunities/alerts feed
+- **Impact / Confidence / Effort / Risk:** High / High / Low-Medium / Low-Medium
+- **Scope (exact):**
+  - `worker/api.ts`
+    - enforce stable behavior for `GET /api/brief`, `GET /api/opportunities`, `GET /api/alerts/feed`.
+    - return typed fallback responses instead of opaque `404` where possible.
+  - `worker/wrangler.toml`
+    - make feature flags explicit by environment for brief/opportunity/in-app alerts.
+  - `frontend/src/App.tsx`
+    - add graceful degraded-state rendering when optional data is unavailable.
+- **Implementation steps (ship plan):**
+  1. Verify production route handlers are deployed and mapped to current worker revision.
+  2. Replace "not found" user experience with typed empty/degraded payloads.
+  3. Add contract smoke checks to fail deploy if routes regress to 404.
+  4. Wire degraded UI copy so traders still get a usable daily plan.
+- **Validation commands:**
+  - `for u in /api/brief /api/opportunities /api/alerts/feed; do curl -sS -o /tmp/out -w \"%{http_code} $u\\n\" https://api.pxicommand.com$u; done`
+  - `curl -sS https://api.pxicommand.com/api/brief | jq '{as_of, summary}'`
+  - `curl -sS https://api.pxicommand.com/api/opportunities?horizon=7d | jq '{as_of, horizon, item_count: (.items | length)}'`
+- **Expected pass criteria:**
+  - 404 rate for the three routes drops to zero.
+  - Response payloads are schema-stable and consumable by frontend.
+  - Frontend remains functional under partial-data states.
+- **Confidence:** High.
+- **Rollback plan:**
+  - Revert route-contract hardening and restore prior feature-flag behavior if regressions appear.
+
 ### P0-1 (CLOSED previous cycle) — Prevent same-day duplicate prediction rows from reruns
 - **Impact / Confidence / Effort / Risk:** High / High / Low / Low
 - **Scope (exact):**
