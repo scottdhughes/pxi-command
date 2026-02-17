@@ -71,7 +71,8 @@ wrangler deploy --env production --var BUILD_SHA:${BUILD_SHA} --var BUILD_TIMEST
 
 ## Verify Routing
 
-- Confirm the worker route pattern is `pxicommand.com/signals` and `pxicommand.com/signals/*`.
+- Confirm the staging worker route pattern is `pxicommand.com/signals-staging` and `pxicommand.com/signals-staging/*`.
+- Confirm the production worker route pattern is `pxicommand.com/signals` and `pxicommand.com/signals/*`.
 - Ensure the main site remains served by Cloudflare Pages for all other paths.
 
 ## Checklist
@@ -80,7 +81,8 @@ wrangler deploy --env production --var BUILD_SHA:${BUILD_SHA} --var BUILD_TIMEST
 - R2 bucket is bound as `SIGNALS_BUCKET`.
 - KV namespace is bound as `SIGNALS_KV`.
 - Secrets are set.
-- `/signals/latest` serves a report.
+- `/signals-staging/latest` serves a staging report.
+- `/signals/latest` serves a production report.
 - `/signals/api/version` returns build metadata (`build_sha`, `build_timestamp`, `worker_version`).
 - `/signals/api/health` returns freshness JSON with `status` and `is_stale`.
 
@@ -90,6 +92,7 @@ Run this after every staging/production deploy:
 
 ```bash
 cd /Users/scott/pxi/signals && npm run smoke:deploy -- https://pxicommand.com/signals
+cd /Users/scott/pxi/signals && npm run smoke:deploy -- https://pxicommand.com/signals-staging
 ```
 
 For production release validation, enforce strict non-placeholder metadata:
