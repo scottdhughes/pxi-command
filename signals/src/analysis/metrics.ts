@@ -5,6 +5,7 @@ import { extractTickers } from "./tickers"
 import {
   SECONDS_PER_DAY,
   RATE_EPSILON,
+  GROWTH_RATIO_CAP,
   LIMITS,
   CONFIRMATION_SUBREDDIT_DIVISOR,
 } from "./constants"
@@ -205,7 +206,8 @@ export function computeMetrics(dataset: RedditDataset, themes: ThemeDefinition[]
 
     const currentRate = mentionsL.length / Math.max(lookbackDays, 1)
     const baselineRate = mentionsB.length / Math.max(baselineDays, 1)
-    const growthRatio = (currentRate + RATE_EPSILON) / (baselineRate + RATE_EPSILON)
+    const growthRatioUncapped = (currentRate + RATE_EPSILON) / (baselineRate + RATE_EPSILON)
+    const growthRatio = Math.min(growthRatioUncapped, GROWTH_RATIO_CAP)
     const slope = linearRegressionSlope(dailyCounts)
 
     const currentSent = mentionsL.length
