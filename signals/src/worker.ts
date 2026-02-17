@@ -1,35 +1,30 @@
 import type { Env } from "./config"
 import { handleRequest } from "./routes"
-import { runPipeline } from "./scheduled"
-import { insertRun } from "./db"
+import { runPipeline, isPipelineLockError } from "./scheduled"
+import { getLatestSuccessfulRun, insertRun } from "./db"
 import { nowUtcIso } from "./utils/time"
-import { logErrorWithStack } from "./utils/logger"
+import { logErrorWithStack, logWarn } from "./utils/logger"
 import { toError } from "./errors"
+import { getNyseHolidaySet, isNyseHolidayDate, toIsoDateUtc } from "./utils/calendar"
 import { ulid } from "ulidx"
 
-// ─────────────────────────────────────────────────────────────────────────────
-// US Monday Market Holidays (NYSE/NASDAQ closed)
-// These are the standard Monday holidays when markets are closed.
-// Update this list annually.
-// ─────────────────────────────────────────────────────────────────────────────
+export { getNyseHolidaySet }
+export const isNyseHoliday = isNyseHolidayDate
 
-const US_MONDAY_HOLIDAYS = new Set([
-  // 2025
-  "2025-01-20", // MLK Day
-  "2025-02-17", // Presidents Day
-  "2025-05-26", // Memorial Day
-  "2025-09-01", // Labor Day
-  // 2026
-  "2026-01-19", // MLK Day
-  "2026-02-16", // Presidents Day
-  "2026-05-25", // Memorial Day
-  "2026-09-07", // Labor Day
-  // 2027
-  "2027-01-18", // MLK Day
-  "2027-02-15", // Presidents Day
-  "2027-05-31", // Memorial Day
-  "2027-09-06", // Labor Day
-])
+const DAY_MS = 24 * 60 * 60 * 1000
+const CATCHUP_STALE_DAYS = 6
+
+interface ScheduleDecisionInput {
+  scheduledAt: Date
+  lastSuccessfulRunAtUtc: string | null
+}
+
+function getDaysSinceLastSuccess(scheduledAt: Date, lastSuccessfulRunAtUtc: string | null): number {
+  if (!lastSuccessfulRunAtUtc) return Number.POSITIVE_INFINITY
+  const last = new Date(lastSuccessfulRunAtUtc)
+  if (Number.isNaN(last.getTime())) return Number.POSITIVE_INFINITY
+  return (scheduledAt.getTime() - last.getTime()) / DAY_MS
+}
 
 /**
  * Determines if the scheduled pipeline should run based on the current day.
@@ -37,23 +32,26 @@ const US_MONDAY_HOLIDAYS = new Set([
  * Logic:
  * - Monday: Run if NOT a US market holiday
  * - Tuesday: Run only if the previous Monday WAS a US market holiday
+ * - Tuesday/Wednesday: Catch up automatically if last successful run is stale
  * - Other days: Do not run (cron shouldn't trigger, but guard anyway)
  *
  * @returns { shouldRun: boolean, reason: string }
  */
-function shouldRunScheduledPipeline(): { shouldRun: boolean; reason: string } {
-  const now = new Date()
-  const dayOfWeek = now.getUTCDay() // 0=Sun, 1=Mon, 2=Tue, ...
-  const todayIso = now.toISOString().slice(0, 10) // YYYY-MM-DD
+export function shouldRunScheduledPipeline(input: ScheduleDecisionInput): { shouldRun: boolean; reason: string } {
+  const { scheduledAt, lastSuccessfulRunAtUtc } = input
+  const dayOfWeek = scheduledAt.getUTCDay() // 0=Sun, 1=Mon, 2=Tue, ...
+  const todayIso = toIsoDateUtc(scheduledAt)
+  const daysSinceLastSuccess = getDaysSinceLastSuccess(scheduledAt, lastSuccessfulRunAtUtc)
+  const staleForCatchup = !Number.isFinite(daysSinceLastSuccess) || daysSinceLastSuccess >= CATCHUP_STALE_DAYS
 
   // Calculate yesterday (for Tuesday to check Monday)
-  const yesterday = new Date(now)
-  yesterday.setUTCDate(now.getUTCDate() - 1)
-  const yesterdayIso = yesterday.toISOString().slice(0, 10)
+  const yesterday = new Date(scheduledAt)
+  yesterday.setUTCDate(scheduledAt.getUTCDate() - 1)
+  const yesterdayIso = toIsoDateUtc(yesterday)
 
   if (dayOfWeek === 1) {
     // Monday
-    if (US_MONDAY_HOLIDAYS.has(todayIso)) {
+    if (isNyseHoliday(scheduledAt)) {
       return {
         shouldRun: false,
         reason: `Skipping: Monday ${todayIso} is a US market holiday. Will run Tuesday.`,
@@ -67,15 +65,44 @@ function shouldRunScheduledPipeline(): { shouldRun: boolean; reason: string } {
 
   if (dayOfWeek === 2) {
     // Tuesday
-    if (US_MONDAY_HOLIDAYS.has(yesterdayIso)) {
+    if (isNyseHoliday(yesterday)) {
       return {
         shouldRun: true,
         reason: `Running: Tuesday ${todayIso} (Monday ${yesterdayIso} was a holiday).`,
       }
     }
+
+    if (staleForCatchup) {
+      const staleReason = Number.isFinite(daysSinceLastSuccess)
+        ? `${daysSinceLastSuccess.toFixed(1)} days since last successful run`
+        : "no previous successful run found"
+      return {
+        shouldRun: true,
+        reason: `Running: Tuesday ${todayIso} catch-up (${staleReason}).`,
+      }
+    }
+
     return {
       shouldRun: false,
       reason: `Skipping: Tuesday ${todayIso} - Monday was not a holiday.`,
+    }
+  }
+
+  if (dayOfWeek === 3) {
+    // Wednesday catch-up fallback in case earlier scheduled events were missed.
+    if (staleForCatchup) {
+      const staleReason = Number.isFinite(daysSinceLastSuccess)
+        ? `${daysSinceLastSuccess.toFixed(1)} days since last successful run`
+        : "no previous successful run found"
+      return {
+        shouldRun: true,
+        reason: `Running: Wednesday ${todayIso} stale-data catch-up (${staleReason}).`,
+      }
+    }
+
+    return {
+      shouldRun: false,
+      reason: `Skipping: Wednesday ${todayIso} - latest run is fresh.`,
     }
   }
 
@@ -95,11 +122,26 @@ export default {
     return handleRequest(request, env)
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
-    const runId = `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${ulid()}`
+  async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext) {
+    const scheduledAt = typeof event.scheduledTime === "number" ? new Date(event.scheduledTime) : new Date()
+    const runId = `${toIsoDateUtc(scheduledAt).replace(/-/g, "")}-${ulid()}`
+
+    let lastSuccessfulRunAtUtc: string | null = null
+    try {
+      const latest = await getLatestSuccessfulRun(env)
+      lastSuccessfulRunAtUtc = latest?.created_at_utc ?? null
+    } catch (err) {
+      logWarn("Failed to fetch latest successful run before schedule decision", {
+        component: "scheduled",
+        error: String(err),
+      })
+    }
 
     // Check if we should run based on day/holiday logic
-    const { shouldRun, reason } = shouldRunScheduledPipeline()
+    const { shouldRun, reason } = shouldRunScheduledPipeline({
+      scheduledAt,
+      lastSuccessfulRunAtUtc,
+    })
     console.log(`[pxi-signals] ${reason}`)
 
     if (!shouldRun) {
@@ -114,6 +156,14 @@ export default {
       console.log(`[pxi-signals] Pipeline completed: ${runId}`)
     } catch (err: unknown) {
       const error = toError(err)
+
+      if (isPipelineLockError(error)) {
+        logWarn("Scheduled run skipped: pipeline already locked by another execution", {
+          runId,
+          component: "scheduled",
+        })
+        return
+      }
 
       logErrorWithStack("Scheduled pipeline failed", error, {
         runId,

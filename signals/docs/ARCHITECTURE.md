@@ -1,6 +1,6 @@
 # Architecture
 
-This worker is mounted only on the `pxicommand.com/signals*` route and does not touch the rest of the site.
+This worker is mounted only on the `pxicommand.com/signals` and `pxicommand.com/signals/*` routes and does not touch the rest of the site.
 
 ## Components
 

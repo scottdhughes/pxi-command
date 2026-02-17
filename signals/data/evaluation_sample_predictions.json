@@ -1,0 +1,35 @@
+{
+  "predictions": [
+    { "signal_date": "2026-01-01", "rank": 1, "return_pct": 2.2, "hit": true, "confidence": "High", "timing": "Now" },
+    { "signal_date": "2026-01-01", "rank": 2, "return_pct": -1.1, "hit": false, "confidence": "Medium", "timing": "Building" },
+    { "signal_date": "2026-01-01", "rank": 3, "return_pct": 0.4, "hit": true, "confidence": "Low", "timing": "Ongoing" },
+
+    { "signal_date": "2026-01-02", "rank": 1, "return_pct": 1.8, "hit": true, "confidence": "High", "timing": "Now" },
+    { "signal_date": "2026-01-02", "rank": 2, "return_pct": -0.5, "hit": false, "confidence": "Medium", "timing": "Building" },
+    { "signal_date": "2026-01-02", "rank": 3, "return_pct": 0.2, "hit": true, "confidence": "Low", "timing": "Ongoing" },
+
+    { "signal_date": "2026-01-05", "rank": 1, "return_pct": 2.4, "hit": true, "confidence": "High", "timing": "Now" },
+    { "signal_date": "2026-01-05", "rank": 2, "return_pct": -0.9, "hit": false, "confidence": "Medium", "timing": "Building" },
+    { "signal_date": "2026-01-05", "rank": 3, "return_pct": 0.3, "hit": true, "confidence": "Low", "timing": "Ongoing" },
+
+    { "signal_date": "2026-01-06", "rank": 1, "return_pct": 2.0, "hit": true, "confidence": "High", "timing": "Now" },
+    { "signal_date": "2026-01-06", "rank": 2, "return_pct": -1.2, "hit": false, "confidence": "Medium", "timing": "Building" },
+    { "signal_date": "2026-01-06", "rank": 3, "return_pct": 0.5, "hit": true, "confidence": "Low", "timing": "Ongoing" },
+
+    { "signal_date": "2026-01-07", "rank": 1, "return_pct": 2.1, "hit": true, "confidence": "High", "timing": "Now" },
+    { "signal_date": "2026-01-07", "rank": 2, "return_pct": -1.0, "hit": false, "confidence": "Medium", "timing": "Building" },
+    { "signal_date": "2026-01-07", "rank": 3, "return_pct": 0.1, "hit": true, "confidence": "Low", "timing": "Ongoing" },
+
+    { "signal_date": "2026-01-08", "rank": 1, "return_pct": 1.7, "hit": true, "confidence": "High", "timing": "Now" },
+    { "signal_date": "2026-01-08", "rank": 2, "return_pct": -0.8, "hit": false, "confidence": "Medium", "timing": "Building" },
+    { "signal_date": "2026-01-08", "rank": 3, "return_pct": 0.2, "hit": true, "confidence": "Low", "timing": "Ongoing" },
+
+    { "signal_date": "2026-01-09", "rank": 1, "return_pct": 2.5, "hit": true, "confidence": "High", "timing": "Now" },
+    { "signal_date": "2026-01-09", "rank": 2, "return_pct": -1.4, "hit": false, "confidence": "Medium", "timing": "Building" },
+    { "signal_date": "2026-01-09", "rank": 3, "return_pct": 0.6, "hit": true, "confidence": "Low", "timing": "Ongoing" },
+
+    { "signal_date": "2026-01-12", "rank": 1, "return_pct": 2.3, "hit": true, "confidence": "High", "timing": "Now" },
+    { "signal_date": "2026-01-12", "rank": 2, "return_pct": -0.7, "hit": false, "confidence": "Medium", "timing": "Building" },
+    { "signal_date": "2026-01-12", "rank": 3, "return_pct": 0.4, "hit": true, "confidence": "Low", "timing": "Ongoing" }
+  ]
+}

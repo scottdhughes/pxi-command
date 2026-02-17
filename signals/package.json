@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "offline": "tsx scripts/offline_run.ts",
+    "smoke:deploy": "tsx scripts/deploy_parity_check.ts",
+    "report:evaluation": "tsx scripts/evaluation_report.ts",
     "test": "vitest run",
     "lint": "eslint .",
     "format": "prettier -w ."

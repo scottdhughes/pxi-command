@@ -10,7 +10,7 @@ Weekly sector rotation signals from Reddit investment discussions. Analyzes soci
 
 ## Features
 
-- **Weekly Analysis**: Runs every Monday (or Tuesday if Monday is a US market holiday)
+- **Weekly Analysis**: Primary run Monday; Tuesday holiday fallback; Wednesday stale-data catch-up
 - **Mention Velocity Tracking**: Detects accelerating discussion around investment themes
 - **Sentiment Analysis**: VADER-based sentiment scoring with shift detection
 - **Multi-Subreddit Dispersion**: Identifies themes spreading across communities

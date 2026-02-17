@@ -11,18 +11,22 @@ import {
   getPendingPredictions,
   updatePredictionOutcome,
   insertSignalPredictions,
+  getExistingPredictionThemesForDate,
   type SignalPredictionInput,
 } from "./db"
 import {
   fetchMultipleETFPrices,
+  fetchMultipleHistoricalETFPrices,
+  historicalPriceRequestKey,
   calculateReturn,
   isHit,
 } from "./utils/price"
+import { addTradingDays } from "./utils/calendar"
 import { THEMES } from "./analysis/themes"
 import { logInfo, logWarn } from "./utils/logger"
 
-/** Number of days to wait before evaluating a prediction */
-const EVALUATION_WINDOW_DAYS = 7
+/** Number of trading days to wait before evaluating a prediction */
+const EVALUATION_WINDOW_TRADING_DAYS = 7
 
 /**
  * Evaluates all pending predictions that have reached their target date.
@@ -45,9 +49,14 @@ export async function evaluatePendingPredictions(env: Env): Promise<{
 
   logInfo(`Evaluating ${pending.length} pending predictions`)
 
-  // Collect unique proxy ETFs that need price fetching
-  const etfsToFetch = [...new Set(pending.map((p) => p.proxy_etf).filter(Boolean))] as string[]
-  const priceMap = await fetchMultipleETFPrices(etfsToFetch)
+  const historicalRequests = pending
+    .filter((prediction) => prediction.proxy_etf && prediction.entry_price !== null)
+    .map((prediction) => ({
+      symbol: prediction.proxy_etf as string,
+      targetDate: prediction.target_date,
+    }))
+
+  const historicalPriceMap = await fetchMultipleHistoricalETFPrices(historicalRequests)
 
   let evaluated = 0
   let hits = 0
@@ -55,42 +64,69 @@ export async function evaluatePendingPredictions(env: Env): Promise<{
 
   for (const prediction of pending) {
     try {
-      // Skip if no proxy ETF
       if (!prediction.proxy_etf) {
-        await updatePredictionOutcome(env, prediction.id, null, null, null)
+        await updatePredictionOutcome(env, prediction.id, {
+          exitPrice: null,
+          exitPriceDate: null,
+          returnPct: null,
+          hit: null,
+          evaluationNote: "missing_proxy_etf",
+        })
         evaluated++
         continue
       }
 
-      // Skip if no entry price
       if (prediction.entry_price === null) {
-        await updatePredictionOutcome(env, prediction.id, null, null, null)
+        await updatePredictionOutcome(env, prediction.id, {
+          exitPrice: null,
+          exitPriceDate: null,
+          returnPct: null,
+          hit: null,
+          evaluationNote: "missing_entry_price",
+        })
         evaluated++
         continue
       }
 
-      const priceResult = priceMap.get(prediction.proxy_etf)
+      const historicalKey = historicalPriceRequestKey(prediction.proxy_etf, prediction.target_date)
+      const priceResult = historicalPriceMap.get(historicalKey)
 
-      if (!priceResult || priceResult.error || priceResult.price === null) {
-        logWarn(`Price fetch failed for ${prediction.proxy_etf}: ${priceResult?.error || "No data"}`)
-        // Still mark as evaluated but with no outcome
-        await updatePredictionOutcome(env, prediction.id, null, null, null)
+      if (!priceResult || priceResult.error || priceResult.price === null || !priceResult.priceDate) {
+        const failureReason = priceResult?.error || "historical_price_unavailable"
+        logWarn(
+          `Historical price fetch failed for ${prediction.proxy_etf} @ ${prediction.target_date}: ${failureReason}`
+        )
+
+        await updatePredictionOutcome(env, prediction.id, {
+          exitPrice: null,
+          exitPriceDate: null,
+          returnPct: null,
+          hit: null,
+          evaluationNote: failureReason,
+        })
         errors++
         evaluated++
         continue
       }
 
       const exitPrice = priceResult.price
+      const exitPriceDate = priceResult.priceDate
       const returnPct = calculateReturn(prediction.entry_price, exitPrice)
       const hitValue = isHit(returnPct)
 
-      await updatePredictionOutcome(env, prediction.id, exitPrice, returnPct, hitValue)
+      await updatePredictionOutcome(env, prediction.id, {
+        exitPrice,
+        exitPriceDate,
+        returnPct,
+        hit: hitValue,
+        evaluationNote: null,
+      })
 
       evaluated++
       if (hitValue === 1) hits++
 
       logInfo(
-        `Evaluated ${prediction.theme_name}: entry=${prediction.entry_price}, exit=${exitPrice}, return=${returnPct}%, hit=${hitValue}`
+        `Evaluated ${prediction.theme_name}: entry=${prediction.entry_price}, exit=${exitPrice} (${exitPriceDate}), return=${returnPct}%, hit=${hitValue}`
       )
     } catch (err) {
       logWarn(`Error evaluating prediction ${prediction.id}: ${err}`)
@@ -117,7 +153,7 @@ export async function storePredictions(
   ranked: ThemeReportItem[]
 ): Promise<number> {
   const signalDate = new Date().toISOString().slice(0, 10)
-  const targetDate = calculateTargetDate(signalDate, EVALUATION_WINDOW_DAYS)
+  const targetDate = calculateTargetDate(signalDate, EVALUATION_WINDOW_TRADING_DAYS)
 
   // Get proxy ETFs for each theme
   const themeEtfMap = new Map<string, string>()
@@ -136,27 +172,36 @@ export async function storePredictions(
 
   const priceMap = await fetchMultipleETFPrices(etfsToFetch)
 
-  const predictions: SignalPredictionInput[] = ranked.map((item) => {
-    const proxyEtf = themeEtfMap.get(item.theme_id) || null
-    const priceResult = proxyEtf ? priceMap.get(proxyEtf) : null
-    const entryPrice = priceResult?.price ?? null
+  const existingThemes = await getExistingPredictionThemesForDate(env, signalDate)
 
-    return {
-      run_id: runId,
-      signal_date: signalDate,
-      target_date: targetDate,
-      theme_id: item.theme_id,
-      theme_name: item.theme_name,
-      rank: item.rank,
-      score: item.score,
-      signal_type: item.classification.signal_type,
-      confidence: item.classification.confidence,
-      timing: item.classification.timing,
-      stars: item.classification.stars,
-      proxy_etf: proxyEtf,
-      entry_price: entryPrice,
-    }
-  })
+  const predictions: SignalPredictionInput[] = ranked
+    .filter((item) => !existingThemes.has(item.theme_id))
+    .map((item) => {
+      const proxyEtf = themeEtfMap.get(item.theme_id) || null
+      const priceResult = proxyEtf ? priceMap.get(proxyEtf) : null
+      const entryPrice = priceResult?.price ?? null
+
+      return {
+        run_id: runId,
+        signal_date: signalDate,
+        target_date: targetDate,
+        theme_id: item.theme_id,
+        theme_name: item.theme_name,
+        rank: item.rank,
+        score: item.score,
+        signal_type: item.classification.signal_type,
+        confidence: item.classification.confidence,
+        timing: item.classification.timing,
+        stars: item.classification.stars,
+        proxy_etf: proxyEtf,
+        entry_price: entryPrice,
+      }
+    })
+
+  if (predictions.length === 0) {
+    logInfo(`Skipped prediction storage for run ${runId}: signal date ${signalDate} already populated`)
+    return 0
+  }
 
   await insertSignalPredictions(env, predictions)
 
@@ -165,17 +210,14 @@ export async function storePredictions(
 }
 
 /**
- * Calculates target date by adding business days (skipping weekends).
- * For simplicity, we add calendar days but this could be enhanced.
+ * Calculates target date by adding trading days (skip weekends + NYSE holidays).
  *
  * @param startDate - Signal date in YYYY-MM-DD format
- * @param days - Number of days to add
+ * @param tradingDays - Number of trading days to add
  * @returns Target date in YYYY-MM-DD format
  */
-function calculateTargetDate(startDate: string, days: number): string {
-  const date = new Date(startDate)
-  date.setDate(date.getDate() + days)
-  return date.toISOString().slice(0, 10)
+export function calculateTargetDate(startDate: string, tradingDays: number): string {
+  return addTradingDays(startDate, tradingDays)
 }
 
 /**

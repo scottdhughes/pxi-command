@@ -13,6 +13,9 @@ export interface Env {
   REDDIT_CLIENT_SECRET?: string
   REDDIT_USER_AGENT?: string
   ADMIN_RUN_TOKEN?: string
+  BUILD_SHA?: string
+  BUILD_TIMESTAMP?: string
+  WORKER_VERSION?: string
 }
 
 export const DEFAULTS = {
@@ -24,6 +27,20 @@ export const DEFAULTS = {
   eps: 1e-6,
 }
 
+function normalizeOptionalString(value: string | undefined): string | null {
+  if (typeof value !== "string") return null
+  const normalized = value.trim()
+  return normalized.length > 0 ? normalized : null
+}
+
+function normalizeIsoTimestamp(value: string | undefined): string | null {
+  const normalized = normalizeOptionalString(value)
+  if (!normalized) return null
+  const parsed = Date.parse(normalized)
+  if (Number.isNaN(parsed)) return null
+  return new Date(parsed).toISOString()
+}
+
 export function getConfig(env: Env) {
   return {
     publicBasePath: env.PUBLIC_BASE_PATH || "/signals",
@@ -33,6 +50,9 @@ export function getConfig(env: Env) {
     enableComments: Number(env.ENABLE_COMMENTS) === 1,
     enableRss: Number(env.ENABLE_RSS) === 1,
     priceProvider: env.PRICE_PROVIDER || "none",
+    buildSha: normalizeOptionalString(env.BUILD_SHA),
+    buildTimestamp: normalizeIsoTimestamp(env.BUILD_TIMESTAMP),
+    workerVersion: normalizeOptionalString(env.WORKER_VERSION),
     maxPostsPerSubreddit: DEFAULTS.maxPostsPerSubreddit,
     maxCommentsPerPost: DEFAULTS.maxCommentsPerPost,
     eps: DEFAULTS.eps,

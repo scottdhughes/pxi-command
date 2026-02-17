@@ -135,6 +135,36 @@ describe("config", () => {
       })
     })
 
+    describe("deploy metadata", () => {
+      it("normalizes build metadata when provided", () => {
+        const env = createMockEnv({
+          BUILD_SHA: "abc123",
+          BUILD_TIMESTAMP: "2026-02-17T09:00:00Z",
+          WORKER_VERSION: "signals-prod-20260217-0900",
+        })
+
+        const config = getConfig(env)
+
+        expect(config.buildSha).toBe("abc123")
+        expect(config.buildTimestamp).toBe("2026-02-17T09:00:00.000Z")
+        expect(config.workerVersion).toBe("signals-prod-20260217-0900")
+      })
+
+      it("returns null metadata fields when values are invalid", () => {
+        const env = createMockEnv({
+          BUILD_SHA: "   " as any,
+          BUILD_TIMESTAMP: "not-a-date" as any,
+          WORKER_VERSION: "" as any,
+        })
+
+        const config = getConfig(env)
+
+        expect(config.buildSha).toBeNull()
+        expect(config.buildTimestamp).toBeNull()
+        expect(config.workerVersion).toBeNull()
+      })
+    })
+
     describe("static config values", () => {
       it("always uses DEFAULTS.maxPostsPerSubreddit", () => {
         const env = createMockEnv()

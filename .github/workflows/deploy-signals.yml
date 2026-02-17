@@ -45,6 +45,9 @@ jobs:
       - name: Run Signals tests
         run: npm test
 
+      - name: Run Signals lint
+        run: npm run lint
+
       - name: Validate Cloudflare deploy credentials
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -60,8 +63,49 @@ jobs:
             exit 1
           fi
 
-      - name: Deploy Signals Worker
+      - name: Compute deploy metadata
+        run: |
+          set -euo pipefail
+          BUILD_SHA="$(git rev-parse --short=12 HEAD)"
+          BUILD_TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          WORKER_VERSION="signals-${BUILD_SHA}-${BUILD_TIMESTAMP}"
+          {
+            echo "BUILD_SHA=${BUILD_SHA}"
+            echo "BUILD_TIMESTAMP=${BUILD_TIMESTAMP}"
+            echo "WORKER_VERSION=${WORKER_VERSION}"
+          } >> "$GITHUB_ENV"
+
+      - name: Deploy Signals Worker (production)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler deploy
+        run: |
+          set -euo pipefail
+          npx wrangler deploy \
+            --env production \
+            --var "BUILD_SHA:${BUILD_SHA}" \
+            --var "BUILD_TIMESTAMP:${BUILD_TIMESTAMP}" \
+            --var "WORKER_VERSION:${WORKER_VERSION}"
+
+      - name: Apply remote D1 migrations (production)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler d1 migrations apply SIGNALS_DB --remote --env production
+
+      - name: Run strict deploy parity gate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npm run smoke:deploy -- \
+            https://pxicommand.com/signals \
+            --strict-version \
+            --expect-worker-version "${WORKER_VERSION}" \
+            --expect-build-sha "${BUILD_SHA}" \
+            --check-migrations \
+            --migration-env production \
+            --migration-db SIGNALS_DB

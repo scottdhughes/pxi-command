@@ -14,6 +14,19 @@ https://pxicommand.com/signals
 
 Most endpoints are public and read-only. The admin endpoint (`POST /api/run`) requires the `X-Admin-Token` header.
 
+## Cache Policy (Operational/Admin Endpoints)
+
+To prevent stale intermediary reads and cached admin responses, the following endpoints return:
+
+- `Cache-Control: no-store`
+
+Applied to:
+- `GET /api/version`
+- `GET /api/health`
+- `GET /api/accuracy`
+- `GET /api/predictions`
+- `POST /api/run` (including `409` lock and `500` failure responses)
+
 ---
 
 ## Public Endpoints
@@ -151,6 +164,171 @@ curl https://pxicommand.com/signals/api/runs/20250118-01HQXYZABC123DEF456GHI789
 
 ---
 
+### GET /api/version
+
+Returns immutable deploy metadata for release provenance and parity checks.
+
+**Response**
+```json
+{
+  "generated_at": "2026-02-17T06:00:00.000Z",
+  "api_contract_version": "2026-02-17",
+  "worker_version": "signals-prod-20260217-0600",
+  "build_sha": "a1b2c3d4e5f6",
+  "build_timestamp": "2026-02-17T05:58:41.000Z"
+}
+```
+
+Notes:
+- `generated_at` is response generation time.
+- `build_timestamp` is normalized to ISO format.
+- If deploy metadata is missing/malformed, fields may be `null` and parity checks should fail.
+
+**Example**
+```bash
+curl https://pxicommand.com/signals/api/version
+```
+
+---
+
+### GET /api/health
+
+Returns pipeline freshness health based on the most recent successful run.
+
+**Response**
+```json
+{
+  "generated_at": "2026-02-17T06:00:00.000Z",
+  "latest_success_at": "2026-02-17T05:00:00.000Z",
+  "hours_since_success": 1,
+  "threshold_days": 8,
+  "is_stale": false,
+  "status": "ok"
+}
+```
+
+`status` values:
+- `ok`: latest successful run is within threshold
+- `stale`: latest successful run exists but is older than threshold
+- `no_history`: no successful run exists yet
+
+**Example**
+```bash
+curl https://pxicommand.com/signals/api/health
+```
+
+---
+
+### GET /api/accuracy
+
+Returns evaluated prediction performance with uncertainty bands.
+
+**Response**
+```json
+{
+  "generated_at": "2026-02-17T06:10:00.000Z",
+  "sample_size": 40,
+  "minimum_recommended_sample_size": 30,
+  "evaluated_count": 43,
+  "resolved_count": 40,
+  "unresolved_count": 3,
+  "unresolved_rate": "7.0%",
+  "overall": {
+    "hit_rate": "60.0%",
+    "hit_rate_ci_low": "44.6%",
+    "hit_rate_ci_high": "73.7%",
+    "count": 40,
+    "sample_size_warning": false,
+    "avg_return": "+1.2%"
+  },
+  "by_timing": {
+    "Now": {
+      "hit_rate": "64.5%",
+      "hit_rate_ci_low": "46.9%",
+      "hit_rate_ci_high": "78.9%",
+      "count": 31,
+      "sample_size_warning": false,
+      "avg_return": "+1.5%"
+    }
+  },
+  "by_confidence": {
+    "High": {
+      "hit_rate": "65.7%",
+      "hit_rate_ci_low": "48.1%",
+      "hit_rate_ci_high": "80.0%",
+      "count": 35,
+      "sample_size_warning": false,
+      "avg_return": "+1.8%"
+    }
+  }
+}
+```
+
+Notes:
+- Confidence intervals are 95% Wilson score intervals on hit-rate proportions.
+- `sample_size_warning = true` when subgroup `count` is below `minimum_recommended_sample_size`.
+- `evaluated_count` includes all evaluated rows with `proxy_etf` (resolved + unresolved).
+- `resolved_count` is the denominator used for hit-rate/return aggregates (`hit` is non-null).
+- `unresolved_count` and `unresolved_rate` quantify evaluation attrition from unresolved exits (`hit = null`).
+- For zero-sample cases, interval fields return `"0.0%"` deterministically.
+
+**Example**
+```bash
+curl https://pxicommand.com/signals/api/accuracy
+```
+
+---
+
+### GET /api/predictions
+
+Returns recent prediction rows with optional filtering.
+
+Optional query parameters:
+- `limit` (integer, clamped to `[1, 100]`, default `50`)
+- `evaluated=true|false`
+
+Malformed query values return `400`.
+
+**Response (example)**
+```json
+{
+  "predictions": [
+    {
+      "signal_date": "2026-02-17",
+      "target_date": "2026-02-26",
+      "theme_id": "nuclear_uranium",
+      "theme_name": "Nuclear Uranium",
+      "rank": 1,
+      "score": 9.12,
+      "signal_type": "Rotation",
+      "confidence": "High",
+      "timing": "Now",
+      "stars": 5,
+      "proxy_etf": "URNM",
+      "entry_price": 97.44,
+      "exit_price": 101.2,
+      "exit_price_date": "2026-02-26",
+      "return_pct": 3.86,
+      "hit": true,
+      "status": "evaluated",
+      "evaluated_at": "2026-03-01T14:00:00.000Z",
+      "evaluation_note": null
+    }
+  ]
+}
+```
+
+Evaluation alignment notes:
+- `exit_price_date` is the actual market date used for exit pricing.
+- `evaluation_note` is populated when no valid historical close could be resolved (e.g., data gap), in which case `hit` remains `null`.
+
+**Example**
+```bash
+curl "https://pxicommand.com/signals/api/predictions?limit=25&evaluated=true"
+```
+
+---
+
 ## Admin Endpoints
 
 ### POST /api/run
@@ -178,7 +356,20 @@ Triggers a new pipeline run. Requires authentication and is rate-limited.
 ```json
 {
   "ok": false,
-  "error": "insufficient_data"
+  "error": "run_failed"
+}
+```
+
+Notes:
+- `500` responses intentionally return the sanitized code `run_failed` to avoid leaking internal pipeline details.
+- Detailed failure context is still persisted in the internal `runs.error_message` field for operators.
+
+If another run is already active, the endpoint returns:
+
+```json
+{
+  "ok": false,
+  "error": "pipeline_locked"
 }
 ```
 
@@ -187,6 +378,7 @@ Triggers a new pipeline run. Requires authentication and is rate-limited.
 |------|-------------|
 | `200` | Pipeline completed successfully |
 | `401` | Invalid or missing admin token |
+| `409` | Pipeline already running (`pipeline_locked`) |
 | `429` | Rate limit exceeded |
 | `500` | Pipeline execution failed |
 
@@ -301,8 +493,8 @@ All error responses include a JSON body with an `error` field:
 | `Unauthorized` | 401 | Missing or invalid admin token |
 | `Not found` | 404 | Requested resource doesn't exist |
 | `Rate limit exceeded` | 429 | Too many requests |
-| `insufficient_data` | 500 | Not enough data to generate report |
-| `insufficient_evidence` | 500 | Themes lack required evidence links |
+| `run_failed` | 500 | Pipeline execution failed (sanitized public error code) |
+| `pipeline_locked` | 409 | Another run currently holds the pipeline lock |
 
 ---
 
@@ -314,4 +506,4 @@ CORS headers are not currently configured. For cross-origin access, deploy a pro
 
 ## Versioning
 
-The API does not currently use versioning. Breaking changes will be documented in release notes.
+The API does not currently use URL path versioning. Deploy provenance and contract compatibility are exposed via `GET /api/version` (`api_contract_version`, `worker_version`, `build_sha`, `build_timestamp`).
