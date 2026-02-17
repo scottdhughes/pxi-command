@@ -311,10 +311,30 @@ CREATE TABLE IF NOT EXISTS market_consistency_checks (
     score REAL NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('PASS', 'WARN', 'FAIL')),
     violations_json TEXT NOT NULL,
+    components_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_market_consistency_created ON market_consistency_checks(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS market_refresh_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed')),
+    "trigger" TEXT NOT NULL DEFAULT 'unknown',
+    brief_generated INTEGER DEFAULT 0,
+    opportunities_generated INTEGER DEFAULT 0,
+    calibrations_generated INTEGER DEFAULT 0,
+    alerts_generated INTEGER DEFAULT 0,
+    stale_count INTEGER,
+    as_of TEXT,
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS market_alert_events (
     id TEXT PRIMARY KEY,

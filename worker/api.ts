@@ -1029,6 +1029,8 @@ type AlertSeverity = 'info' | 'warning' | 'critical';
 type ConflictState = 'ALIGNED' | 'MIXED' | 'CONFLICT';
 type EdgeQualityLabel = 'HIGH' | 'MEDIUM' | 'LOW';
 type CalibrationQuality = 'ROBUST' | 'LIMITED' | 'INSUFFICIENT';
+type CoverageQuality = CalibrationQuality;
+type OpportunityExpectancyBasis = 'theme_direction' | 'theme_direction_shrunk_prior' | 'direction_prior_proxy' | 'none';
 
 interface EdgeQualityCalibration {
   bin: string | null;
@@ -1046,11 +1048,13 @@ interface OpportunityCalibration {
   sample_size: number;
   quality: CalibrationQuality;
   basis: 'conviction_decile';
+  window: string | null;
   unavailable_reason: string | null;
 }
 
 interface CalibrationBinSnapshot {
   bin: string;
+  correct_count: number;
   probability_correct: number | null;
   ci95_low: number | null;
   ci95_high: number | null;
@@ -1093,6 +1097,8 @@ interface OpportunityExpectancy {
   expected_move_pct: number | null;
   max_adverse_move_pct: number | null;
   sample_size: number;
+  basis: OpportunityExpectancyBasis;
+  quality: CoverageQuality;
   unavailable_reason: string | null;
 }
 
@@ -1180,6 +1186,11 @@ interface ConsistencySnapshot {
   score: number;
   state: ConsistencyState;
   violations: string[];
+  components: {
+    base_score: number;
+    structural_penalty: number;
+    reliability_penalty: number;
+  };
 }
 
 interface TraderPlaybookSnapshot {
@@ -1213,6 +1224,8 @@ interface PlanPayload {
   policy_state: PolicyStateSnapshot;
   action_now: {
     risk_allocation_target: number;
+    raw_signal_allocation_target: number;
+    risk_allocation_basis: 'penalized_playbook_target' | 'fallback_neutral';
     horizon_bias: string;
     primary_signal: SignalType;
   };
@@ -1240,6 +1253,7 @@ const BRIEF_CONTRACT_VERSION = '2026-02-17-v2';
 const CONSISTENCY_PASS_MIN = 90;
 const CONSISTENCY_WARN_MIN = 80;
 const REFRESH_HOURS_UTC = [6, 14, 18, 22];
+const MINIMUM_RELIABLE_SAMPLE = 30;
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -1594,6 +1608,7 @@ function buildOpportunityCalibrationFallback(): OpportunityCalibration {
     sample_size: 0,
     quality: 'INSUFFICIENT',
     basis: 'conviction_decile',
+    window: null,
     unavailable_reason: 'insufficient_sample',
   };
 }
@@ -1610,6 +1625,12 @@ function parseCalibrationSnapshotPayload(raw: string | null | undefined): Market
         const candidate = bin as Partial<CalibrationBinSnapshot>;
         if (typeof candidate.bin !== 'string') return null;
         const sampleSize = toNumber(candidate.sample_size, 0);
+        const inferredCorrectCount = Math.round(
+          sampleSize > 0 && candidate.probability_correct !== null && candidate.probability_correct !== undefined
+            ? clamp(0, 1, toNumber(candidate.probability_correct, 0)) * sampleSize
+            : 0
+        );
+        const correctCount = Math.max(0, Math.min(Math.floor(sampleSize), Math.floor(toNumber(candidate.correct_count, inferredCorrectCount))));
         const probability = candidate.probability_correct === null || candidate.probability_correct === undefined
           ? null
           : clamp(0, 1, toNumber(candidate.probability_correct, 0));
@@ -1621,6 +1642,7 @@ function parseCalibrationSnapshotPayload(raw: string | null | undefined): Market
           : clamp(0, 1, toNumber(candidate.ci95_high, 0));
         return {
           bin: candidate.bin,
+          correct_count: correctCount,
           probability_correct: probability,
           ci95_low: ci95Low,
           ci95_high: ci95High,
@@ -1649,6 +1671,13 @@ function pickCalibrationBin(
   if (!snapshot || !Array.isArray(snapshot.bins) || snapshot.bins.length === 0) return null;
   const bin = buildDecileBinLabel(score);
   return snapshot.bins.find((entry) => entry.bin === bin) || null;
+}
+
+function parseBinStart(bin: string): number | null {
+  const match = /^(\d+)-(\d+)$/.exec(bin);
+  if (!match) return null;
+  const start = Number(match[1]);
+  return Number.isFinite(start) ? start : null;
 }
 
 function buildEdgeQualityCalibrationFromSnapshot(
@@ -1686,14 +1715,45 @@ function buildOpportunityCalibrationFromSnapshot(
       sample_size: 0,
       quality: 'INSUFFICIENT',
       basis: 'conviction_decile',
+      window: null,
       unavailable_reason: 'neutral_direction',
     };
   }
-  const bin = pickCalibrationBin(snapshot, convictionScore);
-  if (!bin) {
+  if (!snapshot || !Array.isArray(snapshot.bins) || snapshot.bins.length === 0) {
     return buildOpportunityCalibrationFallback();
   }
-  if (bin.sample_size <= 0) {
+
+  const targetBin = buildDecileBinLabel(convictionScore);
+  const targetStart = parseBinStart(targetBin) ?? 0;
+  const candidates = snapshot.bins
+    .map((entry) => ({
+      ...entry,
+      start: parseBinStart(entry.bin),
+    }))
+    .filter((entry): entry is CalibrationBinSnapshot & { start: number } => entry.start !== null)
+    .sort((a, b) => {
+      const distanceA = Math.abs(a.start - targetStart);
+      const distanceB = Math.abs(b.start - targetStart);
+      if (distanceA !== distanceB) return distanceA - distanceB;
+      return a.start - b.start;
+    });
+
+  let pooledSamples = 0;
+  let pooledCorrect = 0;
+  let minStart: number | null = null;
+  let maxStart: number | null = null;
+  for (const candidate of candidates) {
+    if (candidate.sample_size <= 0) continue;
+    pooledSamples += candidate.sample_size;
+    pooledCorrect += Math.max(0, Math.min(candidate.sample_size, candidate.correct_count));
+    minStart = minStart === null ? candidate.start : Math.min(minStart, candidate.start);
+    maxStart = maxStart === null ? candidate.start : Math.max(maxStart, candidate.start);
+    if (pooledSamples >= MINIMUM_RELIABLE_SAMPLE) {
+      break;
+    }
+  }
+
+  if (pooledSamples <= 0) {
     return {
       probability_correct_direction: null,
       ci95_low: null,
@@ -1701,17 +1761,26 @@ function buildOpportunityCalibrationFromSnapshot(
       sample_size: 0,
       quality: 'INSUFFICIENT',
       basis: 'conviction_decile',
+      window: null,
       unavailable_reason: 'insufficient_sample',
     };
   }
+
+  const interval = computeWilson95(pooledCorrect, pooledSamples);
+  const quality = calibrationQualityForSampleSize(pooledSamples);
+  const window = minStart !== null && maxStart !== null
+    ? `${minStart}-${maxStart === 90 ? 100 : maxStart + 9}`
+    : targetBin;
+
   return {
-    probability_correct_direction: bin.probability_correct,
-    ci95_low: bin.ci95_low,
-    ci95_high: bin.ci95_high,
-    sample_size: bin.sample_size,
-    quality: bin.quality,
+    probability_correct_direction: interval.probability,
+    ci95_low: interval.ci95_low,
+    ci95_high: interval.ci95_high,
+    sample_size: pooledSamples,
+    quality,
     basis: 'conviction_decile',
-    unavailable_reason: null,
+    window,
+    unavailable_reason: pooledSamples < MINIMUM_RELIABLE_SAMPLE ? 'insufficient_sample' : null,
   };
 }
 
@@ -1796,7 +1865,51 @@ function buildUncertaintySnapshot(degradedReasons: string[]): UncertaintySnapsho
   };
 }
 
-function buildConsistencySnapshot(policyState: PolicyStateSnapshot): ConsistencySnapshot {
+interface ConsistencyReliabilityInputs {
+  stale_count: number;
+  calibration_quality: CalibrationQuality;
+  limited_scenario_sample: boolean;
+  conflict_state: ConflictState;
+  allocation_target_mismatch: boolean;
+}
+
+interface RiskSizingSnapshot {
+  raw_signal_allocation_target: number;
+  target_pct: number;
+  min_pct: number;
+  max_pct: number;
+}
+
+function computeRiskSizingSnapshot(params: {
+  signal: PXISignal;
+  policyState: PolicyStateSnapshot;
+  edgeQuality: EdgeQualitySnapshot;
+  freshness: { stale_count: number };
+}): RiskSizingSnapshot {
+  const { signal, policyState, edgeQuality, freshness } = params;
+  const rawTarget = clamp(0, 1, signal.risk_allocation);
+  const baseTargetPct = Math.round(rawTarget * 100);
+  const conflictPenalty = policyState.conflict_state === 'CONFLICT' ? 8 : 0;
+  const freshnessPenalty = freshness.stale_count > 0 ? Math.min(15, Math.round(freshness.stale_count * 0.5)) : 0;
+  const calibrationPenalty = edgeQuality.calibration.quality === 'ROBUST'
+    ? 0
+    : edgeQuality.calibration.quality === 'LIMITED' ? 5 : 10;
+  const target = Math.max(0, Math.min(100, baseTargetPct - conflictPenalty - freshnessPenalty - calibrationPenalty));
+  const min = Math.max(0, target - 12);
+  const max = Math.min(100, target + 12);
+
+  return {
+    raw_signal_allocation_target: rawTarget,
+    target_pct: target,
+    min_pct: min,
+    max_pct: max,
+  };
+}
+
+function buildConsistencySnapshot(
+  policyState: PolicyStateSnapshot,
+  reliability?: ConsistencyReliabilityInputs
+): ConsistencySnapshot {
   const violations: string[] = [];
 
   if (policyState.conflict_state === 'CONFLICT' && policyState.stance !== 'MIXED') {
@@ -1824,7 +1937,37 @@ function buildConsistencySnapshot(policyState: PolicyStateSnapshot): Consistency
     violations.push('risk_posture_stance_mismatch');
   }
 
-  const score = Math.max(0, Math.round(100 - (violations.length * 12)));
+  const structuralPenalty = violations.length * 12;
+  let reliabilityPenalty = 0;
+
+  if (reliability) {
+    if (reliability.stale_count > 0) {
+      violations.push('stale_inputs_penalty');
+      reliabilityPenalty += 3;
+    }
+    if (reliability.calibration_quality === 'LIMITED') {
+      violations.push('limited_calibration_penalty');
+      reliabilityPenalty += 3;
+    }
+    if (reliability.calibration_quality === 'INSUFFICIENT') {
+      violations.push('insufficient_calibration_penalty');
+      reliabilityPenalty += 6;
+    }
+    if (reliability.limited_scenario_sample) {
+      violations.push('limited_scenario_sample_penalty');
+      reliabilityPenalty += 2;
+    }
+    if (reliability.conflict_state === 'CONFLICT') {
+      violations.push('conflict_state_penalty');
+      reliabilityPenalty += 1;
+    }
+    if (reliability.allocation_target_mismatch) {
+      violations.push('allocation_target_mismatch');
+      reliabilityPenalty += 20;
+    }
+  }
+
+  const score = Math.max(0, Math.round(100 - structuralPenalty - reliabilityPenalty));
   const state: ConsistencyState = score >= CONSISTENCY_PASS_MIN
     ? 'PASS'
     : score >= CONSISTENCY_WARN_MIN
@@ -1835,6 +1978,11 @@ function buildConsistencySnapshot(policyState: PolicyStateSnapshot): Consistency
     score,
     state,
     violations,
+    components: {
+      base_score: 100,
+      structural_penalty: structuralPenalty,
+      reliability_penalty: reliabilityPenalty,
+    },
   };
 }
 
@@ -1886,19 +2034,19 @@ async function buildTraderPlaybookSnapshot(
     policyState: PolicyStateSnapshot;
     edgeQuality: EdgeQualitySnapshot;
     freshness: { stale_count: number };
+    sizing?: RiskSizingSnapshot;
   }
 ): Promise<TraderPlaybookSnapshot> {
   const { signal, policyState, edgeQuality, freshness } = params;
-
-  const baseTarget = Math.round(clamp(0, 1, signal.risk_allocation) * 100);
-  const conflictPenalty = policyState.conflict_state === 'CONFLICT' ? 8 : 0;
-  const freshnessPenalty = freshness.stale_count > 0 ? Math.min(15, Math.round(freshness.stale_count * 0.5)) : 0;
-  const calibrationPenalty = edgeQuality.calibration.quality === 'ROBUST'
-    ? 0
-    : edgeQuality.calibration.quality === 'LIMITED' ? 5 : 10;
-  const target = Math.max(0, Math.min(100, baseTarget - conflictPenalty - freshnessPenalty - calibrationPenalty));
-  const min = Math.max(0, target - 12);
-  const max = Math.min(100, target + 12);
+  const sizing = params.sizing || computeRiskSizingSnapshot({
+    signal,
+    policyState,
+    edgeQuality,
+    freshness,
+  });
+  const target = sizing.target_pct;
+  const min = sizing.min_pct;
+  const max = sizing.max_pct;
 
   const benchmark = await buildBenchmarkFollowThrough7d(db);
   const scenarios: TraderPlaybookSnapshot['scenarios'] = [
@@ -1975,6 +2123,7 @@ async function buildCanonicalMarketDecision(
   pxi: PXIRow;
   categories: CategoryRow[];
   signal: PXISignal;
+  risk_sizing: RiskSizingSnapshot;
   regime: RegimeResult | null;
   freshness: { has_stale_data: boolean; stale_count: number };
   risk_band: { d7: PlanRiskBand; d30: PlanRiskBand };
@@ -2043,12 +2192,27 @@ async function buildCanonicalMarketDecision(
   if (edgeQualityWithCalibration.calibration.quality !== 'ROBUST') degradedReasons.push('limited_calibration_sample');
 
   const uncertainty = buildUncertaintySnapshot(degradedReasons);
-  const consistency = buildConsistencySnapshot(policyState);
+  const riskSizing = computeRiskSizingSnapshot({
+    signal,
+    policyState,
+    edgeQuality: edgeQualityWithCalibration,
+    freshness,
+  });
   const traderPlaybook = await buildTraderPlaybookSnapshot(db, {
     signal,
     policyState,
     edgeQuality: edgeQualityWithCalibration,
     freshness,
+    sizing: riskSizing,
+  });
+  const limitedScenarioSample = riskBand.d7.sample_size < 20 || riskBand.d30.sample_size < 20;
+  const allocationTargetMismatch = Math.abs(traderPlaybook.recommended_size_pct.target - riskSizing.target_pct) > 0.5;
+  const consistency = buildConsistencySnapshot(policyState, {
+    stale_count: freshness.stale_count,
+    calibration_quality: edgeQualityWithCalibration.calibration.quality,
+    limited_scenario_sample: limitedScenarioSample,
+    conflict_state: policyState.conflict_state,
+    allocation_target_mismatch: allocationTargetMismatch,
   });
 
   return {
@@ -2056,6 +2220,7 @@ async function buildCanonicalMarketDecision(
     pxi,
     categories,
     signal,
+    risk_sizing: riskSizing,
     regime,
     freshness,
     risk_band: riskBand,
@@ -2074,6 +2239,7 @@ function isBriefSnapshotCompatible(snapshot: BriefSnapshot | null): boolean {
   if (!snapshot.policy_state || !snapshot.source_plan_as_of || !snapshot.consistency) return false;
   if (!snapshot.policy_state.stance || !snapshot.policy_state.risk_posture) return false;
   if (typeof snapshot.consistency.score !== 'number' || typeof snapshot.consistency.state !== 'string') return false;
+  if (!snapshot.consistency.components || typeof snapshot.consistency.components !== 'object') return false;
   return true;
 }
 
@@ -2490,6 +2656,8 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
     policy_state: policyState,
     action_now: {
       risk_allocation_target: 0.5,
+      raw_signal_allocation_target: 0.5,
+      risk_allocation_basis: 'fallback_neutral',
       horizon_bias: '7d_neutral_30d_neutral',
       primary_signal: 'REDUCED_RISK',
     },
@@ -2645,10 +2813,37 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
         score REAL NOT NULL,
         state TEXT NOT NULL,
         violations_json TEXT NOT NULL,
+        components_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT DEFAULT (datetime('now'))
       )
     `).run();
+    const hasComponentsJson = await tableHasColumn(db, 'market_consistency_checks', 'components_json');
+    if (!hasComponentsJson) {
+      await db.prepare(
+        `ALTER TABLE market_consistency_checks ADD COLUMN components_json TEXT NOT NULL DEFAULT '{}'`
+      ).run();
+    }
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_consistency_created ON market_consistency_checks(created_at DESC)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS market_refresh_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed')),
+        "trigger" TEXT NOT NULL DEFAULT 'unknown',
+        brief_generated INTEGER DEFAULT 0,
+        opportunities_generated INTEGER DEFAULT 0,
+        calibrations_generated INTEGER DEFAULT 0,
+        alerts_generated INTEGER DEFAULT 0,
+        stale_count INTEGER,
+        as_of TEXT,
+        error TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
 
     marketSchemaInitializedAt = Date.now();
   })();
@@ -3004,6 +3199,7 @@ async function buildEdgeQualityCalibrationSnapshot(db: D1Database): Promise<Mark
     const interval = computeWilson95(entry.correct, entry.total);
     return {
       bin,
+      correct_count: entry.correct,
       probability_correct: entry.total > 0 ? interval.probability : null,
       ci95_low: entry.total > 0 ? interval.ci95_low : null,
       ci95_high: entry.total > 0 ? interval.ci95_high : null,
@@ -3096,6 +3292,7 @@ async function buildConvictionCalibrationSnapshot(
     const interval = computeWilson95(entry.correct, entry.total);
     return {
       bin,
+      correct_count: entry.correct,
       probability_correct: entry.total > 0 ? interval.probability : null,
       ci95_low: entry.total > 0 ? interval.ci95_low : null,
       ci95_high: entry.total > 0 ? interval.ci95_high : null,
@@ -3164,77 +3361,227 @@ async function computeHistoricalHitStats(
   };
 }
 
-function buildExpectancyFromOutcomes(
-  outcomes: number[],
-  direction: OpportunityDirection
+function buildExpectancyUnavailable(
+  direction: OpportunityDirection,
+  reason: string,
+  basis: OpportunityExpectancyBasis = 'none',
+  sampleSize = 0
 ): OpportunityExpectancy {
   if (direction === 'neutral') {
     return {
       expected_move_pct: null,
       max_adverse_move_pct: null,
       sample_size: 0,
+      basis: 'none',
+      quality: 'INSUFFICIENT',
       unavailable_reason: 'neutral_direction',
     };
   }
 
-  if (outcomes.length < 20) {
-    return {
-      expected_move_pct: null,
-      max_adverse_move_pct: null,
-      sample_size: outcomes.length,
-      unavailable_reason: 'insufficient_sample',
-    };
+  return {
+    expected_move_pct: null,
+    max_adverse_move_pct: null,
+    sample_size: sampleSize,
+    basis,
+    quality: calibrationQualityForSampleSize(sampleSize),
+    unavailable_reason: reason,
+  };
+}
+
+function resolveMaxAdverseMove(outcomes: number[], direction: OpportunityDirection): number {
+  return direction === 'bullish' ? Math.min(...outcomes) : Math.max(...outcomes);
+}
+
+function buildExpectancyFromOutcomes(
+  outcomes: number[],
+  direction: OpportunityDirection,
+  basis: OpportunityExpectancyBasis
+): OpportunityExpectancy {
+  if (direction !== 'bullish' && direction !== 'bearish') {
+    return buildExpectancyUnavailable(direction, 'neutral_direction');
   }
-
+  if (outcomes.length === 0) {
+    return buildExpectancyUnavailable(direction, 'insufficient_sample', basis, 0);
+  }
   const expectedMove = outcomes.reduce((sum, value) => sum + value, 0) / outcomes.length;
-  const maxAdverse = direction === 'bullish'
-    ? Math.min(...outcomes)
-    : Math.max(...outcomes);
-
+  const maxAdverse = resolveMaxAdverseMove(outcomes, direction);
+  const quality = calibrationQualityForSampleSize(outcomes.length);
   return {
     expected_move_pct: expectedMove,
     max_adverse_move_pct: maxAdverse,
     sample_size: outcomes.length,
-    unavailable_reason: null,
+    basis,
+    quality,
+    unavailable_reason: outcomes.length < MINIMUM_RELIABLE_SAMPLE ? 'insufficient_sample' : null,
   };
 }
 
-async function computeOpportunityExpectancyByDirection(
+async function computeOpportunityOutcomeHistory(
   db: D1Database,
   horizon: '7d' | '30d'
-): Promise<Record<OpportunityDirection, OpportunityExpectancy>> {
-  const rows = horizon === '7d'
-    ? await db.prepare(`
-      SELECT predicted_change_7d as predicted_change, actual_change_7d as actual_change
-      FROM prediction_log
-      WHERE predicted_change_7d IS NOT NULL
-        AND actual_change_7d IS NOT NULL
-      ORDER BY prediction_date DESC
-      LIMIT 1000
-    `).all<{ predicted_change: number; actual_change: number }>()
-    : await db.prepare(`
-      SELECT predicted_change_30d as predicted_change, actual_change_30d as actual_change
-      FROM prediction_log
-      WHERE predicted_change_30d IS NOT NULL
-        AND actual_change_30d IS NOT NULL
-      ORDER BY prediction_date DESC
-      LIMIT 1000
-    `).all<{ predicted_change: number; actual_change: number }>();
+): Promise<{
+  byThemeDirection: Map<string, number[]>;
+  byDirection: Record<OpportunityDirection, number[]>;
+}> {
+  const horizonDays = horizon === '7d' ? 7 : 30;
+  const [snapshots, spyRows] = await Promise.all([
+    db.prepare(`
+      SELECT as_of, payload_json
+      FROM opportunity_snapshots
+      WHERE horizon = ?
+      ORDER BY as_of DESC
+      LIMIT 730
+    `).bind(horizon).all<{ as_of: string; payload_json: string }>(),
+    db.prepare(`
+      SELECT date, value
+      FROM indicator_values
+      WHERE indicator_id = 'spy_close'
+      ORDER BY date ASC
+    `).all<{ date: string; value: number }>(),
+  ]);
 
-  const bullishOutcomes: number[] = [];
-  const bearishOutcomes: number[] = [];
-  for (const row of rows.results || []) {
-    if (row.predicted_change > 0) {
-      bullishOutcomes.push(row.actual_change);
-    } else if (row.predicted_change < 0) {
-      bearishOutcomes.push(row.actual_change);
+  const spyMap = new Map<string, number>();
+  for (const row of spyRows.results || []) {
+    spyMap.set(row.date, row.value);
+  }
+
+  const priceOnOrAfter = (date: string, toleranceDays = 3): number | null => {
+    for (let offset = 0; offset <= toleranceDays; offset += 1) {
+      const candidateDate = addCalendarDays(date, offset);
+      const price = spyMap.get(candidateDate);
+      if (price !== undefined) return price;
+    }
+    return null;
+  };
+
+  const byThemeDirection = new Map<string, number[]>();
+  const byDirection: Record<OpportunityDirection, number[]> = {
+    bullish: [],
+    bearish: [],
+    neutral: [],
+  };
+
+  for (const row of snapshots.results || []) {
+    let payload: OpportunitySnapshot | null = null;
+    try {
+      payload = JSON.parse(row.payload_json) as OpportunitySnapshot;
+    } catch {
+      payload = null;
+    }
+    if (!payload?.items || payload.items.length === 0) continue;
+
+    const asOfDate = (payload.as_of || row.as_of).slice(0, 10);
+    const spot = priceOnOrAfter(asOfDate, 3);
+    const forward = priceOnOrAfter(addCalendarDays(asOfDate, horizonDays), 3);
+    if (spot === null || forward === null || spot === 0) continue;
+    const forwardReturnPct = ((forward - spot) / spot) * 100;
+
+    for (const item of payload.items) {
+      if (item.direction !== 'bullish' && item.direction !== 'bearish') {
+        continue;
+      }
+      const key = `${item.theme_id}::${item.direction}`;
+      const outcomes = byThemeDirection.get(key) || [];
+      outcomes.push(forwardReturnPct);
+      byThemeDirection.set(key, outcomes);
+      byDirection[item.direction].push(forwardReturnPct);
     }
   }
 
   return {
-    bullish: buildExpectancyFromOutcomes(bullishOutcomes, 'bullish'),
-    bearish: buildExpectancyFromOutcomes(bearishOutcomes, 'bearish'),
-    neutral: buildExpectancyFromOutcomes([], 'neutral'),
+    byThemeDirection,
+    byDirection,
+  };
+}
+
+function buildOpportunityExpectancy(
+  history: {
+    byThemeDirection: Map<string, number[]>;
+    byDirection: Record<OpportunityDirection, number[]>;
+  },
+  item: Pick<OpportunityItem, 'theme_id' | 'direction'>
+): OpportunityExpectancy {
+  if (item.direction !== 'bullish' && item.direction !== 'bearish') {
+    return buildExpectancyUnavailable(item.direction, 'neutral_direction');
+  }
+
+  const themeOutcomes = history.byThemeDirection.get(`${item.theme_id}::${item.direction}`) || [];
+  const directionPrior = history.byDirection[item.direction] || [];
+
+  if (themeOutcomes.length >= 20) {
+    return buildExpectancyFromOutcomes(themeOutcomes, item.direction, 'theme_direction');
+  }
+
+  if (themeOutcomes.length >= 5 && directionPrior.length >= 20) {
+    const themeExpected = themeOutcomes.reduce((sum, value) => sum + value, 0) / themeOutcomes.length;
+    const priorExpected = directionPrior.reduce((sum, value) => sum + value, 0) / directionPrior.length;
+    const themeAdverse = resolveMaxAdverseMove(themeOutcomes, item.direction);
+    const priorAdverse = resolveMaxAdverseMove(directionPrior, item.direction);
+    const w = themeOutcomes.length / (themeOutcomes.length + 20);
+    const shrunkExpected = w * themeExpected + (1 - w) * priorExpected;
+    const shrunkAdverse = w * themeAdverse + (1 - w) * priorAdverse;
+    const sampleSize = themeOutcomes.length + directionPrior.length;
+    return {
+      expected_move_pct: shrunkExpected,
+      max_adverse_move_pct: shrunkAdverse,
+      sample_size: sampleSize,
+      basis: 'theme_direction_shrunk_prior',
+      quality: calibrationQualityForSampleSize(sampleSize),
+      unavailable_reason: sampleSize < MINIMUM_RELIABLE_SAMPLE ? 'insufficient_sample' : null,
+    };
+  }
+
+  if (themeOutcomes.length < 5 && directionPrior.length >= 20) {
+    return buildExpectancyFromOutcomes(directionPrior, item.direction, 'direction_prior_proxy');
+  }
+
+  return buildExpectancyUnavailable(item.direction, 'insufficient_sample', 'none', themeOutcomes.length);
+}
+
+function normalizeOpportunityExpectancy(
+  expectancy: Partial<OpportunityExpectancy> | null | undefined,
+  direction: OpportunityDirection
+): OpportunityExpectancy {
+  if (direction === 'neutral') {
+    return buildExpectancyUnavailable(direction, 'neutral_direction');
+  }
+
+  if (!expectancy || typeof expectancy !== 'object') {
+    return buildExpectancyUnavailable(direction, 'insufficient_sample');
+  }
+
+  const sampleSize = Math.max(0, Math.floor(toNumber(expectancy.sample_size, 0)));
+  const expectedMove = expectancy.expected_move_pct === null || expectancy.expected_move_pct === undefined
+    ? null
+    : toNumber(expectancy.expected_move_pct, 0);
+  const maxAdverse = expectancy.max_adverse_move_pct === null || expectancy.max_adverse_move_pct === undefined
+    ? null
+    : toNumber(expectancy.max_adverse_move_pct, 0);
+  const basis = (() => {
+    const candidate = String(expectancy.basis || '');
+    if (candidate === 'theme_direction' || candidate === 'theme_direction_shrunk_prior' || candidate === 'direction_prior_proxy' || candidate === 'none') {
+      return candidate as OpportunityExpectancyBasis;
+    }
+    return expectedMove !== null || maxAdverse !== null ? 'theme_direction' : 'none';
+  })();
+  const quality = (() => {
+    const candidate = String(expectancy.quality || '');
+    if (candidate === 'ROBUST' || candidate === 'LIMITED' || candidate === 'INSUFFICIENT') {
+      return candidate as CoverageQuality;
+    }
+    return calibrationQualityForSampleSize(sampleSize);
+  })();
+  const unavailableReason = expectancy.unavailable_reason === null || expectancy.unavailable_reason === undefined
+    ? (sampleSize < MINIMUM_RELIABLE_SAMPLE ? 'insufficient_sample' : null)
+    : String(expectancy.unavailable_reason);
+
+  return {
+    expected_move_pct: expectedMove,
+    max_adverse_move_pct: maxAdverse,
+    sample_size: sampleSize,
+    basis,
+    quality,
+    unavailable_reason: unavailableReason,
   };
 }
 
@@ -3254,7 +3601,7 @@ async function buildOpportunitySnapshot(
     return null;
   }
 
-  const [latestSignal, latestEnsemble, hitStats, themes, convictionCalibration, expectancyByDirection] = await Promise.all([
+  const [latestSignal, latestEnsemble, hitStats, themes, convictionCalibration, opportunityHistory] = await Promise.all([
     db.prepare(`
       SELECT date, risk_allocation, signal_type, regime
       FROM pxi_signal
@@ -3276,7 +3623,7 @@ async function buildOpportunitySnapshot(
     computeHistoricalHitStats(db, horizon),
     fetchLatestSignalsThemes(),
     calibrationSnapshot ? Promise.resolve(calibrationSnapshot) : fetchLatestCalibrationSnapshot(db, 'conviction', horizon),
-    computeOpportunityExpectancyByDirection(db, horizon),
+    computeOpportunityOutcomeHistory(db, horizon),
   ]);
 
   const themeSource = themes.length > 0
@@ -3336,7 +3683,10 @@ async function buildOpportunitySnapshot(
       historical_hit_rate: hitStats.hitRate,
       sample_size: hitStats.sampleSize,
       calibration: buildOpportunityCalibrationFromSnapshot(convictionCalibration, conviction, directionalSignal),
-      expectancy: expectancyByDirection[directionalSignal],
+      expectancy: buildOpportunityExpectancy(opportunityHistory, {
+        theme_id: theme.theme_id,
+        direction: directionalSignal,
+      }),
       updated_at: asIsoDateTime(new Date()),
     };
   });
@@ -3366,7 +3716,7 @@ function buildMarketEvent(
 ): MarketAlertEvent {
   const dedupeKey = `${type}:${runDate}:${entityId || 'market'}`;
   return {
-    id: `${runDate}-${type}-${stableHash(dedupeKey + asIsoDateTime(new Date()))}`,
+    id: `${runDate}-${type}-${stableHash(dedupeKey)}`,
     event_type: type,
     severity,
     title,
@@ -3508,9 +3858,15 @@ async function storeConsistencyCheck(
   consistency: ConsistencySnapshot
 ): Promise<void> {
   await db.prepare(`
-    INSERT OR REPLACE INTO market_consistency_checks (as_of, score, state, violations_json, created_at)
-    VALUES (?, ?, ?, ?, datetime('now'))
-  `).bind(asOf, consistency.score, consistency.state, JSON.stringify(consistency.violations)).run();
+    INSERT OR REPLACE INTO market_consistency_checks (as_of, score, state, violations_json, components_json, created_at)
+    VALUES (?, ?, ?, ?, ?, datetime('now'))
+  `).bind(
+    asOf,
+    consistency.score,
+    consistency.state,
+    JSON.stringify(consistency.violations),
+    JSON.stringify(consistency.components),
+  ).run();
 }
 
 async function fetchLatestConsistencyCheck(db: D1Database): Promise<{
@@ -3518,10 +3874,11 @@ async function fetchLatestConsistencyCheck(db: D1Database): Promise<{
   score: number;
   state: ConsistencyState;
   violations: string[];
+  components: ConsistencySnapshot['components'];
   created_at: string;
 } | null> {
   const row = await db.prepare(`
-    SELECT as_of, score, state, violations_json, created_at
+    SELECT as_of, score, state, violations_json, components_json, created_at
     FROM market_consistency_checks
     ORDER BY as_of DESC
     LIMIT 1
@@ -3530,10 +3887,16 @@ async function fetchLatestConsistencyCheck(db: D1Database): Promise<{
     score: number;
     state: string;
     violations_json: string;
+    components_json?: string | null;
     created_at: string;
   }>();
   if (!row) return null;
   let violations: string[] = [];
+  let components: ConsistencySnapshot['components'] = {
+    base_score: 100,
+    structural_penalty: 0,
+    reliability_penalty: 0,
+  };
   try {
     const parsed = JSON.parse(row.violations_json) as unknown;
     if (Array.isArray(parsed)) {
@@ -3542,14 +3905,139 @@ async function fetchLatestConsistencyCheck(db: D1Database): Promise<{
   } catch {
     violations = [];
   }
+  try {
+    if (row.components_json) {
+      const parsed = JSON.parse(row.components_json) as Partial<ConsistencySnapshot['components']>;
+      if (parsed && typeof parsed === 'object') {
+        components = {
+          base_score: toNumber(parsed.base_score, 100),
+          structural_penalty: toNumber(parsed.structural_penalty, 0),
+          reliability_penalty: toNumber(parsed.reliability_penalty, 0),
+        };
+      }
+    }
+  } catch {
+    components = {
+      base_score: 100,
+      structural_penalty: 0,
+      reliability_penalty: 0,
+    };
+  }
   const state: ConsistencyState = row.state === 'FAIL' ? 'FAIL' : row.state === 'WARN' ? 'WARN' : 'PASS';
   return {
     as_of: row.as_of,
     score: toNumber(row.score, 0),
     state,
     violations,
+    components,
     created_at: row.created_at,
   };
+}
+
+async function recordMarketRefreshRunStart(db: D1Database, trigger: string): Promise<number | null> {
+  try {
+    const result = await db.prepare(`
+      INSERT INTO market_refresh_runs (started_at, status, "trigger", created_at)
+      VALUES (?, 'running', ?, datetime('now'))
+    `).bind(asIsoDateTime(new Date()), trigger || 'unknown').run();
+
+    if (typeof result.meta?.last_row_id === 'number') {
+      return result.meta.last_row_id;
+    }
+    return null;
+  } catch (err) {
+    console.error('Failed to record market refresh run start:', err);
+    return null;
+  }
+}
+
+async function recordMarketRefreshRunFinish(
+  db: D1Database,
+  runId: number | null,
+  payload: {
+    status: 'success' | 'failed';
+    brief_generated?: number;
+    opportunities_generated?: number;
+    calibrations_generated?: number;
+    alerts_generated?: number;
+    stale_count?: number | null;
+    as_of?: string | null;
+    error?: string | null;
+  }
+): Promise<void> {
+  if (!runId) return;
+  try {
+    await db.prepare(`
+      UPDATE market_refresh_runs
+      SET completed_at = ?,
+          status = ?,
+          brief_generated = ?,
+          opportunities_generated = ?,
+          calibrations_generated = ?,
+          alerts_generated = ?,
+          stale_count = ?,
+          as_of = ?,
+          error = ?
+      WHERE id = ?
+    `).bind(
+      asIsoDateTime(new Date()),
+      payload.status,
+      payload.brief_generated ?? 0,
+      payload.opportunities_generated ?? 0,
+      payload.calibrations_generated ?? 0,
+      payload.alerts_generated ?? 0,
+      payload.stale_count ?? null,
+      payload.as_of ?? null,
+      payload.error ?? null,
+      runId,
+    ).run();
+  } catch (err) {
+    console.error('Failed to finalize market refresh run:', err);
+  }
+}
+
+async function fetchLatestSuccessfulMarketRefreshRun(db: D1Database): Promise<{
+  completed_at: string | null;
+  trigger: string | null;
+  stale_count: number | null;
+  as_of: string | null;
+} | null> {
+  try {
+    const row = await db.prepare(`
+      SELECT completed_at, "trigger" as trigger, stale_count, as_of
+      FROM market_refresh_runs
+      WHERE status = 'success'
+        AND completed_at IS NOT NULL
+      ORDER BY completed_at DESC, id DESC
+      LIMIT 1
+    `).first<{
+      completed_at: string | null;
+      trigger: string | null;
+      stale_count: number | null;
+      as_of: string | null;
+    }>();
+    return row || null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLatestMarketProductSnapshotWrite(db: D1Database): Promise<string | null> {
+  try {
+    const row = await db.prepare(`
+      SELECT MAX(created_at) as latest_created_at
+      FROM (
+        SELECT created_at FROM market_brief_snapshots
+        UNION ALL
+        SELECT created_at FROM opportunity_snapshots
+        UNION ALL
+        SELECT created_at FROM market_calibration_snapshots
+      )
+    `).first<{ latest_created_at: string | null }>();
+    return row?.latest_created_at || null;
+  } catch {
+    return null;
+  }
 }
 
 async function storeOpportunitySnapshot(db: D1Database, snapshot: OpportunitySnapshot): Promise<void> {
@@ -3562,12 +4050,31 @@ async function storeOpportunitySnapshot(db: D1Database, snapshot: OpportunitySna
 async function insertMarketEvents(db: D1Database, events: MarketAlertEvent[], inAppEnabled: boolean): Promise<number> {
   let inserted = 0;
   for (const event of events) {
-    const result = await db.prepare(`
-      INSERT OR IGNORE INTO market_alert_events
+    const existing = await db.prepare(`
+      SELECT id
+      FROM market_alert_events
+      WHERE dedupe_key = ?
+      LIMIT 1
+    `).bind(event.dedupe_key).first<{ id: string }>();
+
+    const eventId = existing?.id || event.id;
+    const isNew = !existing?.id;
+
+    await db.prepare(`
+      INSERT INTO market_alert_events
       (id, event_type, severity, title, body, entity_type, entity_id, dedupe_key, payload_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(dedupe_key) DO UPDATE SET
+        event_type = excluded.event_type,
+        severity = excluded.severity,
+        title = excluded.title,
+        body = excluded.body,
+        entity_type = excluded.entity_type,
+        entity_id = excluded.entity_id,
+        payload_json = excluded.payload_json,
+        created_at = excluded.created_at
     `).bind(
-      event.id,
+      eventId,
       event.event_type,
       event.severity,
       event.title,
@@ -3579,13 +4086,13 @@ async function insertMarketEvents(db: D1Database, events: MarketAlertEvent[], in
       event.created_at
     ).run();
 
-    if (result.meta?.changes && result.meta.changes > 0) {
+    if (isNew) {
       inserted += 1;
       if (inAppEnabled) {
         await db.prepare(`
           INSERT INTO market_alert_deliveries (event_id, channel, status, attempted_at)
           VALUES (?, 'in_app', 'sent', datetime('now'))
-        `).bind(event.id).run();
+        `).bind(eventId).run();
       }
     }
   }
@@ -5284,13 +5791,44 @@ export default {
               score REAL NOT NULL,
               state TEXT NOT NULL CHECK(state IN ('PASS', 'WARN', 'FAIL')),
               violations_json TEXT NOT NULL,
+              components_json TEXT NOT NULL DEFAULT '{}',
               created_at TEXT DEFAULT (datetime('now'))
             )
           `).run();
+          try {
+            await env.DB.prepare(
+              `ALTER TABLE market_consistency_checks ADD COLUMN components_json TEXT NOT NULL DEFAULT '{}'`
+            ).run();
+          } catch (e) { /* Column already exists */ }
           await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_consistency_created ON market_consistency_checks(created_at DESC)`).run();
           migrations.push('market_consistency_checks');
         } catch (e) {
           console.error('market_consistency_checks migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS market_refresh_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              started_at TEXT NOT NULL,
+              completed_at TEXT,
+              status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed')),
+              "trigger" TEXT NOT NULL DEFAULT 'unknown',
+              brief_generated INTEGER DEFAULT 0,
+              opportunities_generated INTEGER DEFAULT 0,
+              calibrations_generated INTEGER DEFAULT 0,
+              alerts_generated INTEGER DEFAULT 0,
+              stale_count INTEGER,
+              as_of TEXT,
+              error TEXT,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
+          migrations.push('market_refresh_runs');
+        } catch (e) {
+          console.error('market_refresh_runs migration failed:', e);
         }
 
         try {
@@ -5567,11 +6105,24 @@ export default {
           .slice(0, 3)
           .map(({ excessDays: _excessDays, ...offender }) => offender);
 
-        const lastRefreshRow = await env.DB.prepare(`
+        const latestRefreshRun = await fetchLatestSuccessfulMarketRefreshRun(env.DB);
+        const latestProductSnapshotWrite = await fetchLatestMarketProductSnapshotWrite(env.DB);
+        const lastFetchLogRow = await env.DB.prepare(`
           SELECT MAX(completed_at) as last_refresh_at
           FROM fetch_logs
           WHERE completed_at IS NOT NULL
         `).first<{ last_refresh_at: string | null }>();
+        const lastRefreshAtUtc = latestRefreshRun?.completed_at
+          || latestProductSnapshotWrite
+          || lastFetchLogRow?.last_refresh_at
+          || null;
+        const lastRefreshSource = latestRefreshRun?.completed_at
+          ? 'market_refresh_runs'
+          : latestProductSnapshotWrite
+            ? 'market_product_snapshots'
+            : lastFetchLogRow?.last_refresh_at
+              ? 'fetch_logs'
+              : 'unknown';
         const nextRefresh = computeNextExpectedRefresh(new Date());
 
         const response = {
@@ -5611,7 +6162,8 @@ export default {
               daysOld: s.days_old === null || !Number.isFinite(s.days_old) ? null : Math.round(s.days_old),
             })) : [],
             topOffenders,
-            lastRefreshAtUtc: lastRefreshRow?.last_refresh_at || null,
+            lastRefreshAtUtc,
+            lastRefreshSource,
             nextExpectedRefreshAtUtc: nextRefresh.at,
             nextExpectedRefreshInMinutes: nextRefresh.in_minutes,
           },
@@ -5810,7 +6362,13 @@ export default {
 
         const convictionCalibration = await fetchLatestCalibrationSnapshot(env.DB, 'conviction', horizon);
         const calibratedItems = snapshot.items
-          .map((item) => applyOpportunityCalibration(item, convictionCalibration))
+          .map((item) => {
+            const calibrated = applyOpportunityCalibration(item, convictionCalibration);
+            return {
+              ...calibrated,
+              expectancy: normalizeOpportunityExpectancy(calibrated.expectancy, calibrated.direction),
+            };
+          })
           .slice(0, limit);
 
         return Response.json({
@@ -6112,6 +6670,7 @@ export default {
             score: latest.score,
             state: latest.state,
             violations: latest.violations,
+            components: latest.components,
             created_at: latest.created_at,
           }, { headers: corsHeaders });
         }
@@ -6123,6 +6682,7 @@ export default {
             score: canonical.consistency.score,
             state: canonical.consistency.state,
             violations: canonical.consistency.violations,
+            components: canonical.consistency.components,
             created_at: asIsoDateTime(new Date()),
           }, { headers: corsHeaders });
         } catch (err) {
@@ -6147,88 +6707,118 @@ export default {
         const briefEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_BRIEF', 'ENABLE_BRIEF', true);
         const opportunitiesEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true);
         const inAppAlertsEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_IN_APP', 'ENABLE_ALERTS_IN_APP', true);
-
-        let edgeCalibrationSnapshot: MarketCalibrationSnapshotPayload | null = null;
-        let convictionCalibration7d: MarketCalibrationSnapshotPayload | null = null;
-        let convictionCalibration30d: MarketCalibrationSnapshotPayload | null = null;
-        let calibrationsGenerated = 0;
+        const triggerHeader = request.headers.get('X-Refresh-Trigger');
+        const refreshTrigger = triggerHeader && triggerHeader.trim().length > 0
+          ? triggerHeader.trim().slice(0, 128)
+          : 'unknown';
+        const refreshRunId = await recordMarketRefreshRunStart(env.DB, refreshTrigger);
 
         try {
-          edgeCalibrationSnapshot = await buildEdgeQualityCalibrationSnapshot(env.DB);
-          await storeCalibrationSnapshot(env.DB, edgeCalibrationSnapshot);
-          calibrationsGenerated += 1;
+          let edgeCalibrationSnapshot: MarketCalibrationSnapshotPayload | null = null;
+          let convictionCalibration7d: MarketCalibrationSnapshotPayload | null = null;
+          let convictionCalibration30d: MarketCalibrationSnapshotPayload | null = null;
+          let calibrationsGenerated = 0;
+
+          try {
+            edgeCalibrationSnapshot = await buildEdgeQualityCalibrationSnapshot(env.DB);
+            await storeCalibrationSnapshot(env.DB, edgeCalibrationSnapshot);
+            calibrationsGenerated += 1;
+          } catch (err) {
+            console.error('Edge calibration refresh failed:', err);
+            edgeCalibrationSnapshot = null;
+          }
+
+          if (opportunitiesEnabled) {
+            try {
+              convictionCalibration7d = await buildConvictionCalibrationSnapshot(env.DB, '7d');
+              await storeCalibrationSnapshot(env.DB, convictionCalibration7d);
+              calibrationsGenerated += 1;
+            } catch (err) {
+              console.error('7d conviction calibration refresh failed:', err);
+              convictionCalibration7d = null;
+            }
+
+            try {
+              convictionCalibration30d = await buildConvictionCalibrationSnapshot(env.DB, '30d');
+              await storeCalibrationSnapshot(env.DB, convictionCalibration30d);
+              calibrationsGenerated += 1;
+            } catch (err) {
+              console.error('30d conviction calibration refresh failed:', err);
+              convictionCalibration30d = null;
+            }
+          }
+
+          let brief: BriefSnapshot | null = null;
+          let consistencyStored = false;
+          if (briefEnabled) {
+            brief = await buildBriefSnapshot(env.DB);
+            if (brief) {
+              await storeBriefSnapshot(env.DB, brief);
+              await storeConsistencyCheck(env.DB, brief.source_plan_as_of, brief.consistency);
+              consistencyStored = true;
+            }
+          }
+
+          if (!consistencyStored) {
+            try {
+              const canonical = await buildCanonicalMarketDecision(env.DB);
+              await storeConsistencyCheck(env.DB, canonical.as_of, canonical.consistency);
+              consistencyStored = true;
+            } catch (err) {
+              console.error('Consistency snapshot fallback store failed:', err);
+            }
+          }
+
+          let opportunities7d: OpportunitySnapshot | null = null;
+          let opportunities30d: OpportunitySnapshot | null = null;
+          if (opportunitiesEnabled) {
+            opportunities7d = await buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d);
+            opportunities30d = await buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d);
+            if (opportunities7d) await storeOpportunitySnapshot(env.DB, opportunities7d);
+            if (opportunities30d) await storeOpportunitySnapshot(env.DB, opportunities30d);
+          }
+
+          let alertsGenerated = 0;
+          if (brief && opportunities7d) {
+            const generated = await generateMarketEvents(env.DB, brief, opportunities7d);
+            alertsGenerated = await insertMarketEvents(env.DB, generated, inAppAlertsEnabled);
+          }
+
+          const staleCountForRun = brief?.freshness_status.stale_count
+            ?? (await computeFreshnessStatus(env.DB)).stale_count;
+          await recordMarketRefreshRunFinish(env.DB, refreshRunId, {
+            status: 'success',
+            brief_generated: brief ? 1 : 0,
+            opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
+            calibrations_generated: calibrationsGenerated,
+            alerts_generated: alertsGenerated,
+            stale_count: staleCountForRun,
+            as_of: brief?.as_of || opportunities7d?.as_of || null,
+            error: null,
+          });
+
+          return Response.json({
+            ok: true,
+            brief_generated: brief ? 1 : 0,
+            opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
+            calibrations_generated: calibrationsGenerated,
+            alerts_generated: alertsGenerated,
+            consistency_stored: consistencyStored ? 1 : 0,
+            consistency_state: brief?.consistency.state || null,
+            consistency_score: brief?.consistency.score ?? null,
+            as_of: brief?.as_of || opportunities7d?.as_of || null,
+            refresh_trigger: refreshTrigger,
+            refresh_run_id: refreshRunId,
+          }, { headers: corsHeaders });
         } catch (err) {
-          console.error('Edge calibration refresh failed:', err);
-          edgeCalibrationSnapshot = null;
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          await recordMarketRefreshRunFinish(env.DB, refreshRunId, {
+            status: 'failed',
+            error: errorMessage.slice(0, 1000),
+          });
+          console.error('Refresh-products failed:', err);
+          return Response.json({ error: 'Refresh products failed', detail: errorMessage }, { status: 500, headers: corsHeaders });
         }
-
-        if (opportunitiesEnabled) {
-          try {
-            convictionCalibration7d = await buildConvictionCalibrationSnapshot(env.DB, '7d');
-            await storeCalibrationSnapshot(env.DB, convictionCalibration7d);
-            calibrationsGenerated += 1;
-          } catch (err) {
-            console.error('7d conviction calibration refresh failed:', err);
-            convictionCalibration7d = null;
-          }
-
-          try {
-            convictionCalibration30d = await buildConvictionCalibrationSnapshot(env.DB, '30d');
-            await storeCalibrationSnapshot(env.DB, convictionCalibration30d);
-            calibrationsGenerated += 1;
-          } catch (err) {
-            console.error('30d conviction calibration refresh failed:', err);
-            convictionCalibration30d = null;
-          }
-        }
-
-        let brief: BriefSnapshot | null = null;
-        let consistencyStored = false;
-        if (briefEnabled) {
-          brief = await buildBriefSnapshot(env.DB);
-          if (brief) {
-            await storeBriefSnapshot(env.DB, brief);
-            await storeConsistencyCheck(env.DB, brief.source_plan_as_of, brief.consistency);
-            consistencyStored = true;
-          }
-        }
-
-        if (!consistencyStored) {
-          try {
-            const canonical = await buildCanonicalMarketDecision(env.DB);
-            await storeConsistencyCheck(env.DB, canonical.as_of, canonical.consistency);
-            consistencyStored = true;
-          } catch (err) {
-            console.error('Consistency snapshot fallback store failed:', err);
-          }
-        }
-
-        let opportunities7d: OpportunitySnapshot | null = null;
-        let opportunities30d: OpportunitySnapshot | null = null;
-        if (opportunitiesEnabled) {
-          opportunities7d = await buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d);
-          opportunities30d = await buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d);
-          if (opportunities7d) await storeOpportunitySnapshot(env.DB, opportunities7d);
-          if (opportunities30d) await storeOpportunitySnapshot(env.DB, opportunities30d);
-        }
-
-        let alertsGenerated = 0;
-        if (brief && opportunities7d) {
-          const generated = await generateMarketEvents(env.DB, brief, opportunities7d);
-          alertsGenerated = await insertMarketEvents(env.DB, generated, inAppAlertsEnabled);
-        }
-
-        return Response.json({
-          ok: true,
-          brief_generated: brief ? 1 : 0,
-          opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
-          calibrations_generated: calibrationsGenerated,
-          alerts_generated: alertsGenerated,
-          consistency_stored: consistencyStored ? 1 : 0,
-          consistency_state: brief?.consistency.state || null,
-          consistency_score: brief?.consistency.score ?? null,
-          as_of: brief?.as_of || opportunities7d?.as_of || null,
-        }, { headers: corsHeaders });
       }
 
       if (url.pathname === '/api/market/send-digest' && method === 'POST') {
@@ -6709,8 +7299,8 @@ export default {
           });
         }
 
-        const { pxi, signal, regime, freshness, risk_band, edge_quality, policy_state, degraded_reasons } = canonical;
-        const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policy_state.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} tactical posture at ${Math.round(signal.risk_allocation * 100)}% risk budget.${
+        const { pxi, signal, regime, freshness, risk_band, edge_quality, policy_state, degraded_reasons, risk_sizing } = canonical;
+        const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policy_state.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} tactical posture at ${risk_sizing.target_pct}% risk budget (raw ${Math.round(signal.risk_allocation * 100)}%).${
           freshness.stale_count > 0 ? ` ${freshness.stale_count} stale indicator(s) are penalizing confidence.` : ''
         }`;
 
@@ -6719,7 +7309,9 @@ export default {
           setup_summary: setupSummary,
           policy_state,
           action_now: {
-            risk_allocation_target: signal.risk_allocation,
+            risk_allocation_target: risk_sizing.target_pct / 100,
+            raw_signal_allocation_target: risk_sizing.raw_signal_allocation_target,
+            risk_allocation_basis: 'penalized_playbook_target',
             horizon_bias: resolveHorizonBias(signal, regime, edge_quality.score),
             primary_signal: signal.signal_type,
           },
@@ -8585,6 +9177,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
             includePending ? 'no_predictions' : 'no_evaluated_predictions',
             'no_7d_evaluated_predictions',
             'no_30d_evaluated_predictions',
+            'insufficient_sample',
           ];
           const coverage = {
             total_predictions: 0,
@@ -8595,6 +9188,8 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
             message: includePending ? 'No predictions logged yet' : 'No evaluated predictions yet',
             as_of: asIsoDateTime(new Date()),
             coverage,
+            coverage_quality: 'INSUFFICIENT',
+            minimum_reliable_sample: MINIMUM_RELIABLE_SAMPLE,
             unavailable_reasons: unavailableReasons,
             total_predictions: 0,
             evaluated_count: 0,
@@ -8672,6 +9267,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         if (d7_total === 0) unavailableReasons.push('no_7d_evaluated_predictions');
         if (d30_total === 0) unavailableReasons.push('no_30d_evaluated_predictions');
         if (evaluatedCount === 0) unavailableReasons.push('no_evaluated_predictions');
+        if (evaluatedCount < MINIMUM_RELIABLE_SAMPLE) unavailableReasons.push('insufficient_sample');
         const asOfPredictionDate = predictions.results[0]?.prediction_date;
         const asOf = asOfPredictionDate ? `${asOfPredictionDate}T00:00:00.000Z` : asIsoDateTime(new Date());
         const coverage = {
@@ -8679,10 +9275,13 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           evaluated_count: evaluatedCount,
           pending_count: pendingCount,
         };
+        const coverageQuality = calibrationQualityForSampleSize(evaluatedCount);
 
         return Response.json({
           as_of: asOf,
           coverage,
+          coverage_quality: coverageQuality,
+          minimum_reliable_sample: MINIMUM_RELIABLE_SAMPLE,
           unavailable_reasons: unavailableReasons,
           total_predictions: predictions.results.length,
           evaluated_count: evaluatedCount,
@@ -8743,6 +9342,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
             includePending ? 'no_predictions' : 'no_evaluated_predictions',
             'no_7d_evaluated_predictions',
             'no_30d_evaluated_predictions',
+            'insufficient_sample',
           ];
           const coverage = {
             total_predictions: 0,
@@ -8753,6 +9353,8 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
             message: includePending ? 'No ensemble predictions logged yet' : 'No evaluated ensemble predictions yet',
             as_of: asIsoDateTime(new Date()),
             coverage,
+            coverage_quality: 'INSUFFICIENT',
+            minimum_reliable_sample: MINIMUM_RELIABLE_SAMPLE,
             unavailable_reasons: unavailableReasons,
             total_predictions: 0,
             evaluated_count: 0,
@@ -8882,6 +9484,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         if (metrics.ensemble.d7_total === 0) unavailableReasons.push('no_7d_evaluated_predictions');
         if (metrics.ensemble.d30_total === 0) unavailableReasons.push('no_30d_evaluated_predictions');
         if (evaluatedCount === 0) unavailableReasons.push('no_evaluated_predictions');
+        if (evaluatedCount < MINIMUM_RELIABLE_SAMPLE) unavailableReasons.push('insufficient_sample');
         const asOfPredictionDate = predictions.results[0]?.prediction_date;
         const asOf = asOfPredictionDate ? `${asOfPredictionDate}T00:00:00.000Z` : asIsoDateTime(new Date());
         const coverage = {
@@ -8889,10 +9492,13 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           evaluated_count: evaluatedCount,
           pending_count: pendingCount,
         };
+        const coverageQuality = calibrationQualityForSampleSize(evaluatedCount);
 
         return Response.json({
           as_of: asOf,
           coverage,
+          coverage_quality: coverageQuality,
+          minimum_reliable_sample: MINIMUM_RELIABLE_SAMPLE,
           unavailable_reasons: unavailableReasons,
           total_predictions: predictions.results.length,
           evaluated_count: evaluatedCount,

@@ -1067,6 +1067,7 @@ async function triggerMarketProductsRefresh(): Promise<void> {
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${writeApiKey}`,
+      'X-Refresh-Trigger': 'cron_fast_pipeline',
     },
   });
 

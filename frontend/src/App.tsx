@@ -228,6 +228,8 @@ interface MLAccuracyApiResponse {
     evaluated_count: number
     pending_count: number
   }
+  coverage_quality?: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+  minimum_reliable_sample?: number
   unavailable_reasons?: string[]
   total_predictions: number
   evaluated_count: number
@@ -249,6 +251,8 @@ interface MLAccuracyData {
     evaluated_count: number
     pending_count: number
   }
+  coverage_quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+  minimum_reliable_sample: number
   unavailable_reasons: string[]
   rolling_7d: {
     direction_accuracy: number | null
@@ -285,6 +289,8 @@ function parseMLAccuracy(api: MLAccuracyApiResponse): MLAccuracyData | null {
       evaluated_count: api.evaluated_count || 0,
       pending_count: api.pending_count || 0,
     },
+    coverage_quality: api.coverage_quality || 'INSUFFICIENT',
+    minimum_reliable_sample: typeof api.minimum_reliable_sample === 'number' ? api.minimum_reliable_sample : 30,
     unavailable_reasons: Array.isArray(api.unavailable_reasons) ? api.unavailable_reasons : [],
     rolling_7d: {
       direction_accuracy: parsePercent(d7?.direction_accuracy),
@@ -389,12 +395,15 @@ interface OpportunityItem {
     sample_size: number
     quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
     basis: 'conviction_decile'
+    window: string | null
     unavailable_reason: string | null
   }
   expectancy?: {
     expected_move_pct: number | null
     max_adverse_move_pct: number | null
     sample_size: number
+    basis: 'theme_direction' | 'theme_direction_shrunk_prior' | 'direction_prior_proxy' | 'none'
+    quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
     unavailable_reason: string | null
   }
   updated_at: string
@@ -437,6 +446,8 @@ interface PlanData {
   }
   action_now: {
     risk_allocation_target: number
+    raw_signal_allocation_target: number
+    risk_allocation_basis: 'penalized_playbook_target' | 'fallback_neutral'
     horizon_bias: string
     primary_signal: 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE' | string
   }
@@ -476,6 +487,11 @@ interface PlanData {
     score: number
     state: 'PASS' | 'WARN' | 'FAIL'
     violations: string[]
+    components?: {
+      base_score: number
+      structural_penalty: number
+      reliability_penalty: number
+    }
   }
   trader_playbook: {
     recommended_size_pct: { min: number; target: number; max: number }
@@ -646,6 +662,7 @@ interface PXIData {
       escalation: 'observe' | 'retry_source' | 'escalate_ops'
     }>
     lastRefreshAtUtc?: string | null
+    lastRefreshSource?: string
     nextExpectedRefreshAtUtc?: string
     nextExpectedRefreshInMinutes?: number
   }
@@ -881,6 +898,7 @@ function fallbackOpportunityCalibration(): NonNullable<OpportunityItem['calibrat
     sample_size: 0,
     quality: 'INSUFFICIENT',
     basis: 'conviction_decile',
+    window: null,
     unavailable_reason: 'insufficient_sample',
   }
 }
@@ -890,6 +908,8 @@ function fallbackOpportunityExpectancy(): NonNullable<OpportunityItem['expectanc
     expected_move_pct: null,
     max_adverse_move_pct: null,
     sample_size: 0,
+    basis: 'none',
+    quality: 'INSUFFICIENT',
     unavailable_reason: 'insufficient_sample',
   }
 }
@@ -916,6 +936,8 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
   if (!plan) return null
 
   const policyStance = derivePolicyStance(plan)
+  const targetPct = Math.round(plan.action_now.risk_allocation_target * 100)
+  const rawTargetPct = Math.round((plan.action_now.raw_signal_allocation_target ?? plan.action_now.risk_allocation_target) * 100)
   const qualityColor =
     plan.edge_quality.label === 'HIGH' ? 'text-[#00c896]' :
     plan.edge_quality.label === 'MEDIUM' ? 'text-[#f59e0b]' :
@@ -965,9 +987,14 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
               tactical {plan.action_now.primary_signal.replace('_', ' ')}
             </span>
             <span className="rounded border border-[#26272b] px-2 py-1 text-[#d7dbe1]">
-              target {Math.round(plan.action_now.risk_allocation_target * 100)}%
+              target {targetPct}%
             </span>
           </div>
+          {rawTargetPct !== targetPct && (
+            <p className="mt-1 text-[9px] text-[#949ba5]/75">
+              raw {rawTargetPct}% · {plan.action_now.risk_allocation_basis.replace(/_/g, ' ')}
+            </p>
+          )}
           <p className="mt-2 text-[12px] leading-relaxed text-[#e4e8ee]">{plan.setup_summary}</p>
         </div>
         <div className="shrink-0 text-right">
@@ -996,6 +1023,11 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
             calibration {calibration.quality.toLowerCase()}
           </span>
         </div>
+        {plan.consistency.components && (
+          <p className="mt-2 text-[9px] text-[#949ba5]/70">
+            score build: base {plan.consistency.components.base_score} - structural {plan.consistency.components.structural_penalty} - reliability {plan.consistency.components.reliability_penalty}
+          </p>
+        )}
         <div className="mt-3 grid grid-cols-3 gap-2">
           {bars.map((bar) => (
             <div key={bar.label}>
@@ -1890,6 +1922,7 @@ function StaleDataWarning({ freshness }: { freshness: PXIData['dataFreshness'] }
           <div className="flex flex-wrap gap-3 text-[9px] text-[#949ba5]/70 uppercase tracking-wider mb-3">
             <div>
               last refresh {freshness.lastRefreshAtUtc ? new Date(freshness.lastRefreshAtUtc).toLocaleString() : 'unknown'}
+              {freshness.lastRefreshSource ? ` (${freshness.lastRefreshSource.replace(/_/g, ' ')})` : ''}
             </div>
             <div>
               next refresh {freshness.nextExpectedRefreshAtUtc ? new Date(freshness.nextExpectedRefreshAtUtc).toLocaleString() : 'unknown'}
@@ -1946,8 +1979,10 @@ function MLAccuracyBadge({ accuracy }: { accuracy: MLAccuracyData | null }) {
 
   const acc7d = accuracy.rolling_7d.direction_accuracy
   const acc30d = accuracy.rolling_30d.direction_accuracy
+  const insufficientSample = accuracy.coverage_quality === 'INSUFFICIENT' || accuracy.coverage.evaluated_count < accuracy.minimum_reliable_sample
 
   const getColor = (acc: number | null) => {
+    if (insufficientSample) return 'text-[#949ba5]'
     if (acc === null) return 'text-[#949ba5]'
     if (acc >= 70) return 'text-[#00c896]'
     if (acc >= 55) return 'text-[#f59e0b]'
@@ -1977,6 +2012,11 @@ function MLAccuracyBadge({ accuracy }: { accuracy: MLAccuracyData | null }) {
       {accuracy.unavailable_reasons.length > 0 && (
         <div className="text-[8px] text-[#949ba5]/60 self-center">
           {accuracy.unavailable_reasons.slice(0, 1).map((reason) => formatUnavailableReason(reason)).join(', ')}
+        </div>
+      )}
+      {insufficientSample && (
+        <div className="text-[8px] text-[#949ba5]/60 self-center">
+          low sample (n={accuracy.coverage.evaluated_count}/{accuracy.minimum_reliable_sample})
         </div>
       )}
     </div>
@@ -2587,12 +2627,12 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
             <p className="mt-1 text-[9px] text-[#949ba5]/70">
               calibrated hit {formatProbability(calibration.probability_correct_direction)} ·
               {' '}95% CI {formatProbability(calibration.ci95_low)}-{formatProbability(calibration.ci95_high)} ·
-              {' '}n={calibration.sample_size}
+              {' '}n={calibration.sample_size} · window {calibration.window || 'n/a'}
             </p>
             <p className="mt-1 text-[9px] text-[#949ba5]/70">
               expectancy {formatMaybePercent(expectancy.expected_move_pct)} ·
               {' '}max adverse {formatMaybePercent(expectancy.max_adverse_move_pct)} ·
-              {' '}n={expectancy.sample_size}
+              {' '}n={expectancy.sample_size} · {expectancy.basis.replace(/_/g, ' ')} · {expectancy.quality.toLowerCase()}
             </p>
             {(calibration.unavailable_reason || expectancy.unavailable_reason) && (
               <p className="mt-1 text-[9px] text-[#949ba5]/70">
@@ -2791,12 +2831,12 @@ function OpportunitiesPage({
                 <div className="mt-2 text-[9px] text-[#949ba5]/70">
                   Calibrated p(correct) {formatProbability(calibration.probability_correct_direction)} ·
                   {' '}95% CI {formatProbability(calibration.ci95_low)}-{formatProbability(calibration.ci95_high)} ·
-                  {' '}n={calibration.sample_size}
+                  {' '}n={calibration.sample_size} · window {calibration.window || 'n/a'}
                 </div>
                 <div className="mt-1 text-[9px] text-[#949ba5]/70">
                   Expectancy {formatMaybePercent(expectancy.expected_move_pct)} ·
                   {' '}max adverse {formatMaybePercent(expectancy.max_adverse_move_pct)} ·
-                  {' '}n={expectancy.sample_size}
+                  {' '}n={expectancy.sample_size} · {expectancy.basis.replace(/_/g, ' ')} · {expectancy.quality.toLowerCase()}
                 </div>
                 {(calibration.unavailable_reason || expectancy.unavailable_reason) && (
                   <div className="mt-1 text-[9px] text-[#949ba5]/70">
@@ -3913,6 +3953,11 @@ function App() {
           if (planJson.setup_summary && planJson.action_now) {
             setPlanData({
               ...planJson,
+              action_now: {
+                ...planJson.action_now,
+                raw_signal_allocation_target: planJson.action_now.raw_signal_allocation_target ?? planJson.action_now.risk_allocation_target,
+                risk_allocation_basis: planJson.action_now.risk_allocation_basis || 'penalized_playbook_target',
+              },
               policy_state: planJson.policy_state ? {
                 ...planJson.policy_state,
                 rationale_codes: planJson.policy_state.rationale_codes || [],
@@ -3925,11 +3970,25 @@ function App() {
                   limited_scenario_sample: false,
                 },
               },
-              consistency: planJson.consistency || {
-                score: 100,
-                state: 'PASS',
-                violations: [],
-              },
+              consistency: planJson.consistency
+                ? {
+                    ...planJson.consistency,
+                    components: planJson.consistency.components || {
+                      base_score: 100,
+                      structural_penalty: 0,
+                      reliability_penalty: 0,
+                    },
+                  }
+                : {
+                    score: 100,
+                    state: 'PASS',
+                    violations: [],
+                    components: {
+                      base_score: 100,
+                      structural_penalty: 0,
+                      reliability_penalty: 0,
+                    },
+                  },
               trader_playbook: planJson.trader_playbook || {
                 recommended_size_pct: { min: 25, target: 50, max: 65 },
                 scenarios: [],

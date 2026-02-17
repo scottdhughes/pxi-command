@@ -6,6 +6,7 @@ import { writeFile } from 'node:fs/promises';
 const WRITE_API_URL = process.env.WRITE_API_URL ?? '';
 const WRITE_API_KEY = process.env.WRITE_API_KEY ?? '';
 const MARKET_SUMMARY_PATH = process.env.MARKET_SUMMARY_PATH ?? '/tmp/pxi-market-summary.json';
+const REFRESH_TRIGGER = process.env.REFRESH_TRIGGER ?? 'postrefresh_market_script';
 
 function getBaseUrl(): string {
   if (!WRITE_API_URL) {
@@ -24,6 +25,7 @@ async function main(): Promise<void> {
     headers: {
       Authorization: `Bearer ${WRITE_API_KEY}`,
       'Content-Type': 'application/json',
+      'X-Refresh-Trigger': REFRESH_TRIGGER,
     },
   });
 

@@ -49,6 +49,7 @@ jobs:
           BASE_URL="${WRITE_API_URL%/api/write}"
           RESPONSE="$(curl -fsS -X POST "${BASE_URL}/api/market/refresh-products" \
             -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H "X-Refresh-Trigger: github_actions_daily_refresh" \
             -H "Content-Type: application/json")"
           jq -n \
             --arg generated_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
