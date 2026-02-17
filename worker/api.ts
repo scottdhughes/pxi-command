@@ -1021,6 +1021,7 @@ interface IndicatorRow {
 
 type RegimeDelta = 'UNCHANGED' | 'SHIFTED' | 'STRENGTHENED' | 'WEAKENED';
 type RiskPosture = 'risk_on' | 'neutral' | 'risk_off';
+type PolicyStance = 'RISK_ON' | 'RISK_OFF' | 'MIXED';
 type OpportunityDirection = 'bullish' | 'bearish' | 'neutral';
 type MarketAlertType = 'regime_change' | 'threshold_cross' | 'opportunity_spike' | 'freshness_warning';
 type AlertSeverity = 'info' | 'warning' | 'critical';
@@ -1070,6 +1071,7 @@ interface BriefSnapshot {
   regime_delta: RegimeDelta;
   top_changes: string[];
   risk_posture: RiskPosture;
+  policy_state?: PolicyStateSnapshot;
   explainability: {
     category_movers: Array<{ category: string; score_change: number }>;
     indicator_movers: Array<{ indicator_id: string; value_change: number; z_impact: number }>;
@@ -1141,6 +1143,15 @@ interface EdgeQualitySnapshot {
   calibration: EdgeQualityCalibration;
 }
 
+interface PolicyStateSnapshot {
+  stance: PolicyStance;
+  risk_posture: RiskPosture;
+  conflict_state: ConflictState;
+  base_signal: SignalType;
+  regime_context: RegimeType;
+  rationale: string;
+}
+
 interface PlanRiskBand {
   bear: number | null;
   base: number | null;
@@ -1151,6 +1162,7 @@ interface PlanRiskBand {
 interface PlanPayload {
   as_of: string;
   setup_summary: string;
+  policy_state: PolicyStateSnapshot;
   action_now: {
     risk_allocation_target: number;
     horizon_bias: string;
@@ -1620,10 +1632,56 @@ function buildOpportunityCalibrationFromSnapshot(
   };
 }
 
-function mapRiskPosture(regime: RegimeResult | null, score: number): RiskPosture {
-  if (regime?.regime === 'RISK_OFF' || score <= 40) return 'risk_off';
-  if (regime?.regime === 'RISK_ON' || score >= 60) return 'risk_on';
+function signalTypeToPolicyStance(signalType: SignalType): PolicyStance {
+  if (signalType === 'RISK_OFF' || signalType === 'DEFENSIVE') {
+    return 'RISK_OFF';
+  }
+  return 'RISK_ON';
+}
+
+function policyStanceToRiskPosture(stance: PolicyStance): RiskPosture {
+  if (stance === 'RISK_ON') return 'risk_on';
+  if (stance === 'RISK_OFF') return 'risk_off';
   return 'neutral';
+}
+
+function buildPolicyStateSnapshot(params: {
+  signal: PXISignal;
+  regime: RegimeResult | null;
+  edgeQuality: EdgeQualitySnapshot;
+  freshness: { stale_count: number };
+  calibrationQuality?: CalibrationQuality | null;
+}): PolicyStateSnapshot {
+  const { signal, regime, edgeQuality, freshness, calibrationQuality } = params;
+  const baseStance = signalTypeToPolicyStance(signal.signal_type);
+  const reasons: string[] = [];
+
+  if (edgeQuality.conflict_state === 'CONFLICT') {
+    reasons.push('regime_signal_conflict');
+  }
+  if (edgeQuality.label === 'LOW') {
+    reasons.push('low_edge_quality');
+  }
+  if (freshness.stale_count > 0) {
+    reasons.push('stale_inputs');
+  }
+  if (calibrationQuality && calibrationQuality !== 'ROBUST') {
+    reasons.push('limited_calibration');
+  }
+
+  const stance: PolicyStance = reasons.length > 0 ? 'MIXED' : baseStance;
+  const rationale = reasons.length > 0
+    ? `mixed:${reasons.join(',')}`
+    : `aligned:${signal.signal_type.toLowerCase()}`;
+
+  return {
+    stance,
+    risk_posture: policyStanceToRiskPosture(stance),
+    conflict_state: edgeQuality.conflict_state,
+    base_signal: signal.signal_type,
+    regime_context: regime?.regime || 'TRANSITION',
+    rationale,
+  };
 }
 
 function resolveRegimeDelta(
@@ -1952,6 +2010,14 @@ function buildBriefFallbackSnapshot(reason: string): BriefSnapshot & { degraded_
     regime_delta: 'UNCHANGED',
     top_changes: [`degraded: ${reason}`],
     risk_posture: 'neutral',
+    policy_state: {
+      stance: 'MIXED',
+      risk_posture: 'neutral',
+      conflict_state: 'MIXED',
+      base_signal: 'REDUCED_RISK',
+      regime_context: 'TRANSITION',
+      rationale: `fallback:${reason}`,
+    },
     explainability: {
       category_movers: [],
       indicator_movers: [],
@@ -1981,6 +2047,14 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
   return {
     as_of: asIsoDateTime(new Date()),
     setup_summary: 'Plan service is in degraded mode. Use neutral sizing until full context is restored.',
+    policy_state: {
+      stance: 'MIXED',
+      risk_posture: 'neutral',
+      conflict_state: 'MIXED',
+      base_signal: 'REDUCED_RISK',
+      regime_context: 'TRANSITION',
+      rationale: `fallback:${reason}`,
+    },
     action_now: {
       risk_allocation_target: 0.5,
       horizon_bias: '7d_neutral_30d_neutral',
@@ -2145,20 +2219,22 @@ async function fetchLatestSignalsThemes(): Promise<SignalsThemeRecord[]> {
 
 async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null> {
   const latestAndPrevious = await db.prepare(`
-    SELECT date, score, label, status
+    SELECT date, score, label, status, delta_7d, delta_30d
     FROM pxi_scores
     ORDER BY date DESC
     LIMIT 2
-  `).all<{ date: string; score: number; label: string; status: string }>();
+  `).all<{ date: string; score: number; label: string; status: string; delta_7d: number | null; delta_30d: number | null }>();
 
   const latest = latestAndPrevious.results?.[0];
   if (!latest) return null;
   const previous = latestAndPrevious.results?.[1] || null;
 
-  const [currentRegime, previousRegime, freshness] = await Promise.all([
+  const [currentRegime, previousRegime, freshness, mlSampleSize, edgeCalibrationSnapshot] = await Promise.all([
     detectRegime(db, latest.date),
     previous ? detectRegime(db, previous.date) : Promise.resolve(null),
     computeFreshnessStatus(db),
+    fetchPredictionEvaluationSampleSize(db),
+    fetchLatestCalibrationSnapshot(db, 'edge_quality', null),
   ]);
 
   const categoryRows = await db.prepare(`
@@ -2180,24 +2256,58 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
     .sort((a, b) => Math.abs(b.score_change) - Math.abs(a.score_change))
     .slice(0, 5);
 
-  const indicatorRows = await db.prepare(`
-    SELECT i.indicator_id as indicator_id,
-           i.raw_value as current_value,
-           p.raw_value as previous_value,
-           i.normalized_value as current_norm,
-           p.normalized_value as previous_norm
-    FROM indicator_scores i
-    LEFT JOIN indicator_scores p
-      ON p.indicator_id = i.indicator_id
-      AND p.date = ?
-    WHERE i.date = ?
-  `).bind(previous?.date || '', latest.date).all<{
-    indicator_id: string;
-    current_value: number;
-    previous_value: number | null;
-    current_norm: number;
-    previous_norm: number | null;
-  }>();
+  const categoryScoresForSignal = (categoryRows.results || []).map((row) => ({ score: row.current_score }));
+  if (categoryScoresForSignal.length === 0) {
+    categoryScoresForSignal.push({ score: latest.score });
+  }
+
+  const [indicatorRows, divergence] = await Promise.all([
+    db.prepare(`
+      SELECT i.indicator_id as indicator_id,
+             i.raw_value as current_value,
+             p.raw_value as previous_value,
+             i.normalized_value as current_norm,
+             p.normalized_value as previous_norm
+      FROM indicator_scores i
+      LEFT JOIN indicator_scores p
+        ON p.indicator_id = i.indicator_id
+        AND p.date = ?
+      WHERE i.date = ?
+    `).bind(previous?.date || '', latest.date).all<{
+      indicator_id: string;
+      current_value: number;
+      previous_value: number | null;
+      current_norm: number;
+      previous_norm: number | null;
+    }>(),
+    detectDivergence(db, latest.score, currentRegime),
+  ]);
+
+  const signal = await calculatePXISignal(
+    db,
+    { score: latest.score, delta_7d: latest.delta_7d, delta_30d: latest.delta_30d },
+    currentRegime,
+    categoryScoresForSignal,
+  );
+  const conflictState = resolveConflictState(currentRegime, signal);
+  const edgeQuality = computeEdgeQualitySnapshot({
+    staleCount: freshness.stale_count,
+    mlSampleSize,
+    regime: currentRegime,
+    conflictState,
+    divergenceCount: divergence.alerts.length,
+  });
+  const edgeQualityWithCalibration: EdgeQualitySnapshot = {
+    ...edgeQuality,
+    calibration: buildEdgeQualityCalibrationFromSnapshot(edgeCalibrationSnapshot, edgeQuality.score),
+  };
+  const policyState = buildPolicyStateSnapshot({
+    signal,
+    regime: currentRegime,
+    edgeQuality: edgeQualityWithCalibration,
+    freshness,
+    calibrationQuality: edgeQualityWithCalibration.calibration.quality,
+  });
 
   const indicatorMovers = (indicatorRows.results || [])
     .map((row) => ({
@@ -2210,7 +2320,7 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
 
   const scoreDelta = previous ? latest.score - previous.score : null;
   const regimeDelta = resolveRegimeDelta(currentRegime, previousRegime, scoreDelta);
-  const riskPosture = mapRiskPosture(currentRegime, latest.score);
+  const riskPosture = policyState.risk_posture;
   const deltaText = scoreDelta !== null ? `${scoreDelta >= 0 ? '+' : ''}${scoreDelta.toFixed(1)}` : 'n/a';
 
   const topChanges: string[] = [];
@@ -2225,7 +2335,7 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
     );
   }
 
-  const summary = `PXI ${latest.score.toFixed(1)} (${latest.label}), ${deltaText} vs prior reading. Regime ${regimeLabel(currentRegime)}; posture ${riskPosture.replace('_', '-')}.${
+  const summary = `PXI ${latest.score.toFixed(1)} (${latest.label}), ${deltaText} vs prior reading. Regime ${regimeLabel(currentRegime)}; posture ${riskPosture.replace('_', '-')} (${policyState.stance.replace('_', ' ')}).${
     freshness.has_stale_data ? ` ${freshness.stale_count} indicator(s) stale.` : ''
   }`;
 
@@ -2235,6 +2345,7 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
     regime_delta: regimeDelta,
     top_changes: topChanges.slice(0, 5),
     risk_posture: riskPosture,
+    policy_state: policyState,
     explainability: {
       category_movers: categoryMovers,
       indicator_movers: indicatorMovers,
@@ -5916,8 +6027,15 @@ export default {
           ...edgeQuality,
           calibration: buildEdgeQualityCalibrationFromSnapshot(edgeCalibrationSnapshot, edgeQuality.score),
         };
+        const policyState = buildPolicyStateSnapshot({
+          signal,
+          regime,
+          edgeQuality: edgeQualityWithCalibration,
+          freshness,
+          calibrationQuality: edgeQualityWithCalibration.calibration.quality,
+        });
 
-        const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${signal.signal_type.replace('_', ' ')} posture at ${Math.round(signal.risk_allocation * 100)}% risk budget.${
+        const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policyState.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} tactical posture at ${Math.round(signal.risk_allocation * 100)}% risk budget.${
           freshness.stale_count > 0 ? ` ${freshness.stale_count} stale indicator(s) are penalizing confidence.` : ''
         }`;
 
@@ -5932,6 +6050,7 @@ export default {
         const payload: PlanPayload = {
           as_of: `${pxi.date}T00:00:00.000Z`,
           setup_summary: setupSummary,
+          policy_state: policyState,
           action_now: {
             risk_allocation_target: signal.risk_allocation,
             horizon_bias: resolveHorizonBias(signal, regime, edgeQuality.score),

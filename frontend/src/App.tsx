@@ -377,6 +377,14 @@ interface AlertsFeedResponse {
 interface PlanData {
   as_of: string
   setup_summary: string
+  policy_state?: {
+    stance: 'RISK_ON' | 'RISK_OFF' | 'MIXED'
+    risk_posture: 'risk_on' | 'neutral' | 'risk_off'
+    conflict_state: 'ALIGNED' | 'MIXED' | 'CONFLICT'
+    base_signal: 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE' | string
+    regime_context: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
+    rationale: string
+  }
   action_now: {
     risk_allocation_target: number
     horizon_bias: string
@@ -782,9 +790,28 @@ function fallbackOpportunityCalibration(): NonNullable<OpportunityItem['calibrat
   }
 }
 
+function derivePolicyStance(plan: PlanData): 'RISK_ON' | 'RISK_OFF' | 'MIXED' {
+  if (plan.policy_state?.stance) return plan.policy_state.stance
+
+  if (plan.edge_quality.conflict_state === 'CONFLICT') {
+    return 'MIXED'
+  }
+
+  return (plan.action_now.primary_signal === 'RISK_OFF' || plan.action_now.primary_signal === 'DEFENSIVE')
+    ? 'RISK_OFF'
+    : 'RISK_ON'
+}
+
+function policyStanceClass(stance: 'RISK_ON' | 'RISK_OFF' | 'MIXED'): string {
+  if (stance === 'RISK_ON') return 'border-[#00c896]/40 text-[#00c896]'
+  if (stance === 'RISK_OFF') return 'border-[#ff6b6b]/40 text-[#ff6b6b]'
+  return 'border-[#f59e0b]/40 text-[#f59e0b]'
+}
+
 function TodayPlanCard({ plan }: { plan: PlanData | null }) {
   if (!plan) return null
 
+  const policyStance = derivePolicyStance(plan)
   const qualityColor =
     plan.edge_quality.label === 'HIGH' ? 'text-[#00c896]' :
     plan.edge_quality.label === 'MEDIUM' ? 'text-[#f59e0b]' :
@@ -807,7 +834,20 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-[9px] uppercase tracking-[0.25em] text-[#949ba5]">Today Plan</p>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wide">
+            <span className={`rounded border px-2 py-1 ${policyStanceClass(policyStance)}`}>
+              stance {policyStance.replace('_', ' ')}
+            </span>
+            <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
+              tactical {plan.action_now.primary_signal.replace('_', ' ')}
+            </span>
+          </div>
           <p className="mt-1 text-[12px] leading-relaxed text-[#e4e8ee]">{plan.setup_summary}</p>
+          {plan.policy_state?.rationale ? (
+            <p className="mt-1 text-[9px] uppercase tracking-wide text-[#949ba5]/70">
+              {plan.policy_state.rationale.replace(/_/g, ' ')}
+            </p>
+          ) : null}
         </div>
         <div className="shrink-0 text-right">
           <p className={`text-[11px] font-medium uppercase tracking-wide ${qualityColor}`}>
@@ -820,9 +860,6 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
       <div className="mt-3 flex flex-wrap gap-2 text-[10px]">
         <span className="rounded border border-[#26272b] px-2 py-1 text-[#d7dbe1]">
           risk {Math.round(plan.action_now.risk_allocation_target * 100)}%
-        </span>
-        <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
-          {plan.action_now.primary_signal.replace('_', ' ')}
         </span>
         <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
           {plan.action_now.horizon_bias.replace(/_/g, ' ')}
@@ -2248,11 +2285,19 @@ function BacktestCard({ data }: { data: BacktestData | null }) {
   )
 }
 
-function BriefCompactCard({ brief, onOpen }: { brief: BriefData | null; onOpen: () => void }) {
+function BriefCompactCard({
+  brief,
+  onOpen,
+  className,
+}: {
+  brief: BriefData | null
+  onOpen: () => void
+  className?: string
+}) {
   if (!brief) return null
 
   return (
-    <div className="w-full mt-6 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+    <div className={className || "w-full mt-6 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg"}>
       <div className="flex items-center justify-between mb-2">
         <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider">Today&apos;s Brief</div>
         <button
@@ -3935,10 +3980,9 @@ function App() {
 
       {/* Main Content */}
       <main className="flex flex-col items-center max-w-lg w-full pt-8 sm:pt-0">
-        {/* Status Badge & Regime */}
+        {/* Status Badge */}
         <div className="mb-6 sm:mb-8 flex flex-col items-center gap-3">
           <StatusBadge status={data.status} label={data.label} />
-          {data.regime && <RegimeBadge regime={data.regime} />}
         </div>
 
         <TodayPlanCard plan={planData} />
@@ -3995,9 +4039,6 @@ function App() {
           />
         )}
 
-        {/* v1.1: Signal Indicator */}
-        {signal && <SignalIndicator signal={signal.signal} />}
-
         {/* Divergence Alerts */}
         {data.divergence && <DivergenceAlerts divergence={data.divergence} />}
 
@@ -4010,8 +4051,23 @@ function App() {
         {/* v1.5: Top Themes from Signals */}
         <TopThemesWidget data={signalsData} regime={data.regime?.type} />
 
-        <BriefCompactCard brief={briefData} onOpen={() => navigateTo('/brief')} />
         <OpportunityPreview data={opportunitiesData} onOpen={() => navigateTo('/opportunities')} />
+
+        <details className="w-full mt-6 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+          <summary className="cursor-pointer text-[9px] text-[#949ba5]/60 uppercase tracking-wider">
+            Context Tools
+          </summary>
+          <div className="mt-3 space-y-3">
+            {data.regime ? (
+              <div className="flex justify-start">
+                <RegimeBadge regime={data.regime} />
+              </div>
+            ) : null}
+            {signal && <SignalIndicator signal={signal.signal} />}
+            <BriefCompactCard brief={briefData} onOpen={() => navigateTo('/brief')} className="w-full p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg" />
+          </div>
+        </details>
+
         {subscriptionNotice && (
           <div className="w-full mt-4 p-3 border border-[#1f3e56] bg-[#091825] rounded text-[11px] text-[#9ec5e2]">
             {subscriptionNotice}
