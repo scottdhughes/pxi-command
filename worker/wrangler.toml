@@ -4,28 +4,99 @@ compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 # D1 Database
-[[d1_databases]]
+[env.staging]
+[[env.staging.d1_databases]]
 binding = "DB"
 database_name = "pxi-db"
 database_id = "2254a52c-11b6-40a6-8881-ef6880f70d21"
 
 # Vectorize for market embeddings
-[[vectorize]]
+[[env.staging.vectorize]]
 binding = "VECTORIZE"
 index_name = "pxi-embeddings"
 
 # Workers AI
-[ai]
+[env.staging.ai]
 binding = "AI"
 
 # KV for ML models
-[[kv_namespaces]]
+[[env.staging.kv_namespaces]]
 binding = "ML_MODELS"
 id = "88901ff0216a484eb81b8004be0f5aea"
 
-[[kv_namespaces]]
+[[env.staging.kv_namespaces]]
 binding = "RATE_LIMIT_KV"
 id = "e9d69a554ea44727b185127ea67e6932"
+
+[env.staging.vars]
+FEATURE_ENABLE_BRIEF = "true"
+FEATURE_ENABLE_OPPORTUNITIES = "true"
+FEATURE_ENABLE_ALERTS_IN_APP = "true"
+FEATURE_ENABLE_ALERTS_EMAIL = "true"
+FEATURE_ENABLE_PLAN = "true"
+
+[env.production]
+routes = [
+  { pattern = "api.pxicommand.com", custom_domain = true },
+  { pattern = "www.pxicommand.com/*", zone_name = "pxicommand.com" }
+]
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "pxi-db"
+database_id = "2254a52c-11b6-40a6-8881-ef6880f70d21"
+
+[[env.production.vectorize]]
+binding = "VECTORIZE"
+index_name = "pxi-embeddings"
+
+[env.production.ai]
+binding = "AI"
+
+[[env.production.kv_namespaces]]
+binding = "ML_MODELS"
+id = "88901ff0216a484eb81b8004be0f5aea"
+
+[[env.production.kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "e9d69a554ea44727b185127ea67e6932"
+
+[env.production.vars]
+FEATURE_ENABLE_BRIEF = "true"
+FEATURE_ENABLE_OPPORTUNITIES = "true"
+FEATURE_ENABLE_ALERTS_IN_APP = "true"
+FEATURE_ENABLE_ALERTS_EMAIL = "true"
+FEATURE_ENABLE_PLAN = "true"
+
+[env.fallback]
+name = "pxi-api"
+
+[[env.fallback.d1_databases]]
+binding = "DB"
+database_name = "pxi-db"
+database_id = "2254a52c-11b6-40a6-8881-ef6880f70d21"
+
+[[env.fallback.vectorize]]
+binding = "VECTORIZE"
+index_name = "pxi-embeddings"
+
+[env.fallback.ai]
+binding = "AI"
+
+[[env.fallback.kv_namespaces]]
+binding = "ML_MODELS"
+id = "88901ff0216a484eb81b8004be0f5aea"
+
+[[env.fallback.kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "e9d69a554ea44727b185127ea67e6932"
+
+[env.fallback.vars]
+FEATURE_ENABLE_BRIEF = "true"
+FEATURE_ENABLE_OPPORTUNITIES = "true"
+FEATURE_ENABLE_ALERTS_IN_APP = "true"
+FEATURE_ENABLE_ALERTS_EMAIL = "true"
+FEATURE_ENABLE_PLAN = "true"
 
 # Cron Triggers - Disabled (using GitHub Actions instead due to Yahoo API blocking Workers)
 # [triggers]

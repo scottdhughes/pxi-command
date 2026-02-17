@@ -12,6 +12,19 @@ interface Env {
   RATE_LIMIT_KV?: KVNamespace;
   FRED_API_KEY?: string;
   WRITE_API_KEY?: string;
+  RESEND_API_KEY?: string;
+  RESEND_FROM_EMAIL?: string;
+  ALERTS_SIGNING_SECRET?: string;
+  FEATURE_ENABLE_BRIEF?: string;
+  FEATURE_ENABLE_OPPORTUNITIES?: string;
+  FEATURE_ENABLE_PLAN?: string;
+  FEATURE_ENABLE_ALERTS_EMAIL?: string;
+  FEATURE_ENABLE_ALERTS_IN_APP?: string;
+  ENABLE_BRIEF?: string;
+  ENABLE_OPPORTUNITIES?: string;
+  ENABLE_PLAN?: string;
+  ENABLE_ALERTS_EMAIL?: string;
+  ENABLE_ALERTS_IN_APP?: string;
 }
 
 // ============== Data Fetchers ==============
@@ -1006,6 +1019,113 @@ interface IndicatorRow {
   value: number;
 }
 
+type RegimeDelta = 'UNCHANGED' | 'SHIFTED' | 'STRENGTHENED' | 'WEAKENED';
+type RiskPosture = 'risk_on' | 'neutral' | 'risk_off';
+type OpportunityDirection = 'bullish' | 'bearish' | 'neutral';
+type MarketAlertType = 'regime_change' | 'threshold_cross' | 'opportunity_spike' | 'freshness_warning';
+type AlertSeverity = 'info' | 'warning' | 'critical';
+type ConflictState = 'ALIGNED' | 'MIXED' | 'CONFLICT';
+type EdgeQualityLabel = 'HIGH' | 'MEDIUM' | 'LOW';
+
+interface BriefSnapshot {
+  as_of: string;
+  summary: string;
+  regime_delta: RegimeDelta;
+  top_changes: string[];
+  risk_posture: RiskPosture;
+  explainability: {
+    category_movers: Array<{ category: string; score_change: number }>;
+    indicator_movers: Array<{ indicator_id: string; value_change: number; z_impact: number }>;
+  };
+  freshness_status: {
+    has_stale_data: boolean;
+    stale_count: number;
+  };
+  updated_at: string;
+}
+
+interface OpportunityItem {
+  id: string;
+  symbol: string | null;
+  theme_id: string;
+  theme_name: string;
+  direction: OpportunityDirection;
+  conviction_score: number;
+  rationale: string;
+  supporting_factors: string[];
+  historical_hit_rate: number;
+  sample_size: number;
+  updated_at: string;
+}
+
+interface OpportunitySnapshot {
+  as_of: string;
+  horizon: '7d' | '30d';
+  items: OpportunityItem[];
+}
+
+interface MarketAlertEvent {
+  id: string;
+  event_type: MarketAlertType;
+  severity: AlertSeverity;
+  title: string;
+  body: string;
+  entity_type: 'market' | 'theme' | 'indicator';
+  entity_id: string | null;
+  dedupe_key: string;
+  payload_json: string;
+  created_at: string;
+}
+
+interface SignalsThemeRecord {
+  theme_id: string;
+  theme_name: string;
+  score: number;
+  key_tickers: string[];
+  classification?: {
+    signal_type?: string;
+    confidence?: string;
+    timing?: string;
+  };
+}
+
+interface EdgeQualitySnapshot {
+  score: number;
+  label: EdgeQualityLabel;
+  breakdown: {
+    data_quality: number;
+    model_agreement: number;
+    regime_stability: number;
+  };
+  stale_count: number;
+  ml_sample_size: number;
+  conflict_state: ConflictState;
+}
+
+interface PlanRiskBand {
+  bear: number | null;
+  base: number | null;
+  bull: number | null;
+  sample_size: number;
+}
+
+interface PlanPayload {
+  as_of: string;
+  setup_summary: string;
+  action_now: {
+    risk_allocation_target: number;
+    horizon_bias: string;
+    primary_signal: SignalType;
+  };
+  edge_quality: EdgeQualitySnapshot;
+  risk_band: {
+    d7: PlanRiskBand;
+    d30: PlanRiskBand;
+  };
+  invalidation_rules: string[];
+  degraded_reason: string | null;
+}
+
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
   'https://pxicommand.com',
@@ -1219,6 +1339,1029 @@ function parseBackfillDateRange(start?: string, end?: string): {
     start: parsedStart,
     end: parsedEnd,
   };
+}
+
+const TRUE_FLAG_VALUES = new Set(['1', 'true', 'yes', 'on']);
+const VALID_ALERT_TYPES: MarketAlertType[] = ['regime_change', 'threshold_cross', 'opportunity_spike', 'freshness_warning'];
+const VALID_CADENCE = new Set(['daily_8am_et']);
+
+function isFeatureEnabled(
+  env: Env,
+  primary: keyof Env,
+  fallback: keyof Env,
+  defaultValue: boolean
+): boolean {
+  const raw = env[primary] ?? env[fallback];
+  if (raw === undefined || raw === null || raw === '') {
+    return defaultValue;
+  }
+  return TRUE_FLAG_VALUES.has(String(raw).toLowerCase());
+}
+
+function clamp(min: number, max: number, value: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function asIsoDate(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function asIsoDateTime(date: Date): string {
+  return date.toISOString();
+}
+
+function toNumber(value: unknown, fallback = 0): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function stableHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = (hash * 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+function normalizeAlertTypes(rawTypes: unknown): MarketAlertType[] {
+  if (!Array.isArray(rawTypes)) return VALID_ALERT_TYPES;
+  const normalized = rawTypes
+    .map((value) => String(value).trim())
+    .filter((value): value is MarketAlertType => VALID_ALERT_TYPES.includes(value as MarketAlertType));
+  return normalized.length > 0 ? [...new Set(normalized)] : VALID_ALERT_TYPES;
+}
+
+function normalizeCadence(raw: unknown): string {
+  const value = String(raw || 'daily_8am_et').trim().toLowerCase();
+  if (VALID_CADENCE.has(value)) {
+    return value;
+  }
+  return 'daily_8am_et';
+}
+
+function validateEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function parseSignalDirection(value: number): OpportunityDirection {
+  if (value > 1) return 'bullish';
+  if (value < -1) return 'bearish';
+  return 'neutral';
+}
+
+function confidenceTextToScore(value: string | null | undefined): number {
+  const normalized = String(value || '').toUpperCase();
+  if (normalized === 'HIGH' || normalized === 'VERY HIGH') return 90;
+  if (normalized === 'MEDIUM-HIGH') return 75;
+  if (normalized === 'MEDIUM') return 65;
+  if (normalized === 'MEDIUM-LOW') return 55;
+  if (normalized === 'LOW') return 45;
+  return 50;
+}
+
+function mapRiskPosture(regime: RegimeResult | null, score: number): RiskPosture {
+  if (regime?.regime === 'RISK_OFF' || score <= 40) return 'risk_off';
+  if (regime?.regime === 'RISK_ON' || score >= 60) return 'risk_on';
+  return 'neutral';
+}
+
+function resolveRegimeDelta(
+  currentRegime: RegimeResult | null,
+  previousRegime: RegimeResult | null,
+  scoreDelta: number | null
+): RegimeDelta {
+  if (currentRegime && previousRegime && currentRegime.regime !== previousRegime.regime) {
+    return 'SHIFTED';
+  }
+  if (scoreDelta !== null && scoreDelta >= 5) {
+    return 'STRENGTHENED';
+  }
+  if (scoreDelta !== null && scoreDelta <= -5) {
+    return 'WEAKENED';
+  }
+  return 'UNCHANGED';
+}
+
+function getAlertsSigningSecret(env: Env): string {
+  return (env.ALERTS_SIGNING_SECRET || env.WRITE_API_KEY || '').trim();
+}
+
+async function hashToken(secret: string, token: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`${secret}:${token}`)
+  );
+  const bytes = new Uint8Array(digest);
+  let output = '';
+  for (const byte of bytes) {
+    output += byte.toString(16).padStart(2, '0');
+  }
+  return output;
+}
+
+function generateToken(byteLength = 24): string {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  let out = '';
+  for (const byte of bytes) {
+    out += byte.toString(16).padStart(2, '0');
+  }
+  return out;
+}
+
+async function parseJsonBody<T>(request: Request): Promise<T | null> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+function indicatorName(indicatorId: string): string {
+  const map: Record<string, string> = {
+    vix: 'VIX',
+    spy_close: 'SPY close',
+    dxy: 'Dollar index',
+    copper_gold_ratio: 'Copper/Gold ratio',
+    aaii_sentiment: 'AAII sentiment',
+    fear_greed: 'Fear/Greed',
+    hyg: 'HYG',
+    lqd: 'LQD',
+  };
+  return map[indicatorId] || indicatorId.replace(/_/g, ' ');
+}
+
+function regimeLabel(regime: RegimeResult | null): string {
+  if (!regime) return 'unknown';
+  return regime.regime.replace('_', ' ').toLowerCase();
+}
+
+function buildOpportunityId(asOfDate: string, themeId: string, horizon: '7d' | '30d'): string {
+  return `${asOfDate}-${themeId}-${horizon}-${stableHash(`${asOfDate}:${themeId}:${horizon}`)}`;
+}
+
+async function computeFreshnessStatus(db: D1Database): Promise<{ has_stale_data: boolean; stale_count: number }> {
+  const freshnessResult = await db.prepare(`
+    SELECT indicator_id, MAX(date) as last_date,
+           julianday('now') - julianday(MAX(date)) as days_old
+    FROM indicator_values
+    GROUP BY indicator_id
+  `).all<{ indicator_id: string; last_date: string; days_old: number }>();
+
+  const staleCount = (freshnessResult.results || []).filter((row) => {
+    const threshold = getStaleThresholdDays(row.indicator_id);
+    return Number.isFinite(row.days_old) && row.days_old > threshold;
+  }).length;
+
+  return {
+    has_stale_data: staleCount > 0,
+    stale_count: staleCount,
+  };
+}
+
+function resolveConflictState(regime: RegimeResult | null, signal: PXISignal): ConflictState {
+  if (!regime || regime.regime === 'TRANSITION') {
+    return 'MIXED';
+  }
+
+  if (regime.regime === 'RISK_ON') {
+    if (signal.signal_type === 'RISK_OFF' || signal.signal_type === 'DEFENSIVE' || signal.risk_allocation < 0.5) {
+      return 'CONFLICT';
+    }
+    return 'ALIGNED';
+  }
+
+  if (signal.signal_type === 'FULL_RISK' || signal.risk_allocation > 0.75) {
+    return 'CONFLICT';
+  }
+
+  return 'ALIGNED';
+}
+
+function edgeQualityLabel(score: number): EdgeQualityLabel {
+  if (score >= 75) return 'HIGH';
+  if (score >= 50) return 'MEDIUM';
+  return 'LOW';
+}
+
+async function fetchPredictionEvaluationSampleSize(db: D1Database): Promise<number> {
+  const row = await db.prepare(`
+    SELECT COUNT(*) as n
+    FROM prediction_log
+    WHERE actual_change_7d IS NOT NULL
+       OR actual_change_30d IS NOT NULL
+  `).first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+function computeEdgeQualitySnapshot(params: {
+  staleCount: number;
+  mlSampleSize: number;
+  regime: RegimeResult | null;
+  conflictState: ConflictState;
+  divergenceCount: number;
+}): EdgeQualitySnapshot {
+  const { staleCount, mlSampleSize, regime, conflictState, divergenceCount } = params;
+
+  const dataQuality = Math.round(clamp(0, 100, 100 - staleCount * 4));
+
+  let modelAgreement = 78;
+  if (mlSampleSize < 5) modelAgreement -= 35;
+  else if (mlSampleSize < 20) modelAgreement -= 25;
+  else if (mlSampleSize < 50) modelAgreement -= 15;
+  else if (mlSampleSize < 100) modelAgreement -= 8;
+  modelAgreement = Math.round(clamp(0, 100, modelAgreement));
+
+  let regimeStability = regime?.regime === 'TRANSITION' ? 58 : 82;
+  if (divergenceCount >= 3) regimeStability -= 12;
+  else if (divergenceCount >= 1) regimeStability -= 6;
+
+  if (conflictState === 'CONFLICT') regimeStability -= 22;
+  if (conflictState === 'MIXED') regimeStability -= 10;
+  regimeStability = Math.round(clamp(0, 100, regimeStability));
+
+  const score = Math.round(clamp(
+    0,
+    100,
+    dataQuality * 0.4 + modelAgreement * 0.35 + regimeStability * 0.25,
+  ));
+
+  return {
+    score,
+    label: edgeQualityLabel(score),
+    breakdown: {
+      data_quality: dataQuality,
+      model_agreement: modelAgreement,
+      regime_stability: regimeStability,
+    },
+    stale_count: staleCount,
+    ml_sample_size: mlSampleSize,
+    conflict_state: conflictState,
+  };
+}
+
+function quantile(values: number[], q: number): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const pos = (sorted.length - 1) * q;
+  const low = Math.floor(pos);
+  const high = Math.ceil(pos);
+  if (low === high) return sorted[low];
+  const weight = pos - low;
+  return sorted[low] * (1 - weight) + sorted[high] * weight;
+}
+
+async function buildCurrentBucketRiskBands(db: D1Database, currentScore: number): Promise<{
+  d7: PlanRiskBand;
+  d30: PlanRiskBand;
+}> {
+  const thresholdParams = await db.prepare(`
+    SELECT param_key, param_value FROM model_params
+    WHERE param_key LIKE 'bucket_threshold_%'
+  `).all<{ param_key: string; param_value: number }>();
+
+  const thresholds = { t1: 20, t2: 40, t3: 60, t4: 80 };
+  for (const p of thresholdParams.results || []) {
+    if (p.param_key === 'bucket_threshold_1') thresholds.t1 = toNumber(p.param_value, 20);
+    if (p.param_key === 'bucket_threshold_2') thresholds.t2 = toNumber(p.param_value, 40);
+    if (p.param_key === 'bucket_threshold_3') thresholds.t3 = toNumber(p.param_value, 60);
+    if (p.param_key === 'bucket_threshold_4') thresholds.t4 = toNumber(p.param_value, 80);
+  }
+
+  const bucketFor = (score: number): string => {
+    if (score < thresholds.t1) return `0-${thresholds.t1}`;
+    if (score < thresholds.t2) return `${thresholds.t1}-${thresholds.t2}`;
+    if (score < thresholds.t3) return `${thresholds.t2}-${thresholds.t3}`;
+    if (score < thresholds.t4) return `${thresholds.t3}-${thresholds.t4}`;
+    return `${thresholds.t4}-100`;
+  };
+
+  const currentBucket = bucketFor(currentScore);
+
+  const [pxiScores, spyPrices] = await Promise.all([
+    db.prepare(`SELECT date, score FROM pxi_scores ORDER BY date ASC`).all<{ date: string; score: number }>(),
+    db.prepare(`
+      SELECT date, value FROM indicator_values
+      WHERE indicator_id = 'spy_close'
+      ORDER BY date ASC
+    `).all<{ date: string; value: number }>(),
+  ]);
+
+  const spyMap = new Map<string, number>();
+  for (const row of spyPrices.results || []) {
+    spyMap.set(row.date, row.value);
+  }
+
+  const getSpyPrice = (dateStr: string, maxDaysForward = 5): number | null => {
+    const date = new Date(dateStr);
+    for (let i = 0; i <= maxDaysForward; i += 1) {
+      const checkDate = new Date(date);
+      checkDate.setDate(checkDate.getDate() + i);
+      const checkKey = checkDate.toISOString().split('T')[0];
+      const value = spyMap.get(checkKey);
+      if (value !== undefined) return value;
+    }
+    return null;
+  };
+
+  const returns7d: number[] = [];
+  const returns30d: number[] = [];
+
+  for (const row of pxiScores.results || []) {
+    if (bucketFor(row.score) !== currentBucket) continue;
+
+    const spot = getSpyPrice(row.date);
+    if (!spot) continue;
+
+    const start = new Date(row.date);
+    const date7d = new Date(start);
+    date7d.setDate(date7d.getDate() + 7);
+    const date30d = new Date(start);
+    date30d.setDate(date30d.getDate() + 30);
+
+    const spy7d = getSpyPrice(date7d.toISOString().split('T')[0]);
+    const spy30d = getSpyPrice(date30d.toISOString().split('T')[0]);
+
+    if (spy7d !== null) returns7d.push(((spy7d - spot) / spot) * 100);
+    if (spy30d !== null) returns30d.push(((spy30d - spot) / spot) * 100);
+  }
+
+  const bandFor = (values: number[]): PlanRiskBand => ({
+    bear: quantile(values, 0.25),
+    base: quantile(values, 0.5),
+    bull: quantile(values, 0.75),
+    sample_size: values.length,
+  });
+
+  return {
+    d7: bandFor(returns7d),
+    d30: bandFor(returns30d),
+  };
+}
+
+function resolveHorizonBias(signal: PXISignal, regime: RegimeResult | null, edgeQualityScore: number): string {
+  if (edgeQualityScore < 45) return 'capital_preservation';
+  if (signal.risk_allocation < 0.45) return '7d_defensive_30d_neutral';
+  if (regime?.regime === 'RISK_OFF') return '7d_defensive_30d_defensive';
+  if (regime?.regime === 'RISK_ON' && signal.risk_allocation >= 0.7) return '7d_risk_on_30d_risk_on';
+  return '7d_neutral_30d_neutral';
+}
+
+function buildInvalidationRules(params: {
+  pxi: PXIRow;
+  freshness: { stale_count: number };
+  regime: RegimeResult | null;
+  edgeQuality: EdgeQualitySnapshot;
+}): string[] {
+  const { pxi, freshness, regime, edgeQuality } = params;
+  const rules: string[] = [];
+
+  if (pxi.score < 50) {
+    rules.push('If PXI closes above 50 for two consecutive sessions, increase risk by one tier.');
+  } else {
+    rules.push('If PXI closes below 45 for two consecutive sessions, reduce risk by one tier.');
+  }
+
+  if (freshness.stale_count > 0) {
+    const capThreshold = Math.max(3, freshness.stale_count);
+    rules.push(`If stale indicator count remains above ${capThreshold}, keep risk allocation capped until freshness improves.`);
+  }
+
+  if (regime?.regime === 'RISK_ON') {
+    rules.push('If regime flips to RISK_OFF, immediately move to defensive allocation.');
+  } else if (regime?.regime === 'RISK_OFF') {
+    rules.push('Only increase risk after regime returns to RISK_ON with edge quality at MEDIUM or HIGH.');
+  } else {
+    rules.push('During TRANSITION regime, keep sizing reduced until regime stabilizes.');
+  }
+
+  if (edgeQuality.label === 'LOW') {
+    rules.push('Do not add new risk while edge quality remains LOW.');
+  }
+
+  return rules.slice(0, 3);
+}
+
+function buildBriefFallbackSnapshot(reason: string): BriefSnapshot & { degraded_reason: string } {
+  const now = asIsoDateTime(new Date());
+  return {
+    as_of: now,
+    summary: 'Daily market brief is temporarily unavailable. Showing neutral fallback context.',
+    regime_delta: 'UNCHANGED',
+    top_changes: [`degraded: ${reason}`],
+    risk_posture: 'neutral',
+    explainability: {
+      category_movers: [],
+      indicator_movers: [],
+    },
+    freshness_status: {
+      has_stale_data: false,
+      stale_count: 0,
+    },
+    updated_at: now,
+    degraded_reason: reason,
+  };
+}
+
+function buildOpportunityFallbackSnapshot(
+  horizon: '7d' | '30d',
+  reason: string
+): OpportunitySnapshot & { degraded_reason: string } {
+  return {
+    as_of: asIsoDateTime(new Date()),
+    horizon,
+    items: [],
+    degraded_reason: reason,
+  };
+}
+
+function buildPlanFallbackPayload(reason: string): PlanPayload {
+  return {
+    as_of: asIsoDateTime(new Date()),
+    setup_summary: 'Plan service is in degraded mode. Use neutral sizing until full context is restored.',
+    action_now: {
+      risk_allocation_target: 0.5,
+      horizon_bias: '7d_neutral_30d_neutral',
+      primary_signal: 'REDUCED_RISK',
+    },
+    edge_quality: {
+      score: 50,
+      label: 'MEDIUM',
+      breakdown: {
+        data_quality: 50,
+        model_agreement: 50,
+        regime_stability: 50,
+      },
+      stale_count: 0,
+      ml_sample_size: 0,
+      conflict_state: 'MIXED',
+    },
+    risk_band: {
+      d7: { bear: null, base: null, bull: null, sample_size: 0 },
+      d30: { bear: null, base: null, bull: null, sample_size: 0 },
+    },
+    invalidation_rules: [
+      'Hold neutral risk until plan data is fully available.',
+    ],
+    degraded_reason: reason,
+  };
+}
+
+async function fetchLatestSignalsThemes(): Promise<SignalsThemeRecord[]> {
+  try {
+    const runsRes = await fetch('https://pxicommand.com/signals/api/runs?status=ok');
+    if (!runsRes.ok) {
+      return [];
+    }
+    const runsJson = await runsRes.json() as { runs?: Array<{ id?: string }> };
+    const latestRunId = runsJson.runs?.[0]?.id;
+    if (!latestRunId) {
+      return [];
+    }
+
+    const detailRes = await fetch(`https://pxicommand.com/signals/api/runs/${encodeURIComponent(latestRunId)}`);
+    if (!detailRes.ok) {
+      return [];
+    }
+
+    const detailJson = await detailRes.json() as { themes?: Array<Record<string, unknown>> };
+    const themes = detailJson.themes || [];
+    return themes.map((theme) => ({
+      theme_id: String(theme.theme_id || 'unknown_theme'),
+      theme_name: String(theme.theme_name || theme.theme_id || 'Unknown Theme'),
+      score: toNumber(theme.score, 50),
+      key_tickers: Array.isArray(theme.key_tickers)
+        ? theme.key_tickers.map((ticker) => String(ticker))
+        : [],
+      classification: typeof theme.classification === 'object' && theme.classification
+        ? {
+            signal_type: String((theme.classification as Record<string, unknown>).signal_type || ''),
+            confidence: String((theme.classification as Record<string, unknown>).confidence || ''),
+            timing: String((theme.classification as Record<string, unknown>).timing || ''),
+          }
+        : undefined,
+    }));
+  } catch (err) {
+    console.error('Failed to fetch signals themes:', err);
+    return [];
+  }
+}
+
+async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null> {
+  const latestAndPrevious = await db.prepare(`
+    SELECT date, score, label, status
+    FROM pxi_scores
+    ORDER BY date DESC
+    LIMIT 2
+  `).all<{ date: string; score: number; label: string; status: string }>();
+
+  const latest = latestAndPrevious.results?.[0];
+  if (!latest) return null;
+  const previous = latestAndPrevious.results?.[1] || null;
+
+  const [currentRegime, previousRegime, freshness] = await Promise.all([
+    detectRegime(db, latest.date),
+    previous ? detectRegime(db, previous.date) : Promise.resolve(null),
+    computeFreshnessStatus(db),
+  ]);
+
+  const categoryRows = await db.prepare(`
+    SELECT c.category as category,
+           c.score as current_score,
+           p.score as previous_score
+    FROM category_scores c
+    LEFT JOIN category_scores p
+      ON p.category = c.category
+      AND p.date = ?
+    WHERE c.date = ?
+  `).bind(previous?.date || '', latest.date).all<{ category: string; current_score: number; previous_score: number | null }>();
+
+  const categoryMovers = (categoryRows.results || [])
+    .map((row) => ({
+      category: row.category,
+      score_change: row.current_score - (row.previous_score ?? row.current_score),
+    }))
+    .sort((a, b) => Math.abs(b.score_change) - Math.abs(a.score_change))
+    .slice(0, 5);
+
+  const indicatorRows = await db.prepare(`
+    SELECT i.indicator_id as indicator_id,
+           i.raw_value as current_value,
+           p.raw_value as previous_value,
+           i.normalized_value as current_norm,
+           p.normalized_value as previous_norm
+    FROM indicator_scores i
+    LEFT JOIN indicator_scores p
+      ON p.indicator_id = i.indicator_id
+      AND p.date = ?
+    WHERE i.date = ?
+  `).bind(previous?.date || '', latest.date).all<{
+    indicator_id: string;
+    current_value: number;
+    previous_value: number | null;
+    current_norm: number;
+    previous_norm: number | null;
+  }>();
+
+  const indicatorMovers = (indicatorRows.results || [])
+    .map((row) => ({
+      indicator_id: row.indicator_id,
+      value_change: row.current_value - (row.previous_value ?? row.current_value),
+      z_impact: row.current_norm - (row.previous_norm ?? row.current_norm),
+    }))
+    .sort((a, b) => Math.abs(b.z_impact) - Math.abs(a.z_impact))
+    .slice(0, 5);
+
+  const scoreDelta = previous ? latest.score - previous.score : null;
+  const regimeDelta = resolveRegimeDelta(currentRegime, previousRegime, scoreDelta);
+  const riskPosture = mapRiskPosture(currentRegime, latest.score);
+  const deltaText = scoreDelta !== null ? `${scoreDelta >= 0 ? '+' : ''}${scoreDelta.toFixed(1)}` : 'n/a';
+
+  const topChanges: string[] = [];
+  for (const category of categoryMovers.slice(0, 3)) {
+    topChanges.push(
+      `${category.category} ${category.score_change >= 0 ? '+' : ''}${category.score_change.toFixed(1)}`
+    );
+  }
+  for (const indicator of indicatorMovers.slice(0, 2)) {
+    topChanges.push(
+      `${indicatorName(indicator.indicator_id)} ${indicator.value_change >= 0 ? '+' : ''}${indicator.value_change.toFixed(2)}`
+    );
+  }
+
+  const summary = `PXI ${latest.score.toFixed(1)} (${latest.label}), ${deltaText} vs prior reading. Regime ${regimeLabel(currentRegime)}; posture ${riskPosture.replace('_', '-')}.${
+    freshness.has_stale_data ? ` ${freshness.stale_count} indicator(s) stale.` : ''
+  }`;
+
+  return {
+    as_of: `${latest.date}T00:00:00.000Z`,
+    summary,
+    regime_delta: regimeDelta,
+    top_changes: topChanges.slice(0, 5),
+    risk_posture: riskPosture,
+    explainability: {
+      category_movers: categoryMovers,
+      indicator_movers: indicatorMovers,
+    },
+    freshness_status: freshness,
+    updated_at: asIsoDateTime(new Date()),
+  };
+}
+
+async function computeHistoricalHitStats(
+  db: D1Database,
+  horizon: '7d' | '30d'
+): Promise<{ hitRate: number; sampleSize: number }> {
+  const rows = horizon === '7d'
+    ? await db.prepare(`
+      SELECT predicted_change_7d as predicted_change, actual_change_7d as actual_change
+      FROM prediction_log
+      WHERE predicted_change_7d IS NOT NULL
+        AND actual_change_7d IS NOT NULL
+      ORDER BY prediction_date DESC
+      LIMIT 500
+    `).all<{ predicted_change: number; actual_change: number }>()
+    : await db.prepare(`
+      SELECT predicted_change_30d as predicted_change, actual_change_30d as actual_change
+      FROM prediction_log
+      WHERE predicted_change_30d IS NOT NULL
+        AND actual_change_30d IS NOT NULL
+      ORDER BY prediction_date DESC
+      LIMIT 500
+    `).all<{ predicted_change: number; actual_change: number }>();
+
+  const samples = rows.results || [];
+  if (samples.length === 0) {
+    return { hitRate: 0.5, sampleSize: 0 };
+  }
+
+  let correct = 0;
+  for (const sample of samples) {
+    if ((sample.predicted_change >= 0 && sample.actual_change >= 0) || (sample.predicted_change < 0 && sample.actual_change < 0)) {
+      correct += 1;
+    }
+  }
+
+  return {
+    hitRate: correct / samples.length,
+    sampleSize: samples.length,
+  };
+}
+
+async function buildOpportunitySnapshot(
+  db: D1Database,
+  horizon: '7d' | '30d'
+): Promise<OpportunitySnapshot | null> {
+  const latestPxi = await db.prepare(`
+    SELECT date, score, delta_7d, delta_30d
+    FROM pxi_scores
+    ORDER BY date DESC
+    LIMIT 1
+  `).first<{ date: string; score: number; delta_7d: number | null; delta_30d: number | null }>();
+
+  if (!latestPxi) {
+    return null;
+  }
+
+  const [latestSignal, latestEnsemble, hitStats, themes] = await Promise.all([
+    db.prepare(`
+      SELECT date, risk_allocation, signal_type, regime
+      FROM pxi_signal
+      ORDER BY date DESC
+      LIMIT 1
+    `).first<{ date: string; risk_allocation: number; signal_type: string; regime: string }>(),
+    db.prepare(`
+      SELECT prediction_date, ensemble_7d, ensemble_30d, confidence_7d, confidence_30d
+      FROM ensemble_predictions
+      ORDER BY prediction_date DESC
+      LIMIT 1
+    `).first<{
+      prediction_date: string;
+      ensemble_7d: number | null;
+      ensemble_30d: number | null;
+      confidence_7d: string | null;
+      confidence_30d: string | null;
+    }>(),
+    computeHistoricalHitStats(db, horizon),
+    fetchLatestSignalsThemes(),
+  ]);
+
+  const themeSource = themes.length > 0
+    ? themes
+    : (await db.prepare(`
+      SELECT category as theme_id, category as theme_name, score
+      FROM category_scores
+      WHERE date = ?
+      ORDER BY score DESC
+      LIMIT 12
+    `).bind(latestPxi.date).all<{ theme_id: string; theme_name: string; score: number }>())
+      .results
+      ?.map((row) => ({
+        theme_id: row.theme_id,
+        theme_name: row.theme_name,
+        score: row.score,
+        key_tickers: [],
+      })) || [];
+
+  const ensembleValue = horizon === '7d' ? (latestEnsemble?.ensemble_7d ?? 0) : (latestEnsemble?.ensemble_30d ?? 0);
+  const ensembleConfidence = horizon === '7d' ? latestEnsemble?.confidence_7d : latestEnsemble?.confidence_30d;
+  const deltaBias = horizon === '7d' ? (latestPxi.delta_7d ?? 0) : (latestPxi.delta_30d ?? 0);
+
+  const mlComponent = clamp(0, 100, 50 + ensembleValue * 6 + confidenceTextToScore(ensembleConfidence) * 0.3 + deltaBias * 0.4);
+  const similarComponent = clamp(0, 100, hitStats.hitRate * 100 + Math.min(20, Math.log10(hitStats.sampleSize + 1) * 10));
+  const signalComponent = clamp(0, 100, (latestSignal?.risk_allocation ?? 0.5) * 100);
+
+  const items: OpportunityItem[] = themeSource.map((theme) => {
+    const confidenceScore = confidenceTextToScore(theme.classification?.confidence);
+    const themeComponent = clamp(0, 100, theme.score * 0.75 + confidenceScore * 0.25);
+    const conviction = clamp(0, 100, Math.round(
+      0.35 * mlComponent +
+      0.25 * similarComponent +
+      0.20 * signalComponent +
+      0.20 * themeComponent
+    ));
+
+    const directionalSignal = parseSignalDirection(ensembleValue + (theme.score - 50) * 0.06 + deltaBias * 0.08);
+    const supportingFactors = [
+      ...(theme.classification?.signal_type ? [theme.classification.signal_type] : []),
+      ...(theme.key_tickers.slice(0, 3)),
+      latestSignal?.signal_type || 'signal_context',
+    ].filter(Boolean);
+
+    const id = buildOpportunityId(latestPxi.date, theme.theme_id, horizon);
+    const rationale = `${theme.theme_name}: ${directionalSignal} setup with conviction ${conviction}/100, combining ensemble trend, historical analog hit-rate, and current signal regime.`;
+
+    return {
+      id,
+      symbol: theme.key_tickers[0] || null,
+      theme_id: theme.theme_id,
+      theme_name: theme.theme_name,
+      direction: directionalSignal,
+      conviction_score: conviction,
+      rationale,
+      supporting_factors: supportingFactors.slice(0, 6),
+      historical_hit_rate: hitStats.hitRate,
+      sample_size: hitStats.sampleSize,
+      updated_at: asIsoDateTime(new Date()),
+    };
+  });
+
+  items.sort((a, b) => {
+    if (b.conviction_score !== a.conviction_score) return b.conviction_score - a.conviction_score;
+    if (b.sample_size !== a.sample_size) return b.sample_size - a.sample_size;
+    return a.theme_id.localeCompare(b.theme_id);
+  });
+
+  return {
+    as_of: `${latestPxi.date}T00:00:00.000Z`,
+    horizon,
+    items,
+  };
+}
+
+function buildMarketEvent(
+  type: MarketAlertType,
+  runDate: string,
+  severity: AlertSeverity,
+  title: string,
+  body: string,
+  entityType: 'market' | 'theme' | 'indicator',
+  entityId: string | null,
+  payload: Record<string, unknown>
+): MarketAlertEvent {
+  const dedupeKey = `${type}:${runDate}:${entityId || 'market'}`;
+  return {
+    id: `${runDate}-${type}-${stableHash(dedupeKey + asIsoDateTime(new Date()))}`,
+    event_type: type,
+    severity,
+    title,
+    body,
+    entity_type: entityType,
+    entity_id: entityId,
+    dedupe_key: dedupeKey,
+    payload_json: JSON.stringify(payload),
+    created_at: asIsoDateTime(new Date()),
+  };
+}
+
+async function generateMarketEvents(
+  db: D1Database,
+  brief: BriefSnapshot,
+  opportunities: OpportunitySnapshot
+): Promise<MarketAlertEvent[]> {
+  const events: MarketAlertEvent[] = [];
+  const runDate = brief.as_of.slice(0, 10);
+
+  if (brief.regime_delta === 'SHIFTED') {
+    events.push(buildMarketEvent(
+      'regime_change',
+      runDate,
+      'warning',
+      'Market regime shifted',
+      `PXI regime changed as of ${runDate}. Current posture is ${brief.risk_posture.replace('_', '-')}.`,
+      'market',
+      'pxi',
+      { regime_delta: brief.regime_delta, risk_posture: brief.risk_posture }
+    ));
+  }
+
+  const latestPxiRows = await db.prepare(`
+    SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 2
+  `).all<{ date: string; score: number }>();
+  const current = latestPxiRows.results?.[0];
+  const previous = latestPxiRows.results?.[1];
+  if (current && previous) {
+    for (const threshold of [30, 45, 65, 80]) {
+      const crossedUp = previous.score < threshold && current.score >= threshold;
+      const crossedDown = previous.score > threshold && current.score <= threshold;
+      if (crossedUp || crossedDown) {
+        events.push(buildMarketEvent(
+          'threshold_cross',
+          runDate,
+          threshold >= 65 ? 'warning' : 'info',
+          `PXI crossed ${threshold}`,
+          `PXI moved ${crossedUp ? 'above' : 'below'} ${threshold} (${previous.score.toFixed(1)} → ${current.score.toFixed(1)}).`,
+          'indicator',
+          `pxi_${threshold}`,
+          { threshold, from: previous.score, to: current.score, direction: crossedUp ? 'up' : 'down' }
+        ));
+      }
+    }
+  }
+
+  const topOpportunity = opportunities.items[0];
+  if (topOpportunity) {
+    const previousSnapshot = await db.prepare(`
+      SELECT payload_json
+      FROM opportunity_snapshots
+      WHERE horizon = ?
+      ORDER BY as_of DESC
+      LIMIT 1 OFFSET 1
+    `).bind(opportunities.horizon).first<{ payload_json: string }>();
+
+    let previousTopConviction: number | null = null;
+    if (previousSnapshot?.payload_json) {
+      try {
+        const previousPayload = JSON.parse(previousSnapshot.payload_json) as OpportunitySnapshot;
+        previousTopConviction = previousPayload.items?.[0]?.conviction_score ?? null;
+      } catch {
+        previousTopConviction = null;
+      }
+    }
+
+    if (previousTopConviction !== null && (topOpportunity.conviction_score - previousTopConviction) >= 12) {
+      events.push(buildMarketEvent(
+        'opportunity_spike',
+        runDate,
+        'info',
+        'Opportunity conviction spike',
+        `${topOpportunity.theme_name} conviction jumped from ${previousTopConviction} to ${topOpportunity.conviction_score}.`,
+        'theme',
+        topOpportunity.theme_id,
+        {
+          theme_id: topOpportunity.theme_id,
+          previous_conviction: previousTopConviction,
+          current_conviction: topOpportunity.conviction_score,
+        }
+      ));
+    }
+  }
+
+  if (brief.freshness_status.has_stale_data || brief.freshness_status.stale_count > 0) {
+    events.push(buildMarketEvent(
+      'freshness_warning',
+      runDate,
+      'critical',
+      'Data freshness warning',
+      `${brief.freshness_status.stale_count} indicator(s) are stale and may impact confidence.`,
+      'market',
+      'data_freshness',
+      { stale_count: brief.freshness_status.stale_count }
+    ));
+  }
+
+  return events;
+}
+
+async function storeBriefSnapshot(db: D1Database, brief: BriefSnapshot): Promise<void> {
+  await db.prepare(`
+    INSERT OR REPLACE INTO market_brief_snapshots (as_of, payload_json, created_at)
+    VALUES (?, ?, datetime('now'))
+  `).bind(brief.as_of, JSON.stringify(brief)).run();
+}
+
+async function storeOpportunitySnapshot(db: D1Database, snapshot: OpportunitySnapshot): Promise<void> {
+  await db.prepare(`
+    INSERT OR REPLACE INTO opportunity_snapshots (as_of, horizon, payload_json, created_at)
+    VALUES (?, ?, ?, datetime('now'))
+  `).bind(snapshot.as_of, snapshot.horizon, JSON.stringify(snapshot)).run();
+}
+
+async function insertMarketEvents(db: D1Database, events: MarketAlertEvent[], inAppEnabled: boolean): Promise<number> {
+  let inserted = 0;
+  for (const event of events) {
+    const result = await db.prepare(`
+      INSERT OR IGNORE INTO market_alert_events
+      (id, event_type, severity, title, body, entity_type, entity_id, dedupe_key, payload_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      event.id,
+      event.event_type,
+      event.severity,
+      event.title,
+      event.body,
+      event.entity_type,
+      event.entity_id,
+      event.dedupe_key,
+      event.payload_json,
+      event.created_at
+    ).run();
+
+    if (result.meta?.changes && result.meta.changes > 0) {
+      inserted += 1;
+      if (inAppEnabled) {
+        await db.prepare(`
+          INSERT INTO market_alert_deliveries (event_id, channel, status, attempted_at)
+          VALUES (?, 'in_app', 'sent', datetime('now'))
+        `).bind(event.id).run();
+      }
+    }
+  }
+  return inserted;
+}
+
+async function sendResendEmail(
+  env: Env,
+  payload: { to: string; subject: string; html: string; text: string }
+): Promise<{ ok: boolean; providerId?: string; error?: string }> {
+  if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
+    return { ok: false, error: 'Resend not configured' };
+  }
+
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      },
+      body: JSON.stringify({
+        from: env.RESEND_FROM_EMAIL,
+        to: [payload.to],
+        subject: payload.subject,
+        html: payload.html,
+        text: payload.text,
+      }),
+    });
+
+    const body = await response.json().catch(() => ({} as Record<string, unknown>));
+    if (!response.ok) {
+      const message = String((body as { message?: string }).message || `Resend API ${response.status}`);
+      return { ok: false, error: message };
+    }
+
+    const providerId = String((body as { id?: string }).id || '');
+    return { ok: true, providerId };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function sendDigestToSubscriber(
+  env: Env,
+  email: string,
+  brief: BriefSnapshot | null,
+  opportunities: OpportunitySnapshot | null,
+  events: MarketAlertEvent[],
+  unsubscribeToken: string
+): Promise<{ ok: boolean; providerId?: string; error?: string }> {
+  const topOpportunities = opportunities?.items.slice(0, 3) || [];
+  const recentEvents = events.slice(0, 10);
+  const unsubscribeUrl = `https://pxicommand.com/inbox?unsubscribe_token=${encodeURIComponent(unsubscribeToken)}`;
+
+  const summaryText = brief?.summary || 'PXI market brief unavailable for this run.';
+  const eventLines = recentEvents.length > 0
+    ? recentEvents.map((event) => `- [${event.severity}] ${event.title}: ${event.body}`).join('\n')
+    : '- No market alerts in the last 24 hours.';
+  const opportunityLines = topOpportunities.length > 0
+    ? topOpportunities.map((item) => `- ${item.theme_name}: ${item.direction} (${item.conviction_score}/100)`).join('\n')
+    : '- No opportunities available.';
+
+  const text = [
+    'PXI Daily Digest',
+    '',
+    `As of: ${brief?.as_of || asIsoDateTime(new Date())}`,
+    '',
+    'Market Brief',
+    summaryText,
+    '',
+    'Top Opportunities',
+    opportunityLines,
+    '',
+    'Last 24h Alerts',
+    eventLines,
+    '',
+    `Unsubscribe: ${unsubscribeUrl}`,
+  ].join('\n');
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;padding:20px;color:#111;">
+      <h2>PXI Daily Digest</h2>
+      <p><strong>As of:</strong> ${brief?.as_of || asIsoDateTime(new Date())}</p>
+      <h3>Market Brief</h3>
+      <p>${summaryText}</p>
+      <h3>Top Opportunities</h3>
+      <ul>${topOpportunities.map((item) => `<li><strong>${item.theme_name}</strong>: ${item.direction} (${item.conviction_score}/100)</li>`).join('')}</ul>
+      <h3>Last 24h Alerts</h3>
+      <ul>${recentEvents.map((event) => `<li><strong>[${event.severity}] ${event.title}</strong> - ${event.body}</li>`).join('')}</ul>
+      <p><a href="${unsubscribeUrl}">Unsubscribe</a></p>
+      <p style="font-size:12px;color:#555;">Not investment advice.</p>
+    </div>
+  `;
+
+  const subject = `PXI Daily Digest • ${asIsoDate(new Date())}`;
+  return sendResendEmail(env, { to: email, subject, html, text });
 }
 
 // ============== PXI Calculation ==============
@@ -2703,6 +3846,133 @@ export default {
           console.error('alerts migration failed:', e);
         }
 
+        // Create market product layer tables
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS email_subscribers (
+              id TEXT PRIMARY KEY,
+              email TEXT UNIQUE NOT NULL,
+              status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'unsubscribed', 'bounced')),
+              cadence TEXT NOT NULL DEFAULT 'daily_8am_et',
+              types_json TEXT NOT NULL,
+              timezone TEXT NOT NULL DEFAULT 'America/New_York',
+              created_at TEXT DEFAULT (datetime('now')),
+              updated_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_email_subscribers_status ON email_subscribers(status)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_email_subscribers_updated ON email_subscribers(updated_at DESC)`).run();
+          migrations.push('email_subscribers');
+        } catch (e) {
+          console.error('email_subscribers migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS email_verification_tokens (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              email TEXT NOT NULL,
+              token_hash TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              used_at TEXT,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_email_verification_email_expires ON email_verification_tokens(email, expires_at DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_email_verification_hash ON email_verification_tokens(token_hash)`).run();
+          migrations.push('email_verification_tokens');
+        } catch (e) {
+          console.error('email_verification_tokens migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS email_unsubscribe_tokens (
+              subscriber_id TEXT PRIMARY KEY,
+              token_hash TEXT NOT NULL,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_email_unsubscribe_hash ON email_unsubscribe_tokens(token_hash)`).run();
+          migrations.push('email_unsubscribe_tokens');
+        } catch (e) {
+          console.error('email_unsubscribe_tokens migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS market_brief_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              as_of TEXT NOT NULL UNIQUE,
+              payload_json TEXT NOT NULL,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_brief_as_of ON market_brief_snapshots(as_of DESC)`).run();
+          migrations.push('market_brief_snapshots');
+        } catch (e) {
+          console.error('market_brief_snapshots migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS opportunity_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              as_of TEXT NOT NULL,
+              horizon TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at TEXT DEFAULT (datetime('now')),
+              UNIQUE(as_of, horizon)
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_opportunity_snapshots_lookup ON opportunity_snapshots(as_of DESC, horizon)`).run();
+          migrations.push('opportunity_snapshots');
+        } catch (e) {
+          console.error('opportunity_snapshots migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS market_alert_events (
+              id TEXT PRIMARY KEY,
+              event_type TEXT NOT NULL,
+              severity TEXT NOT NULL CHECK(severity IN ('info', 'warning', 'critical')),
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              entity_type TEXT NOT NULL CHECK(entity_type IN ('market', 'theme', 'indicator')),
+              entity_id TEXT,
+              dedupe_key TEXT NOT NULL UNIQUE,
+              payload_json TEXT,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_events_created ON market_alert_events(created_at DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_events_type ON market_alert_events(event_type, created_at DESC)`).run();
+          migrations.push('market_alert_events');
+        } catch (e) {
+          console.error('market_alert_events migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS market_alert_deliveries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_id TEXT NOT NULL,
+              channel TEXT NOT NULL CHECK(channel IN ('in_app', 'email')),
+              subscriber_id TEXT,
+              status TEXT NOT NULL CHECK(status IN ('queued', 'sent', 'failed')),
+              provider_id TEXT,
+              error TEXT,
+              attempted_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_event ON market_alert_deliveries(event_id, attempted_at DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_subscriber ON market_alert_deliveries(subscriber_id, attempted_at DESC)`).run();
+          migrations.push('market_alert_deliveries');
+        } catch (e) {
+          console.error('market_alert_deliveries migration failed:', e);
+        }
+
         return Response.json({
           success: true,
           tables_created: migrations,
@@ -2962,6 +4232,548 @@ export default {
             'Cache-Control': 'public, max-age=60',
           },
         });
+      }
+
+      if (url.pathname === '/api/brief' && method === 'GET') {
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_BRIEF', 'ENABLE_BRIEF', true)) {
+          return Response.json(buildBriefFallbackSnapshot('feature_disabled'), {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        const scope = (url.searchParams.get('scope') || 'market').trim().toLowerCase();
+        if (scope !== 'market') {
+          return Response.json({ error: 'Only scope=market is supported in phase 1' }, { status: 400, headers: corsHeaders });
+        }
+
+        let snapshot: BriefSnapshot | null = null;
+        const stored = await env.DB.prepare(`
+          SELECT payload_json
+          FROM market_brief_snapshots
+          ORDER BY as_of DESC
+          LIMIT 1
+        `).first<{ payload_json: string }>();
+
+        if (stored?.payload_json) {
+          try {
+            snapshot = JSON.parse(stored.payload_json) as BriefSnapshot;
+          } catch {
+            snapshot = null;
+          }
+        }
+
+        if (!snapshot) {
+          try {
+            snapshot = await buildBriefSnapshot(env.DB);
+          } catch (err) {
+            console.error('Failed to build brief snapshot:', err);
+            snapshot = null;
+          }
+          if (!snapshot) {
+            return Response.json(buildBriefFallbackSnapshot('snapshot_unavailable'), {
+              headers: {
+                ...corsHeaders,
+                'Cache-Control': 'no-store',
+              },
+            });
+          }
+          await storeBriefSnapshot(env.DB, snapshot);
+        }
+
+        return Response.json(snapshot, {
+          headers: {
+            ...corsHeaders,
+            'Cache-Control': 'public, max-age=60',
+          },
+        });
+      }
+
+      if (url.pathname === '/api/opportunities' && method === 'GET') {
+        const horizon = (url.searchParams.get('horizon') || '7d').trim() === '30d' ? '30d' : '7d';
+        const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20', 10)));
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true)) {
+          const fallback = buildOpportunityFallbackSnapshot(horizon, 'feature_disabled');
+          return Response.json({
+            as_of: fallback.as_of,
+            horizon: fallback.horizon,
+            items: fallback.items,
+            degraded_reason: fallback.degraded_reason,
+          }, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        let snapshot: OpportunitySnapshot | null = null;
+        const stored = await env.DB.prepare(`
+          SELECT payload_json
+          FROM opportunity_snapshots
+          WHERE horizon = ?
+          ORDER BY as_of DESC
+          LIMIT 1
+        `).bind(horizon).first<{ payload_json: string }>();
+
+        if (stored?.payload_json) {
+          try {
+            snapshot = JSON.parse(stored.payload_json) as OpportunitySnapshot;
+          } catch {
+            snapshot = null;
+          }
+        }
+
+        if (!snapshot) {
+          try {
+            snapshot = await buildOpportunitySnapshot(env.DB, horizon);
+          } catch (err) {
+            console.error('Failed to build opportunity snapshot:', err);
+            snapshot = null;
+          }
+          if (!snapshot) {
+            const fallback = buildOpportunityFallbackSnapshot(horizon, 'snapshot_unavailable');
+            return Response.json({
+              as_of: fallback.as_of,
+              horizon: fallback.horizon,
+              items: fallback.items,
+              degraded_reason: fallback.degraded_reason,
+            }, {
+              headers: {
+                ...corsHeaders,
+                'Cache-Control': 'no-store',
+              },
+            });
+          }
+          await storeOpportunitySnapshot(env.DB, snapshot);
+        }
+
+        return Response.json({
+          as_of: snapshot.as_of,
+          horizon: snapshot.horizon,
+          items: snapshot.items.slice(0, limit),
+        }, {
+          headers: {
+            ...corsHeaders,
+            'Cache-Control': 'public, max-age=60',
+          },
+        });
+      }
+
+      if (url.pathname === '/api/alerts/feed' && method === 'GET') {
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_IN_APP', 'ENABLE_ALERTS_IN_APP', true)) {
+          return Response.json({
+            as_of: new Date().toISOString(),
+            alerts: [],
+            degraded_reason: 'feature_disabled',
+          }, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit') || '50', 10)));
+        const since = url.searchParams.get('since');
+        const rawTypes = (url.searchParams.get('types') || '')
+          .split(',')
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0);
+        const types = rawTypes.filter((value): value is MarketAlertType => VALID_ALERT_TYPES.includes(value as MarketAlertType));
+
+        let query = `
+          SELECT id, event_type, severity, title, body, entity_type, entity_id, created_at
+          FROM market_alert_events
+          WHERE 1 = 1
+        `;
+        const params: (string | number)[] = [];
+
+        if (since) {
+          query += ' AND created_at >= ?';
+          params.push(since);
+        }
+
+        if (types.length > 0) {
+          query += ` AND event_type IN (${types.map(() => '?').join(',')})`;
+          params.push(...types);
+        }
+
+        query += ' ORDER BY created_at DESC LIMIT ?';
+        params.push(limit);
+
+        let events: D1Result<{
+          id: string;
+          event_type: MarketAlertType;
+          severity: AlertSeverity;
+          title: string;
+          body: string;
+          entity_type: 'market' | 'theme' | 'indicator';
+          entity_id: string | null;
+          created_at: string;
+        }>;
+        try {
+          events = await env.DB.prepare(query).bind(...params).all<{
+            id: string;
+            event_type: MarketAlertType;
+            severity: AlertSeverity;
+            title: string;
+            body: string;
+            entity_type: 'market' | 'theme' | 'indicator';
+            entity_id: string | null;
+            created_at: string;
+          }>();
+        } catch (err) {
+          console.error('Failed to load in-app alerts feed:', err);
+          return Response.json({
+            as_of: new Date().toISOString(),
+            alerts: [],
+            degraded_reason: 'query_failed',
+          }, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        return Response.json({
+          as_of: new Date().toISOString(),
+          alerts: events.results || [],
+          degraded_reason: null,
+        }, {
+          headers: {
+            ...corsHeaders,
+            'Cache-Control': 'public, max-age=30',
+          },
+        });
+      }
+
+      if (url.pathname === '/api/alerts/subscribe/start' && method === 'POST') {
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_EMAIL', 'ENABLE_ALERTS_EMAIL', true)) {
+          return Response.json({ error: 'Email alerts disabled' }, { status: 404, headers: corsHeaders });
+        }
+        if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
+          return Response.json({ error: 'Email service unavailable' }, { status: 503, headers: corsHeaders });
+        }
+
+        const body = await parseJsonBody<{ email?: string; types?: string[]; cadence?: string }>(request);
+        const email = String(body?.email || '').trim().toLowerCase();
+        if (!validateEmail(email)) {
+          return Response.json({ error: 'Invalid email' }, { status: 400, headers: corsHeaders });
+        }
+
+        const secret = getAlertsSigningSecret(env);
+        if (!secret) {
+          return Response.json({ error: 'Signing secret unavailable' }, { status: 503, headers: corsHeaders });
+        }
+
+        const subscriberId = `sub_${stableHash(`${email}:${Date.now()}:${generateToken(4)}`)}`;
+        const cadence = normalizeCadence(body?.cadence);
+        const types = normalizeAlertTypes(body?.types);
+        const verifyToken = generateToken(18);
+        const tokenHash = await hashToken(secret, verifyToken);
+        const expiresAt = new Date(Date.now() + (15 * 60 * 1000)).toISOString();
+
+        await env.DB.prepare(`
+          INSERT INTO email_subscribers (id, email, status, cadence, types_json, timezone, created_at, updated_at)
+          VALUES (?, ?, 'pending', ?, ?, 'America/New_York', datetime('now'), datetime('now'))
+          ON CONFLICT(email) DO UPDATE SET
+            status = 'pending',
+            cadence = excluded.cadence,
+            types_json = excluded.types_json,
+            updated_at = datetime('now')
+        `).bind(subscriberId, email, cadence, JSON.stringify(types)).run();
+
+        await env.DB.prepare(`
+          INSERT INTO email_verification_tokens (email, token_hash, expires_at, created_at)
+          VALUES (?, ?, ?, datetime('now'))
+        `).bind(email, tokenHash, expiresAt).run();
+
+        const verifyUrl = `https://pxicommand.com/inbox?verify_token=${encodeURIComponent(verifyToken)}`;
+        const verificationEmail = await sendResendEmail(env, {
+          to: email,
+          subject: 'Verify your PXI alert subscription',
+          text: `Verify your PXI alerts subscription by opening: ${verifyUrl}\n\nThis link expires in 15 minutes.`,
+          html: `
+            <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#111;">
+              <h2>Verify your PXI alerts subscription</h2>
+              <p>Confirm your email to receive daily 8:00 AM ET digest emails.</p>
+              <p><a href="${verifyUrl}">Verify subscription</a></p>
+              <p style="font-size:12px;color:#555;">This link expires in 15 minutes.</p>
+            </div>
+          `,
+        });
+
+        if (!verificationEmail.ok) {
+          return Response.json({ error: verificationEmail.error || 'Verification email failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        return Response.json({ ok: true }, { headers: corsHeaders });
+      }
+
+      if (url.pathname === '/api/alerts/subscribe/verify' && method === 'POST') {
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_EMAIL', 'ENABLE_ALERTS_EMAIL', true)) {
+          return Response.json({ error: 'Email alerts disabled' }, { status: 404, headers: corsHeaders });
+        }
+
+        const body = await parseJsonBody<{ token?: string }>(request);
+        const token = String(body?.token || '').trim();
+        if (!token) {
+          return Response.json({ error: 'Token required' }, { status: 400, headers: corsHeaders });
+        }
+
+        const secret = getAlertsSigningSecret(env);
+        if (!secret) {
+          return Response.json({ error: 'Signing secret unavailable' }, { status: 503, headers: corsHeaders });
+        }
+
+        const tokenHash = await hashToken(secret, token);
+        const tokenRecord = await env.DB.prepare(`
+          SELECT id, email
+          FROM email_verification_tokens
+          WHERE token_hash = ?
+            AND used_at IS NULL
+            AND expires_at > datetime('now')
+          ORDER BY id DESC
+          LIMIT 1
+        `).bind(tokenHash).first<{ id: number; email: string }>();
+
+        if (!tokenRecord) {
+          return Response.json({ error: 'Invalid or expired token' }, { status: 400, headers: corsHeaders });
+        }
+
+        await env.DB.prepare(`
+          UPDATE email_verification_tokens
+          SET used_at = datetime('now')
+          WHERE id = ?
+        `).bind(tokenRecord.id).run();
+
+        await env.DB.prepare(`
+          UPDATE email_subscribers
+          SET status = 'active', updated_at = datetime('now')
+          WHERE email = ?
+        `).bind(tokenRecord.email).run();
+
+        const subscriber = await env.DB.prepare(`
+          SELECT id
+          FROM email_subscribers
+          WHERE email = ?
+          LIMIT 1
+        `).bind(tokenRecord.email).first<{ id: string }>();
+
+        if (subscriber?.id) {
+          const unsubscribeToken = `${subscriber.id}.${generateToken(8)}`;
+          const unsubscribeHash = await hashToken(secret, unsubscribeToken);
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO email_unsubscribe_tokens (subscriber_id, token_hash, created_at)
+            VALUES (?, ?, datetime('now'))
+          `).bind(subscriber.id, unsubscribeHash).run();
+        }
+
+        return Response.json({
+          ok: true,
+          subscriber_status: 'active',
+        }, { headers: corsHeaders });
+      }
+
+      if (url.pathname === '/api/alerts/unsubscribe' && method === 'POST') {
+        const body = await parseJsonBody<{ token?: string }>(request);
+        const token = String(body?.token || '').trim();
+        const subscriberId = token.split('.')[0];
+
+        if (!token || !subscriberId) {
+          return Response.json({ error: 'Token required' }, { status: 400, headers: corsHeaders });
+        }
+
+        const secret = getAlertsSigningSecret(env);
+        if (!secret) {
+          return Response.json({ error: 'Signing secret unavailable' }, { status: 503, headers: corsHeaders });
+        }
+
+        const record = await env.DB.prepare(`
+          SELECT token_hash
+          FROM email_unsubscribe_tokens
+          WHERE subscriber_id = ?
+        `).bind(subscriberId).first<{ token_hash: string }>();
+
+        if (!record) {
+          return Response.json({ error: 'Invalid unsubscribe token' }, { status: 400, headers: corsHeaders });
+        }
+
+        const tokenHash = await hashToken(secret, token);
+        if (!constantTimeEquals(tokenHash, record.token_hash)) {
+          return Response.json({ error: 'Invalid unsubscribe token' }, { status: 400, headers: corsHeaders });
+        }
+
+        await env.DB.prepare(`
+          UPDATE email_subscribers
+          SET status = 'unsubscribed', updated_at = datetime('now')
+          WHERE id = ?
+        `).bind(subscriberId).run();
+
+        return Response.json({ ok: true }, { headers: corsHeaders });
+      }
+
+      if (url.pathname === '/api/market/refresh-products' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
+        }
+
+        const briefEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_BRIEF', 'ENABLE_BRIEF', true);
+        const opportunitiesEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true);
+        const inAppAlertsEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_IN_APP', 'ENABLE_ALERTS_IN_APP', true);
+
+        let brief: BriefSnapshot | null = null;
+        if (briefEnabled) {
+          brief = await buildBriefSnapshot(env.DB);
+          if (brief) {
+            await storeBriefSnapshot(env.DB, brief);
+          }
+        }
+
+        let opportunities7d: OpportunitySnapshot | null = null;
+        let opportunities30d: OpportunitySnapshot | null = null;
+        if (opportunitiesEnabled) {
+          opportunities7d = await buildOpportunitySnapshot(env.DB, '7d');
+          opportunities30d = await buildOpportunitySnapshot(env.DB, '30d');
+          if (opportunities7d) await storeOpportunitySnapshot(env.DB, opportunities7d);
+          if (opportunities30d) await storeOpportunitySnapshot(env.DB, opportunities30d);
+        }
+
+        let alertsGenerated = 0;
+        if (brief && opportunities7d) {
+          const generated = await generateMarketEvents(env.DB, brief, opportunities7d);
+          alertsGenerated = await insertMarketEvents(env.DB, generated, inAppAlertsEnabled);
+        }
+
+        return Response.json({
+          ok: true,
+          brief_generated: brief ? 1 : 0,
+          opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
+          alerts_generated: alertsGenerated,
+          as_of: brief?.as_of || opportunities7d?.as_of || null,
+        }, { headers: corsHeaders });
+      }
+
+      if (url.pathname === '/api/market/send-digest' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
+        }
+
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_EMAIL', 'ENABLE_ALERTS_EMAIL', true)) {
+          return Response.json({
+            ok: true,
+            skipped: true,
+            reason: 'Email alerts disabled',
+          }, { headers: corsHeaders });
+        }
+
+        if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
+          return Response.json({ error: 'Email service unavailable' }, { status: 503, headers: corsHeaders });
+        }
+
+        const secret = getAlertsSigningSecret(env);
+        if (!secret) {
+          return Response.json({ error: 'Signing secret unavailable' }, { status: 503, headers: corsHeaders });
+        }
+
+        const [briefRow, opportunityRow, alertRows, subscribers] = await Promise.all([
+          env.DB.prepare(`SELECT payload_json FROM market_brief_snapshots ORDER BY as_of DESC LIMIT 1`).first<{ payload_json: string }>(),
+          env.DB.prepare(`SELECT payload_json FROM opportunity_snapshots WHERE horizon = '7d' ORDER BY as_of DESC LIMIT 1`).first<{ payload_json: string }>(),
+          env.DB.prepare(`
+            SELECT id, event_type, severity, title, body, entity_type, entity_id, dedupe_key, payload_json, created_at
+            FROM market_alert_events
+            WHERE created_at >= datetime('now', '-24 hours')
+            ORDER BY created_at DESC
+            LIMIT 200
+          `).all<MarketAlertEvent>(),
+          env.DB.prepare(`
+            SELECT id, email, types_json, cadence, status
+            FROM email_subscribers
+            WHERE status = 'active'
+              AND cadence = 'daily_8am_et'
+          `).all<{ id: string; email: string; types_json: string; cadence: string; status: string }>(),
+        ]);
+
+        let brief: BriefSnapshot | null = null;
+        let opportunities: OpportunitySnapshot | null = null;
+        try {
+          brief = briefRow?.payload_json ? (JSON.parse(briefRow.payload_json) as BriefSnapshot) : null;
+        } catch {
+          brief = null;
+        }
+        try {
+          opportunities = opportunityRow?.payload_json ? (JSON.parse(opportunityRow.payload_json) as OpportunitySnapshot) : null;
+        } catch {
+          opportunities = null;
+        }
+        const events = alertRows.results || [];
+
+        let sentCount = 0;
+        let failCount = 0;
+        let bounceCount = 0;
+
+        for (const subscriber of subscribers.results || []) {
+          let types: MarketAlertType[] = VALID_ALERT_TYPES;
+          try {
+            types = normalizeAlertTypes(JSON.parse(subscriber.types_json));
+          } catch {
+            types = VALID_ALERT_TYPES;
+          }
+
+          const filteredEvents = events.filter((event) => types.includes(event.event_type));
+          const unsubscribeToken = `${subscriber.id}.${generateToken(8)}`;
+          const unsubscribeHash = await hashToken(secret, unsubscribeToken);
+          await env.DB.prepare(`
+            INSERT OR REPLACE INTO email_unsubscribe_tokens (subscriber_id, token_hash, created_at)
+            VALUES (?, ?, datetime('now'))
+          `).bind(subscriber.id, unsubscribeHash).run();
+
+          let result: { ok: boolean; providerId?: string; error?: string } = { ok: false, error: 'Unknown error' };
+          for (let attempt = 1; attempt <= 3; attempt += 1) {
+            result = await sendDigestToSubscriber(env, subscriber.email, brief, opportunities, filteredEvents, unsubscribeToken);
+            if (result.ok) break;
+            const delayMs = attempt * attempt * 300;
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
+
+          if (result.ok) {
+            sentCount += 1;
+            await env.DB.prepare(`
+              INSERT INTO market_alert_deliveries
+              (event_id, channel, subscriber_id, status, provider_id, attempted_at)
+              VALUES (?, 'email', ?, 'sent', ?, datetime('now'))
+            `).bind(`digest-${asIsoDate(new Date())}`, subscriber.id, result.providerId || null).run();
+          } else {
+            failCount += 1;
+            const errorText = result.error || 'Delivery failed';
+            if (errorText.toLowerCase().includes('bounce')) {
+              bounceCount += 1;
+              await env.DB.prepare(`
+                UPDATE email_subscribers SET status = 'bounced', updated_at = datetime('now')
+                WHERE id = ?
+              `).bind(subscriber.id).run();
+            }
+            await env.DB.prepare(`
+              INSERT INTO market_alert_deliveries
+              (event_id, channel, subscriber_id, status, error, attempted_at)
+              VALUES (?, 'email', ?, 'failed', ?, datetime('now'))
+            `).bind(`digest-${asIsoDate(new Date())}`, subscriber.id, errorText).run();
+          }
+        }
+
+        return Response.json({
+          ok: true,
+          sent_count: sentCount,
+          fail_count: failCount,
+          bounce_count: bounceCount,
+          active_subscribers: subscribers.results?.length || 0,
+        }, { headers: corsHeaders });
       }
 
       // v1.4: Historical data endpoint for charts
@@ -3229,8 +5041,19 @@ export default {
           cats.results || []
         );
 
-        // Get divergence
-        const divergence = await detectDivergence(env.DB, pxi.score, regime);
+        const [divergence, freshness, mlSampleSize] = await Promise.all([
+          detectDivergence(env.DB, pxi.score, regime),
+          computeFreshnessStatus(env.DB),
+          fetchPredictionEvaluationSampleSize(env.DB),
+        ]);
+        const conflictState = resolveConflictState(regime, signal);
+        const edgeQuality = computeEdgeQualitySnapshot({
+          staleCount: freshness.stale_count,
+          mlSampleSize,
+          regime,
+          conflictState,
+          divergenceCount: divergence.alerts.length,
+        });
 
         return Response.json({
           date: pxi.date,
@@ -3257,6 +5080,7 @@ export default {
             volatility_percentile: signal.volatility_percentile,
             category_dispersion: signal.category_dispersion,
             adjustments: signal.adjustments,
+            conflict_state: conflictState,
           },
           // Regime info
           regime: regime ? {
@@ -3268,10 +5092,119 @@ export default {
           divergence: divergence.has_divergence ? {
             alerts: divergence.alerts,
           } : null,
+          edge_quality: edgeQuality,
+          freshness_status: freshness,
         }, {
           headers: {
             ...corsHeaders,
             'Cache-Control': 'public, max-age=60',
+          },
+        });
+      }
+
+      if (url.pathname === '/api/plan' && method === 'GET') {
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_PLAN', 'ENABLE_PLAN', true)) {
+          return Response.json(buildPlanFallbackPayload('feature_disabled'), {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        const recentScores = await env.DB.prepare(
+          'SELECT date, score, label, status, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 10'
+        ).all<PXIRow>();
+
+        let pxi: PXIRow | null = null;
+        let catResult: D1Result<CategoryRow> | null = null;
+        for (const candidate of recentScores.results || []) {
+          const cats = await env.DB.prepare(
+            'SELECT category, score, weight FROM category_scores WHERE date = ?'
+          ).bind(candidate.date).all<CategoryRow>();
+          if ((cats.results?.length || 0) >= 3) {
+            pxi = candidate;
+            catResult = cats;
+            break;
+          }
+        }
+
+        if (!pxi) {
+          pxi = recentScores.results?.[0] || null;
+          if (pxi) {
+            catResult = await env.DB.prepare(
+              'SELECT category, score, weight FROM category_scores WHERE date = ?'
+            ).bind(pxi.date).all<CategoryRow>();
+          }
+        }
+
+        if (!pxi) {
+          return Response.json(buildPlanFallbackPayload('no_pxi_data'), {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        const categories = (catResult?.results || []).map((row) => ({ score: row.score }));
+        const [regime, freshness, mlSampleSize, riskBand] = await Promise.all([
+          detectRegime(env.DB, pxi.date),
+          computeFreshnessStatus(env.DB),
+          fetchPredictionEvaluationSampleSize(env.DB),
+          buildCurrentBucketRiskBands(env.DB, pxi.score),
+        ]);
+
+        const signal = await calculatePXISignal(
+          env.DB,
+          { score: pxi.score, delta_7d: pxi.delta_7d, delta_30d: pxi.delta_30d },
+          regime,
+          categories,
+        );
+        const divergence = await detectDivergence(env.DB, pxi.score, regime);
+        const conflictState = resolveConflictState(regime, signal);
+        const edgeQuality = computeEdgeQualitySnapshot({
+          staleCount: freshness.stale_count,
+          mlSampleSize,
+          regime,
+          conflictState,
+          divergenceCount: divergence.alerts.length,
+        });
+
+        const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${signal.signal_type.replace('_', ' ')} posture at ${Math.round(signal.risk_allocation * 100)}% risk budget.${
+          freshness.stale_count > 0 ? ` ${freshness.stale_count} stale indicator(s) are penalizing confidence.` : ''
+        }`;
+
+        const degradedReasons: string[] = [];
+        if (riskBand.d7.sample_size < 20 || riskBand.d30.sample_size < 20) {
+          degradedReasons.push('limited_scenario_sample');
+        }
+        if (freshness.stale_count > 0) degradedReasons.push('stale_inputs');
+        if (edgeQuality.label === 'LOW') degradedReasons.push('low_edge_quality');
+
+        const payload: PlanPayload = {
+          as_of: `${pxi.date}T00:00:00.000Z`,
+          setup_summary: setupSummary,
+          action_now: {
+            risk_allocation_target: signal.risk_allocation,
+            horizon_bias: resolveHorizonBias(signal, regime, edgeQuality.score),
+            primary_signal: signal.signal_type,
+          },
+          edge_quality: edgeQuality,
+          risk_band: riskBand,
+          invalidation_rules: buildInvalidationRules({
+            pxi,
+            freshness,
+            regime,
+            edgeQuality,
+          }),
+          degraded_reason: degradedReasons.length > 0 ? degradedReasons.join(',') : null,
+        };
+
+        return Response.json(payload, {
+          headers: {
+            ...corsHeaders,
+            'Cache-Control': 'no-store',
           },
         });
       }

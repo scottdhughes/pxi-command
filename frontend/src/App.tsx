@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
+import './App.css'
 
-type AppRoute = '/' | '/spec' | '/alerts' | '/guide'
+type AppRoute = '/' | '/spec' | '/alerts' | '/guide' | '/brief' | '/opportunities' | '/inbox'
 
 interface RouteMeta {
   title: string
@@ -74,6 +75,48 @@ const ROUTE_META: Record<AppRoute, RouteMeta> = {
       step: [],
     },
   },
+  '/brief': {
+    title: 'PXI Daily Brief',
+    description: 'Daily market brief with regime delta, explainability movers, and data freshness context.',
+    canonical: 'https://pxicommand.com/brief',
+    ogTitle: 'PXI Daily Brief',
+    ogDescription: 'Daily macro brief: what changed, why it matters, and current risk posture.',
+    jsonLd: {
+      '@context': 'https://schema.org',
+      '@type': 'WebPage',
+      name: 'PXI Daily Brief',
+      url: 'https://pxicommand.com/brief',
+      description: 'Daily PXI brief with explainability and freshness context.',
+    },
+  },
+  '/opportunities': {
+    title: 'PXI Opportunities',
+    description: 'Ranked market opportunities blending PXI, ML, and Signals theme context.',
+    canonical: 'https://pxicommand.com/opportunities',
+    ogTitle: 'PXI Opportunities',
+    ogDescription: 'Deterministic opportunity feed with conviction, rationale, and historical hit-rate context.',
+    jsonLd: {
+      '@context': 'https://schema.org',
+      '@type': 'WebPage',
+      name: 'PXI Opportunities',
+      url: 'https://pxicommand.com/opportunities',
+      description: 'Opportunity feed for 7d and 30d horizons.',
+    },
+  },
+  '/inbox': {
+    title: 'PXI Alert Inbox',
+    description: 'Market-wide alert feed with severity, event metadata, and email digest subscription.',
+    canonical: 'https://pxicommand.com/inbox',
+    ogTitle: 'PXI Alert Inbox',
+    ogDescription: 'In-app feed for regime changes, threshold events, opportunity spikes, and freshness warnings.',
+    jsonLd: {
+      '@context': 'https://schema.org',
+      '@type': 'WebPage',
+      name: 'PXI Alert Inbox',
+      url: 'https://pxicommand.com/inbox',
+      description: 'In-app market alerts feed for PXI.',
+    },
+  },
 }
 
 function normalizeRoute(pathname: string): AppRoute {
@@ -81,6 +124,9 @@ function normalizeRoute(pathname: string): AppRoute {
   if (path === '/spec') return '/spec'
   if (path === '/alerts') return '/alerts'
   if (path === '/guide') return '/guide'
+  if (path === '/brief') return '/brief'
+  if (path === '/opportunities') return '/opportunities'
+  if (path === '/inbox') return '/inbox'
   return '/'
 }
 
@@ -128,6 +174,49 @@ function applyRouteMetadata(route: AppRoute) {
   setMeta('twitter:description', meta.ogDescription, 'name')
   setCanonical(meta.canonical)
   setJsonLd(meta.jsonLd)
+}
+
+const API_PRIMARY = 'https://api.pxicommand.com'
+const API_ROLLBACK = 'https://pxi-api.novoamorx1.workers.dev'
+let pinnedApiBase: string | null = null
+
+function getApiUrlCandidates() {
+  const configured = import.meta.env.VITE_API_URL?.trim()
+  let candidates: string[]
+
+  if (import.meta.env.DEV) {
+    candidates = [configured || 'http://localhost:3000']
+  } else if (configured) {
+    candidates = configured === API_ROLLBACK ? [configured] : [configured, API_ROLLBACK]
+  } else {
+    candidates = [API_PRIMARY, API_ROLLBACK]
+  }
+
+  if (pinnedApiBase && candidates.includes(pinnedApiBase)) {
+    return [pinnedApiBase, ...candidates.filter(c => c !== pinnedApiBase)]
+  }
+  return candidates
+}
+
+async function fetchApi(path: string, init?: RequestInit): Promise<Response> {
+  const candidates = getApiUrlCandidates()
+  let lastError: unknown
+
+  for (let i = 0; i < candidates.length; i += 1) {
+    const base = candidates[i]
+    try {
+      const response = await fetch(`${base}${path}`, init)
+      pinnedApiBase = base
+      return response
+    } catch (err) {
+      lastError = err
+      if (i < candidates.length - 1) {
+        console.warn(`API host unreachable (${base}), trying fallback`, err)
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('API fetch failed')
 }
 
 // ============== ML Accuracy Data Interface ==============
@@ -221,6 +310,88 @@ interface AlertsApiResponse {
     accuracy_7d: number | null
     avg_return_7d: number
   }>
+}
+
+interface BriefData {
+  as_of: string
+  summary: string
+  regime_delta: 'UNCHANGED' | 'SHIFTED' | 'STRENGTHENED' | 'WEAKENED'
+  top_changes: string[]
+  risk_posture: 'risk_on' | 'neutral' | 'risk_off'
+  explainability: {
+    category_movers: { category: string; score_change: number }[]
+    indicator_movers: { indicator_id: string; value_change: number; z_impact: number }[]
+  }
+  freshness_status: {
+    has_stale_data: boolean
+    stale_count: number
+  }
+  updated_at: string
+}
+
+interface OpportunityItem {
+  id: string
+  symbol: string | null
+  theme_id: string
+  theme_name: string
+  direction: 'bullish' | 'bearish' | 'neutral'
+  conviction_score: number
+  rationale: string
+  supporting_factors: string[]
+  historical_hit_rate: number
+  sample_size: number
+  updated_at: string
+}
+
+interface OpportunitiesResponse {
+  as_of: string
+  horizon: '7d' | '30d'
+  items: OpportunityItem[]
+}
+
+interface MarketFeedAlert {
+  id: string
+  event_type: 'regime_change' | 'threshold_cross' | 'opportunity_spike' | 'freshness_warning'
+  severity: 'info' | 'warning' | 'critical'
+  title: string
+  body: string
+  entity_type: 'market' | 'theme' | 'indicator'
+  entity_id: string | null
+  created_at: string
+}
+
+interface AlertsFeedResponse {
+  as_of: string
+  alerts: MarketFeedAlert[]
+  degraded_reason?: string | null
+}
+
+interface PlanData {
+  as_of: string
+  setup_summary: string
+  action_now: {
+    risk_allocation_target: number
+    horizon_bias: string
+    primary_signal: 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE' | string
+  }
+  edge_quality: {
+    score: number
+    label: 'HIGH' | 'MEDIUM' | 'LOW'
+    breakdown: {
+      data_quality: number
+      model_agreement: number
+      regime_stability: number
+    }
+    stale_count: number
+    ml_sample_size: number
+    conflict_state: 'ALIGNED' | 'MIXED' | 'CONFLICT'
+  }
+  risk_band: {
+    d7: { bear: number | null; base: number | null; bull: number | null; sample_size: number }
+    d30: { bear: number | null; base: number | null; bull: number | null; sample_size: number }
+  }
+  invalidation_rules: string[]
+  degraded_reason: string | null
 }
 
 // ============== Category Details Interface ==============
@@ -388,6 +559,7 @@ interface SignalData {
     volatility_percentile: number | null
     category_dispersion: number
     adjustments: string[]
+    conflict_state?: 'ALIGNED' | 'MIXED' | 'CONFLICT'
   }
   regime: {
     type: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
@@ -395,6 +567,11 @@ interface SignalData {
     description: string
   } | null
   divergence: PXIData['divergence']
+  edge_quality?: PlanData['edge_quality']
+  freshness_status?: {
+    has_stale_data: boolean
+    stale_count: number
+  }
 }
 
 interface PredictionData {
@@ -549,6 +726,107 @@ function RegimeBadge({ regime }: { regime: PXIData['regime'] }) {
   )
 }
 
+function formatBand(value: number | null): string {
+  return value === null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`
+}
+
+function TodayPlanCard({ plan }: { plan: PlanData | null }) {
+  if (!plan) return null
+
+  const qualityColor =
+    plan.edge_quality.label === 'HIGH' ? 'text-[#00c896]' :
+    plan.edge_quality.label === 'MEDIUM' ? 'text-[#f59e0b]' :
+    'text-[#ff6b6b]'
+
+  const conflictColor =
+    plan.edge_quality.conflict_state === 'ALIGNED' ? 'text-[#00c896]' :
+    plan.edge_quality.conflict_state === 'MIXED' ? 'text-[#f59e0b]' :
+    'text-[#ff6b6b]'
+
+  const bars = [
+    { label: 'data', value: plan.edge_quality.breakdown.data_quality },
+    { label: 'model', value: plan.edge_quality.breakdown.model_agreement },
+    { label: 'regime', value: plan.edge_quality.breakdown.regime_stability },
+  ]
+
+  return (
+    <section className="w-full mb-6 rounded border border-[#26272b] bg-[#0a0a0a]/80 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[9px] uppercase tracking-[0.25em] text-[#949ba5]">Today Plan</p>
+          <p className="mt-1 text-[12px] leading-relaxed text-[#e4e8ee]">{plan.setup_summary}</p>
+        </div>
+        <div className="shrink-0 text-right">
+          <p className={`text-[11px] font-medium uppercase tracking-wide ${qualityColor}`}>
+            {plan.edge_quality.label}
+          </p>
+          <p className="text-[10px] text-[#949ba5]">edge {plan.edge_quality.score}</p>
+        </div>
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2 text-[10px]">
+        <span className="rounded border border-[#26272b] px-2 py-1 text-[#d7dbe1]">
+          risk {Math.round(plan.action_now.risk_allocation_target * 100)}%
+        </span>
+        <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
+          {plan.action_now.primary_signal.replace('_', ' ')}
+        </span>
+        <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
+          {plan.action_now.horizon_bias.replace(/_/g, ' ')}
+        </span>
+        <span className={`rounded border border-[#26272b] px-2 py-1 ${conflictColor}`}>
+          {plan.edge_quality.conflict_state.toLowerCase()}
+        </span>
+      </div>
+
+      <div className="mt-3 grid grid-cols-3 gap-2">
+        {bars.map((bar) => (
+          <div key={bar.label}>
+            <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-wide text-[#949ba5]">
+              <span>{bar.label}</span>
+              <span className="text-[#d7dbe1]">{bar.value}</span>
+            </div>
+            <div className="h-1.5 rounded bg-[#15161a]">
+              <div
+                className="h-1.5 rounded bg-[#00a3ff]"
+                style={{ width: `${Math.max(0, Math.min(100, bar.value))}%` }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2 text-[10px]">
+        <div className="rounded border border-[#26272b] px-2 py-2">
+          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">7d band</p>
+          <p className="text-[#d7dbe1]">
+            {formatBand(plan.risk_band.d7.bear)} / {formatBand(plan.risk_band.d7.base)} / {formatBand(plan.risk_band.d7.bull)}
+          </p>
+          <p className="text-[#949ba5]/70">n={plan.risk_band.d7.sample_size}</p>
+        </div>
+        <div className="rounded border border-[#26272b] px-2 py-2">
+          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">30d band</p>
+          <p className="text-[#d7dbe1]">
+            {formatBand(plan.risk_band.d30.bear)} / {formatBand(plan.risk_band.d30.base)} / {formatBand(plan.risk_band.d30.bull)}
+          </p>
+          <p className="text-[#949ba5]/70">n={plan.risk_band.d30.sample_size}</p>
+        </div>
+      </div>
+
+      {plan.invalidation_rules.length > 0 && (
+        <div className="mt-3 rounded border border-[#26272b] px-2 py-2">
+          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Invalidation</p>
+          <ul className="mt-1 space-y-1 text-[10px] text-[#d7dbe1]">
+            {plan.invalidation_rules.slice(0, 3).map((rule) => (
+              <li key={rule}>• {rule}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  )
+}
+
 // v1.1: Signal indicator component
 function SignalIndicator({ signal }: { signal: SignalData['signal'] | null }) {
   if (!signal) return null
@@ -590,6 +868,17 @@ function SignalIndicator({ signal }: { signal: SignalData['signal'] | null }) {
             <span className="text-[11px] text-[#f3f3f3]/80 font-mono">
               {allocationPct}%
             </span>
+            {signal.conflict_state && (
+              <span className={`text-[8px] uppercase tracking-widest ${
+                signal.conflict_state === 'ALIGNED'
+                  ? 'text-[#00c896]'
+                  : signal.conflict_state === 'MIXED'
+                    ? 'text-[#f59e0b]'
+                    : 'text-[#ff6b6b]'
+              }`}>
+                {signal.conflict_state.toLowerCase()}
+              </span>
+            )}
           </div>
           {signal.adjustments.length > 0 && (
             <p className="text-[9px] text-[#949ba5]/50 mt-1">
@@ -1386,8 +1675,7 @@ function CategoryModal({
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
-        const res = await fetch(`${apiUrl}/api/category/${category}`)
+        const res = await fetchApi(`/api/category/${category}`)
         if (res.ok) {
           const json = await res.json()
           setData(json)
@@ -1692,24 +1980,44 @@ function SimilarPeriodsCard({ data }: { data: SimilarPeriodsData | null }) {
     return <span className={color}>{val >= 0 ? '+' : ''}{val.toFixed(2)}%</span>
   }
 
-  // Calculate probability-weighted outlook (guard against division by zero)
-  const totalWeight = data.similar_periods.reduce((sum, p) => sum + p.weights.combined, 0)
-  const safeWeight = totalWeight || 1  // Prevent division by zero
+  // Only compute outlook from periods with real forward return values.
+  const weightedForwardReturn = (horizon: 'd7' | 'd30') => {
+    let weightedSum = 0
+    let totalWeight = 0
+    let sampleCount = 0
 
-  const weightedReturn7d = data.similar_periods.reduce((sum, p) => {
-    const ret = p.forward_returns?.d7 ?? 0
-    return sum + ret * p.weights.combined
-  }, 0) / safeWeight
+    for (const period of data.similar_periods) {
+      const value = period.forward_returns?.[horizon]
+      if (typeof value === 'number') {
+        weightedSum += value * period.weights.combined
+        totalWeight += period.weights.combined
+        sampleCount += 1
+      }
+    }
 
-  const weightedReturn30d = data.similar_periods.reduce((sum, p) => {
-    const ret = p.forward_returns?.d30 ?? 0
-    return sum + ret * p.weights.combined
-  }, 0) / safeWeight
+    if (sampleCount === 0 || totalWeight === 0) {
+      return { value: null as number | null, sampleCount: 0 }
+    }
 
-  const positiveCount = data.similar_periods.filter(p => (p.forward_returns?.d30 ?? 0) > 0).length
-  const winRate = data.similar_periods.length > 0
-    ? (positiveCount / data.similar_periods.length) * 100
-    : 0
+    return { value: weightedSum / totalWeight, sampleCount }
+  }
+
+  const outlook7d = weightedForwardReturn('d7')
+  const outlook30d = weightedForwardReturn('d30')
+
+  const valid30dReturns = data.similar_periods
+    .map(period => period.forward_returns?.d30)
+    .filter((value): value is number => typeof value === 'number')
+
+  const positiveCount = valid30dReturns.filter(value => value > 0).length
+  const winRate = valid30dReturns.length > 0
+    ? (positiveCount / valid30dReturns.length) * 100
+    : null
+
+  const metricColor = (value: number | null, threshold = 0) => {
+    if (value === null) return 'text-[#949ba5]/60'
+    return value >= threshold ? 'text-[#00c896]' : 'text-[#ff6b6b]'
+  }
 
   return (
     <div className="w-full mt-6 sm:mt-8 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
@@ -1725,23 +2033,28 @@ function SimilarPeriodsCard({ data }: { data: SimilarPeriodsData | null }) {
         <div className="flex justify-between items-center">
           <div className="text-center">
             <div className="text-[10px] text-[#949ba5]/60">7d</div>
-            <div className={`text-lg font-mono ${weightedReturn7d >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
-              {weightedReturn7d >= 0 ? '+' : ''}{weightedReturn7d.toFixed(2)}%
+            <div className={`text-lg font-mono ${metricColor(outlook7d.value)}`}>
+              {outlook7d.value === null ? '—' : `${outlook7d.value >= 0 ? '+' : ''}${outlook7d.value.toFixed(2)}%`}
             </div>
           </div>
           <div className="text-center">
             <div className="text-[10px] text-[#949ba5]/60">30d</div>
-            <div className={`text-lg font-mono ${weightedReturn30d >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
-              {weightedReturn30d >= 0 ? '+' : ''}{weightedReturn30d.toFixed(2)}%
+            <div className={`text-lg font-mono ${metricColor(outlook30d.value)}`}>
+              {outlook30d.value === null ? '—' : `${outlook30d.value >= 0 ? '+' : ''}${outlook30d.value.toFixed(2)}%`}
             </div>
           </div>
           <div className="text-center">
             <div className="text-[10px] text-[#949ba5]/60">Win Rate</div>
-            <div className={`text-lg font-mono ${winRate >= 50 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
-              {Math.round(winRate)}%
+            <div className={`text-lg font-mono ${metricColor(winRate, 50)}`}>
+              {winRate === null ? '—' : `${Math.round(winRate)}%`}
             </div>
           </div>
         </div>
+        {(outlook7d.sampleCount < data.similar_periods.length || outlook30d.sampleCount < data.similar_periods.length) && (
+          <div className="mt-2 text-[8px] text-[#949ba5]/40 text-center">
+            sample coverage: 7d {outlook7d.sampleCount}/{data.similar_periods.length}, 30d {outlook30d.sampleCount}/{data.similar_periods.length}
+          </div>
+        )}
       </div>
 
       {/* Similar Periods List */}
@@ -1858,6 +2171,413 @@ function BacktestCard({ data }: { data: BacktestData | null }) {
   )
 }
 
+function BriefCompactCard({ brief, onOpen }: { brief: BriefData | null; onOpen: () => void }) {
+  if (!brief) return null
+
+  return (
+    <div className="w-full mt-6 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider">Today&apos;s Brief</div>
+        <button
+          onClick={onOpen}
+          className="text-[9px] uppercase tracking-[0.2em] text-[#00a3ff] hover:text-[#7ccfff]"
+        >
+          open /brief
+        </button>
+      </div>
+      <p className="text-[12px] text-[#d7dbe1] leading-relaxed">{brief.summary}</p>
+      <div className="mt-3 flex items-center gap-2 text-[9px] uppercase tracking-wider">
+        <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.regime_delta}</span>
+        <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.risk_posture.replace('_', '-')}</span>
+        {brief.freshness_status.has_stale_data && (
+          <span className="px-2 py-1 border border-[#ff6b6b]/40 rounded text-[#ff6b6b]">
+            stale: {brief.freshness_status.stale_count}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | null; onOpen: () => void }) {
+  if (!data || !data.items || data.items.length === 0) return null
+  const top = data.items.slice(0, 3)
+
+  return (
+    <div className="w-full mt-6 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider">Top Opportunities</div>
+        <button
+          onClick={onOpen}
+          className="text-[9px] uppercase tracking-[0.2em] text-[#00a3ff] hover:text-[#7ccfff]"
+        >
+          open /opportunities
+        </button>
+      </div>
+
+      <div className="space-y-2">
+        {top.map((item) => (
+          <div key={item.id} className="p-3 bg-[#0f0f0f] border border-[#1a1a1a] rounded">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <div className="text-[12px] text-[#f3f3f3]">{item.theme_name}</div>
+                <div className="text-[9px] text-[#949ba5]/60 uppercase tracking-wider">
+                  {item.direction} · {item.sample_size} samples
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-[18px] leading-none font-mono text-[#f3f3f3]">{item.conviction_score}</div>
+                <div className="text-[8px] text-[#949ba5]/50 uppercase tracking-wider">conviction</div>
+              </div>
+            </div>
+            <p className="mt-2 text-[10px] text-[#b8bec8]">{item.rationale}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => void }) {
+  return (
+    <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex items-center justify-between mb-8">
+          <h1 className="text-[11px] uppercase tracking-[0.3em] text-[#949ba5]">PXI /brief</h1>
+          <button
+            onClick={onBack}
+            className="text-[10px] uppercase tracking-[0.2em] border border-[#26272b] px-3 py-1.5 rounded text-[#949ba5] hover:text-[#f3f3f3]"
+          >
+            home
+          </button>
+        </div>
+
+        {!brief ? (
+          <div className="text-[#949ba5]">No brief snapshot available yet.</div>
+        ) : (
+          <div className="space-y-6">
+            <div className="p-5 bg-[#0a0a0a]/70 border border-[#26272b] rounded-lg">
+              <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-2">
+                Market Summary
+              </div>
+              <p className="text-[14px] leading-relaxed text-[#e4e8ee]">{brief.summary}</p>
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wider">
+                <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.regime_delta}</span>
+                <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.risk_posture.replace('_', '-')}</span>
+                <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+                  as of {new Date(brief.as_of).toLocaleString()}
+                </span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+                <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-3">Category Movers</div>
+                <div className="space-y-2">
+                  {brief.explainability.category_movers.slice(0, 5).map((row) => (
+                    <div key={row.category} className="flex items-center justify-between text-[11px]">
+                      <span className="text-[#cfd5de]">{row.category}</span>
+                      <span className={row.score_change >= 0 ? 'text-[#00c896] font-mono' : 'text-[#ff6b6b] font-mono'}>
+                        {row.score_change >= 0 ? '+' : ''}{row.score_change.toFixed(1)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+                <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-3">Indicator Movers</div>
+                <div className="space-y-2">
+                  {brief.explainability.indicator_movers.slice(0, 5).map((row) => (
+                    <div key={row.indicator_id} className="flex items-center justify-between text-[11px]">
+                      <span className="text-[#cfd5de]">{row.indicator_id}</span>
+                      <span className={row.z_impact >= 0 ? 'text-[#00c896] font-mono' : 'text-[#ff6b6b] font-mono'}>
+                        {row.z_impact >= 0 ? '+' : ''}{row.z_impact.toFixed(1)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+              <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-2">Top Changes</div>
+              <ul className="space-y-1">
+                {brief.top_changes.map((change, idx) => (
+                  <li key={`${change}-${idx}`} className="text-[11px] text-[#cfd5de]">{change}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function OpportunitiesPage({
+  data,
+  horizon,
+  onHorizonChange,
+  onBack,
+}: {
+  data: OpportunitiesResponse | null
+  horizon: '7d' | '30d'
+  onHorizonChange: (h: '7d' | '30d') => void
+  onBack: () => void
+}) {
+  return (
+    <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
+      <div className="max-w-5xl mx-auto">
+        <div className="flex items-center justify-between mb-8">
+          <h1 className="text-[11px] uppercase tracking-[0.3em] text-[#949ba5]">PXI /opportunities</h1>
+          <button
+            onClick={onBack}
+            className="text-[10px] uppercase tracking-[0.2em] border border-[#26272b] px-3 py-1.5 rounded text-[#949ba5] hover:text-[#f3f3f3]"
+          >
+            home
+          </button>
+        </div>
+
+        <div className="mb-6 flex items-center gap-2">
+          <button
+            onClick={() => onHorizonChange('7d')}
+            className={`px-3 py-1.5 text-[10px] uppercase tracking-[0.2em] border rounded ${
+              horizon === '7d' ? 'border-[#00a3ff] text-[#00a3ff]' : 'border-[#26272b] text-[#949ba5]'
+            }`}
+          >
+            7d
+          </button>
+          <button
+            onClick={() => onHorizonChange('30d')}
+            className={`px-3 py-1.5 text-[10px] uppercase tracking-[0.2em] border rounded ${
+              horizon === '30d' ? 'border-[#00a3ff] text-[#00a3ff]' : 'border-[#26272b] text-[#949ba5]'
+            }`}
+          >
+            30d
+          </button>
+        </div>
+
+        {!data || data.items.length === 0 ? (
+          <div className="text-[#949ba5]">No opportunities available yet.</div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {data.items.map((item) => (
+              <div key={item.id} className="p-4 bg-[#0a0a0a]/65 border border-[#26272b] rounded-lg">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-[13px] text-[#f3f3f3]">{item.theme_name}</div>
+                    <div className="text-[9px] text-[#949ba5]/60 uppercase tracking-wider">
+                      {item.direction} · {item.symbol || 'theme-level'}
+                    </div>
+                  </div>
+                  <div className="px-2 py-1 rounded border border-[#1d2f3f] bg-[#081521]">
+                    <div className="text-[16px] leading-none font-mono text-[#00a3ff]">{item.conviction_score}</div>
+                    <div className="text-[8px] text-[#7fa8c7] uppercase tracking-wider">conviction</div>
+                  </div>
+                </div>
+                <p className="mt-3 text-[11px] text-[#cfd5de] leading-relaxed">{item.rationale}</p>
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {item.supporting_factors.slice(0, 5).map((factor) => (
+                    <span key={factor} className="px-2 py-1 text-[8px] uppercase tracking-wider border border-[#26272b] text-[#949ba5] rounded">
+                      {factor}
+                    </span>
+                  ))}
+                </div>
+                <div className="mt-3 text-[9px] text-[#949ba5]/60">
+                  Hit rate {(item.historical_hit_rate * 100).toFixed(0)}% · n={item.sample_size}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function severityClass(severity: MarketFeedAlert['severity']) {
+  if (severity === 'critical') return 'text-[#ff6b6b] border-[#ff6b6b]/40'
+  if (severity === 'warning') return 'text-[#f59e0b] border-[#f59e0b]/40'
+  return 'text-[#00a3ff] border-[#00a3ff]/40'
+}
+
+function InboxPage({
+  alerts,
+  onBack,
+  onOpenSubscribe,
+  notice,
+}: {
+  alerts: MarketFeedAlert[]
+  onBack: () => void
+  onOpenSubscribe: () => void
+  notice: string | null
+}) {
+  return (
+    <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex items-center justify-between mb-8">
+          <h1 className="text-[11px] uppercase tracking-[0.3em] text-[#949ba5]">PXI /inbox</h1>
+          <button
+            onClick={onBack}
+            className="text-[10px] uppercase tracking-[0.2em] border border-[#26272b] px-3 py-1.5 rounded text-[#949ba5] hover:text-[#f3f3f3]"
+          >
+            home
+          </button>
+        </div>
+
+        {notice && (
+          <div className="mb-4 p-3 border border-[#1f3e56] bg-[#091825] rounded text-[11px] text-[#9ec5e2]">
+            {notice}
+          </div>
+        )}
+
+        <div className="mb-4 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg flex items-center justify-between gap-3">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-[#949ba5]/60">Email Digest</div>
+            <div className="text-[12px] text-[#d7dbe1]">Subscribe for the daily 8:00 AM ET market digest.</div>
+          </div>
+          <button
+            onClick={onOpenSubscribe}
+            className="px-3 py-2 border border-[#00a3ff] text-[#00a3ff] rounded text-[10px] uppercase tracking-[0.2em]"
+          >
+            subscribe
+          </button>
+        </div>
+
+        {alerts.length === 0 ? (
+          <div className="text-[#949ba5]">No alerts recorded yet.</div>
+        ) : (
+          <div className="space-y-3">
+            {alerts.map((alert) => (
+              <div key={alert.id} className="p-4 bg-[#0a0a0a]/65 border border-[#26272b] rounded-lg">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-[13px] text-[#f3f3f3]">{alert.title}</div>
+                    <div className="text-[10px] text-[#949ba5]/60 uppercase tracking-wider">
+                      {alert.event_type.replace('_', ' ')} · {new Date(alert.created_at).toLocaleString()}
+                    </div>
+                  </div>
+                  <span className={`px-2 py-1 border rounded text-[8px] uppercase tracking-wider ${severityClass(alert.severity)}`}>
+                    {alert.severity}
+                  </span>
+                </div>
+                <p className="mt-2 text-[11px] text-[#cfd5de]">{alert.body}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function EmailSubscribeModal({
+  onClose,
+  onSuccess,
+}: {
+  onClose: () => void
+  onSuccess: (message: string) => void
+}) {
+  const [email, setEmail] = useState('')
+  const [types, setTypes] = useState<Array<MarketFeedAlert['event_type']>>([
+    'regime_change',
+    'threshold_cross',
+    'opportunity_spike',
+    'freshness_warning',
+  ])
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const toggleType = (type: MarketFeedAlert['event_type']) => {
+    setTypes((prev) => {
+      if (prev.includes(type)) return prev.filter((item) => item !== type)
+      return [...prev, type]
+    })
+  }
+
+  const submit = async () => {
+    setSubmitting(true)
+    setError(null)
+    try {
+      const res = await fetchApi('/api/alerts/subscribe/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email,
+          types,
+          cadence: 'daily_8am_et',
+        }),
+      })
+
+      const payload = await res.json().catch(() => ({} as { error?: string }))
+      if (!res.ok) {
+        throw new Error(payload.error || 'Subscription failed')
+      }
+
+      onSuccess('Verification email sent. Use the link in your inbox to activate.')
+      onClose()
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Subscription failed'
+      setError(message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[80] bg-black/80 backdrop-blur-sm flex items-center justify-center px-4">
+      <div className="w-full max-w-md p-5 bg-[#090909] border border-[#26272b] rounded-lg">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-[11px] uppercase tracking-[0.25em] text-[#949ba5]">Email Alerts</h2>
+          <button onClick={onClose} className="text-[10px] uppercase tracking-[0.2em] text-[#949ba5] hover:text-[#f3f3f3]">
+            close
+          </button>
+        </div>
+
+        <label className="block text-[9px] uppercase tracking-wider text-[#949ba5]/60 mb-1">Email</label>
+        <input
+          type="email"
+          value={email}
+          onChange={(event) => setEmail(event.target.value)}
+          className="w-full bg-[#111] border border-[#26272b] rounded px-3 py-2 text-[12px] text-[#f3f3f3] outline-none focus:border-[#00a3ff]"
+          placeholder="you@example.com"
+        />
+
+        <div className="mt-4">
+          <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60 mb-2">Event types</div>
+          <div className="grid grid-cols-2 gap-2">
+            {(['regime_change', 'threshold_cross', 'opportunity_spike', 'freshness_warning'] as const).map((type) => (
+              <button
+                key={type}
+                onClick={() => toggleType(type)}
+                className={`px-2 py-1.5 text-[9px] uppercase tracking-wider border rounded ${
+                  types.includes(type)
+                    ? 'border-[#00a3ff] text-[#00a3ff]'
+                    : 'border-[#26272b] text-[#949ba5]'
+                }`}
+              >
+                {type.replace('_', ' ')}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {error && <p className="mt-3 text-[10px] text-[#ff6b6b]">{error}</p>}
+
+        <div className="mt-4 flex justify-end">
+          <button
+            onClick={submit}
+            disabled={submitting || !email || types.length === 0}
+            className="px-3 py-2 rounded border border-[#00a3ff] text-[#00a3ff] text-[10px] uppercase tracking-[0.2em] disabled:opacity-40"
+          >
+            {submitting ? 'sending...' : 'send verify link'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ============== CSV Export Button ==============
 function ExportButton() {
   const [exporting, setExporting] = useState(false)
@@ -1865,8 +2585,7 @@ function ExportButton() {
   const handleExport = async () => {
     setExporting(true)
     try {
-      const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
-      const response = await fetch(`${apiUrl}/api/export/history?format=csv&days=365`)
+      const response = await fetchApi('/api/export/history?format=csv&days=365')
       if (!response.ok) throw new Error('Export failed')
 
       const blob = await response.blob()
@@ -2634,6 +3353,13 @@ function App() {
   const [signalsData, setSignalsData] = useState<SignalsData | null>(null)  // v1.5: PXI + Signals integration
   const [similarData, setSimilarData] = useState<SimilarPeriodsData | null>(null)  // v1.6: Similar periods
   const [backtestData, setBacktestData] = useState<BacktestData | null>(null)  // v1.6: Backtest performance
+  const [planData, setPlanData] = useState<PlanData | null>(null)
+  const [briefData, setBriefData] = useState<BriefData | null>(null)
+  const [opportunitiesData, setOpportunitiesData] = useState<OpportunitiesResponse | null>(null)
+  const [opportunityHorizon, setOpportunityHorizon] = useState<'7d' | '30d'>('7d')
+  const [alertsFeed, setAlertsFeed] = useState<AlertsFeedResponse | null>(null)
+  const [showSubscribeModal, setShowSubscribeModal] = useState(false)
+  const [subscriptionNotice, setSubscriptionNotice] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -2681,19 +3407,71 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const verifyToken = params.get('verify_token')
+    const unsubscribeToken = params.get('unsubscribe_token')
+    if (!verifyToken && !unsubscribeToken) {
+      return
+    }
+
+    const finalize = () => {
+      const cleanUrl = `${window.location.pathname}`
+      window.history.replaceState({}, '', cleanUrl)
+      setRoute(normalizeRoute(window.location.pathname))
+    }
+
+    const run = async () => {
+      try {
+        if (verifyToken) {
+          const response = await fetchApi('/api/alerts/subscribe/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: verifyToken }),
+          })
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({ error: 'Verification failed' }))
+            throw new Error((payload as { error?: string }).error || 'Verification failed')
+          }
+          setSubscriptionNotice('Email alerts verified. Daily digest is active.')
+        } else if (unsubscribeToken) {
+          const response = await fetchApi('/api/alerts/unsubscribe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: unsubscribeToken }),
+          })
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({ error: 'Unsubscribe failed' }))
+            throw new Error((payload as { error?: string }).error || 'Unsubscribe failed')
+          }
+          setSubscriptionNotice('You have been unsubscribed from PXI digest emails.')
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : 'Token action failed'
+        setSubscriptionNotice(message)
+      } finally {
+        finalize()
+      }
+    }
+
+    run()
+  }, [])
+
+  useEffect(() => {
     const fetchData = async () => {
       try {
-        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000'
-
-        // Fetch PXI data, signal data, predictions, ML ensemble, accuracy, history, and alerts in parallel
-        const [pxiRes, signalRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes] = await Promise.all([
-          fetch(`${apiUrl}/api/pxi`),
-          fetch(`${apiUrl}/api/signal`).catch(() => null),  // v1.1
-          fetch(`${apiUrl}/api/predict`).catch(() => null),
-          fetch(`${apiUrl}/api/ml/ensemble`).catch(() => null),  // Ensemble
-          fetch(`${apiUrl}/api/ml/accuracy`).catch(() => null),  // v1.4: ML accuracy
-          fetch(`${apiUrl}/api/history?days=90`).catch(() => null),  // v1.4: Historical data
-          fetch(`${apiUrl}/api/alerts?limit=50`).catch(() => null)  // v1.5: Alert history
+        // Fetch PXI data, signal data, predictions, ML ensemble, accuracy, history, alerts, and product APIs in parallel
+        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, oppRes, inboxRes] = await Promise.all([
+          fetchApi('/api/pxi'),
+          fetchApi('/api/signal').catch(() => null),  // v1.1
+          fetchApi('/api/plan').catch(() => null),
+          fetchApi('/api/predict').catch(() => null),
+          fetchApi('/api/ml/ensemble').catch(() => null),  // Ensemble
+          fetchApi('/api/ml/accuracy').catch(() => null),  // v1.4: ML accuracy
+          fetchApi('/api/history?days=90').catch(() => null),  // v1.4: Historical data
+          fetchApi('/api/alerts?limit=50').catch(() => null),  // v1.5: Alert history
+          fetchApi('/api/brief?scope=market').catch(() => null),
+          fetchApi(`/api/opportunities?horizon=${opportunityHorizon}&limit=20`).catch(() => null),
+          fetchApi('/api/alerts/feed?limit=50').catch(() => null),
         ])
 
         if (!pxiRes.ok) throw new Error('Failed to fetch')
@@ -2705,6 +3483,13 @@ function App() {
           const signalJson = await signalRes.json()
           if (!signalJson.error) {
             setSignal(signalJson)
+          }
+        }
+
+        if (planRes?.ok) {
+          const planJson = await planRes.json() as PlanData
+          if (planJson.setup_summary && planJson.action_now) {
+            setPlanData(planJson)
           }
         }
 
@@ -2751,6 +3536,27 @@ function App() {
           }
         }
 
+        if (briefRes?.ok) {
+          const briefJson = await briefRes.json() as BriefData
+          if (briefJson.summary) {
+            setBriefData(briefJson)
+          }
+        }
+
+        if (oppRes?.ok) {
+          const oppJson = await oppRes.json() as OpportunitiesResponse
+          if (Array.isArray(oppJson.items)) {
+            setOpportunitiesData(oppJson)
+          }
+        }
+
+        if (inboxRes?.ok) {
+          const inboxJson = await inboxRes.json() as AlertsFeedResponse
+          if (Array.isArray(inboxJson.alerts)) {
+            setAlertsFeed(inboxJson)
+          }
+        }
+
         // v1.5: Signals data - fetch latest run from signals API
         try {
           const signalsApiUrl = '/signals/api/runs'
@@ -2772,7 +3578,7 @@ function App() {
 
         // v1.6: Similar periods data
         try {
-          const similarRes = await fetch(`${apiUrl}/api/similar`)
+          const similarRes = await fetchApi('/api/similar')
           if (similarRes.ok) {
             const similarJson = await similarRes.json() as SimilarPeriodsData
             if (similarJson.similar_periods) {
@@ -2785,7 +3591,7 @@ function App() {
 
         // v1.6: Backtest data
         try {
-          const backtestRes = await fetch(`${apiUrl}/api/backtest`)
+          const backtestRes = await fetchApi('/api/backtest')
           if (backtestRes.ok) {
             const backtestJson = await backtestRes.json() as BacktestData
             if (backtestJson.bucket_analysis) {
@@ -2808,7 +3614,7 @@ function App() {
     fetchData()
     const interval = setInterval(fetchData, 5 * 60 * 1000)
     return () => clearInterval(interval)
-  }, [])
+  }, [opportunityHorizon])
 
   if (loading) {
     return (
@@ -2860,6 +3666,32 @@ function App() {
     return <OnboardingModal onClose={() => navigateTo('/')} inPage />
   }
 
+  if (route === '/brief') {
+    return <BriefPage brief={briefData} onBack={() => navigateTo('/')} />
+  }
+
+  if (route === '/opportunities') {
+    return (
+      <OpportunitiesPage
+        data={opportunitiesData}
+        horizon={opportunityHorizon}
+        onHorizonChange={setOpportunityHorizon}
+        onBack={() => navigateTo('/')}
+      />
+    )
+  }
+
+  if (route === '/inbox') {
+    return (
+      <InboxPage
+        alerts={alertsFeed?.alerts || []}
+        onBack={() => navigateTo('/')}
+        onOpenSubscribe={() => setShowSubscribeModal(true)}
+        notice={subscriptionNotice}
+      />
+    )
+  }
+
   // v1.4: Handler to close onboarding and persist preference
   const handleCloseOnboarding = () => {
     setShowOnboarding(false)
@@ -2890,6 +3722,13 @@ function App() {
         <CategoryModal
           category={selectedCategory}
           onClose={() => setSelectedCategory(null)}
+        />
+      )}
+
+      {showSubscribeModal && (
+        <EmailSubscribeModal
+          onClose={() => setShowSubscribeModal(false)}
+          onSuccess={(message) => setSubscriptionNotice(message)}
         />
       )}
 
@@ -2941,6 +3780,36 @@ function App() {
               </button>
               <button
                 onClick={() => {
+                  navigateTo('/brief')
+                  setMenuOpen(false)
+                }}
+                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
+              >
+                /brief
+              </button>
+              <button
+                onClick={() => {
+                  navigateTo('/opportunities')
+                  setMenuOpen(false)
+                }}
+                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
+              >
+                /opportunities
+              </button>
+              <button
+                onClick={() => {
+                  navigateTo('/inbox')
+                  setMenuOpen(false)
+                }}
+                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
+              >
+                /inbox
+                {alertsFeed?.alerts?.length ? (
+                  <span className="ml-2 text-[8px] text-[#00a3ff]">({alertsFeed.alerts.length})</span>
+                ) : null}
+              </button>
+              <button
+                onClick={() => {
                   navigateTo('/guide')
                   setMenuOpen(false)
                 }}
@@ -2966,6 +3835,8 @@ function App() {
           <StatusBadge status={data.status} label={data.label} />
           {data.regime && <RegimeBadge regime={data.regime} />}
         </div>
+
+        <TodayPlanCard plan={planData} />
 
         {/* Hero Score */}
         <div className="text-center mb-4 sm:mb-6">
@@ -3033,6 +3904,14 @@ function App() {
 
         {/* v1.5: Top Themes from Signals */}
         <TopThemesWidget data={signalsData} regime={data.regime?.type} />
+
+        <BriefCompactCard brief={briefData} onOpen={() => navigateTo('/brief')} />
+        <OpportunityPreview data={opportunitiesData} onOpen={() => navigateTo('/opportunities')} />
+        {subscriptionNotice && (
+          <div className="w-full mt-4 p-3 border border-[#1f3e56] bg-[#091825] rounded text-[11px] text-[#9ec5e2]">
+            {subscriptionNotice}
+          </div>
+        )}
 
         {/* v1.6: Similar Periods */}
         <SimilarPeriodsCard data={similarData} />
