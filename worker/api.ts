@@ -4250,12 +4250,18 @@ export default {
         }
 
         let snapshot: BriefSnapshot | null = null;
-        const stored = await env.DB.prepare(`
-          SELECT payload_json
-          FROM market_brief_snapshots
-          ORDER BY as_of DESC
-          LIMIT 1
-        `).first<{ payload_json: string }>();
+        let stored: { payload_json: string } | null = null;
+        try {
+          stored = await env.DB.prepare(`
+            SELECT payload_json
+            FROM market_brief_snapshots
+            ORDER BY as_of DESC
+            LIMIT 1
+          `).first<{ payload_json: string }>();
+        } catch (err) {
+          console.error('Brief snapshot lookup failed:', err);
+          stored = null;
+        }
 
         if (stored?.payload_json) {
           try {
@@ -4280,7 +4286,11 @@ export default {
               },
             });
           }
-          await storeBriefSnapshot(env.DB, snapshot);
+          try {
+            await storeBriefSnapshot(env.DB, snapshot);
+          } catch (err) {
+            console.error('Brief snapshot store failed:', err);
+          }
         }
 
         return Response.json(snapshot, {
@@ -4310,13 +4320,19 @@ export default {
         }
 
         let snapshot: OpportunitySnapshot | null = null;
-        const stored = await env.DB.prepare(`
-          SELECT payload_json
-          FROM opportunity_snapshots
-          WHERE horizon = ?
-          ORDER BY as_of DESC
-          LIMIT 1
-        `).bind(horizon).first<{ payload_json: string }>();
+        let stored: { payload_json: string } | null = null;
+        try {
+          stored = await env.DB.prepare(`
+            SELECT payload_json
+            FROM opportunity_snapshots
+            WHERE horizon = ?
+            ORDER BY as_of DESC
+            LIMIT 1
+          `).bind(horizon).first<{ payload_json: string }>();
+        } catch (err) {
+          console.error('Opportunity snapshot lookup failed:', err);
+          stored = null;
+        }
 
         if (stored?.payload_json) {
           try {
@@ -4347,7 +4363,11 @@ export default {
               },
             });
           }
-          await storeOpportunitySnapshot(env.DB, snapshot);
+          try {
+            await storeOpportunitySnapshot(env.DB, snapshot);
+          } catch (err) {
+            console.error('Opportunity snapshot store failed:', err);
+          }
         }
 
         return Response.json({
