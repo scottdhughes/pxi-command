@@ -222,6 +222,13 @@ async function fetchApi(path: string, init?: RequestInit): Promise<Response> {
 // ============== ML Accuracy Data Interface ==============
 // Matches the /api/ml/accuracy response format
 interface MLAccuracyApiResponse {
+  as_of?: string
+  coverage?: {
+    total_predictions: number
+    evaluated_count: number
+    pending_count: number
+  }
+  unavailable_reasons?: string[]
   total_predictions: number
   evaluated_count: number
   pending_count: number
@@ -236,44 +243,62 @@ interface MLAccuracyApiResponse {
 
 // Parsed format for display
 interface MLAccuracyData {
+  as_of: string | null
+  coverage: {
+    total_predictions: number
+    evaluated_count: number
+    pending_count: number
+  }
+  unavailable_reasons: string[]
   rolling_7d: {
-    direction_accuracy: number
+    direction_accuracy: number | null
     sample_size: number
     mae: number | null
   }
   rolling_30d: {
-    direction_accuracy: number
+    direction_accuracy: number | null
     sample_size: number
     mae: number | null
   }
   all_time: {
-    direction_accuracy_7d: number
-    direction_accuracy_30d: number
+    direction_accuracy_7d: number | null
+    direction_accuracy_30d: number | null
     total_predictions: number
   }
 }
 
 // Parse API response to display format
 function parseMLAccuracy(api: MLAccuracyApiResponse): MLAccuracyData | null {
-  if (!api.metrics?.ensemble) return null
+  const parsePercent = (value?: string | null): number | null => {
+    if (!value || typeof value !== 'string') return null
+    const parsed = parseFloat(value.replace('%', ''))
+    return Number.isFinite(parsed) ? parsed : null
+  }
 
-  const d7 = api.metrics.ensemble.d7
-  const d30 = api.metrics.ensemble.d30
+  const d7 = api.metrics?.ensemble?.d7 ?? null
+  const d30 = api.metrics?.ensemble?.d30 ?? null
 
   return {
+    as_of: api.as_of || null,
+    coverage: api.coverage || {
+      total_predictions: api.total_predictions || 0,
+      evaluated_count: api.evaluated_count || 0,
+      pending_count: api.pending_count || 0,
+    },
+    unavailable_reasons: Array.isArray(api.unavailable_reasons) ? api.unavailable_reasons : [],
     rolling_7d: {
-      direction_accuracy: d7 ? parseFloat(d7.direction_accuracy.replace('%', '')) : 50,
+      direction_accuracy: parsePercent(d7?.direction_accuracy),
       sample_size: d7?.sample_size || 0,
       mae: d7 ? parseFloat(d7.mean_absolute_error) : null
     },
     rolling_30d: {
-      direction_accuracy: d30 ? parseFloat(d30.direction_accuracy.replace('%', '')) : 50,
+      direction_accuracy: parsePercent(d30?.direction_accuracy),
       sample_size: d30?.sample_size || 0,
       mae: d30 ? parseFloat(d30.mean_absolute_error) : null
     },
     all_time: {
-      direction_accuracy_7d: d7 ? parseFloat(d7.direction_accuracy.replace('%', '')) : 50,
-      direction_accuracy_30d: d30 ? parseFloat(d30.direction_accuracy.replace('%', '')) : 50,
+      direction_accuracy_7d: parsePercent(d7?.direction_accuracy),
+      direction_accuracy_30d: parsePercent(d30?.direction_accuracy),
       total_predictions: api.total_predictions
     }
   }
@@ -318,6 +343,22 @@ interface BriefData {
   regime_delta: 'UNCHANGED' | 'SHIFTED' | 'STRENGTHENED' | 'WEAKENED'
   top_changes: string[]
   risk_posture: 'risk_on' | 'neutral' | 'risk_off'
+  policy_state: {
+    stance: 'RISK_ON' | 'RISK_OFF' | 'MIXED'
+    risk_posture: 'risk_on' | 'neutral' | 'risk_off'
+    conflict_state: 'ALIGNED' | 'MIXED' | 'CONFLICT'
+    base_signal: string
+    regime_context: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
+    rationale: string
+    rationale_codes: string[]
+  }
+  source_plan_as_of: string
+  contract_version: string
+  consistency: {
+    score: number
+    state: 'PASS' | 'WARN' | 'FAIL'
+    violations: string[]
+  }
   explainability: {
     category_movers: { category: string; score_change: number }[]
     indicator_movers: { indicator_id: string; value_change: number; z_impact: number }[]
@@ -327,6 +368,7 @@ interface BriefData {
     stale_count: number
   }
   updated_at: string
+  degraded_reason: string | null
 }
 
 interface OpportunityItem {
@@ -347,6 +389,13 @@ interface OpportunityItem {
     sample_size: number
     quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
     basis: 'conviction_decile'
+    unavailable_reason: string | null
+  }
+  expectancy?: {
+    expected_move_pct: number | null
+    max_adverse_move_pct: number | null
+    sample_size: number
+    unavailable_reason: string | null
   }
   updated_at: string
 }
@@ -384,6 +433,7 @@ interface PlanData {
     base_signal: 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE' | string
     regime_context: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
     rationale: string
+    rationale_codes: string[]
   }
   action_now: {
     risk_allocation_target: number
@@ -413,6 +463,28 @@ interface PlanData {
   risk_band: {
     d7: { bear: number | null; base: number | null; bull: number | null; sample_size: number }
     d30: { bear: number | null; base: number | null; bull: number | null; sample_size: number }
+  }
+  uncertainty: {
+    headline: string | null
+    flags: {
+      stale_inputs: boolean
+      limited_calibration: boolean
+      limited_scenario_sample: boolean
+    }
+  }
+  consistency: {
+    score: number
+    state: 'PASS' | 'WARN' | 'FAIL'
+    violations: string[]
+  }
+  trader_playbook: {
+    recommended_size_pct: { min: number; target: number; max: number }
+    scenarios: Array<{ condition: string; action: string; invalidation: string }>
+    benchmark_follow_through_7d: {
+      hit_rate: number | null
+      sample_size: number
+      unavailable_reason: string | null
+    }
   }
   invalidation_rules: string[]
   degraded_reason: string | null
@@ -561,9 +633,21 @@ interface PXIData {
     staleCount: number
     staleIndicators: {
       id: string
-      lastUpdate: string
-      daysOld: number
+      lastUpdate: string | null
+      daysOld: number | null
     }[]
+    topOffenders?: Array<{
+      id: string
+      lastUpdate: string | null
+      daysOld: number | null
+      maxAgeDays: number
+      chronic: boolean
+      owner: 'market_data' | 'macro_data' | 'risk_ops'
+      escalation: 'observe' | 'retry_source' | 'escalate_ops'
+    }>
+    lastRefreshAtUtc?: string | null
+    nextExpectedRefreshAtUtc?: string
+    nextExpectedRefreshInMinutes?: number
   }
 }
 
@@ -759,6 +843,16 @@ function formatProbability(value: number | null, digits = 0): string {
   return `${(value * 100).toFixed(digits)}%`
 }
 
+function formatMaybePercent(value: number | null, digits = 1): string {
+  if (value === null || Number.isNaN(value)) return '—'
+  return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}%`
+}
+
+function formatUnavailableReason(reason: string | null | undefined): string {
+  if (!reason) return ''
+  return reason.replace(/_/g, ' ')
+}
+
 function calibrationQualityClass(quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'): string {
   if (quality === 'ROBUST') return 'border-[#00c896]/40 text-[#00c896]'
   if (quality === 'LIMITED') return 'border-[#f59e0b]/40 text-[#f59e0b]'
@@ -787,6 +881,16 @@ function fallbackOpportunityCalibration(): NonNullable<OpportunityItem['calibrat
     sample_size: 0,
     quality: 'INSUFFICIENT',
     basis: 'conviction_decile',
+    unavailable_reason: 'insufficient_sample',
+  }
+}
+
+function fallbackOpportunityExpectancy(): NonNullable<OpportunityItem['expectancy']> {
+  return {
+    expected_move_pct: null,
+    max_adverse_move_pct: null,
+    sample_size: 0,
+    unavailable_reason: 'insufficient_sample',
   }
 }
 
@@ -828,12 +932,31 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
     { label: 'regime', value: plan.edge_quality.breakdown.regime_stability },
   ]
   const calibration = plan.edge_quality.calibration ?? fallbackEdgeCalibration(plan.edge_quality.score)
+  const consistencyClass =
+    plan.consistency.state === 'PASS' ? 'border-[#00c896]/40 text-[#00c896]' :
+    plan.consistency.state === 'WARN' ? 'border-[#f59e0b]/40 text-[#f59e0b]' :
+    'border-[#ff6b6b]/40 text-[#ff6b6b]'
+  const shouldShowUncertaintyBanner =
+    Boolean(plan.uncertainty?.headline) ||
+    Boolean(plan.degraded_reason) ||
+    plan.uncertainty?.flags.stale_inputs ||
+    plan.uncertainty?.flags.limited_calibration ||
+    plan.uncertainty?.flags.limited_scenario_sample
 
   return (
     <section className="w-full mb-6 rounded border border-[#26272b] bg-[#0a0a0a]/80 p-4">
+      {shouldShowUncertaintyBanner && (
+        <div className="mb-3 rounded border border-[#f59e0b]/40 bg-[#f59e0b]/10 px-3 py-2">
+          <p className="text-[9px] uppercase tracking-wider text-[#f59e0b]">Uncertainty</p>
+          <p className="mt-1 text-[11px] text-[#f3e3c2]">
+            {plan.uncertainty?.headline || plan.degraded_reason?.replace(/,/g, ', ') || 'Signals are in degraded mode.'}
+          </p>
+        </div>
+      )}
+
       <div className="flex items-start justify-between gap-3">
-        <div>
-          <p className="text-[9px] uppercase tracking-[0.25em] text-[#949ba5]">Today Plan</p>
+        <div className="min-w-0">
+          <p className="text-[9px] uppercase tracking-[0.25em] text-[#949ba5]">Decision</p>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wide">
             <span className={`rounded border px-2 py-1 ${policyStanceClass(policyStance)}`}>
               stance {policyStance.replace('_', ' ')}
@@ -841,13 +964,11 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
             <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
               tactical {plan.action_now.primary_signal.replace('_', ' ')}
             </span>
+            <span className="rounded border border-[#26272b] px-2 py-1 text-[#d7dbe1]">
+              target {Math.round(plan.action_now.risk_allocation_target * 100)}%
+            </span>
           </div>
-          <p className="mt-1 text-[12px] leading-relaxed text-[#e4e8ee]">{plan.setup_summary}</p>
-          {plan.policy_state?.rationale ? (
-            <p className="mt-1 text-[9px] uppercase tracking-wide text-[#949ba5]/70">
-              {plan.policy_state.rationale.replace(/_/g, ' ')}
-            </p>
-          ) : null}
+          <p className="mt-2 text-[12px] leading-relaxed text-[#e4e8ee]">{plan.setup_summary}</p>
         </div>
         <div className="shrink-0 text-right">
           <p className={`text-[11px] font-medium uppercase tracking-wide ${qualityColor}`}>
@@ -857,68 +978,44 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
         </div>
       </div>
 
-      <div className="mt-3 flex flex-wrap gap-2 text-[10px]">
-        <span className="rounded border border-[#26272b] px-2 py-1 text-[#d7dbe1]">
-          risk {Math.round(plan.action_now.risk_allocation_target * 100)}%
-        </span>
-        <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
-          {plan.action_now.horizon_bias.replace(/_/g, ' ')}
-        </span>
-        <span className={`rounded border border-[#26272b] px-2 py-1 ${conflictColor}`}>
-          {plan.edge_quality.conflict_state.toLowerCase()}
-        </span>
-        <span className={`rounded border px-2 py-1 ${calibrationQualityClass(calibration.quality)}`}>
-          calibration {calibration.quality.toLowerCase()}
-        </span>
-      </div>
-
-      <div className="mt-3 grid grid-cols-3 gap-2">
-        {bars.map((bar) => (
-          <div key={bar.label}>
-            <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-wide text-[#949ba5]">
-              <span>{bar.label}</span>
-              <span className="text-[#d7dbe1]">{bar.value}</span>
-            </div>
-            <div className="h-1.5 rounded bg-[#15161a]">
-              <div
-                className="h-1.5 rounded bg-[#00a3ff]"
-                style={{ width: `${Math.max(0, Math.min(100, bar.value))}%` }}
-              />
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="mt-3 grid grid-cols-2 gap-2 text-[10px]">
-        <div className="rounded border border-[#26272b] px-2 py-2">
-          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">7d band</p>
-          <p className="text-[#d7dbe1]">
-            {formatBand(plan.risk_band.d7.bear)} / {formatBand(plan.risk_band.d7.base)} / {formatBand(plan.risk_band.d7.bull)}
-          </p>
-          <p className="text-[#949ba5]/70">n={plan.risk_band.d7.sample_size}</p>
-        </div>
-        <div className="rounded border border-[#26272b] px-2 py-2">
-          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">30d band</p>
-          <p className="text-[#d7dbe1]">
-            {formatBand(plan.risk_band.d30.bear)} / {formatBand(plan.risk_band.d30.base)} / {formatBand(plan.risk_band.d30.bull)}
-          </p>
-          <p className="text-[#949ba5]/70">n={plan.risk_band.d30.sample_size}</p>
-        </div>
-      </div>
-
-      <div className="mt-3 rounded border border-[#26272b] px-2 py-2">
+      <div className="mt-4 rounded border border-[#26272b] px-2 py-2">
         <div className="flex items-center justify-between gap-2">
-          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Edge Calibration (7d)</p>
-          <p className={`text-[9px] uppercase tracking-wide ${calibrationQualityClass(calibration.quality)}`}>
-            {calibration.quality}
-          </p>
+          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Confidence</p>
+          <span className={`rounded border px-2 py-0.5 text-[8px] uppercase tracking-wider ${consistencyClass}`}>
+            consistency {plan.consistency.state} {plan.consistency.score}
+          </span>
         </div>
-        <p className="mt-1 text-[10px] text-[#d7dbe1]">
+        <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+          <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
+            {plan.action_now.horizon_bias.replace(/_/g, ' ')}
+          </span>
+          <span className={`rounded border border-[#26272b] px-2 py-1 ${conflictColor}`}>
+            {plan.edge_quality.conflict_state.toLowerCase()}
+          </span>
+          <span className={`rounded border px-2 py-1 ${calibrationQualityClass(calibration.quality)}`}>
+            calibration {calibration.quality.toLowerCase()}
+          </span>
+        </div>
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          {bars.map((bar) => (
+            <div key={bar.label}>
+              <div className="mb-1 flex items-center justify-between text-[9px] uppercase tracking-wide text-[#949ba5]">
+                <span>{bar.label}</span>
+                <span className="text-[#d7dbe1]">{bar.value}</span>
+              </div>
+              <div className="h-1.5 rounded bg-[#15161a]">
+                <div
+                  className="h-1.5 rounded bg-[#00a3ff]"
+                  style={{ width: `${Math.max(0, Math.min(100, bar.value))}%` }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+        <p className="mt-2 text-[10px] text-[#d7dbe1]">
           p(correct) {formatProbability(calibration.probability_correct_7d)} ·
-          {' '}95% CI {formatProbability(calibration.ci95_low_7d)}-{formatProbability(calibration.ci95_high_7d)}
-        </p>
-        <p className="text-[9px] text-[#949ba5]/70">
-          bin {calibration.bin || 'n/a'} · n={calibration.sample_size_7d}
+          {' '}95% CI {formatProbability(calibration.ci95_low_7d)}-{formatProbability(calibration.ci95_high_7d)} ·
+          {' '}bin {calibration.bin || 'n/a'} · n={calibration.sample_size_7d}
         </p>
         {calibration.quality !== 'ROBUST' && (
           <p className="mt-1 text-[9px] text-[#f59e0b]">
@@ -927,14 +1024,81 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
         )}
       </div>
 
-      {plan.invalidation_rules.length > 0 && (
-        <div className="mt-3 rounded border border-[#26272b] px-2 py-2">
-          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Invalidation</p>
-          <ul className="mt-1 space-y-1 text-[10px] text-[#d7dbe1]">
-            {plan.invalidation_rules.slice(0, 3).map((rule) => (
-              <li key={rule}>• {rule}</li>
+      <div className="mt-3 rounded border border-[#26272b] px-2 py-2">
+        <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Why</p>
+        <p className="mt-1 text-[10px] text-[#d7dbe1]">
+          {plan.policy_state?.rationale ? plan.policy_state.rationale.replace(/_/g, ' ') : 'No rationale available.'}
+        </p>
+        {plan.policy_state?.rationale_codes?.length ? (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {plan.policy_state.rationale_codes.slice(0, 6).map((code) => (
+              <span key={code} className="rounded border border-[#26272b] px-2 py-0.5 text-[8px] uppercase tracking-wider text-[#949ba5]">
+                {code.replace(/_/g, ' ')}
+              </span>
             ))}
-          </ul>
+          </div>
+        ) : null}
+      </div>
+
+      <div className="mt-3 rounded border border-[#26272b] px-2 py-2">
+        <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Risk Limits</p>
+        <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+          <div className="rounded border border-[#26272b] px-2 py-2">
+            <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">7d band</p>
+            <p className="text-[#d7dbe1]">
+              {formatBand(plan.risk_band.d7.bear)} / {formatBand(plan.risk_band.d7.base)} / {formatBand(plan.risk_band.d7.bull)}
+            </p>
+            <p className="text-[#949ba5]/70">n={plan.risk_band.d7.sample_size}</p>
+          </div>
+          <div className="rounded border border-[#26272b] px-2 py-2">
+            <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">30d band</p>
+            <p className="text-[#d7dbe1]">
+              {formatBand(plan.risk_band.d30.bear)} / {formatBand(plan.risk_band.d30.base)} / {formatBand(plan.risk_band.d30.bull)}
+            </p>
+            <p className="text-[#949ba5]/70">n={plan.risk_band.d30.sample_size}</p>
+          </div>
+        </div>
+        <div className="mt-2 rounded border border-[#26272b] px-2 py-2">
+          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Sizing Playbook</p>
+          <p className="mt-1 text-[10px] text-[#d7dbe1]">
+            size range {plan.trader_playbook.recommended_size_pct.min}%-{plan.trader_playbook.recommended_size_pct.max}%
+            {' '}· target {plan.trader_playbook.recommended_size_pct.target}%
+          </p>
+          <p className="mt-1 text-[9px] text-[#949ba5]/70">
+            7d follow-through {formatProbability(plan.trader_playbook.benchmark_follow_through_7d.hit_rate)}
+            {' '}· n={plan.trader_playbook.benchmark_follow_through_7d.sample_size}
+            {plan.trader_playbook.benchmark_follow_through_7d.unavailable_reason
+              ? ` · ${formatUnavailableReason(plan.trader_playbook.benchmark_follow_through_7d.unavailable_reason)}`
+              : ''}
+          </p>
+          <div className="mt-2 space-y-1">
+            {plan.trader_playbook.scenarios.slice(0, 3).map((scenario) => (
+              <div key={`${scenario.condition}-${scenario.action}`} className="text-[9px] text-[#cfd5de]">
+                <span className="text-[#949ba5]">if</span> {scenario.condition} <span className="text-[#949ba5]">then</span> {scenario.action}
+              </div>
+            ))}
+          </div>
+        </div>
+        {plan.invalidation_rules.length > 0 && (
+          <div className="mt-2">
+            <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Invalidation</p>
+            <ul className="mt-1 space-y-1 text-[10px] text-[#d7dbe1]">
+              {plan.invalidation_rules.slice(0, 3).map((rule) => (
+                <li key={rule}>• {rule}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      {plan.consistency.violations.length > 0 && (
+        <div className="mt-2 text-[9px] text-[#ff6b6b]">
+          Violations: {plan.consistency.violations.join(', ').replace(/_/g, ' ')}
+        </div>
+      )}
+      {plan.degraded_reason && (
+        <div className="mt-1 text-[9px] text-[#949ba5]/80">
+          degraded: {plan.degraded_reason.replace(/,/g, ', ')}
         </div>
       )}
     </section>
@@ -1704,7 +1868,12 @@ function HistoricalChart({
 function StaleDataWarning({ freshness }: { freshness: PXIData['dataFreshness'] }) {
   const [expanded, setExpanded] = useState(false)
 
-  if (!freshness?.hasStaleData) return null
+  if (!freshness) return null
+
+  const topOffenders = freshness.topOffenders || []
+  const hasOffenders = freshness.hasStaleData || topOffenders.length > 0
+
+  if (!hasOffenders) return null
 
   return (
     <div className="w-full mt-4">
@@ -1712,26 +1881,57 @@ function StaleDataWarning({ freshness }: { freshness: PXIData['dataFreshness'] }
         onClick={() => setExpanded(!expanded)}
         className="w-full flex items-center justify-center gap-2 py-2 px-4 bg-[#f59e0b]/10 border border-[#f59e0b]/30 rounded text-[10px] text-[#f59e0b] uppercase tracking-wider hover:bg-[#f59e0b]/20 transition-colors"
       >
-        <span>⚠</span>
-        <span>{freshness.staleCount} indicator{freshness.staleCount > 1 ? 's' : ''} may be stale</span>
+        <span>operator panel</span>
+        <span>{freshness.staleCount} stale input{freshness.staleCount === 1 ? '' : 's'}</span>
         <span className="text-[#f59e0b]/50">{expanded ? '▲' : '▼'}</span>
       </button>
-      {expanded && freshness.staleIndicators.length > 0 && (
+      {expanded && (
         <div className="mt-2 p-3 bg-[#0a0a0a]/60 border border-[#26272b] rounded">
-          <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-2">
-            Last updated more than 2 days ago
+          <div className="flex flex-wrap gap-3 text-[9px] text-[#949ba5]/70 uppercase tracking-wider mb-3">
+            <div>
+              last refresh {freshness.lastRefreshAtUtc ? new Date(freshness.lastRefreshAtUtc).toLocaleString() : 'unknown'}
+            </div>
+            <div>
+              next refresh {freshness.nextExpectedRefreshAtUtc ? new Date(freshness.nextExpectedRefreshAtUtc).toLocaleString() : 'unknown'}
+              {typeof freshness.nextExpectedRefreshInMinutes === 'number' ? ` (${freshness.nextExpectedRefreshInMinutes}m)` : ''}
+            </div>
           </div>
-          <div className="space-y-1">
-            {freshness.staleIndicators.map(ind => (
-              <div key={ind.id} className="flex justify-between text-[10px]">
-                <span className="text-[#949ba5]">{ind.id.replace(/_/g, ' ')}</span>
-                <span className="text-[#f59e0b]/70">{ind.daysOld}d ago</span>
+          <div className="space-y-2">
+            {(topOffenders.length > 0 ? topOffenders : freshness.staleIndicators.slice(0, 3).map((s) => ({
+              id: s.id,
+              lastUpdate: s.lastUpdate,
+              daysOld: s.daysOld,
+              maxAgeDays: 0,
+              chronic: false,
+              owner: 'market_data' as const,
+              escalation: 'observe' as const,
+            }))).map((ind) => (
+              <div key={ind.id} className="border border-[#26272b] rounded px-2 py-2">
+                <div className="flex justify-between items-center gap-2 text-[10px]">
+                  <span className="text-[#d7dbe1]">{ind.id.replace(/_/g, ' ')}</span>
+                  <span className="text-[#f59e0b]/80">
+                    {ind.daysOld === null ? 'unknown age' : `${ind.daysOld}d old`}
+                    {ind.maxAgeDays > 0 ? ` / max ${ind.maxAgeDays}d` : ''}
+                  </span>
+                </div>
+                <div className="mt-1 flex flex-wrap gap-2 text-[8px] uppercase tracking-wider">
+                  <span className="px-1.5 py-0.5 border border-[#26272b] rounded text-[#949ba5]">{ind.owner}</span>
+                  <span className="px-1.5 py-0.5 border border-[#26272b] rounded text-[#949ba5]">{ind.escalation.replace(/_/g, ' ')}</span>
+                  {ind.chronic && (
+                    <span className="px-1.5 py-0.5 border border-[#ff6b6b]/40 rounded text-[#ff6b6b]">chronic</span>
+                  )}
+                </div>
+                {ind.lastUpdate && (
+                  <div className="mt-1 text-[8px] text-[#949ba5]/60">
+                    last update {new Date(ind.lastUpdate).toLocaleDateString()}
+                  </div>
+                )}
               </div>
             ))}
           </div>
-          {freshness.staleCount > 5 && (
+          {freshness.staleCount > 3 && (
             <div className="text-[8px] text-[#949ba5]/40 mt-2">
-              +{freshness.staleCount - 5} more
+              +{freshness.staleCount - 3} more stale indicators
             </div>
           )}
         </div>
@@ -1747,11 +1947,14 @@ function MLAccuracyBadge({ accuracy }: { accuracy: MLAccuracyData | null }) {
   const acc7d = accuracy.rolling_7d.direction_accuracy
   const acc30d = accuracy.rolling_30d.direction_accuracy
 
-  const getColor = (acc: number) => {
+  const getColor = (acc: number | null) => {
+    if (acc === null) return 'text-[#949ba5]'
     if (acc >= 70) return 'text-[#00c896]'
     if (acc >= 55) return 'text-[#f59e0b]'
     return 'text-[#ff6b6b]'
   }
+
+  const renderValue = (acc: number | null) => (acc === null ? 'N/A' : `${Math.round(acc)}%`)
 
   return (
     <div className="flex justify-center gap-4 mt-3 mb-2">
@@ -1759,7 +1962,7 @@ function MLAccuracyBadge({ accuracy }: { accuracy: MLAccuracyData | null }) {
         <div className="flex items-center gap-2 bg-[#0a0a0a]/60 rounded px-2.5 py-1 border border-[#1a1a1a]">
           <span className="text-[8px] text-[#949ba5]/50 uppercase tracking-wider">7d Acc</span>
           <span className={`text-[10px] font-mono ${getColor(acc7d)}`}>
-            {Math.round(acc7d)}%
+            {renderValue(acc7d)}
           </span>
         </div>
       </Tooltip>
@@ -1767,10 +1970,15 @@ function MLAccuracyBadge({ accuracy }: { accuracy: MLAccuracyData | null }) {
         <div className="flex items-center gap-2 bg-[#0a0a0a]/60 rounded px-2.5 py-1 border border-[#1a1a1a]">
           <span className="text-[8px] text-[#949ba5]/50 uppercase tracking-wider">30d Acc</span>
           <span className={`text-[10px] font-mono ${getColor(acc30d)}`}>
-            {Math.round(acc30d)}%
+            {renderValue(acc30d)}
           </span>
         </div>
       </Tooltip>
+      {accuracy.unavailable_reasons.length > 0 && (
+        <div className="text-[8px] text-[#949ba5]/60 self-center">
+          {accuracy.unavailable_reasons.slice(0, 1).map((reason) => formatUnavailableReason(reason)).join(', ')}
+        </div>
+      )}
     </div>
   )
 }
@@ -2311,12 +2519,29 @@ function BriefCompactCard({
       <div className="mt-3 flex items-center gap-2 text-[9px] uppercase tracking-wider">
         <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.regime_delta}</span>
         <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.risk_posture.replace('_', '-')}</span>
+        <span className={`px-2 py-1 border rounded ${
+          brief.consistency.state === 'PASS'
+            ? 'border-[#00c896]/40 text-[#00c896]'
+            : brief.consistency.state === 'WARN'
+              ? 'border-[#f59e0b]/40 text-[#f59e0b]'
+              : 'border-[#ff6b6b]/40 text-[#ff6b6b]'
+        }`}>
+          {brief.consistency.state} {brief.consistency.score}
+        </span>
         {brief.freshness_status.has_stale_data && (
           <span className="px-2 py-1 border border-[#ff6b6b]/40 rounded text-[#ff6b6b]">
             stale: {brief.freshness_status.stale_count}
           </span>
         )}
       </div>
+      <div className="mt-2 text-[9px] uppercase tracking-wider text-[#949ba5]/70">
+        policy {brief.policy_state.stance.replace('_', ' ')} · {brief.policy_state.base_signal.replace(/_/g, ' ')}
+      </div>
+      {brief.degraded_reason && (
+        <div className="mt-1 text-[9px] text-[#f59e0b]">
+          degraded: {brief.degraded_reason.replace(/_/g, ' ')}
+        </div>
+      )}
     </div>
   )
 }
@@ -2340,6 +2565,7 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
       <div className="space-y-2">
         {top.map((item) => {
           const calibration = item.calibration ?? fallbackOpportunityCalibration()
+          const expectancy = item.expectancy ?? fallbackOpportunityExpectancy()
           return (
           <div key={item.id} className="p-3 bg-[#0f0f0f] border border-[#1a1a1a] rounded">
             <div className="flex items-start justify-between gap-2">
@@ -2363,6 +2589,16 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
               {' '}95% CI {formatProbability(calibration.ci95_low)}-{formatProbability(calibration.ci95_high)} ·
               {' '}n={calibration.sample_size}
             </p>
+            <p className="mt-1 text-[9px] text-[#949ba5]/70">
+              expectancy {formatMaybePercent(expectancy.expected_move_pct)} ·
+              {' '}max adverse {formatMaybePercent(expectancy.max_adverse_move_pct)} ·
+              {' '}n={expectancy.sample_size}
+            </p>
+            {(calibration.unavailable_reason || expectancy.unavailable_reason) && (
+              <p className="mt-1 text-[9px] text-[#949ba5]/70">
+                unavailable: {[calibration.unavailable_reason, expectancy.unavailable_reason].filter(Boolean).map((r) => formatUnavailableReason(r)).join(' · ')}
+              </p>
+            )}
             {calibration.quality !== 'ROBUST' && (
               <p className="mt-1 text-[9px] text-[#f59e0b]">Use reduced sizing until calibration quality improves.</p>
             )}
@@ -2400,9 +2636,34 @@ function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => v
                 <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.regime_delta}</span>
                 <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.risk_posture.replace('_', '-')}</span>
                 <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+                  stance {brief.policy_state.stance.replace('_', ' ')}
+                </span>
+                <span className={`px-2 py-1 border rounded ${
+                  brief.consistency.state === 'PASS'
+                    ? 'border-[#00c896]/40 text-[#00c896]'
+                    : brief.consistency.state === 'WARN'
+                      ? 'border-[#f59e0b]/40 text-[#f59e0b]'
+                      : 'border-[#ff6b6b]/40 text-[#ff6b6b]'
+                }`}>
+                  consistency {brief.consistency.state} {brief.consistency.score}
+                </span>
+                <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
                   as of {new Date(brief.as_of).toLocaleString()}
                 </span>
               </div>
+              <div className="mt-2 text-[10px] text-[#949ba5]/80">
+                source plan {new Date(brief.source_plan_as_of).toLocaleString()} · contract {brief.contract_version}
+              </div>
+              {brief.policy_state.rationale && (
+                <div className="mt-2 text-[10px] text-[#cfd5de]">
+                  {brief.policy_state.rationale.replace(/_/g, ' ')}
+                </div>
+              )}
+              {brief.degraded_reason && (
+                <div className="mt-2 text-[9px] text-[#f59e0b]">
+                  degraded: {brief.degraded_reason.replace(/_/g, ' ')}
+                </div>
+              )}
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -2498,6 +2759,7 @@ function OpportunitiesPage({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {data.items.map((item) => {
               const calibration = item.calibration ?? fallbackOpportunityCalibration()
+              const expectancy = item.expectancy ?? fallbackOpportunityExpectancy()
               return (
               <div key={item.id} className="p-4 bg-[#0a0a0a]/65 border border-[#26272b] rounded-lg">
                 <div className="flex items-start justify-between gap-2">
@@ -2531,6 +2793,16 @@ function OpportunitiesPage({
                   {' '}95% CI {formatProbability(calibration.ci95_low)}-{formatProbability(calibration.ci95_high)} ·
                   {' '}n={calibration.sample_size}
                 </div>
+                <div className="mt-1 text-[9px] text-[#949ba5]/70">
+                  Expectancy {formatMaybePercent(expectancy.expected_move_pct)} ·
+                  {' '}max adverse {formatMaybePercent(expectancy.max_adverse_move_pct)} ·
+                  {' '}n={expectancy.sample_size}
+                </div>
+                {(calibration.unavailable_reason || expectancy.unavailable_reason) && (
+                  <div className="mt-1 text-[9px] text-[#949ba5]/70">
+                    unavailable: {[calibration.unavailable_reason, expectancy.unavailable_reason].filter(Boolean).map((r) => formatUnavailableReason(r)).join(' · ')}
+                  </div>
+                )}
                 {calibration.quality !== 'ROBUST' && (
                   <div className="mt-1 text-[9px] text-[#f59e0b]">
                     Limited calibration quality; treat this as exploratory risk.
@@ -3639,7 +3911,35 @@ function App() {
         if (planRes?.ok) {
           const planJson = await planRes.json() as PlanData
           if (planJson.setup_summary && planJson.action_now) {
-            setPlanData(planJson)
+            setPlanData({
+              ...planJson,
+              policy_state: planJson.policy_state ? {
+                ...planJson.policy_state,
+                rationale_codes: planJson.policy_state.rationale_codes || [],
+              } : undefined,
+              uncertainty: planJson.uncertainty || {
+                headline: null,
+                flags: {
+                  stale_inputs: false,
+                  limited_calibration: false,
+                  limited_scenario_sample: false,
+                },
+              },
+              consistency: planJson.consistency || {
+                score: 100,
+                state: 'PASS',
+                violations: [],
+              },
+              trader_playbook: planJson.trader_playbook || {
+                recommended_size_pct: { min: 25, target: 50, max: 65 },
+                scenarios: [],
+                benchmark_follow_through_7d: {
+                  hit_rate: null,
+                  sample_size: 0,
+                  unavailable_reason: 'insufficient_sample',
+                },
+              },
+            })
           }
         }
 
@@ -3662,7 +3962,7 @@ function App() {
         // v1.4: ML accuracy data - parse API response to display format
         if (accuracyRes?.ok) {
           const accuracyJson = await accuracyRes.json() as MLAccuracyApiResponse
-          if (!accuracyJson.error && accuracyJson.metrics) {
+          if (!accuracyJson.error) {
             const parsed = parseMLAccuracy(accuracyJson)
             if (parsed) {
               setMlAccuracy(parsed)
@@ -3689,7 +3989,26 @@ function App() {
         if (briefRes?.ok) {
           const briefJson = await briefRes.json() as BriefData
           if (briefJson.summary) {
-            setBriefData(briefJson)
+            setBriefData({
+              ...briefJson,
+              policy_state: briefJson.policy_state || {
+                stance: 'MIXED',
+                risk_posture: 'neutral',
+                conflict_state: 'MIXED',
+                base_signal: 'REDUCED_RISK',
+                regime_context: 'TRANSITION',
+                rationale: 'fallback',
+                rationale_codes: ['fallback'],
+              },
+              source_plan_as_of: briefJson.source_plan_as_of || briefJson.as_of,
+              contract_version: briefJson.contract_version || 'legacy',
+              consistency: briefJson.consistency || {
+                score: 100,
+                state: 'PASS',
+                violations: [],
+              },
+              degraded_reason: briefJson.degraded_reason || null,
+            })
           }
         }
 

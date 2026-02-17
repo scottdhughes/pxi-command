@@ -275,6 +275,7 @@ CREATE INDEX IF NOT EXISTS idx_email_unsubscribe_hash ON email_unsubscribe_token
 CREATE TABLE IF NOT EXISTS market_brief_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     as_of TEXT NOT NULL UNIQUE,
+    contract_version TEXT NOT NULL DEFAULT '2026-02-17-v2',
     payload_json TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -303,6 +304,17 @@ CREATE TABLE IF NOT EXISTS market_calibration_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_market_calibration_lookup ON market_calibration_snapshots(metric, horizon, as_of DESC);
+
+CREATE TABLE IF NOT EXISTS market_consistency_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of TEXT NOT NULL UNIQUE,
+    score REAL NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('PASS', 'WARN', 'FAIL')),
+    violations_json TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_consistency_created ON market_consistency_checks(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS market_alert_events (
     id TEXT PRIMARY KEY,

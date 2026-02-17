@@ -277,9 +277,9 @@ describe("scoreThemes", () => {
     })
 
     it("handles zero growth ratio gracefully", () => {
-      // log(0) would be -Infinity, but this shouldn't crash
+      // log(0) would be -Infinity without clamping
       const metrics = [
-        createMinimalMetrics({ growth_ratio: 0.001 }), // Very small but valid
+        createMinimalMetrics({ growth_ratio: 0 }),
         createMinimalMetrics({ growth_ratio: 1.0 }),
       ]
 
@@ -287,6 +287,24 @@ describe("scoreThemes", () => {
 
       expect(result).toHaveLength(2)
       expect(Number.isFinite(result[0].score)).toBe(true)
+      expect(Number.isFinite(result[1].score)).toBe(true)
+    })
+
+    it("handles negative or non-finite growth ratios gracefully", () => {
+      const metrics = [
+        createMinimalMetrics({ theme_id: "neg", growth_ratio: -5 }),
+        createMinimalMetrics({ theme_id: "nan", growth_ratio: Number.NaN }),
+        createMinimalMetrics({ theme_id: "inf", growth_ratio: Number.POSITIVE_INFINITY }),
+        createMinimalMetrics({ theme_id: "ok", growth_ratio: 1.2 }),
+      ]
+
+      const result = scoreThemes(metrics)
+
+      expect(result).toHaveLength(4)
+      for (const row of result) {
+        expect(Number.isFinite(row.score)).toBe(true)
+        expect(Number.isFinite(row.components.velocity)).toBe(true)
+      }
     })
   })
 

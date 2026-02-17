@@ -40,8 +40,15 @@ export interface ThemeScore {
  * console.log(topTheme.theme_name, topTheme.score);
  * ```
  */
+const MIN_GROWTH_RATIO_FOR_LOG = 1e-6
+
+function safeLogGrowthRatio(growthRatio: number): number {
+  if (!Number.isFinite(growthRatio)) return Math.log(MIN_GROWTH_RATIO_FOR_LOG)
+  return Math.log(Math.max(growthRatio, MIN_GROWTH_RATIO_FOR_LOG))
+}
+
 export function scoreThemes(metrics: ThemeMetrics[]) {
-  const velocityRaw = metrics.map((m) => Math.log(m.growth_ratio) + m.slope)
+  const velocityRaw = metrics.map((m) => safeLogGrowthRatio(m.growth_ratio) + m.slope)
   const sentimentRaw = metrics.map((m) => m.sentiment_shift)
   const confirmationRaw = metrics.map((m) => m.confirmation_score)
   const priceRaw = metrics.map((m) => (m.momentum_score || 0) + (m.divergence_score || 0))

@@ -2,7 +2,7 @@
 // Uses D1 (SQLite), Vectorize, and Workers AI
 // Includes scheduled cron handler for daily data refresh
 
-import { getStaleThresholdDays } from '../src/config/indicator-sla';
+import { getStaleThresholdDays, isChronicStaleness, resolveStalePolicy } from '../src/config/indicator-sla';
 
 interface Env {
   DB: D1Database;
@@ -1022,6 +1022,7 @@ interface IndicatorRow {
 type RegimeDelta = 'UNCHANGED' | 'SHIFTED' | 'STRENGTHENED' | 'WEAKENED';
 type RiskPosture = 'risk_on' | 'neutral' | 'risk_off';
 type PolicyStance = 'RISK_ON' | 'RISK_OFF' | 'MIXED';
+type ConsistencyState = 'PASS' | 'WARN' | 'FAIL';
 type OpportunityDirection = 'bullish' | 'bearish' | 'neutral';
 type MarketAlertType = 'regime_change' | 'threshold_cross' | 'opportunity_spike' | 'freshness_warning';
 type AlertSeverity = 'info' | 'warning' | 'critical';
@@ -1045,13 +1046,14 @@ interface OpportunityCalibration {
   sample_size: number;
   quality: CalibrationQuality;
   basis: 'conviction_decile';
+  unavailable_reason: string | null;
 }
 
 interface CalibrationBinSnapshot {
   bin: string;
-  probability_correct: number;
-  ci95_low: number;
-  ci95_high: number;
+  probability_correct: number | null;
+  ci95_low: number | null;
+  ci95_high: number | null;
   sample_size: number;
   quality: CalibrationQuality;
 }
@@ -1071,7 +1073,10 @@ interface BriefSnapshot {
   regime_delta: RegimeDelta;
   top_changes: string[];
   risk_posture: RiskPosture;
-  policy_state?: PolicyStateSnapshot;
+  policy_state: PolicyStateSnapshot;
+  source_plan_as_of: string;
+  contract_version: string;
+  consistency: ConsistencySnapshot;
   explainability: {
     category_movers: Array<{ category: string; score_change: number }>;
     indicator_movers: Array<{ indicator_id: string; value_change: number; z_impact: number }>;
@@ -1081,6 +1086,14 @@ interface BriefSnapshot {
     stale_count: number;
   };
   updated_at: string;
+  degraded_reason: string | null;
+}
+
+interface OpportunityExpectancy {
+  expected_move_pct: number | null;
+  max_adverse_move_pct: number | null;
+  sample_size: number;
+  unavailable_reason: string | null;
 }
 
 interface OpportunityItem {
@@ -1095,6 +1108,7 @@ interface OpportunityItem {
   historical_hit_rate: number;
   sample_size: number;
   calibration: OpportunityCalibration;
+  expectancy: OpportunityExpectancy;
   updated_at: string;
 }
 
@@ -1150,6 +1164,40 @@ interface PolicyStateSnapshot {
   base_signal: SignalType;
   regime_context: RegimeType;
   rationale: string;
+  rationale_codes: string[];
+}
+
+interface UncertaintySnapshot {
+  headline: string | null;
+  flags: {
+    stale_inputs: boolean;
+    limited_calibration: boolean;
+    limited_scenario_sample: boolean;
+  };
+}
+
+interface ConsistencySnapshot {
+  score: number;
+  state: ConsistencyState;
+  violations: string[];
+}
+
+interface TraderPlaybookSnapshot {
+  recommended_size_pct: {
+    min: number;
+    target: number;
+    max: number;
+  };
+  scenarios: Array<{
+    condition: string;
+    action: string;
+    invalidation: string;
+  }>;
+  benchmark_follow_through_7d: {
+    hit_rate: number | null;
+    sample_size: number;
+    unavailable_reason: string | null;
+  };
 }
 
 interface PlanRiskBand {
@@ -1173,6 +1221,9 @@ interface PlanPayload {
     d7: PlanRiskBand;
     d30: PlanRiskBand;
   };
+  uncertainty: UncertaintySnapshot;
+  consistency: ConsistencySnapshot;
+  trader_playbook: TraderPlaybookSnapshot;
   invalidation_rules: string[];
   degraded_reason: string | null;
 }
@@ -1184,6 +1235,11 @@ const ALLOWED_ORIGINS = [
   'https://pxi-command.pages.dev',
   'https://pxi-frontend.pages.dev',
 ];
+
+const BRIEF_CONTRACT_VERSION = '2026-02-17-v2';
+const CONSISTENCY_PASS_MIN = 90;
+const CONSISTENCY_WARN_MIN = 80;
+const REFRESH_HOURS_UTC = [6, 14, 18, 22];
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -1538,6 +1594,7 @@ function buildOpportunityCalibrationFallback(): OpportunityCalibration {
     sample_size: 0,
     quality: 'INSUFFICIENT',
     basis: 'conviction_decile',
+    unavailable_reason: 'insufficient_sample',
   };
 }
 
@@ -1553,14 +1610,20 @@ function parseCalibrationSnapshotPayload(raw: string | null | undefined): Market
         const candidate = bin as Partial<CalibrationBinSnapshot>;
         if (typeof candidate.bin !== 'string') return null;
         const sampleSize = toNumber(candidate.sample_size, 0);
-        const probability = toNumber(candidate.probability_correct, 0);
-        const ci95Low = toNumber(candidate.ci95_low, 0);
-        const ci95High = toNumber(candidate.ci95_high, 0);
+        const probability = candidate.probability_correct === null || candidate.probability_correct === undefined
+          ? null
+          : clamp(0, 1, toNumber(candidate.probability_correct, 0));
+        const ci95Low = candidate.ci95_low === null || candidate.ci95_low === undefined
+          ? null
+          : clamp(0, 1, toNumber(candidate.ci95_low, 0));
+        const ci95High = candidate.ci95_high === null || candidate.ci95_high === undefined
+          ? null
+          : clamp(0, 1, toNumber(candidate.ci95_high, 0));
         return {
           bin: candidate.bin,
-          probability_correct: clamp(0, 1, probability),
-          ci95_low: clamp(0, 1, ci95Low),
-          ci95_high: clamp(0, 1, ci95High),
+          probability_correct: probability,
+          ci95_low: ci95Low,
+          ci95_high: ci95High,
           sample_size: Math.max(0, Math.floor(sampleSize)),
           quality: calibrationQualityForSampleSize(sampleSize),
         };
@@ -1602,9 +1665,9 @@ function buildEdgeQualityCalibrationFromSnapshot(
   }
   return {
     bin: bin.bin,
-    probability_correct_7d: bin.probability_correct,
-    ci95_low_7d: bin.ci95_low,
-    ci95_high_7d: bin.ci95_high,
+    probability_correct_7d: bin.sample_size > 0 ? bin.probability_correct : null,
+    ci95_low_7d: bin.sample_size > 0 ? bin.ci95_low : null,
+    ci95_high_7d: bin.sample_size > 0 ? bin.ci95_high : null,
     sample_size_7d: bin.sample_size,
     quality: bin.quality,
   };
@@ -1616,11 +1679,30 @@ function buildOpportunityCalibrationFromSnapshot(
   direction: OpportunityDirection
 ): OpportunityCalibration {
   if (direction === 'neutral') {
-    return buildOpportunityCalibrationFallback();
+    return {
+      probability_correct_direction: null,
+      ci95_low: null,
+      ci95_high: null,
+      sample_size: 0,
+      quality: 'INSUFFICIENT',
+      basis: 'conviction_decile',
+      unavailable_reason: 'neutral_direction',
+    };
   }
   const bin = pickCalibrationBin(snapshot, convictionScore);
   if (!bin) {
     return buildOpportunityCalibrationFallback();
+  }
+  if (bin.sample_size <= 0) {
+    return {
+      probability_correct_direction: null,
+      ci95_low: null,
+      ci95_high: null,
+      sample_size: 0,
+      quality: 'INSUFFICIENT',
+      basis: 'conviction_decile',
+      unavailable_reason: 'insufficient_sample',
+    };
   }
   return {
     probability_correct_direction: bin.probability_correct,
@@ -1629,6 +1711,7 @@ function buildOpportunityCalibrationFromSnapshot(
     sample_size: bin.sample_size,
     quality: bin.quality,
     basis: 'conviction_decile',
+    unavailable_reason: null,
   };
 }
 
@@ -1673,6 +1756,7 @@ function buildPolicyStateSnapshot(params: {
   const rationale = reasons.length > 0
     ? `mixed:${reasons.join(',')}`
     : `aligned:${signal.signal_type.toLowerCase()}`;
+  const rationaleCodes = reasons.length > 0 ? reasons : ['aligned'];
 
   return {
     stance,
@@ -1681,6 +1765,346 @@ function buildPolicyStateSnapshot(params: {
     base_signal: signal.signal_type,
     regime_context: regime?.regime || 'TRANSITION',
     rationale,
+    rationale_codes: rationaleCodes,
+  };
+}
+
+function buildUncertaintySnapshot(degradedReasons: string[]): UncertaintySnapshot {
+  const reasonSet = new Set(degradedReasons);
+  const staleInputs = reasonSet.has('stale_inputs');
+  const limitedCalibration = reasonSet.has('limited_calibration_sample');
+  const limitedScenarioSample = reasonSet.has('limited_scenario_sample');
+
+  let headline: string | null = null;
+  if (staleInputs && limitedCalibration) {
+    headline = 'Signal quality reduced: stale inputs + limited calibration.';
+  } else if (staleInputs) {
+    headline = 'Signal quality reduced: stale inputs detected.';
+  } else if (limitedCalibration) {
+    headline = 'Signal quality reduced: limited calibration sample.';
+  } else if (limitedScenarioSample) {
+    headline = 'Signal quality reduced: limited scenario sample.';
+  }
+
+  return {
+    headline,
+    flags: {
+      stale_inputs: staleInputs,
+      limited_calibration: limitedCalibration,
+      limited_scenario_sample: limitedScenarioSample,
+    },
+  };
+}
+
+function buildConsistencySnapshot(policyState: PolicyStateSnapshot): ConsistencySnapshot {
+  const violations: string[] = [];
+
+  if (policyState.conflict_state === 'CONFLICT' && policyState.stance !== 'MIXED') {
+    violations.push('conflict_state_requires_mixed_stance');
+  }
+
+  if (
+    policyState.regime_context === 'RISK_ON' &&
+    (policyState.base_signal === 'RISK_OFF' || policyState.base_signal === 'DEFENSIVE') &&
+    policyState.stance !== 'MIXED'
+  ) {
+    violations.push('risk_on_regime_with_defensive_signal_requires_mixed_stance');
+  }
+
+  if (
+    policyState.regime_context === 'RISK_OFF' &&
+    (policyState.base_signal === 'FULL_RISK' || policyState.base_signal === 'REDUCED_RISK') &&
+    policyState.stance !== 'MIXED'
+  ) {
+    violations.push('risk_off_regime_with_risk_on_signal_requires_mixed_stance');
+  }
+
+  const expectedRiskPosture = policyStanceToRiskPosture(policyState.stance);
+  if (policyState.risk_posture !== expectedRiskPosture) {
+    violations.push('risk_posture_stance_mismatch');
+  }
+
+  const score = Math.max(0, Math.round(100 - (violations.length * 12)));
+  const state: ConsistencyState = score >= CONSISTENCY_PASS_MIN
+    ? 'PASS'
+    : score >= CONSISTENCY_WARN_MIN
+      ? 'WARN'
+      : 'FAIL';
+
+  return {
+    score,
+    state,
+    violations,
+  };
+}
+
+async function buildBenchmarkFollowThrough7d(db: D1Database): Promise<{
+  hit_rate: number | null;
+  sample_size: number;
+  unavailable_reason: string | null;
+}> {
+  const rows = await db.prepare(`
+    SELECT predicted_change_7d, actual_change_7d
+    FROM prediction_log
+    WHERE predicted_change_7d IS NOT NULL
+      AND actual_change_7d IS NOT NULL
+    ORDER BY prediction_date DESC
+    LIMIT 500
+  `).all<{ predicted_change_7d: number; actual_change_7d: number }>();
+
+  const samples = rows.results || [];
+  if (samples.length < 20) {
+    return {
+      hit_rate: null,
+      sample_size: samples.length,
+      unavailable_reason: 'insufficient_sample',
+    };
+  }
+
+  let correct = 0;
+  for (const row of samples) {
+    if (
+      (row.predicted_change_7d > 0 && row.actual_change_7d > 0) ||
+      (row.predicted_change_7d < 0 && row.actual_change_7d < 0) ||
+      (row.predicted_change_7d === 0 && row.actual_change_7d === 0)
+    ) {
+      correct += 1;
+    }
+  }
+
+  return {
+    hit_rate: correct / samples.length,
+    sample_size: samples.length,
+    unavailable_reason: null,
+  };
+}
+
+async function buildTraderPlaybookSnapshot(
+  db: D1Database,
+  params: {
+    signal: PXISignal;
+    policyState: PolicyStateSnapshot;
+    edgeQuality: EdgeQualitySnapshot;
+    freshness: { stale_count: number };
+  }
+): Promise<TraderPlaybookSnapshot> {
+  const { signal, policyState, edgeQuality, freshness } = params;
+
+  const baseTarget = Math.round(clamp(0, 1, signal.risk_allocation) * 100);
+  const conflictPenalty = policyState.conflict_state === 'CONFLICT' ? 8 : 0;
+  const freshnessPenalty = freshness.stale_count > 0 ? Math.min(15, Math.round(freshness.stale_count * 0.5)) : 0;
+  const calibrationPenalty = edgeQuality.calibration.quality === 'ROBUST'
+    ? 0
+    : edgeQuality.calibration.quality === 'LIMITED' ? 5 : 10;
+  const target = Math.max(0, Math.min(100, baseTarget - conflictPenalty - freshnessPenalty - calibrationPenalty));
+  const min = Math.max(0, target - 12);
+  const max = Math.min(100, target + 12);
+
+  const benchmark = await buildBenchmarkFollowThrough7d(db);
+  const scenarios: TraderPlaybookSnapshot['scenarios'] = [
+    {
+      condition: 'Conflict persists or volatility percentile remains above 85.',
+      action: `Hold allocation near ${min}% and prioritize downside hedges.`,
+      invalidation: 'Exit scenario when conflict clears and volatility normalizes.',
+    },
+    {
+      condition: 'Calibration improves to ROBUST and stale indicator count drops below 3.',
+      action: `Increase toward ${max}% risk in one tier increments.`,
+      invalidation: 'Stop increasing if edge quality drops to LOW.',
+    },
+    {
+      condition: 'Regime flips to RISK_OFF or primary signal shifts to DEFENSIVE.',
+      action: 'Move to defensive allocation immediately.',
+      invalidation: 'Only re-risk after two consecutive non-defensive plan updates.',
+    },
+  ];
+
+  return {
+    recommended_size_pct: { min, target, max },
+    scenarios,
+    benchmark_follow_through_7d: benchmark,
+  };
+}
+
+async function selectLatestPxiWithCategories(db: D1Database): Promise<{
+  pxi: PXIRow | null;
+  categories: CategoryRow[];
+}> {
+  const recentScores = await db.prepare(
+    'SELECT date, score, label, status, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 10'
+  ).all<PXIRow>();
+
+  let selected: PXIRow | null = null;
+  let selectedCategories: CategoryRow[] = [];
+
+  for (const candidate of recentScores.results || []) {
+    const cats = await db.prepare(
+      'SELECT category, score, weight FROM category_scores WHERE date = ?'
+    ).bind(candidate.date).all<CategoryRow>();
+    if ((cats.results?.length || 0) >= 3) {
+      selected = candidate;
+      selectedCategories = cats.results || [];
+      break;
+    }
+  }
+
+  if (!selected) {
+    selected = recentScores.results?.[0] || null;
+    if (selected) {
+      const cats = await db.prepare(
+        'SELECT category, score, weight FROM category_scores WHERE date = ?'
+      ).bind(selected.date).all<CategoryRow>();
+      selectedCategories = cats.results || [];
+    }
+  }
+
+  return {
+    pxi: selected,
+    categories: selectedCategories,
+  };
+}
+
+async function buildCanonicalMarketDecision(
+  db: D1Database,
+  options?: {
+    pxi?: PXIRow;
+    categories?: CategoryRow[];
+  }
+): Promise<{
+  as_of: string;
+  pxi: PXIRow;
+  categories: CategoryRow[];
+  signal: PXISignal;
+  regime: RegimeResult | null;
+  freshness: { has_stale_data: boolean; stale_count: number };
+  risk_band: { d7: PlanRiskBand; d30: PlanRiskBand };
+  edge_quality: EdgeQualitySnapshot;
+  policy_state: PolicyStateSnapshot;
+  degraded_reasons: string[];
+  uncertainty: UncertaintySnapshot;
+  consistency: ConsistencySnapshot;
+  trader_playbook: TraderPlaybookSnapshot;
+}> {
+  let pxi = options?.pxi || null;
+  let categories = options?.categories || [];
+
+  if (!pxi) {
+    const selected = await selectLatestPxiWithCategories(db);
+    pxi = selected.pxi;
+    categories = selected.categories;
+  }
+
+  if (!pxi) {
+    throw new Error('no_pxi_data');
+  }
+
+  const categoryScores = categories.map((row) => ({ score: row.score }));
+  const [regime, freshness, mlSampleSize, riskBand, edgeCalibrationSnapshot] = await Promise.all([
+    detectRegime(db, pxi.date),
+    computeFreshnessStatus(db),
+    fetchPredictionEvaluationSampleSize(db),
+    buildCurrentBucketRiskBands(db, pxi.score),
+    fetchLatestCalibrationSnapshot(db, 'edge_quality', null),
+  ]);
+
+  const signal = await calculatePXISignal(
+    db,
+    { score: pxi.score, delta_7d: pxi.delta_7d, delta_30d: pxi.delta_30d },
+    regime,
+    categoryScores,
+  );
+
+  const divergence = await detectDivergence(db, pxi.score, regime);
+  const conflictState = resolveConflictState(regime, signal);
+  const edgeQuality = computeEdgeQualitySnapshot({
+    staleCount: freshness.stale_count,
+    mlSampleSize,
+    regime,
+    conflictState,
+    divergenceCount: divergence.alerts.length,
+  });
+  const edgeQualityWithCalibration: EdgeQualitySnapshot = {
+    ...edgeQuality,
+    calibration: buildEdgeQualityCalibrationFromSnapshot(edgeCalibrationSnapshot, edgeQuality.score),
+  };
+
+  const policyState = buildPolicyStateSnapshot({
+    signal,
+    regime,
+    edgeQuality: edgeQualityWithCalibration,
+    freshness,
+    calibrationQuality: edgeQualityWithCalibration.calibration.quality,
+  });
+
+  const degradedReasons: string[] = [];
+  if (riskBand.d7.sample_size < 20 || riskBand.d30.sample_size < 20) degradedReasons.push('limited_scenario_sample');
+  if (freshness.stale_count > 0) degradedReasons.push('stale_inputs');
+  if (edgeQualityWithCalibration.label === 'LOW') degradedReasons.push('low_edge_quality');
+  if (edgeQualityWithCalibration.calibration.quality !== 'ROBUST') degradedReasons.push('limited_calibration_sample');
+
+  const uncertainty = buildUncertaintySnapshot(degradedReasons);
+  const consistency = buildConsistencySnapshot(policyState);
+  const traderPlaybook = await buildTraderPlaybookSnapshot(db, {
+    signal,
+    policyState,
+    edgeQuality: edgeQualityWithCalibration,
+    freshness,
+  });
+
+  return {
+    as_of: `${pxi.date}T00:00:00.000Z`,
+    pxi,
+    categories,
+    signal,
+    regime,
+    freshness,
+    risk_band: riskBand,
+    edge_quality: edgeQualityWithCalibration,
+    policy_state: policyState,
+    degraded_reasons: degradedReasons,
+    uncertainty,
+    consistency,
+    trader_playbook: traderPlaybook,
+  };
+}
+
+function isBriefSnapshotCompatible(snapshot: BriefSnapshot | null): boolean {
+  if (!snapshot) return false;
+  if (snapshot.contract_version !== BRIEF_CONTRACT_VERSION) return false;
+  if (!snapshot.policy_state || !snapshot.source_plan_as_of || !snapshot.consistency) return false;
+  if (!snapshot.policy_state.stance || !snapshot.policy_state.risk_posture) return false;
+  if (typeof snapshot.consistency.score !== 'number' || typeof snapshot.consistency.state !== 'string') return false;
+  return true;
+}
+
+function computeNextExpectedRefresh(now = new Date()): { at: string; in_minutes: number } {
+  const nowMs = now.getTime();
+  const candidateDates: Date[] = [];
+
+  for (let dayOffset = 0; dayOffset <= 2; dayOffset += 1) {
+    for (const hour of REFRESH_HOURS_UTC) {
+      const d = new Date(Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate() + dayOffset,
+        hour,
+        0,
+        0,
+        0,
+      ));
+      if (d.getTime() >= nowMs) {
+        candidateDates.push(d);
+      }
+    }
+  }
+
+  const next = candidateDates.length > 0
+    ? candidateDates.sort((a, b) => a.getTime() - b.getTime())[0]
+    : new Date(nowMs + (6 * 60 * 60 * 1000));
+
+  return {
+    at: next.toISOString(),
+    in_minutes: Math.max(0, Math.round((next.getTime() - nowMs) / 60000)),
   };
 }
 
@@ -2004,20 +2428,26 @@ function buildInvalidationRules(params: {
 
 function buildBriefFallbackSnapshot(reason: string): BriefSnapshot & { degraded_reason: string } {
   const now = asIsoDateTime(new Date());
+  const policyState: PolicyStateSnapshot = {
+    stance: 'MIXED',
+    risk_posture: 'neutral',
+    conflict_state: 'MIXED',
+    base_signal: 'REDUCED_RISK',
+    regime_context: 'TRANSITION',
+    rationale: `fallback:${reason}`,
+    rationale_codes: ['fallback'],
+  };
+  const consistency = buildConsistencySnapshot(policyState);
   return {
     as_of: now,
     summary: 'Daily market brief is temporarily unavailable. Showing neutral fallback context.',
     regime_delta: 'UNCHANGED',
     top_changes: [`degraded: ${reason}`],
     risk_posture: 'neutral',
-    policy_state: {
-      stance: 'MIXED',
-      risk_posture: 'neutral',
-      conflict_state: 'MIXED',
-      base_signal: 'REDUCED_RISK',
-      regime_context: 'TRANSITION',
-      rationale: `fallback:${reason}`,
-    },
+    policy_state: policyState,
+    source_plan_as_of: now,
+    contract_version: BRIEF_CONTRACT_VERSION,
+    consistency,
     explainability: {
       category_movers: [],
       indicator_movers: [],
@@ -2044,17 +2474,20 @@ function buildOpportunityFallbackSnapshot(
 }
 
 function buildPlanFallbackPayload(reason: string): PlanPayload {
+  const policyState: PolicyStateSnapshot = {
+    stance: 'MIXED',
+    risk_posture: 'neutral',
+    conflict_state: 'MIXED',
+    base_signal: 'REDUCED_RISK',
+    regime_context: 'TRANSITION',
+    rationale: `fallback:${reason}`,
+    rationale_codes: ['fallback'],
+  };
+  const consistency = buildConsistencySnapshot(policyState);
   return {
     as_of: asIsoDateTime(new Date()),
     setup_summary: 'Plan service is in degraded mode. Use neutral sizing until full context is restored.',
-    policy_state: {
-      stance: 'MIXED',
-      risk_posture: 'neutral',
-      conflict_state: 'MIXED',
-      base_signal: 'REDUCED_RISK',
-      regime_context: 'TRANSITION',
-      rationale: `fallback:${reason}`,
-    },
+    policy_state: policyState,
     action_now: {
       risk_allocation_target: 0.5,
       horizon_bias: '7d_neutral_30d_neutral',
@@ -2077,6 +2510,30 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
       d7: { bear: null, base: null, bull: null, sample_size: 0 },
       d30: { bear: null, base: null, bull: null, sample_size: 0 },
     },
+    uncertainty: {
+      headline: 'Signal quality reduced: fallback mode.',
+      flags: {
+        stale_inputs: false,
+        limited_calibration: true,
+        limited_scenario_sample: true,
+      },
+    },
+    consistency,
+    trader_playbook: {
+      recommended_size_pct: { min: 25, target: 50, max: 65 },
+      scenarios: [
+        {
+          condition: 'Fallback mode active.',
+          action: 'Hold neutral risk and avoid directional concentration.',
+          invalidation: 'Replace with live plan once service health recovers.',
+        },
+      ],
+      benchmark_follow_through_7d: {
+        hit_rate: null,
+        sample_size: 0,
+        unavailable_reason: 'insufficient_sample',
+      },
+    },
     invalidation_rules: [
       'Hold neutral risk until plan data is fully available.',
     ],
@@ -2087,6 +2544,13 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
 const MARKET_SCHEMA_CACHE_MS = 5 * 60 * 1000;
 let marketSchemaInitPromise: Promise<void> | null = null;
 let marketSchemaInitializedAt = 0;
+
+async function tableHasColumn(db: D1Database, tableName: string, columnName: string): Promise<boolean> {
+  const rows = await db.prepare(`PRAGMA table_info(${tableName})`).all<{
+    name: string;
+  }>();
+  return (rows.results || []).some((row) => row.name === columnName);
+}
 
 async function ensureMarketProductSchema(db: D1Database): Promise<void> {
   const now = Date.now();
@@ -2104,10 +2568,17 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
       CREATE TABLE IF NOT EXISTS market_brief_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         as_of TEXT NOT NULL UNIQUE,
+        contract_version TEXT NOT NULL DEFAULT '${BRIEF_CONTRACT_VERSION}',
         payload_json TEXT NOT NULL,
         created_at TEXT DEFAULT (datetime('now'))
       )
     `).run();
+    const hasContractVersion = await tableHasColumn(db, 'market_brief_snapshots', 'contract_version');
+    if (!hasContractVersion) {
+      await db.prepare(
+        `ALTER TABLE market_brief_snapshots ADD COLUMN contract_version TEXT NOT NULL DEFAULT '${BRIEF_CONTRACT_VERSION}'`
+      ).run();
+    }
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_brief_as_of ON market_brief_snapshots(as_of DESC)`).run();
 
     await db.prepare(`
@@ -2166,6 +2637,18 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
     `).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_event ON market_alert_deliveries(event_id, attempted_at DESC)`).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_subscriber ON market_alert_deliveries(subscriber_id, attempted_at DESC)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS market_consistency_checks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        as_of TEXT NOT NULL UNIQUE,
+        score REAL NOT NULL,
+        state TEXT NOT NULL,
+        violations_json TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_consistency_created ON market_consistency_checks(created_at DESC)`).run();
 
     marketSchemaInitializedAt = Date.now();
   })();
@@ -2229,12 +2712,9 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
   if (!latest) return null;
   const previous = latestAndPrevious.results?.[1] || null;
 
-  const [currentRegime, previousRegime, freshness, mlSampleSize, edgeCalibrationSnapshot] = await Promise.all([
+  const [currentRegime, previousRegime] = await Promise.all([
     detectRegime(db, latest.date),
     previous ? detectRegime(db, previous.date) : Promise.resolve(null),
-    computeFreshnessStatus(db),
-    fetchPredictionEvaluationSampleSize(db),
-    fetchLatestCalibrationSnapshot(db, 'edge_quality', null),
   ]);
 
   const categoryRows = await db.prepare(`
@@ -2256,13 +2736,7 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
     .sort((a, b) => Math.abs(b.score_change) - Math.abs(a.score_change))
     .slice(0, 5);
 
-  const categoryScoresForSignal = (categoryRows.results || []).map((row) => ({ score: row.current_score }));
-  if (categoryScoresForSignal.length === 0) {
-    categoryScoresForSignal.push({ score: latest.score });
-  }
-
-  const [indicatorRows, divergence] = await Promise.all([
-    db.prepare(`
+  const indicatorRows = await db.prepare(`
       SELECT i.indicator_id as indicator_id,
              i.raw_value as current_value,
              p.raw_value as previous_value,
@@ -2279,35 +2753,26 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
       previous_value: number | null;
       current_norm: number;
       previous_norm: number | null;
-    }>(),
-    detectDivergence(db, latest.score, currentRegime),
-  ]);
+    }>();
 
-  const signal = await calculatePXISignal(
-    db,
-    { score: latest.score, delta_7d: latest.delta_7d, delta_30d: latest.delta_30d },
-    currentRegime,
-    categoryScoresForSignal,
-  );
-  const conflictState = resolveConflictState(currentRegime, signal);
-  const edgeQuality = computeEdgeQualitySnapshot({
-    staleCount: freshness.stale_count,
-    mlSampleSize,
-    regime: currentRegime,
-    conflictState,
-    divergenceCount: divergence.alerts.length,
+  const canonical = await buildCanonicalMarketDecision(db, {
+    pxi: {
+      date: latest.date,
+      score: latest.score,
+      label: latest.label,
+      status: latest.status,
+      delta_1d: null,
+      delta_7d: latest.delta_7d,
+      delta_30d: latest.delta_30d,
+    },
+    categories: (categoryRows.results || []).map((row) => ({
+      category: row.category,
+      score: row.current_score,
+      weight: 0,
+    })),
   });
-  const edgeQualityWithCalibration: EdgeQualitySnapshot = {
-    ...edgeQuality,
-    calibration: buildEdgeQualityCalibrationFromSnapshot(edgeCalibrationSnapshot, edgeQuality.score),
-  };
-  const policyState = buildPolicyStateSnapshot({
-    signal,
-    regime: currentRegime,
-    edgeQuality: edgeQualityWithCalibration,
-    freshness,
-    calibrationQuality: edgeQualityWithCalibration.calibration.quality,
-  });
+
+  const freshness = canonical.freshness;
 
   const indicatorMovers = (indicatorRows.results || [])
     .map((row) => ({
@@ -2320,7 +2785,7 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
 
   const scoreDelta = previous ? latest.score - previous.score : null;
   const regimeDelta = resolveRegimeDelta(currentRegime, previousRegime, scoreDelta);
-  const riskPosture = policyState.risk_posture;
+  const riskPosture = canonical.policy_state.risk_posture;
   const deltaText = scoreDelta !== null ? `${scoreDelta >= 0 ? '+' : ''}${scoreDelta.toFixed(1)}` : 'n/a';
 
   const topChanges: string[] = [];
@@ -2335,23 +2800,27 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
     );
   }
 
-  const summary = `PXI ${latest.score.toFixed(1)} (${latest.label}), ${deltaText} vs prior reading. Regime ${regimeLabel(currentRegime)}; posture ${riskPosture.replace('_', '-')} (${policyState.stance.replace('_', ' ')}).${
+  const summary = `PXI ${latest.score.toFixed(1)} (${latest.label}), ${deltaText} vs prior reading. Regime ${regimeLabel(currentRegime)}; posture ${riskPosture.replace('_', '-')} (${canonical.policy_state.stance.replace('_', ' ')}).${
     freshness.has_stale_data ? ` ${freshness.stale_count} indicator(s) stale.` : ''
   }`;
 
   return {
-    as_of: `${latest.date}T00:00:00.000Z`,
+    as_of: canonical.as_of,
     summary,
     regime_delta: regimeDelta,
     top_changes: topChanges.slice(0, 5),
     risk_posture: riskPosture,
-    policy_state: policyState,
+    policy_state: canonical.policy_state,
+    source_plan_as_of: canonical.as_of,
+    contract_version: BRIEF_CONTRACT_VERSION,
+    consistency: canonical.consistency,
     explainability: {
       category_movers: categoryMovers,
       indicator_movers: indicatorMovers,
     },
     freshness_status: freshness,
     updated_at: asIsoDateTime(new Date()),
+    degraded_reason: canonical.degraded_reasons.length > 0 ? canonical.degraded_reasons.join(',') : null,
   };
 }
 
@@ -2535,9 +3004,9 @@ async function buildEdgeQualityCalibrationSnapshot(db: D1Database): Promise<Mark
     const interval = computeWilson95(entry.correct, entry.total);
     return {
       bin,
-      probability_correct: entry.total > 0 ? interval.probability : 0,
-      ci95_low: entry.total > 0 ? interval.ci95_low : 0,
-      ci95_high: entry.total > 0 ? interval.ci95_high : 0,
+      probability_correct: entry.total > 0 ? interval.probability : null,
+      ci95_low: entry.total > 0 ? interval.ci95_low : null,
+      ci95_high: entry.total > 0 ? interval.ci95_high : null,
       sample_size: entry.total,
       quality: calibrationQualityForSampleSize(entry.total),
     };
@@ -2627,9 +3096,9 @@ async function buildConvictionCalibrationSnapshot(
     const interval = computeWilson95(entry.correct, entry.total);
     return {
       bin,
-      probability_correct: entry.total > 0 ? interval.probability : 0,
-      ci95_low: entry.total > 0 ? interval.ci95_low : 0,
-      ci95_high: entry.total > 0 ? interval.ci95_high : 0,
+      probability_correct: entry.total > 0 ? interval.probability : null,
+      ci95_low: entry.total > 0 ? interval.ci95_low : null,
+      ci95_high: entry.total > 0 ? interval.ci95_high : null,
       sample_size: entry.total,
       quality: calibrationQualityForSampleSize(entry.total),
     };
@@ -2695,6 +3164,80 @@ async function computeHistoricalHitStats(
   };
 }
 
+function buildExpectancyFromOutcomes(
+  outcomes: number[],
+  direction: OpportunityDirection
+): OpportunityExpectancy {
+  if (direction === 'neutral') {
+    return {
+      expected_move_pct: null,
+      max_adverse_move_pct: null,
+      sample_size: 0,
+      unavailable_reason: 'neutral_direction',
+    };
+  }
+
+  if (outcomes.length < 20) {
+    return {
+      expected_move_pct: null,
+      max_adverse_move_pct: null,
+      sample_size: outcomes.length,
+      unavailable_reason: 'insufficient_sample',
+    };
+  }
+
+  const expectedMove = outcomes.reduce((sum, value) => sum + value, 0) / outcomes.length;
+  const maxAdverse = direction === 'bullish'
+    ? Math.min(...outcomes)
+    : Math.max(...outcomes);
+
+  return {
+    expected_move_pct: expectedMove,
+    max_adverse_move_pct: maxAdverse,
+    sample_size: outcomes.length,
+    unavailable_reason: null,
+  };
+}
+
+async function computeOpportunityExpectancyByDirection(
+  db: D1Database,
+  horizon: '7d' | '30d'
+): Promise<Record<OpportunityDirection, OpportunityExpectancy>> {
+  const rows = horizon === '7d'
+    ? await db.prepare(`
+      SELECT predicted_change_7d as predicted_change, actual_change_7d as actual_change
+      FROM prediction_log
+      WHERE predicted_change_7d IS NOT NULL
+        AND actual_change_7d IS NOT NULL
+      ORDER BY prediction_date DESC
+      LIMIT 1000
+    `).all<{ predicted_change: number; actual_change: number }>()
+    : await db.prepare(`
+      SELECT predicted_change_30d as predicted_change, actual_change_30d as actual_change
+      FROM prediction_log
+      WHERE predicted_change_30d IS NOT NULL
+        AND actual_change_30d IS NOT NULL
+      ORDER BY prediction_date DESC
+      LIMIT 1000
+    `).all<{ predicted_change: number; actual_change: number }>();
+
+  const bullishOutcomes: number[] = [];
+  const bearishOutcomes: number[] = [];
+  for (const row of rows.results || []) {
+    if (row.predicted_change > 0) {
+      bullishOutcomes.push(row.actual_change);
+    } else if (row.predicted_change < 0) {
+      bearishOutcomes.push(row.actual_change);
+    }
+  }
+
+  return {
+    bullish: buildExpectancyFromOutcomes(bullishOutcomes, 'bullish'),
+    bearish: buildExpectancyFromOutcomes(bearishOutcomes, 'bearish'),
+    neutral: buildExpectancyFromOutcomes([], 'neutral'),
+  };
+}
+
 async function buildOpportunitySnapshot(
   db: D1Database,
   horizon: '7d' | '30d',
@@ -2711,7 +3254,7 @@ async function buildOpportunitySnapshot(
     return null;
   }
 
-  const [latestSignal, latestEnsemble, hitStats, themes, convictionCalibration] = await Promise.all([
+  const [latestSignal, latestEnsemble, hitStats, themes, convictionCalibration, expectancyByDirection] = await Promise.all([
     db.prepare(`
       SELECT date, risk_allocation, signal_type, regime
       FROM pxi_signal
@@ -2733,6 +3276,7 @@ async function buildOpportunitySnapshot(
     computeHistoricalHitStats(db, horizon),
     fetchLatestSignalsThemes(),
     calibrationSnapshot ? Promise.resolve(calibrationSnapshot) : fetchLatestCalibrationSnapshot(db, 'conviction', horizon),
+    computeOpportunityExpectancyByDirection(db, horizon),
   ]);
 
   const themeSource = themes.length > 0
@@ -2792,6 +3336,7 @@ async function buildOpportunitySnapshot(
       historical_hit_rate: hitStats.hitRate,
       sample_size: hitStats.sampleSize,
       calibration: buildOpportunityCalibrationFromSnapshot(convictionCalibration, conviction, directionalSignal),
+      expectancy: expectancyByDirection[directionalSignal],
       updated_at: asIsoDateTime(new Date()),
     };
   });
@@ -2930,14 +3475,81 @@ async function generateMarketEvents(
     ));
   }
 
+  if (brief.consistency.state === 'WARN' || brief.consistency.state === 'FAIL') {
+    events.push(buildMarketEvent(
+      'threshold_cross',
+      runDate,
+      brief.consistency.state === 'FAIL' ? 'critical' : 'warning',
+      'Consistency warning',
+      `Public decision consistency is ${brief.consistency.state} (score ${brief.consistency.score}).`,
+      'market',
+      'consistency',
+      {
+        consistency_state: brief.consistency.state,
+        consistency_score: brief.consistency.score,
+        violations: brief.consistency.violations,
+      }
+    ));
+  }
+
   return events;
 }
 
 async function storeBriefSnapshot(db: D1Database, brief: BriefSnapshot): Promise<void> {
   await db.prepare(`
-    INSERT OR REPLACE INTO market_brief_snapshots (as_of, payload_json, created_at)
-    VALUES (?, ?, datetime('now'))
-  `).bind(brief.as_of, JSON.stringify(brief)).run();
+    INSERT OR REPLACE INTO market_brief_snapshots (as_of, contract_version, payload_json, created_at)
+    VALUES (?, ?, ?, datetime('now'))
+  `).bind(brief.as_of, brief.contract_version || BRIEF_CONTRACT_VERSION, JSON.stringify(brief)).run();
+}
+
+async function storeConsistencyCheck(
+  db: D1Database,
+  asOf: string,
+  consistency: ConsistencySnapshot
+): Promise<void> {
+  await db.prepare(`
+    INSERT OR REPLACE INTO market_consistency_checks (as_of, score, state, violations_json, created_at)
+    VALUES (?, ?, ?, ?, datetime('now'))
+  `).bind(asOf, consistency.score, consistency.state, JSON.stringify(consistency.violations)).run();
+}
+
+async function fetchLatestConsistencyCheck(db: D1Database): Promise<{
+  as_of: string;
+  score: number;
+  state: ConsistencyState;
+  violations: string[];
+  created_at: string;
+} | null> {
+  const row = await db.prepare(`
+    SELECT as_of, score, state, violations_json, created_at
+    FROM market_consistency_checks
+    ORDER BY as_of DESC
+    LIMIT 1
+  `).first<{
+    as_of: string;
+    score: number;
+    state: string;
+    violations_json: string;
+    created_at: string;
+  }>();
+  if (!row) return null;
+  let violations: string[] = [];
+  try {
+    const parsed = JSON.parse(row.violations_json) as unknown;
+    if (Array.isArray(parsed)) {
+      violations = parsed.map((value) => String(value));
+    }
+  } catch {
+    violations = [];
+  }
+  const state: ConsistencyState = row.state === 'FAIL' ? 'FAIL' : row.state === 'WARN' ? 'WARN' : 'PASS';
+  return {
+    as_of: row.as_of,
+    score: toNumber(row.score, 0),
+    state,
+    violations,
+    created_at: row.created_at,
+  };
 }
 
 async function storeOpportunitySnapshot(db: D1Database, snapshot: OpportunitySnapshot): Promise<void> {
@@ -4613,10 +5225,16 @@ export default {
             CREATE TABLE IF NOT EXISTS market_brief_snapshots (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               as_of TEXT NOT NULL UNIQUE,
+              contract_version TEXT NOT NULL DEFAULT '${BRIEF_CONTRACT_VERSION}',
               payload_json TEXT NOT NULL,
               created_at TEXT DEFAULT (datetime('now'))
             )
           `).run();
+          try {
+            await env.DB.prepare(
+              `ALTER TABLE market_brief_snapshots ADD COLUMN contract_version TEXT NOT NULL DEFAULT '${BRIEF_CONTRACT_VERSION}'`
+            ).run();
+          } catch (e) { /* Column already exists */ }
           await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_brief_as_of ON market_brief_snapshots(as_of DESC)`).run();
           migrations.push('market_brief_snapshots');
         } catch (e) {
@@ -4656,6 +5274,23 @@ export default {
           migrations.push('market_calibration_snapshots');
         } catch (e) {
           console.error('market_calibration_snapshots migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS market_consistency_checks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              as_of TEXT NOT NULL UNIQUE,
+              score REAL NOT NULL,
+              state TEXT NOT NULL CHECK(state IN ('PASS', 'WARN', 'FAIL')),
+              violations_json TEXT NOT NULL,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_consistency_created ON market_consistency_checks(created_at DESC)`).run();
+          migrations.push('market_consistency_checks');
+        } catch (e) {
+          console.error('market_consistency_checks migration failed:', e);
         }
 
         try {
@@ -4906,13 +5541,38 @@ export default {
           FROM indicator_values
           GROUP BY indicator_id
           ORDER BY days_old DESC
-        `).all<{ indicator_id: string; last_date: string; days_old: number }>();
+        `).all<{ indicator_id: string; last_date: string | null; days_old: number | null }>();
 
         const staleIndicators = (freshnessResult.results || []).filter((r) => {
           const threshold = getStaleThresholdDays(r.indicator_id);
-          return r.days_old > threshold;
+          return r.days_old !== null && Number.isFinite(r.days_old) && r.days_old > threshold;
         });
         const hasStaleData = staleIndicators.length > 0;
+        const topOffenders = staleIndicators
+          .map((stale) => {
+            const threshold = getStaleThresholdDays(stale.indicator_id);
+            const stalePolicy = resolveStalePolicy(stale.indicator_id);
+            return {
+              id: stale.indicator_id,
+              lastUpdate: stale.last_date,
+              daysOld: stale.days_old === null || !Number.isFinite(stale.days_old) ? null : Math.round(stale.days_old),
+              maxAgeDays: threshold,
+              chronic: isChronicStaleness(stale.days_old, threshold),
+              owner: stalePolicy.owner,
+              escalation: stalePolicy.escalation,
+              excessDays: stale.days_old === null || !Number.isFinite(stale.days_old) ? Number.POSITIVE_INFINITY : stale.days_old - threshold,
+            };
+          })
+          .sort((a, b) => b.excessDays - a.excessDays)
+          .slice(0, 3)
+          .map(({ excessDays: _excessDays, ...offender }) => offender);
+
+        const lastRefreshRow = await env.DB.prepare(`
+          SELECT MAX(completed_at) as last_refresh_at
+          FROM fetch_logs
+          WHERE completed_at IS NOT NULL
+        `).first<{ last_refresh_at: string | null }>();
+        const nextRefresh = computeNextExpectedRefresh(new Date());
 
         const response = {
           date: pxi.date,
@@ -4948,8 +5608,12 @@ export default {
             staleIndicators: hasStaleData ? staleIndicators.slice(0, 5).map(s => ({
               id: s.indicator_id,
               lastUpdate: s.last_date,
-              daysOld: Math.round(s.days_old),
+              daysOld: s.days_old === null || !Number.isFinite(s.days_old) ? null : Math.round(s.days_old),
             })) : [],
+            topOffenders,
+            lastRefreshAtUtc: lastRefreshRow?.last_refresh_at || null,
+            nextExpectedRefreshAtUtc: nextRefresh.at,
+            nextExpectedRefreshInMinutes: nextRefresh.in_minutes,
           },
         };
 
@@ -5006,6 +5670,23 @@ export default {
           try {
             snapshot = JSON.parse(stored.payload_json) as BriefSnapshot;
           } catch {
+            snapshot = null;
+          }
+        }
+
+        if (snapshot && !isBriefSnapshotCompatible(snapshot)) {
+          snapshot = null;
+        }
+
+        if (snapshot) {
+          const latestDateRow = await env.DB.prepare(`
+            SELECT date
+            FROM pxi_scores
+            ORDER BY date DESC
+            LIMIT 1
+          `).first<{ date: string }>();
+          const expectedPlanAsOf = latestDateRow?.date ? `${latestDateRow.date}T00:00:00.000Z` : null;
+          if (expectedPlanAsOf && snapshot.source_plan_as_of !== expectedPlanAsOf) {
             snapshot = null;
           }
         }
@@ -5136,6 +5817,7 @@ export default {
           as_of: snapshot.as_of,
           horizon: snapshot.horizon,
           items: calibratedItems,
+          degraded_reason: null,
         }, {
           headers: {
             ...corsHeaders,
@@ -5415,6 +6097,40 @@ export default {
         return Response.json({ ok: true }, { headers: corsHeaders });
       }
 
+      if (url.pathname === '/api/market/consistency' && method === 'GET') {
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Consistency schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        const latest = await fetchLatestConsistencyCheck(env.DB);
+        if (latest) {
+          return Response.json({
+            as_of: latest.as_of,
+            score: latest.score,
+            state: latest.state,
+            violations: latest.violations,
+            created_at: latest.created_at,
+          }, { headers: corsHeaders });
+        }
+
+        try {
+          const canonical = await buildCanonicalMarketDecision(env.DB);
+          return Response.json({
+            as_of: canonical.as_of,
+            score: canonical.consistency.score,
+            state: canonical.consistency.state,
+            violations: canonical.consistency.violations,
+            created_at: asIsoDateTime(new Date()),
+          }, { headers: corsHeaders });
+        } catch (err) {
+          console.error('Consistency fallback computation failed:', err);
+          return Response.json({ error: 'Consistency unavailable' }, { status: 503, headers: corsHeaders });
+        }
+      }
+
       if (url.pathname === '/api/market/refresh-products' && method === 'POST') {
         const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
         if (adminAuthFailure) {
@@ -5467,10 +6183,23 @@ export default {
         }
 
         let brief: BriefSnapshot | null = null;
+        let consistencyStored = false;
         if (briefEnabled) {
           brief = await buildBriefSnapshot(env.DB);
           if (brief) {
             await storeBriefSnapshot(env.DB, brief);
+            await storeConsistencyCheck(env.DB, brief.source_plan_as_of, brief.consistency);
+            consistencyStored = true;
+          }
+        }
+
+        if (!consistencyStored) {
+          try {
+            const canonical = await buildCanonicalMarketDecision(env.DB);
+            await storeConsistencyCheck(env.DB, canonical.as_of, canonical.consistency);
+            consistencyStored = true;
+          } catch (err) {
+            console.error('Consistency snapshot fallback store failed:', err);
           }
         }
 
@@ -5495,6 +6224,9 @@ export default {
           opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
           calibrations_generated: calibrationsGenerated,
           alerts_generated: alertsGenerated,
+          consistency_stored: consistencyStored ? 1 : 0,
+          consistency_state: brief?.consistency.state || null,
+          consistency_score: brief?.consistency.score ?? null,
           as_of: brief?.as_of || opportunities7d?.as_of || null,
         }, { headers: corsHeaders });
       }
@@ -5964,33 +6696,11 @@ export default {
           });
         }
 
-        const recentScores = await env.DB.prepare(
-          'SELECT date, score, label, status, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 10'
-        ).all<PXIRow>();
-
-        let pxi: PXIRow | null = null;
-        let catResult: D1Result<CategoryRow> | null = null;
-        for (const candidate of recentScores.results || []) {
-          const cats = await env.DB.prepare(
-            'SELECT category, score, weight FROM category_scores WHERE date = ?'
-          ).bind(candidate.date).all<CategoryRow>();
-          if ((cats.results?.length || 0) >= 3) {
-            pxi = candidate;
-            catResult = cats;
-            break;
-          }
-        }
-
-        if (!pxi) {
-          pxi = recentScores.results?.[0] || null;
-          if (pxi) {
-            catResult = await env.DB.prepare(
-              'SELECT category, score, weight FROM category_scores WHERE date = ?'
-            ).bind(pxi.date).all<CategoryRow>();
-          }
-        }
-
-        if (!pxi) {
+        let canonical: Awaited<ReturnType<typeof buildCanonicalMarketDecision>> | null = null;
+        try {
+          canonical = await buildCanonicalMarketDecision(env.DB);
+        } catch (err) {
+          console.error('Failed to build canonical market decision:', err);
           return Response.json(buildPlanFallbackPayload('no_pxi_data'), {
             headers: {
               ...corsHeaders,
@@ -5999,72 +6709,32 @@ export default {
           });
         }
 
-        const categories = (catResult?.results || []).map((row) => ({ score: row.score }));
-        const [regime, freshness, mlSampleSize, riskBand, edgeCalibrationSnapshot] = await Promise.all([
-          detectRegime(env.DB, pxi.date),
-          computeFreshnessStatus(env.DB),
-          fetchPredictionEvaluationSampleSize(env.DB),
-          buildCurrentBucketRiskBands(env.DB, pxi.score),
-          fetchLatestCalibrationSnapshot(env.DB, 'edge_quality', null),
-        ]);
-
-        const signal = await calculatePXISignal(
-          env.DB,
-          { score: pxi.score, delta_7d: pxi.delta_7d, delta_30d: pxi.delta_30d },
-          regime,
-          categories,
-        );
-        const divergence = await detectDivergence(env.DB, pxi.score, regime);
-        const conflictState = resolveConflictState(regime, signal);
-        const edgeQuality = computeEdgeQualitySnapshot({
-          staleCount: freshness.stale_count,
-          mlSampleSize,
-          regime,
-          conflictState,
-          divergenceCount: divergence.alerts.length,
-        });
-        const edgeQualityWithCalibration: EdgeQualitySnapshot = {
-          ...edgeQuality,
-          calibration: buildEdgeQualityCalibrationFromSnapshot(edgeCalibrationSnapshot, edgeQuality.score),
-        };
-        const policyState = buildPolicyStateSnapshot({
-          signal,
-          regime,
-          edgeQuality: edgeQualityWithCalibration,
-          freshness,
-          calibrationQuality: edgeQualityWithCalibration.calibration.quality,
-        });
-
-        const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policyState.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} tactical posture at ${Math.round(signal.risk_allocation * 100)}% risk budget.${
+        const { pxi, signal, regime, freshness, risk_band, edge_quality, policy_state, degraded_reasons } = canonical;
+        const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policy_state.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} tactical posture at ${Math.round(signal.risk_allocation * 100)}% risk budget.${
           freshness.stale_count > 0 ? ` ${freshness.stale_count} stale indicator(s) are penalizing confidence.` : ''
         }`;
 
-        const degradedReasons: string[] = [];
-        if (riskBand.d7.sample_size < 20 || riskBand.d30.sample_size < 20) {
-          degradedReasons.push('limited_scenario_sample');
-        }
-        if (freshness.stale_count > 0) degradedReasons.push('stale_inputs');
-        if (edgeQualityWithCalibration.label === 'LOW') degradedReasons.push('low_edge_quality');
-        if (edgeQualityWithCalibration.calibration.quality !== 'ROBUST') degradedReasons.push('limited_calibration_sample');
-
         const payload: PlanPayload = {
-          as_of: `${pxi.date}T00:00:00.000Z`,
+          as_of: canonical.as_of,
           setup_summary: setupSummary,
-          policy_state: policyState,
+          policy_state,
           action_now: {
             risk_allocation_target: signal.risk_allocation,
-            horizon_bias: resolveHorizonBias(signal, regime, edgeQuality.score),
+            horizon_bias: resolveHorizonBias(signal, regime, edge_quality.score),
             primary_signal: signal.signal_type,
           },
-          edge_quality: edgeQualityWithCalibration,
-          risk_band: riskBand,
+          edge_quality,
+          risk_band,
+          uncertainty: canonical.uncertainty,
+          consistency: canonical.consistency,
+          trader_playbook: canonical.trader_playbook,
           invalidation_rules: buildInvalidationRules({
             pxi,
             freshness,
             regime,
-            edgeQuality: edgeQualityWithCalibration,
+            edgeQuality: edge_quality,
           }),
-          degraded_reason: degradedReasons.length > 0 ? degradedReasons.join(',') : null,
+          degraded_reason: degraded_reasons.length > 0 ? degraded_reasons.join(',') : null,
         };
 
         return Response.json(payload, {
@@ -7911,9 +8581,24 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         }>();
 
         if (!predictions.results || predictions.results.length === 0) {
+          const unavailableReasons = [
+            includePending ? 'no_predictions' : 'no_evaluated_predictions',
+            'no_7d_evaluated_predictions',
+            'no_30d_evaluated_predictions',
+          ];
+          const coverage = {
+            total_predictions: 0,
+            evaluated_count: 0,
+            pending_count: 0,
+          };
           return Response.json({
             message: includePending ? 'No predictions logged yet' : 'No evaluated predictions yet',
+            as_of: asIsoDateTime(new Date()),
+            coverage,
+            unavailable_reasons: unavailableReasons,
             total_predictions: 0,
+            evaluated_count: 0,
+            pending_count: 0,
             metrics: null,
           }, { headers: corsHeaders });
         }
@@ -7983,7 +8668,22 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           }
         }
 
+        const unavailableReasons: string[] = [];
+        if (d7_total === 0) unavailableReasons.push('no_7d_evaluated_predictions');
+        if (d30_total === 0) unavailableReasons.push('no_30d_evaluated_predictions');
+        if (evaluatedCount === 0) unavailableReasons.push('no_evaluated_predictions');
+        const asOfPredictionDate = predictions.results[0]?.prediction_date;
+        const asOf = asOfPredictionDate ? `${asOfPredictionDate}T00:00:00.000Z` : asIsoDateTime(new Date());
+        const coverage = {
+          total_predictions: predictions.results.length,
+          evaluated_count: evaluatedCount,
+          pending_count: pendingCount,
+        };
+
         return Response.json({
+          as_of: asOf,
+          coverage,
+          unavailable_reasons: unavailableReasons,
           total_predictions: predictions.results.length,
           evaluated_count: evaluatedCount,
           pending_count: pendingCount,
@@ -8039,9 +8739,24 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
         }>();
 
         if (!predictions.results || predictions.results.length === 0) {
+          const unavailableReasons = [
+            includePending ? 'no_predictions' : 'no_evaluated_predictions',
+            'no_7d_evaluated_predictions',
+            'no_30d_evaluated_predictions',
+          ];
+          const coverage = {
+            total_predictions: 0,
+            evaluated_count: 0,
+            pending_count: 0,
+          };
           return Response.json({
             message: includePending ? 'No ensemble predictions logged yet' : 'No evaluated ensemble predictions yet',
+            as_of: asIsoDateTime(new Date()),
+            coverage,
+            unavailable_reasons: unavailableReasons,
             total_predictions: 0,
+            evaluated_count: 0,
+            pending_count: 0,
             metrics: null,
           }, { headers: corsHeaders });
         }
@@ -8163,7 +8878,22 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
           } : null,
         });
 
+        const unavailableReasons: string[] = [];
+        if (metrics.ensemble.d7_total === 0) unavailableReasons.push('no_7d_evaluated_predictions');
+        if (metrics.ensemble.d30_total === 0) unavailableReasons.push('no_30d_evaluated_predictions');
+        if (evaluatedCount === 0) unavailableReasons.push('no_evaluated_predictions');
+        const asOfPredictionDate = predictions.results[0]?.prediction_date;
+        const asOf = asOfPredictionDate ? `${asOfPredictionDate}T00:00:00.000Z` : asIsoDateTime(new Date());
+        const coverage = {
+          total_predictions: predictions.results.length,
+          evaluated_count: evaluatedCount,
+          pending_count: pendingCount,
+        };
+
         return Response.json({
+          as_of: asOf,
+          coverage,
+          unavailable_reasons: unavailableReasons,
           total_predictions: predictions.results.length,
           evaluated_count: evaluatedCount,
           pending_count: pendingCount,

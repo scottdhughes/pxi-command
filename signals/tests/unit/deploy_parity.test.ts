@@ -142,12 +142,17 @@ describe("deploy parity validators", () => {
   it("accepts accuracy payload with CI fields", () => {
     const result = validateAccuracyPayload({
       generated_at: "2026-02-17T08:00:00.000Z",
+      as_of: "2026-02-17T08:00:00.000Z",
       sample_size: 70,
+      total_predictions: 70,
       minimum_recommended_sample_size: 30,
       evaluated_count: 75,
       resolved_count: 70,
+      resolved_predictions: 70,
       unresolved_count: 5,
+      unresolved_predictions: 5,
       unresolved_rate: "6.7%",
+      governance_status: "PASS",
       overall: {
         hit_rate: "50.0%",
         hit_rate_ci_low: "38.6%",
@@ -178,6 +183,8 @@ describe("deploy parity validators", () => {
     expect(result.errors).toContain("accuracy missing field: evaluated_count")
     expect(result.errors).toContain("accuracy missing field: resolved_count")
     expect(result.errors).toContain("accuracy missing field: unresolved_count")
+    expect(result.errors).toContain("accuracy missing field: governance_status")
+    expect(result.errors).toContain("accuracy missing field: as_of")
     expect(result.errors).toContain("accuracy missing field: unresolved_rate")
     expect(result.errors).toContain("accuracy.overall missing field: hit_rate_ci_low")
     expect(result.errors).toContain("accuracy.overall missing field: hit_rate_ci_high")

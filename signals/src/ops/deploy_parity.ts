@@ -260,12 +260,17 @@ export function validateAccuracyPayload(payload: unknown): DeployParityValidatio
 
   const rootRequiredFields = [
     "generated_at",
+    "as_of",
     "sample_size",
+    "total_predictions",
     "minimum_recommended_sample_size",
     "evaluated_count",
     "resolved_count",
+    "resolved_predictions",
     "unresolved_count",
+    "unresolved_predictions",
     "unresolved_rate",
+    "governance_status",
     "overall",
   ]
   for (const field of rootRequiredFields) {
@@ -274,8 +279,20 @@ export function validateAccuracyPayload(payload: unknown): DeployParityValidatio
     }
   }
 
+  if (typeof record.generated_at !== "string") {
+    errors.push("accuracy.generated_at must be a string")
+  }
+
+  if (typeof record.as_of !== "string") {
+    errors.push("accuracy.as_of must be a string")
+  }
+
   if (typeof record.sample_size !== "number") {
     errors.push("accuracy.sample_size must be a number")
+  }
+
+  if (typeof record.total_predictions !== "number") {
+    errors.push("accuracy.total_predictions must be a number")
   }
 
   if (typeof record.minimum_recommended_sample_size !== "number") {
@@ -290,12 +307,46 @@ export function validateAccuracyPayload(payload: unknown): DeployParityValidatio
     errors.push("accuracy.resolved_count must be a number")
   }
 
+  if (typeof record.resolved_predictions !== "number") {
+    errors.push("accuracy.resolved_predictions must be a number")
+  }
+
   if (typeof record.unresolved_count !== "number") {
     errors.push("accuracy.unresolved_count must be a number")
   }
 
+  if (typeof record.unresolved_predictions !== "number") {
+    errors.push("accuracy.unresolved_predictions must be a number")
+  }
+
   if (typeof record.unresolved_rate !== "string") {
     errors.push("accuracy.unresolved_rate must be a percent string")
+  }
+
+  if (typeof record.governance_status !== "string") {
+    errors.push("accuracy.governance_status must be a string")
+  } else if (!["PASS", "WARN", "FAIL", "INSUFFICIENT"].includes(record.governance_status)) {
+    errors.push("accuracy.governance_status must be one of: PASS|WARN|FAIL|INSUFFICIENT")
+  }
+
+  if (typeof record.sample_size === "number" && typeof record.total_predictions === "number" && record.sample_size !== record.total_predictions) {
+    errors.push("accuracy.total_predictions must match sample_size")
+  }
+
+  if (
+    typeof record.resolved_count === "number" &&
+    typeof record.resolved_predictions === "number" &&
+    record.resolved_count !== record.resolved_predictions
+  ) {
+    errors.push("accuracy.resolved_predictions must match resolved_count")
+  }
+
+  if (
+    typeof record.unresolved_count === "number" &&
+    typeof record.unresolved_predictions === "number" &&
+    record.unresolved_count !== record.unresolved_predictions
+  ) {
+    errors.push("accuracy.unresolved_predictions must match unresolved_count")
   }
 
   const overall = asRecord(record.overall)

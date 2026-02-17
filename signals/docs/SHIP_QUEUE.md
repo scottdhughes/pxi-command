@@ -1,6 +1,6 @@
 # SHIP QUEUE (Quant Review)
 
-Last updated: 2026-02-17 11:44 EST
+Last updated: 2026-02-17 13:15 EST
 
 ## Queue Hygiene Sync (2026-02-17)
 - Marked `P0-ET1`, `P0-ET2`, `P0-ET3`, `P0-7`, `P0-8`, and `P0-9` as closed to reflect shipped production behavior.
@@ -8,6 +8,28 @@ Last updated: 2026-02-17 11:44 EST
 - Run references: production endpoint checks on 2026-02-17 for `/api/plan`, `/api/brief?scope=market`, `/api/opportunities?horizon=7d&limit=5`, and `/api/alerts/feed?limit=10` returned HTTP 200 with JSON payloads.
 - Closeout sync: marked `P0-10`, `P0-11`, `P0-6`, `P1-14`, and `P2-3` closed after parity, contract, migration-marker, and governance gate verification.
 - Evidence report: `memory/ship-queue-closeout-2026-02-17.md`.
+
+## Taylor Thought Full Closeout (2026-02-17)
+- Implemented canonical-homepage alignment additions across worker + frontend:
+  - `/api/plan`: `policy_state.rationale_codes`, `uncertainty`, `consistency`, `trader_playbook`.
+  - `/api/brief`: coherence fields (`policy_state`, `source_plan_as_of`, `contract_version`, `consistency`, `degraded_reason`) enforced with legacy snapshot auto-rebuild.
+  - `/api/opportunities`: `expectancy` + calibration `unavailable_reason`.
+  - `/api/pxi`: freshness operator payload (`topOffenders`, `lastRefreshAtUtc`, `nextExpectedRefreshAtUtc`, `nextExpectedRefreshInMinutes`).
+  - `/api/market/consistency`: latest score/state/violations endpoint.
+- Added additive schema/migration support:
+  - `worker/schema.sql`: `market_brief_snapshots.contract_version`, `market_consistency_checks` table/index.
+  - `worker/api.ts` migration path: same table/column/index guards.
+- Updated quality gates and parity checks:
+  - `scripts/api-product-contract-check.sh` enforces plan/brief coherence + consistency threshold (`state != FAIL`, `score >= 90`) and validates new product fields.
+  - `signals/src/routes.ts` accuracy aliases + `governance_status`.
+  - `signals/src/ops/deploy_parity.ts` + `signals/tests/unit/deploy_parity.test.ts` validate new alias contract.
+- Validation run set:
+  - `cd /Users/scott/pxi && npm run build` ✅
+  - `cd /Users/scott/pxi/frontend && npm run build` ✅
+  - `cd /Users/scott/pxi/signals && npm test -- tests/unit/deploy_parity.test.ts` ✅
+  - `cd /Users/scott/pxi && bash -n scripts/api-product-contract-check.sh` ✅
+- Production contract gate note:
+  - `bash scripts/api-product-contract-check.sh https://api.pxicommand.com` currently fails until this change-set is deployed (live `/api/plan` still on previous contract).
 
 ## P0
 

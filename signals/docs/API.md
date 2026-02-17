@@ -227,12 +227,17 @@ Returns evaluated prediction performance with uncertainty bands.
 ```json
 {
   "generated_at": "2026-02-17T06:10:00.000Z",
+  "as_of": "2026-02-17T06:10:00.000Z",
   "sample_size": 40,
+  "total_predictions": 40,
   "minimum_recommended_sample_size": 30,
   "evaluated_count": 43,
   "resolved_count": 40,
+  "resolved_predictions": 40,
   "unresolved_count": 3,
+  "unresolved_predictions": 3,
   "unresolved_rate": "7.0%",
+  "governance_status": "PASS",
   "overall": {
     "hit_rate": "60.0%",
     "hit_rate_ci_low": "44.6%",
@@ -266,6 +271,9 @@ Returns evaluated prediction performance with uncertainty bands.
 
 Notes:
 - Confidence intervals are 95% Wilson score intervals on hit-rate proportions.
+- `as_of` aliases `generated_at` for cross-surface compatibility.
+- `total_predictions`, `resolved_predictions`, and `unresolved_predictions` are aliases of `sample_size`, `resolved_count`, and `unresolved_count`.
+- `governance_status` is one of `PASS|WARN|FAIL|INSUFFICIENT`.
 - `sample_size_warning = true` when subgroup `count` is below `minimum_recommended_sample_size`.
 - `evaluated_count` includes all evaluated rows with `proxy_etf` (resolved + unresolved).
 - `resolved_count` is the denominator used for hit-rate/return aggregates (`hit` is non-null).

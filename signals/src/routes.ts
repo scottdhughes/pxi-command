@@ -421,6 +421,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (method === "GET" && path === "/api/accuracy") {
     try {
       const stats = await getAccuracyStats(env)
+      const generatedAt = nowUtcIso()
+      const governanceStatus: "PASS" | "WARN" | "FAIL" | "INSUFFICIENT" = (() => {
+        if (stats.resolved_total < ACCURACY_MIN_SAMPLE_SIZE) {
+          return "INSUFFICIENT"
+        }
+        if (stats.unresolved_rate > 0.35) {
+          return "FAIL"
+        }
+        if (stats.unresolved_rate > 0.2) {
+          return "WARN"
+        }
+        return "PASS"
+      })()
 
       const formatBucket = (data: {
         total: number
@@ -439,13 +452,18 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
       return jsonResponse(
         {
-          generated_at: nowUtcIso(),
+          generated_at: generatedAt,
+          as_of: generatedAt,
           sample_size: stats.overall.total,
+          total_predictions: stats.overall.total,
           minimum_recommended_sample_size: ACCURACY_MIN_SAMPLE_SIZE,
           evaluated_count: stats.evaluated_total,
           resolved_count: stats.resolved_total,
+          resolved_predictions: stats.resolved_total,
           unresolved_count: stats.unresolved_total,
+          unresolved_predictions: stats.unresolved_total,
           unresolved_rate: formatPercent(stats.unresolved_rate),
+          governance_status: governanceStatus,
           overall: formatBucket(stats.overall),
           by_timing: Object.fromEntries(
             Object.entries(stats.by_timing).map(([timing, data]) => [timing, formatBucket(data)])

@@ -126,16 +126,18 @@ pxi-command/
 ### Core Data
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/pxi` | GET | Current PXI score, categories, sparkline, regime |
+| `/api/pxi` | GET | Current PXI score, categories, sparkline, regime, and freshness operator payload (`topOffenders`, refresh ETA) |
 | `/api/history` | GET | Historical PXI scores |
 | `/api/regime` | GET | Current market regime detection |
 | `/api/signal` | GET | PXI-Signal layer with risk allocation |
+| `/api/plan` | GET | Canonical decision object for homepage (policy state, uncertainty, consistency, trader playbook) |
+| `/api/market/consistency` | GET | Latest decision consistency score/state/violations |
 
 ### Product Layer (Phase 1)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/brief` | GET | Daily market brief with explainability and freshness status |
-| `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon |
+| `/api/brief` | GET | Daily market brief coherent with `/api/plan` policy state (includes contract version + consistency) |
+| `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon with calibration + expectancy + unavailable reasons |
 | `/api/alerts/feed` | GET | In-app alert timeline (`regime_change`, `threshold_cross`, `opportunity_spike`, `freshness_warning`) |
 | `/api/alerts/subscribe/start` | POST | Start email digest subscription with verification token |
 | `/api/alerts/subscribe/verify` | POST | Verify subscription token and activate email digest |
