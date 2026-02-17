@@ -1,8 +1,84 @@
 # SHIP QUEUE (Quant Review)
 
-Last updated: 2026-02-17 08:30 EST
+Last updated: 2026-02-17 10:20 EST
 
 ## P0
+
+### P0-ET1 (OPEN) — Daily Decision Engine (`/api/plan`) + home "Today’s Plan" card
+- **Impact / Confidence / Effort / Risk:** Very High / High / Medium / Low-Medium
+- **Scope (exact):**
+  - `worker/api.ts`
+    - add `GET /api/plan` payload with: `setup_summary`, `action_now`, `confidence_quality`, `risk_band`, `invalidation_rules`.
+  - `frontend/src/App.tsx`
+    - add top-priority `Today’s Plan` card on `/` route.
+    - consume `/api/plan` and render fallback when unavailable.
+- **Precise technical next actions:**
+  1. Define strict response contract for `/api/plan` (no nullable core fields on trading days).
+  2. Implement endpoint by composing existing PXI, signal, and predict data paths.
+  3. Add UI card with one-line setup + risk allocation + horizon bias.
+  4. Add non-blocking fallback (existing page still loads if `/api/plan` fails).
+  5. Add endpoint smoke checks in local verification notes.
+- **Validation commands:**
+  - `cd /Users/scott/pxi && npm run build`
+  - `cd /Users/scott/pxi/frontend && npm run lint && npm run build`
+  - `curl -sS https://api.pxicommand.com/api/plan | jq .`
+- **Expected pass criteria:**
+  - Home page surfaces single actionable plan consistently.
+  - `/api/plan` returns coherent payload with no contradictory action fields.
+- **Rollback plan:**
+  - remove `/api/plan` route and hide card behind feature flag fallback.
+
+### P0-ET2 (OPEN) — Confidence Quality Layer + explicit regime/signal conflict state
+- **Impact / Confidence / Effort / Risk:** Very High / High / Medium / Medium
+- **Scope (exact):**
+  - `worker/api.ts`
+    - add confidence-quality computation with penalties for stale data, model disagreement, and regime/signal conflict.
+    - expose `conflict_state` on `/api/signal`.
+  - `src/config/indicator-sla.ts`
+    - expose helper for confidence penalty contribution from freshness state.
+  - `frontend/src/App.tsx`
+    - render confidence breakdown + conflict badge in primary decision area.
+- **Precise technical next actions:**
+  1. Define bounded confidence formula with capped penalties and monotonic guarantees.
+  2. Implement `conflict_state` trigger conditions in `/api/signal`.
+  3. Add confidence-quality fields to `/api/pxi` + `/api/signal` (+ `/api/plan` once ET1 lands).
+  4. Add deterministic tests for stale/disagreement/conflict edge cases.
+  5. Update UI to show quality decomposition (data/model/regime).
+- **Validation commands:**
+  - `cd /Users/scott/pxi && npm run build`
+  - `cd /Users/scott/pxi && npx tsx src/config/indicator-sla.test.ts`
+  - `curl -sS https://api.pxicommand.com/api/signal | jq .`
+- **Expected pass criteria:**
+  - confidence quality always declines as stale/disagreement penalties rise.
+  - conflict state is explicit when regime and signal are materially misaligned.
+- **Rollback plan:**
+  - disable confidence penalties/conflict field and fall back to legacy confidence labels.
+
+### P0-ET3 (OPEN) — Product surface consistency gate (`/api/brief`, `/api/opportunities`, `/api/alerts/feed`)
+- **Impact / Confidence / Effort / Risk:** Very High / High / Medium / Medium
+- **Scope (exact):**
+  - `.github/workflows/ci.yml`
+    - add contract checks for status + content type + required fields on product endpoints.
+  - `worker/api.ts`
+    - ensure route handlers return deterministic shape and non-empty payload contracts (or explicit disabled-state payload).
+  - `frontend/src/App.tsx`
+    - strengthen fallback UI when product endpoints unavailable.
+- **Precise technical next actions:**
+  1. Define required JSON contract per endpoint (`brief`, `opportunities`, `alerts/feed`).
+  2. Add CI smoke assertions against production-like API target.
+  3. Harmonize route responses (avoid accidental HTML fallback / ambiguous 404s).
+  4. Add frontend message states for disabled/unavailable products.
+  5. Gate deployment on contract pass.
+- **Validation commands:**
+  - `cd /Users/scott/pxi && npm run build`
+  - `curl -sS https://api.pxicommand.com/api/brief?scope=market | jq .`
+  - `curl -sS "https://api.pxicommand.com/api/opportunities?horizon=7d&limit=5" | jq .`
+  - `curl -sS "https://api.pxicommand.com/api/alerts/feed?limit=10" | jq .`
+- **Expected pass criteria:**
+  - no unexpected 404s on surfaced product routes.
+  - CI blocks releases when product contracts drift.
+- **Rollback plan:**
+  - revert CI gate and route-contract changes; preserve UI fallback warnings.
 
 ### P0-5 (CLOSED this cycle) — Anchor evaluation exits to target-date historical close (eliminate delayed-run horizon drift)
 - **Impact / Confidence / Effort / Risk:** High / Medium-High / Medium-High / Medium
