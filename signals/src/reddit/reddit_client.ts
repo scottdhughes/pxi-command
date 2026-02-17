@@ -10,6 +10,8 @@ const REDDIT_PUBLIC_BASES = ["https://api.reddit.com", "https://www.reddit.com",
 
 // Reddit-compliant User-Agent format: <platform>:<app_id>:<version> (by /u/<username>)
 const DEFAULT_USER_AGENT = "web:pxi-signals:1.0.0 (by /u/pxi_command)"
+const RETRYABLE_HTTP_STATUSES = new Set([429, 500, 502, 503, 504, 522, 523, 524])
+const MAX_RETRY_DELAY_MS = 15_000
 
 // Browser-like headers to avoid bot detection (Reddit 2026 requirements)
 function getBrowserHeaders(userAgent: string): Record<string, string> {
@@ -41,18 +43,64 @@ function sleepWithJitter(baseMs: number): Promise<void> {
   return sleep(baseMs + jitter)
 }
 
-async function fetchWithBackoff(input: RequestInfo, init: RequestInit, maxRetries = 3) {
-  let attempt = 0
-  while (attempt <= maxRetries) {
-    const res = await fetch(input, init)
-    if (res.status !== 429 && res.status < 500) {
-      return res
-    }
-    const waitMs = 500 * Math.pow(2, attempt)
-    await sleep(waitMs)
-    attempt += 1
+function parseRetryAfterMs(headers: Headers): number | null {
+  const raw = headers.get("Retry-After")
+  if (!raw) return null
+
+  const seconds = Number(raw)
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(MAX_RETRY_DELAY_MS, Math.round(seconds * 1000))
   }
-  return fetch(input, init)
+
+  const retryAt = Date.parse(raw)
+  if (!Number.isFinite(retryAt)) return null
+  return Math.min(MAX_RETRY_DELAY_MS, Math.max(0, retryAt - Date.now()))
+}
+
+function getRetryDelayMs(attempt: number, headers?: Headers): number {
+  const retryAfter = headers ? parseRetryAfterMs(headers) : null
+  if (retryAfter !== null) return retryAfter
+  const base = Math.min(MAX_RETRY_DELAY_MS, 500 * Math.pow(2, attempt))
+  return Math.round(base + Math.random() * 250)
+}
+
+async function fetchWithBackoff(input: RequestInfo, init: RequestInit, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      const res = await fetch(input, init)
+      if (!RETRYABLE_HTTP_STATUSES.has(res.status)) {
+        return res
+      }
+
+      if (attempt >= maxRetries) {
+        return res
+      }
+
+      const waitMs = getRetryDelayMs(attempt, res.headers)
+      logWarn("Retrying Reddit request after retryable status", {
+        status: res.status,
+        attempt: attempt + 1,
+        maxRetries,
+        waitMs,
+      })
+      await sleep(waitMs)
+    } catch (err) {
+      if (attempt >= maxRetries) {
+        throw err
+      }
+
+      const waitMs = getRetryDelayMs(attempt)
+      logWarn("Retrying Reddit request after network error", {
+        attempt: attempt + 1,
+        maxRetries,
+        waitMs,
+        error: String(err),
+      })
+      await sleep(waitMs)
+    }
+  }
+
+  throw new Error("unreachable_backoff_state")
 }
 
 async function getOAuthToken(env: Env): Promise<string | null> {
@@ -137,7 +185,15 @@ async function fetchListingWithFallback(
   for (const base of baseCandidates) {
     const headers = getAuthHeaders(base, ua, token)
     const url = resolveListingUrl(base, sub, limit, after)
-    const res = await fetchWithBackoff(url, { headers })
+    let res: Response
+    try {
+      res = await fetchWithBackoff(url, { headers })
+    } catch (err) {
+      lastStatus = "network-error"
+      logWarn("Reddit listing request failed with network error", { base, sub, error: String(err) })
+      continue
+    }
+
     if (!res.ok) {
       lastStatus = res.status
       logWarn(`Reddit listing request failed`, { base, status: res.status, sub })
@@ -178,7 +234,15 @@ async function fetchCommentsWithFallback(
   for (const base of baseCandidates) {
     const headers = getAuthHeaders(base, ua, token)
     const url = resolveCommentUrl(base, permalink, maxComments)
-    const res = await fetchWithBackoff(url, { headers })
+    let res: Response
+    try {
+      res = await fetchWithBackoff(url, { headers })
+    } catch (err) {
+      errors.push(`${base}:network-error`)
+      logWarn("Comment request failed with network error", { base, permalink, error: String(err) })
+      continue
+    }
+
     if (!res.ok) {
       const error = `${base}:${res.status}`
       errors.push(error)
@@ -244,12 +308,22 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
   const publicBases = REDDIT_PUBLIC_BASES
 
   const posts: RedditPost[] = []
+  const failedSubreddits: Array<{ subreddit: string; reason: string }> = []
   for (const sub of subreddits) {
     let after: string | null = null
     let fetched = 0
     while (fetched < cfg.maxPostsPerSubreddit) {
       const limit = Math.min(100, cfg.maxPostsPerSubreddit - fetched)
-      const json = await fetchListingWithFallback(sub, limit, after, ua, token, publicBases)
+      let json: Awaited<ReturnType<typeof fetchListingWithFallback>>
+      try {
+        json = await fetchListingWithFallback(sub, limit, after, ua, token, publicBases)
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err)
+        failedSubreddits.push({ subreddit: sub, reason })
+        logWarn("Skipping subreddit after repeated listing failures", { sub, reason })
+        break
+      }
+
       const children = json?.data?.children || []
       for (const child of children) {
         const post = mapPost(child, sub)
@@ -260,6 +334,23 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
       if (!after || children.length === 0) break
       await sleepWithJitter(500) // Increased delay with jitter to avoid detection
     }
+  }
+
+  if (posts.length === 0) {
+    const failureSummary = failedSubreddits.map((entry) => `${entry.subreddit}:${entry.reason}`).join(", ")
+    throw new Error(
+      failureSummary.length > 0
+        ? `Reddit dataset fetch produced no posts (${failureSummary})`
+        : "Reddit dataset fetch produced no posts"
+    )
+  }
+
+  if (failedSubreddits.length > 0) {
+    logWarn("Reddit dataset completed with partial subreddit coverage", {
+      failedSubreddits: failedSubreddits.map((entry) => entry.subreddit),
+      requestedSubreddits: subreddits.length,
+      collectedPosts: posts.length,
+    })
   }
 
   if (cfg.enableComments) {
