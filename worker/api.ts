@@ -1808,6 +1808,86 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
   };
 }
 
+const MARKET_SCHEMA_CACHE_MS = 5 * 60 * 1000;
+let marketSchemaInitPromise: Promise<void> | null = null;
+let marketSchemaInitializedAt = 0;
+
+async function ensureMarketProductSchema(db: D1Database): Promise<void> {
+  const now = Date.now();
+  if (marketSchemaInitializedAt > 0 && (now - marketSchemaInitializedAt) < MARKET_SCHEMA_CACHE_MS) {
+    return;
+  }
+
+  if (marketSchemaInitPromise) {
+    await marketSchemaInitPromise;
+    return;
+  }
+
+  marketSchemaInitPromise = (async () => {
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS market_brief_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        as_of TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_brief_as_of ON market_brief_snapshots(as_of DESC)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS opportunity_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        as_of TEXT NOT NULL,
+        horizon TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(as_of, horizon)
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_opportunity_snapshots_lookup ON opportunity_snapshots(as_of DESC, horizon)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS market_alert_events (
+        id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        severity TEXT NOT NULL CHECK(severity IN ('info', 'warning', 'critical')),
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        entity_type TEXT NOT NULL CHECK(entity_type IN ('market', 'theme', 'indicator')),
+        entity_id TEXT,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        payload_json TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_events_created ON market_alert_events(created_at DESC)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_events_type ON market_alert_events(event_type, created_at DESC)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS market_alert_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL,
+        channel TEXT NOT NULL CHECK(channel IN ('in_app', 'email')),
+        subscriber_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('queued', 'sent', 'failed')),
+        provider_id TEXT,
+        error TEXT,
+        attempted_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_event ON market_alert_deliveries(event_id, attempted_at DESC)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_subscriber ON market_alert_deliveries(subscriber_id, attempted_at DESC)`).run();
+
+    marketSchemaInitializedAt = Date.now();
+  })();
+
+  try {
+    await marketSchemaInitPromise;
+  } finally {
+    marketSchemaInitPromise = null;
+  }
+}
+
 async function fetchLatestSignalsThemes(): Promise<SignalsThemeRecord[]> {
   try {
     const runsRes = await fetch('https://pxicommand.com/signals/api/runs?status=ok');
@@ -4249,6 +4329,18 @@ export default {
           return Response.json({ error: 'Only scope=market is supported in phase 1' }, { status: 400, headers: corsHeaders });
         }
 
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Brief schema guard failed:', err);
+          return Response.json(buildBriefFallbackSnapshot('migration_guard_failed'), {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
         let snapshot: BriefSnapshot | null = null;
         let stored: { payload_json: string } | null = null;
         try {
@@ -4306,6 +4398,24 @@ export default {
         const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20', 10)));
         if (!isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true)) {
           const fallback = buildOpportunityFallbackSnapshot(horizon, 'feature_disabled');
+          return Response.json({
+            as_of: fallback.as_of,
+            horizon: fallback.horizon,
+            items: fallback.items,
+            degraded_reason: fallback.degraded_reason,
+          }, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Opportunities schema guard failed:', err);
+          const fallback = buildOpportunityFallbackSnapshot(horizon, 'migration_guard_failed');
           return Response.json({
             as_of: fallback.as_of,
             horizon: fallback.horizon,
@@ -4388,6 +4498,22 @@ export default {
             as_of: new Date().toISOString(),
             alerts: [],
             degraded_reason: 'feature_disabled',
+          }, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'no-store',
+            },
+          });
+        }
+
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Alerts feed schema guard failed:', err);
+          return Response.json({
+            as_of: new Date().toISOString(),
+            alerts: [],
+            degraded_reason: 'migration_guard_failed',
           }, {
             headers: {
               ...corsHeaders,
@@ -4643,6 +4769,13 @@ export default {
           return adminAuthFailure;
         }
 
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Refresh-products schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
         const briefEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_BRIEF', 'ENABLE_BRIEF', true);
         const opportunitiesEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true);
         const inAppAlertsEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_IN_APP', 'ENABLE_ALERTS_IN_APP', true);
@@ -4683,6 +4816,13 @@ export default {
         const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
         if (adminAuthFailure) {
           return adminAuthFailure;
+        }
+
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Send-digest schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
         }
 
         if (!isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_EMAIL', 'ENABLE_ALERTS_EMAIL', true)) {
