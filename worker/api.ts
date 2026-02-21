@@ -1056,6 +1056,8 @@ type PlanActionabilityReasonCode =
   | 'high_edge_with_eligible_opportunities'
   | 'medium_edge_watch'
   | 'low_edge_watch'
+  | 'cross_horizon_conflict_watch'
+  | 'cross_horizon_insufficient_watch'
   | 'fallback_degraded_mode'
   | `opportunity_${string}`;
 type OpportunityExpectancyBasis = 'theme_direction' | 'theme_direction_shrunk_prior' | 'direction_prior_proxy' | 'none';
@@ -1398,6 +1400,23 @@ interface PlanPayload {
     as_of: string;
     warning_count_24h: number;
     critical_count_24h: number;
+  };
+  cross_horizon?: {
+    as_of: string;
+    state: 'ALIGNED' | 'MIXED' | 'CONFLICT' | 'INSUFFICIENT';
+    eligible_7d: number;
+    eligible_30d: number;
+    top_direction_7d: OpportunityDirection | null;
+    top_direction_30d: OpportunityDirection | null;
+    rationale_codes: string[];
+    invalidation_note: string | null;
+  };
+  decision_stack?: {
+    what_changed: string;
+    what_to_do: string;
+    why_now: string;
+    confidence: string;
+    cta_state: PlanActionabilityState;
   };
   invalidation_rules: string[];
   degraded_reason: string | null;
@@ -4579,6 +4598,133 @@ function resolvePlanActionability(args: {
 
   reasonCodes.push('low_edge_watch');
   return { state: 'WATCH', reason_codes: reasonCodes };
+}
+
+function summarizeCrossHorizonCoherence(args: {
+  projected_7d: OpportunityFeedProjection | null;
+  projected_30d: OpportunityFeedProjection | null;
+  as_of_7d: string | null;
+  as_of_30d: string | null;
+}): {
+  as_of: string;
+  state: 'ALIGNED' | 'MIXED' | 'CONFLICT' | 'INSUFFICIENT';
+  eligible_7d: number;
+  eligible_30d: number;
+  top_direction_7d: OpportunityDirection | null;
+  top_direction_30d: OpportunityDirection | null;
+  rationale_codes: string[];
+  invalidation_note: string | null;
+} | null {
+  const projected7 = args.projected_7d;
+  const projected30 = args.projected_30d;
+  if (!projected7 && !projected30) {
+    return null;
+  }
+
+  const eligible7 = projected7?.items.length || 0;
+  const eligible30 = projected30?.items.length || 0;
+  const top7 = projected7?.items[0]?.direction ?? null;
+  const top30 = projected30?.items[0]?.direction ?? null;
+  const reasons: string[] = [];
+  let state: 'ALIGNED' | 'MIXED' | 'CONFLICT' | 'INSUFFICIENT' = 'INSUFFICIENT';
+  let invalidationNote: string | null = null;
+
+  if (eligible7 <= 0 && eligible30 <= 0) {
+    state = 'INSUFFICIENT';
+    reasons.push('no_eligible_both_horizons');
+    invalidationNote = 'Wait for both horizons to repopulate with eligible opportunities.';
+  } else if (eligible7 > 0 && eligible30 > 0) {
+    if (top7 && top30 && top7 !== top30) {
+      state = 'CONFLICT';
+      reasons.push('direction_conflict');
+      invalidationNote = 'Stand down until 7d and 30d directions re-align.';
+    } else {
+      state = 'ALIGNED';
+      reasons.push('direction_aligned');
+    }
+  } else {
+    state = 'MIXED';
+    reasons.push('single_horizon_signal');
+    invalidationNote = 'Treat the active horizon as tactical only until cross-horizon confirmation appears.';
+  }
+
+  const asOfCandidates = [args.as_of_7d, args.as_of_30d]
+    .filter((value): value is string => Boolean(value))
+    .sort();
+
+  return {
+    as_of: asOfCandidates.length > 0 ? asOfCandidates[asOfCandidates.length - 1] : asIsoDateTime(new Date()),
+    state,
+    eligible_7d: eligible7,
+    eligible_30d: eligible30,
+    top_direction_7d: top7,
+    top_direction_30d: top30,
+    rationale_codes: reasons,
+    invalidation_note: invalidationNote,
+  };
+}
+
+function applyCrossHorizonActionabilityOverride(
+  base: { state: PlanActionabilityState; reason_codes: PlanActionabilityReasonCode[] },
+  coherence: {
+    state: 'ALIGNED' | 'MIXED' | 'CONFLICT' | 'INSUFFICIENT';
+  } | null
+): { state: PlanActionabilityState; reason_codes: PlanActionabilityReasonCode[] } {
+  if (!coherence) return base;
+  if (base.state === 'NO_ACTION') return base;
+
+  const reasonCodes = [...base.reason_codes];
+  if (coherence.state === 'CONFLICT') {
+    reasonCodes.push('cross_horizon_conflict_watch');
+    return {
+      state: 'WATCH',
+      reason_codes: Array.from(new Set(reasonCodes)),
+    };
+  }
+  if (coherence.state === 'INSUFFICIENT') {
+    reasonCodes.push('cross_horizon_insufficient_watch');
+    return {
+      state: 'WATCH',
+      reason_codes: Array.from(new Set(reasonCodes)),
+    };
+  }
+  return base;
+}
+
+function buildDecisionStack(args: {
+  actionability_state: PlanActionabilityState;
+  setup_summary: string;
+  edge_quality: EdgeQualitySnapshot;
+  consistency: ConsistencySnapshot;
+  opportunity_ref?: PlanPayload['opportunity_ref'];
+  brief_ref?: PlanPayload['brief_ref'];
+  alerts_ref?: PlanPayload['alerts_ref'];
+  cross_horizon?: PlanPayload['cross_horizon'];
+}): NonNullable<PlanPayload['decision_stack']> {
+  const regimeDelta = args.brief_ref?.regime_delta?.toLowerCase() || 'unchanged';
+  const eligibleCount = args.opportunity_ref?.eligible_count ?? 0;
+  const warning24h = args.alerts_ref?.warning_count_24h ?? 0;
+  const critical24h = args.alerts_ref?.critical_count_24h ?? 0;
+  const crossHorizonState = args.cross_horizon?.state || 'INSUFFICIENT';
+
+  const whatChanged = `${regimeDelta} regime delta · ${eligibleCount} eligible opportunities · ${warning24h} warning / ${critical24h} critical alerts (24h).`;
+  let whatToDo = 'Monitor and wait for cleaner setup.';
+  if (args.actionability_state === 'ACTIONABLE') {
+    whatToDo = 'Execute the playbook target with standard risk controls and invalidation checks.';
+  } else if (args.actionability_state === 'WATCH') {
+    whatToDo = 'Maintain watch posture and require confirmation before adding risk.';
+  }
+
+  const whyNow = `Edge ${args.edge_quality.label.toLowerCase()} · consistency ${args.consistency.state.toLowerCase()} · cross-horizon ${crossHorizonState.toLowerCase()}.`;
+  const confidence = `edge=${args.edge_quality.label} | consistency=${args.consistency.state} | cross_horizon=${crossHorizonState}`;
+
+  return {
+    what_changed: whatChanged,
+    what_to_do: whatToDo,
+    why_now: whyNow,
+    confidence,
+    cta_state: args.actionability_state,
+  };
 }
 
 function evaluateOpportunityCtaState(
@@ -9282,6 +9428,7 @@ export default {
         let briefRef: PlanPayload['brief_ref'] | undefined;
         let opportunityRef: PlanPayload['opportunity_ref'] | undefined;
         let alertsRef: PlanPayload['alerts_ref'] | undefined;
+        let crossHorizonRef: PlanPayload['cross_horizon'] | undefined;
         try {
           await ensureMarketProductSchema(env.DB);
 
@@ -9321,57 +9468,83 @@ export default {
             }
           }
 
-          const opportunityRow = await env.DB.prepare(`
-            SELECT payload_json
+          const opportunityRows = await env.DB.prepare(`
+            SELECT horizon, as_of, payload_json
             FROM opportunity_snapshots
             WHERE horizon IN ('7d', '30d')
-            ORDER BY
-              CASE WHEN horizon = '7d' THEN 0 ELSE 1 END,
-              as_of DESC
-            LIMIT 1
-          `).first<{ payload_json: string }>();
+              AND as_of = (
+                SELECT MAX(s2.as_of)
+                FROM opportunity_snapshots s2
+                WHERE s2.horizon = opportunity_snapshots.horizon
+              )
+          `).all<{ horizon: '7d' | '30d'; as_of: string; payload_json: string }>();
 
-          if (opportunityRow?.payload_json) {
+          const coherenceGateEnabled = isFeatureEnabled(
+            env,
+            'FEATURE_ENABLE_OPPORTUNITY_COHERENCE_GATE',
+            'ENABLE_OPPORTUNITY_COHERENCE_GATE',
+            true,
+          );
+          const projectedByHorizon: Partial<Record<'7d' | '30d', OpportunityFeedProjection>> = {};
+          const asOfByHorizon: Partial<Record<'7d' | '30d', string>> = {};
+
+          for (const row of opportunityRows.results || []) {
             try {
-              const opportunitySnapshot = JSON.parse(opportunityRow.payload_json) as OpportunitySnapshot;
+              const opportunitySnapshot = JSON.parse(row.payload_json) as OpportunitySnapshot;
               if (
-                opportunitySnapshot &&
-                (opportunitySnapshot.horizon === '7d' || opportunitySnapshot.horizon === '30d') &&
-                Array.isArray(opportunitySnapshot.items)
+                !opportunitySnapshot ||
+                (opportunitySnapshot.horizon !== '7d' && opportunitySnapshot.horizon !== '30d') ||
+                !Array.isArray(opportunitySnapshot.items)
               ) {
-                const coherenceGateEnabled = isFeatureEnabled(
-                  env,
-                  'FEATURE_ENABLE_OPPORTUNITY_COHERENCE_GATE',
-                  'ENABLE_OPPORTUNITY_COHERENCE_GATE',
-                  true,
-                );
-                const calibration = await fetchLatestCalibrationSnapshot(
-                  env.DB,
-                  'conviction',
-                  opportunitySnapshot.horizon
-                );
-                const normalized = normalizeOpportunityItemsForPublishing(
-                  opportunitySnapshot.items,
-                  calibration
-                );
-                const projected = projectOpportunityFeed(normalized, {
-                  coherence_gate_enabled: coherenceGateEnabled,
-                  freshness,
-                  consistency_state: canonical.consistency.state,
-                });
-
-                opportunityRef = {
-                  as_of: opportunitySnapshot.as_of,
-                  horizon: opportunitySnapshot.horizon,
-                  eligible_count: projected.items.length,
-                  suppressed_count: projected.suppressed_count,
-                  degraded_reason: projected.degraded_reason,
-                };
+                continue;
               }
+
+              const calibration = await fetchLatestCalibrationSnapshot(
+                env.DB,
+                'conviction',
+                opportunitySnapshot.horizon
+              );
+              const normalized = normalizeOpportunityItemsForPublishing(
+                opportunitySnapshot.items,
+                calibration
+              );
+              const projected = projectOpportunityFeed(normalized, {
+                coherence_gate_enabled: coherenceGateEnabled,
+                freshness,
+                consistency_state: canonical.consistency.state,
+              });
+
+              projectedByHorizon[opportunitySnapshot.horizon] = projected;
+              asOfByHorizon[opportunitySnapshot.horizon] = opportunitySnapshot.as_of;
             } catch {
-              opportunityRef = undefined;
+              // Skip malformed snapshot payloads.
             }
           }
+
+          if (projectedByHorizon['7d']) {
+            opportunityRef = {
+              as_of: asOfByHorizon['7d'] || canonical.as_of,
+              horizon: '7d',
+              eligible_count: projectedByHorizon['7d'].items.length,
+              suppressed_count: projectedByHorizon['7d'].suppressed_count,
+              degraded_reason: projectedByHorizon['7d'].degraded_reason,
+            };
+          } else if (projectedByHorizon['30d']) {
+            opportunityRef = {
+              as_of: asOfByHorizon['30d'] || canonical.as_of,
+              horizon: '30d',
+              eligible_count: projectedByHorizon['30d'].items.length,
+              suppressed_count: projectedByHorizon['30d'].suppressed_count,
+              degraded_reason: projectedByHorizon['30d'].degraded_reason,
+            };
+          }
+
+          crossHorizonRef = summarizeCrossHorizonCoherence({
+            projected_7d: projectedByHorizon['7d'] || null,
+            projected_30d: projectedByHorizon['30d'] || null,
+            as_of_7d: asOfByHorizon['7d'] || null,
+            as_of_30d: asOfByHorizon['30d'] || null,
+          }) || undefined;
 
           alertsRef = {
             as_of: alertsCounts?.latest_as_of || canonical.as_of,
@@ -9388,13 +9561,34 @@ export default {
           freshness,
           consistency: canonical.consistency,
         });
+        const actionabilityWithCrossHorizon = applyCrossHorizonActionabilityOverride(actionability, crossHorizonRef);
+        const decisionStack = buildDecisionStack({
+          actionability_state: actionabilityWithCrossHorizon.state,
+          setup_summary: setupSummary,
+          edge_quality,
+          consistency: canonical.consistency,
+          opportunity_ref: opportunityRef,
+          brief_ref: briefRef,
+          alerts_ref: alertsRef,
+          cross_horizon: crossHorizonRef,
+        });
+        const invalidationRules = buildInvalidationRules({
+          pxi,
+          freshness,
+          regime,
+          edgeQuality: edge_quality,
+        });
+        if (crossHorizonRef?.invalidation_note) {
+          invalidationRules.unshift(crossHorizonRef.invalidation_note);
+        }
+        const finalInvalidationRules = Array.from(new Set(invalidationRules));
 
         const payload: PlanPayload = {
           as_of: canonical.as_of,
           setup_summary: setupSummary,
           policy_state,
-          actionability_state: actionability.state,
-          actionability_reason_codes: actionability.reason_codes,
+          actionability_state: actionabilityWithCrossHorizon.state,
+          actionability_reason_codes: actionabilityWithCrossHorizon.reason_codes,
           action_now: {
             risk_allocation_target: risk_sizing.target_pct / 100,
             raw_signal_allocation_target: risk_sizing.raw_signal_allocation_target,
@@ -9407,15 +9601,12 @@ export default {
           uncertainty: canonical.uncertainty,
           consistency: canonical.consistency,
           trader_playbook: canonical.trader_playbook,
-          invalidation_rules: buildInvalidationRules({
-            pxi,
-            freshness,
-            regime,
-            edgeQuality: edge_quality,
-          }),
+          invalidation_rules: finalInvalidationRules,
           ...(briefRef ? { brief_ref: briefRef } : {}),
           ...(opportunityRef ? { opportunity_ref: opportunityRef } : {}),
           ...(alertsRef ? { alerts_ref: alertsRef } : {}),
+          ...(crossHorizonRef ? { cross_horizon: crossHorizonRef } : {}),
+          decision_stack: decisionStack,
           degraded_reason: degraded_reasons.length > 0 ? degraded_reasons.join(',') : null,
         };
 

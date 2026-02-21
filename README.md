@@ -280,7 +280,12 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
 - Reports forward-chaining directional uplift vs lagged baseline, CI bounds, and leakage sentinel health per horizon.
 - `/api/market/refresh-products` now fails closed when leakage sentinel checks fail, blocking publish/promotion.
 
-6. **Signals sanitation + stability**
+6. **Decision-stack unification + cross-horizon coherence**
+- `/api/plan` now includes additive `decision_stack` and `cross_horizon` blocks.
+- `cross_horizon.state` (`ALIGNED|MIXED|CONFLICT|INSUFFICIENT`) downgrades `ACTIONABLE -> WATCH` on conflict/insufficient evidence.
+- Additional invalidation guidance is attached when horizons conflict or one horizon is missing.
+
+7. **Signals sanitation + stability**
 - Adapter-side ticker sanitation (allowlist regex, jargon stopwords, dedupe/cap) before PXI opportunity blending.
 - Signals source velocity cap tightened (`GROWTH_RATIO_CAP = 25`) with explicit `growth_ratio_capped` flag in metrics payload.
 
