@@ -1060,6 +1060,39 @@ function formatCtaDisabledReason(reason: string): string {
   return reason.replace(/_/g, ' ')
 }
 
+function deriveNoActionUnlockConditions(args: {
+  actionabilityReasonCodes?: string[]
+  ctaDisabledReasons?: string[]
+  diagnostics?: CalibrationDiagnosticsResponse | null
+}): string[] {
+  const reasonCodes = new Set((args.actionabilityReasonCodes || []).filter(Boolean))
+  const ctaReasons = new Set((args.ctaDisabledReasons || []).filter(Boolean))
+  const hasAny = (...codes: string[]): boolean => codes.some((code) => reasonCodes.has(code) || ctaReasons.has(code) || reasonCodes.has(`cta_${code}`))
+
+  const unlock: string[] = []
+
+  if (hasAny('no_eligible_opportunities', 'opportunity_coherence_gate_failed', 'high_edge_override_no_eligible')) {
+    unlock.push('At least one opportunity must pass coherence (p(correct) >= 50% and aligned expectancy sign).')
+  }
+  if (hasAny('critical_data_quality_block', 'consistency_fail_block', 'suppressed_data_quality', 'opportunity_suppressed_data_quality')) {
+    unlock.push('Critical stale inputs must be zero and consistency must remain PASS.')
+  }
+  if (hasAny('calibration_quality_not_robust')) {
+    unlock.push('Calibration quality must be ROBUST for action CTA.')
+  }
+  if (hasAny('ece_above_threshold')) {
+    const eceNow = args.diagnostics?.diagnostics?.ece
+    unlock.push(`Calibration ECE must be <= 0.08${typeof eceNow === 'number' ? ` (current ${eceNow.toFixed(3)})` : ''}.`)
+  }
+  if (hasAny('calibration_ece_unavailable')) {
+    unlock.push('Calibration diagnostics must publish a valid ECE estimate.')
+  }
+
+  return unlock.length > 0
+    ? unlock
+    : ['Wait for the next refresh cycle and recheck actionability state.']
+}
+
 function calibrationQualityClass(quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'): string {
   if (quality === 'ROBUST') return 'border-[#00c896]/40 text-[#00c896]'
   if (quality === 'LIMITED') return 'border-[#f59e0b]/40 text-[#f59e0b]'
@@ -1128,6 +1161,9 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
   const policyStance = derivePolicyStance(plan)
   const actionabilityState = plan.actionability_state || (plan.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH')
   const actionabilityReasons = (plan.actionability_reason_codes || []).filter(Boolean)
+  const noActionUnlockConditions = actionabilityState === 'NO_ACTION'
+    ? deriveNoActionUnlockConditions({ actionabilityReasonCodes: actionabilityReasons })
+    : []
   const targetPct = Math.round(plan.action_now.risk_allocation_target * 100)
   const rawTargetPct = Math.round((plan.action_now.raw_signal_allocation_target ?? plan.action_now.risk_allocation_target) * 100)
   const qualityColor =
@@ -1200,10 +1236,20 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
               Opportunity feed currently suppressed: {formatOpportunityDegradedReason(plan.opportunity_ref?.degraded_reason)}
             </p>
           )}
-          {actionabilityState === 'NO_ACTION' && actionabilityReasons.length > 0 && (
-            <p className="mt-1 text-[10px] text-[#f59e0b]/90">
-              No-action mode: {actionabilityReasons.slice(0, 3).map((reason) => reason.replace(/_/g, ' ')).join(' · ')}
-            </p>
+          {actionabilityState === 'NO_ACTION' && (
+            <div className="mt-2 rounded border border-[#f59e0b]/30 bg-[#f59e0b]/5 px-2 py-2">
+              <p className="text-[10px] uppercase tracking-wider text-[#f59e0b]">No-action unlock conditions</p>
+              {actionabilityReasons.length > 0 && (
+                <p className="mt-1 text-[9px] text-[#f3e3c2]/80">
+                  reasons: {actionabilityReasons.slice(0, 3).map((reason) => reason.replace(/_/g, ' ')).join(' · ')}
+                </p>
+              )}
+              <div className="mt-1 space-y-1">
+                {noActionUnlockConditions.map((line) => (
+                  <p key={line} className="text-[10px] text-[#f3e3c2]">- {line}</p>
+                ))}
+              </div>
+            </div>
           )}
         </div>
         <div className="shrink-0 text-right">
@@ -3040,6 +3086,13 @@ function OpportunitiesPage({
   const ctaEnabled = typeof data?.cta_enabled === 'boolean'
     ? Boolean(data.cta_enabled)
     : (Boolean(data?.items?.length) && ctaDisabledReasons.length === 0)
+  const noActionUnlockConditions = actionabilityState === 'NO_ACTION'
+    ? deriveNoActionUnlockConditions({
+        actionabilityReasonCodes,
+        ctaDisabledReasons,
+        diagnostics,
+      })
+    : []
   const hasContractGateSuppression = degradedReason === 'coherence_gate_failed'
   const hasDataQualitySuppression = degradedReason === 'suppressed_data_quality'
   const hasQualityFilter = degradedReason === 'quality_filtered'
@@ -3125,6 +3178,16 @@ function OpportunitiesPage({
         {!ctaEnabled && (
           <div className="mb-4 text-[10px] text-[#f59e0b]">
             action CTA disabled: {(ctaDisabledReasons.length > 0 ? ctaDisabledReasons : ['no_eligible_opportunities']).map(formatCtaDisabledReason).join(' · ')}
+          </div>
+        )}
+        {actionabilityState === 'NO_ACTION' && (
+          <div className="mb-4 rounded border border-[#f59e0b]/30 bg-[#f59e0b]/5 px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-[#f59e0b]">No-action unlock conditions</p>
+            <div className="mt-1 space-y-1">
+              {noActionUnlockConditions.map((line) => (
+                <p key={line} className="text-[10px] text-[#f3e3c2]">- {line}</p>
+              ))}
+            </div>
           </div>
         )}
 
