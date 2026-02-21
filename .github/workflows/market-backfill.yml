@@ -1,0 +1,116 @@
+name: Market Backfill Products
+
+concurrency:
+  group: pxi-market-backfill-${{ github.ref_name }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: "2024-01-01"
+      end:
+        description: "End date (YYYY-MM-DD, blank = today)"
+        required: false
+        default: ""
+      limit:
+        description: "Max dates to process (1-365)"
+        required: false
+        default: "365"
+      overwrite:
+        description: "Overwrite existing snapshots"
+        required: false
+        default: "true"
+      dry_run:
+        description: "Dry run only (no writes)"
+        required: false
+        default: "false"
+      recalibrate:
+        description: "Recompute calibration snapshots"
+        required: false
+        default: "true"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    env:
+      WRITE_API_URL: ${{ secrets.WRITE_API_URL }}
+      WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+      INPUT_START: ${{ github.event.inputs.start }}
+      INPUT_END: ${{ github.event.inputs.end }}
+      INPUT_LIMIT: ${{ github.event.inputs.limit }}
+      INPUT_OVERWRITE: ${{ github.event.inputs.overwrite }}
+      INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+      INPUT_RECALIBRATE: ${{ github.event.inputs.recalibrate }}
+    steps:
+      - name: Build request payload
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg start "${INPUT_START}" \
+            --arg end "${INPUT_END}" \
+            --argjson limit "${INPUT_LIMIT}" \
+            --argjson overwrite "${INPUT_OVERWRITE}" \
+            --argjson dry_run "${INPUT_DRY_RUN}" \
+            --argjson recalibrate "${INPUT_RECALIBRATE}" \
+            '
+            {
+              limit: $limit,
+              overwrite: $overwrite,
+              dry_run: $dry_run,
+              recalibrate: $recalibrate
+            }
+            + (if ($start | length) > 0 then {start: $start} else {} end)
+            + (if ($end | length) > 0 then {end: $end} else {} end)
+            ' > /tmp/backfill-request.json
+          cat /tmp/backfill-request.json
+
+      - name: Run market backfill products
+        run: |
+          set -euo pipefail
+          BASE_URL="${WRITE_API_URL%/api/write}"
+          RESPONSE="$(curl -fsS -X POST "${BASE_URL}/api/market/backfill-products" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "X-Refresh-Trigger: github_actions_market_backfill" \
+            --data @/tmp/backfill-request.json)"
+          echo "${RESPONSE}" | jq . > /tmp/backfill-response.json
+          cat /tmp/backfill-response.json
+
+      - name: Refresh latest market products after backfill
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          BASE_URL="${WRITE_API_URL%/api/write}"
+          RESPONSE="$(curl -fsS -X POST "${BASE_URL}/api/market/refresh-products" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "X-Refresh-Trigger: github_actions_market_backfill_post_refresh")"
+          echo "${RESPONSE}" | jq . > /tmp/post-refresh-response.json
+          cat /tmp/post-refresh-response.json
+
+      - name: Append summary
+        if: always()
+        run: |
+          {
+            echo "### Market Backfill Summary"
+            echo ""
+            if [[ -f /tmp/backfill-response.json ]]; then
+              echo "| Processed dates | Seeded snapshots | Calibrations generated | Edge samples | Conviction 7d samples | Conviction 30d samples |"
+              echo "|---:|---:|---:|---:|---:|---:|"
+              jq -r '"| \(.processed_dates // 0) | \(.seeded_snapshots // 0) | \(.calibrations_generated // 0) | \(.calibration_samples.edge_total_samples // 0) | \(.calibration_samples.conviction_7d_total_samples // 0) | \(.calibration_samples.conviction_30d_total_samples // 0) |"' /tmp/backfill-response.json
+            else
+              echo "No backfill response produced."
+            fi
+
+            if [[ -f /tmp/post-refresh-response.json ]]; then
+              echo ""
+              echo "### Post Refresh Summary"
+              echo ""
+              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | As of |"
+              echo "|---:|---:|---:|---:|---|"
+              jq -r '"| \(.brief_generated // 0) | \(.opportunities_generated // 0) | \(.calibrations_generated // 0) | \(.alerts_generated // 0) | \(.as_of // "n/a") |"' /tmp/post-refresh-response.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
