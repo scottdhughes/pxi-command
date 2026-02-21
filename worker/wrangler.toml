@@ -28,12 +28,16 @@ id = "88901ff0216a484eb81b8004be0f5aea"
 binding = "RATE_LIMIT_KV"
 id = "e9d69a554ea44727b185127ea67e6932"
 
+[[env.staging.send_email]]
+name = "EMAIL_OUTBOUND"
+
 [env.staging.vars]
 FEATURE_ENABLE_BRIEF = "true"
 FEATURE_ENABLE_OPPORTUNITIES = "true"
 FEATURE_ENABLE_ALERTS_IN_APP = "true"
 FEATURE_ENABLE_ALERTS_EMAIL = "true"
 FEATURE_ENABLE_PLAN = "true"
+ALERTS_FROM_EMAIL = "alerts@pxicommand.com"
 
 [env.production]
 routes = [
@@ -61,12 +65,16 @@ id = "88901ff0216a484eb81b8004be0f5aea"
 binding = "RATE_LIMIT_KV"
 id = "e9d69a554ea44727b185127ea67e6932"
 
+[[env.production.send_email]]
+name = "EMAIL_OUTBOUND"
+
 [env.production.vars]
 FEATURE_ENABLE_BRIEF = "true"
 FEATURE_ENABLE_OPPORTUNITIES = "true"
 FEATURE_ENABLE_ALERTS_IN_APP = "true"
 FEATURE_ENABLE_ALERTS_EMAIL = "true"
 FEATURE_ENABLE_PLAN = "true"
+ALERTS_FROM_EMAIL = "alerts@pxicommand.com"
 
 [env.fallback]
 name = "pxi-api"
@@ -91,12 +99,16 @@ id = "88901ff0216a484eb81b8004be0f5aea"
 binding = "RATE_LIMIT_KV"
 id = "e9d69a554ea44727b185127ea67e6932"
 
+[[env.fallback.send_email]]
+name = "EMAIL_OUTBOUND"
+
 [env.fallback.vars]
 FEATURE_ENABLE_BRIEF = "true"
 FEATURE_ENABLE_OPPORTUNITIES = "true"
 FEATURE_ENABLE_ALERTS_IN_APP = "true"
 FEATURE_ENABLE_ALERTS_EMAIL = "true"
 FEATURE_ENABLE_PLAN = "true"
+ALERTS_FROM_EMAIL = "alerts@pxicommand.com"
 
 # Cron Triggers - Disabled (using GitHub Actions instead due to Yahoo API blocking Workers)
 # [triggers]
