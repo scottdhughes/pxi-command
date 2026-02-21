@@ -3,6 +3,7 @@ set -euo pipefail
 
 API_URL="${1:-${API_URL:-https://api.pxicommand.com}}"
 EDGE_DIAGNOSTICS_REQUIRED="${EDGE_DIAGNOSTICS_REQUIRED:-0}"
+OPPORTUNITY_TTL_GRACE_SECONDS="${OPPORTUNITY_TTL_GRACE_SECONDS:-5400}"
 
 TMP_HEADERS="$(mktemp)"
 TMP_BODY="$(mktemp)"
@@ -419,6 +420,12 @@ check_opportunity_coherence_contract() {
   local actionability_state
   local quality_filter_rate
   local coherence_fail_rate
+  local ttl_state
+  local data_age_seconds
+  local overdue_seconds
+  local next_expected_refresh_at
+  local has_overdue_reason
+  local has_unknown_reason
 
   opp_json=$(curl -sS --max-time 20 "$API_URL/api/opportunities?horizon=7d&limit=50")
 
@@ -463,10 +470,16 @@ check_opportunity_coherence_contract() {
   actionability_state=$(echo "$opp_json" | jq -r '.actionability_state // ""')
   quality_filter_rate=$(echo "$opp_json" | jq -r '.quality_filter_rate // -1')
   coherence_fail_rate=$(echo "$opp_json" | jq -r '.coherence_fail_rate // -1')
+  ttl_state=$(echo "$opp_json" | jq -r '.ttl_state // ""')
+  data_age_seconds=$(echo "$opp_json" | jq -r '.data_age_seconds // "null"')
+  overdue_seconds=$(echo "$opp_json" | jq -r '.overdue_seconds // "null"')
+  next_expected_refresh_at=$(echo "$opp_json" | jq -r '.next_expected_refresh_at // ""')
+  has_overdue_reason=$(echo "$opp_json" | jq -r '((.cta_disabled_reasons // []) | index("refresh_ttl_overdue")) != null')
+  has_unknown_reason=$(echo "$opp_json" | jq -r '((.cta_disabled_reasons // []) | index("refresh_ttl_unknown")) != null')
 
   if [[ -n "$degraded_reason" ]]; then
     case "$degraded_reason" in
-      quality_filtered|coherence_gate_failed|suppressed_data_quality|feature_disabled|migration_guard_failed|snapshot_unavailable|snapshot_rebuilt)
+      quality_filtered|coherence_gate_failed|suppressed_data_quality|refresh_ttl_overdue|refresh_ttl_unknown|feature_disabled|migration_guard_failed|snapshot_unavailable|snapshot_rebuilt)
         ;;
       *)
         echo "Invalid opportunities degraded_reason: $degraded_reason"
@@ -527,6 +540,69 @@ check_opportunity_coherence_contract() {
     echo "coherence_fail_rate out of bounds: $coherence_fail_rate"
     echo "$opp_json"
     exit 1
+  fi
+
+  case "$ttl_state" in
+    fresh|stale|overdue|unknown) ;;
+    *)
+      echo "Invalid opportunities ttl_state: $ttl_state"
+      echo "$opp_json"
+      exit 1
+      ;;
+  esac
+
+  if [[ "$ttl_state" != "unknown" ]]; then
+    if [[ -z "$next_expected_refresh_at" ]]; then
+      echo "ttl_state=$ttl_state requires next_expected_refresh_at"
+      echo "$opp_json"
+      exit 1
+    fi
+    if [[ "$data_age_seconds" == "null" ]] || ! awk "BEGIN { exit !($data_age_seconds >= 0) }"; then
+      echo "ttl_state=$ttl_state requires non-negative data_age_seconds"
+      echo "$opp_json"
+      exit 1
+    fi
+  fi
+
+  if [[ "$ttl_state" == "fresh" ]]; then
+    if [[ "$overdue_seconds" == "null" ]] || ! awk "BEGIN { exit !($overdue_seconds == 0) }"; then
+      echo "ttl_state=fresh requires overdue_seconds=0"
+      echo "$opp_json"
+      exit 1
+    fi
+  elif [[ "$ttl_state" == "stale" ]]; then
+    if [[ "$overdue_seconds" == "null" ]] || ! awk "BEGIN { exit !($overdue_seconds > 0 && $overdue_seconds <= $OPPORTUNITY_TTL_GRACE_SECONDS) }"; then
+      echo "ttl_state=stale requires overdue_seconds in (0, ${OPPORTUNITY_TTL_GRACE_SECONDS}]"
+      echo "$opp_json"
+      exit 1
+    fi
+  elif [[ "$ttl_state" == "overdue" ]]; then
+    if [[ "$overdue_seconds" == "null" ]] || ! awk "BEGIN { exit !($overdue_seconds > $OPPORTUNITY_TTL_GRACE_SECONDS) }"; then
+      echo "ttl_state=overdue requires overdue_seconds>${OPPORTUNITY_TTL_GRACE_SECONDS}"
+      echo "$opp_json"
+      exit 1
+    fi
+    if [[ "$cta_enabled" == "true" ]]; then
+      echo "ttl_state=overdue must disable CTA"
+      echo "$opp_json"
+      exit 1
+    fi
+    if [[ "$has_overdue_reason" != "true" ]]; then
+      echo "ttl_state=overdue requires cta_disabled_reasons to include refresh_ttl_overdue"
+      echo "$opp_json"
+      exit 1
+    fi
+  else
+    if [[ "$cta_enabled" == "true" ]]; then
+      echo "ttl_state=unknown must disable CTA"
+      echo "$opp_json"
+      exit 1
+    fi
+    if [[ "$has_unknown_reason" != "true" ]]; then
+      echo "ttl_state=unknown requires cta_disabled_reasons to include refresh_ttl_unknown"
+      echo "$opp_json"
+      exit 1
+    fi
   fi
 }
 
@@ -598,7 +674,7 @@ check_api_json_contract "/api/brief?scope=market" \
   "brief"
 
 check_api_json_contract "/api/opportunities?horizon=7d&limit=5" \
-  'type=="object" and (.as_of|type=="string") and (.horizon|type=="string") and (.suppressed_count|type=="number") and (.suppression_by_reason.coherence_failed|type=="number") and (.suppression_by_reason.quality_filtered|type=="number") and (.suppression_by_reason.data_quality_suppressed|type=="number") and (.quality_filter_rate|type=="number") and (.coherence_fail_rate|type=="number") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.cta_enabled|type=="boolean") and (.cta_disabled_reasons|type=="array") and (all(.cta_disabled_reasons[]?; type=="string")) and ((.degraded_reason==null) or (.degraded_reason|type=="string")) and (.items|type=="array") and (all(.items[]?; (.id|type=="string") and (.theme_id|type=="string") and (.direction|type=="string") and (.conviction_score|type=="number") and (.calibration.quality|type=="string") and (.calibration.basis=="conviction_decile") and ((.calibration.window==null) or (.calibration.window|type=="string")) and ((.calibration.unavailable_reason==null) or (.calibration.unavailable_reason|type=="string")) and (.expectancy.sample_size|type=="number") and (.expectancy.basis|type=="string") and (.expectancy.quality|type=="string") and ((.expectancy.expected_move_pct==null) or (.expectancy.expected_move_pct|type=="number")) and ((.expectancy.max_adverse_move_pct==null) or (.expectancy.max_adverse_move_pct|type=="number")) and ((.expectancy.unavailable_reason==null) or (.expectancy.unavailable_reason|type=="string")) and (.eligibility.passed|type=="boolean") and (.eligibility.failed_checks|type=="array") and (.decision_contract.coherent|type=="boolean") and (.decision_contract.confidence_band|type=="string") and (.decision_contract.rationale_codes|type=="array")))' \
+  'type=="object" and (.as_of|type=="string") and (.horizon|type=="string") and (.suppressed_count|type=="number") and (.suppression_by_reason.coherence_failed|type=="number") and (.suppression_by_reason.quality_filtered|type=="number") and (.suppression_by_reason.data_quality_suppressed|type=="number") and (.quality_filter_rate|type=="number") and (.coherence_fail_rate|type=="number") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.cta_enabled|type=="boolean") and (.cta_disabled_reasons|type=="array") and (all(.cta_disabled_reasons[]?; type=="string")) and ((.degraded_reason==null) or (.degraded_reason|type=="string")) and ((.data_age_seconds==null) or (.data_age_seconds|type=="number")) and (.ttl_state|type=="string") and ((.next_expected_refresh_at==null) or (.next_expected_refresh_at|type=="string")) and ((.overdue_seconds==null) or (.overdue_seconds|type=="number")) and (.items|type=="array") and (all(.items[]?; (.id|type=="string") and (.theme_id|type=="string") and (.direction|type=="string") and (.conviction_score|type=="number") and (.calibration.quality|type=="string") and (.calibration.basis=="conviction_decile") and ((.calibration.window==null) or (.calibration.window|type=="string")) and ((.calibration.unavailable_reason==null) or (.calibration.unavailable_reason|type=="string")) and (.expectancy.sample_size|type=="number") and (.expectancy.basis|type=="string") and (.expectancy.quality|type=="string") and ((.expectancy.expected_move_pct==null) or (.expectancy.expected_move_pct|type=="number")) and ((.expectancy.max_adverse_move_pct==null) or (.expectancy.max_adverse_move_pct|type=="number")) and ((.expectancy.unavailable_reason==null) or (.expectancy.unavailable_reason|type=="string")) and (.eligibility.passed|type=="boolean") and (.eligibility.failed_checks|type=="array") and (.decision_contract.coherent|type=="boolean") and (.decision_contract.confidence_band|type=="string") and (.decision_contract.rationale_codes|type=="array")))' \
   "opportunities"
 
 check_api_json_contract "/api/alerts/feed?limit=10" \

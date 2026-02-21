@@ -1047,6 +1047,7 @@ type EdgeQualityLabel = 'HIGH' | 'MEDIUM' | 'LOW';
 type CalibrationQuality = 'ROBUST' | 'LIMITED' | 'INSUFFICIENT';
 type CoverageQuality = CalibrationQuality;
 type PlanActionabilityState = 'ACTIONABLE' | 'WATCH' | 'NO_ACTION';
+type OpportunityTtlState = 'fresh' | 'stale' | 'overdue' | 'unknown';
 type PlanActionabilityReasonCode =
   | 'critical_data_quality_block'
   | 'consistency_fail_block'
@@ -1072,7 +1073,9 @@ type OpportunityCtaDisabledReason =
   | 'suppressed_data_quality'
   | 'calibration_quality_not_robust'
   | 'calibration_ece_unavailable'
-  | 'ece_above_threshold';
+  | 'ece_above_threshold'
+  | 'refresh_ttl_overdue'
+  | 'refresh_ttl_unknown';
 
 interface OpportunityEligibility {
   passed: boolean;
@@ -1269,6 +1272,13 @@ interface OpportunitySuppressionByReason {
   data_quality_suppressed: number;
 }
 
+interface OpportunityTtlMetadata {
+  data_age_seconds: number | null;
+  ttl_state: OpportunityTtlState;
+  next_expected_refresh_at: string | null;
+  overdue_seconds: number | null;
+}
+
 interface MarketAlertEvent {
   id: string;
   event_type: MarketAlertType;
@@ -1441,6 +1451,7 @@ const CALIBRATION_LIMITED_MIN_SAMPLE = 20;
 const CALIBRATION_POOL_TARGET_SAMPLE = CALIBRATION_ROBUST_MIN_SAMPLE;
 const OPPORTUNITY_COHERENCE_MIN_PROBABILITY = 0.5;
 const OPPORTUNITY_CTA_MAX_ECE = 0.08;
+const OPPORTUNITY_REFRESH_TTL_GRACE_SECONDS = 90 * 60;
 const EDGE_DIAGNOSTICS_MAX_ROWS = 5000;
 const SIGNALS_TICKER_REGEX = /^[A-Z]{2,5}$/;
 const SIGNALS_TICKER_LIMIT = 4;
@@ -2812,6 +2823,56 @@ function computeNextExpectedRefresh(now = new Date()): { at: string; in_minutes:
   return {
     at: next.toISOString(),
     in_minutes: Math.max(0, Math.round((next.getTime() - nowMs) / 60000)),
+  };
+}
+
+function parseIsoTimestamp(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+}
+
+function computeOpportunityTtlMetadata(
+  lastRefreshAtUtc: string | null,
+  now = new Date(),
+): OpportunityTtlMetadata {
+  const lastRefreshDate = parseIsoTimestamp(lastRefreshAtUtc);
+  if (!lastRefreshDate) {
+    return {
+      data_age_seconds: null,
+      ttl_state: 'unknown',
+      next_expected_refresh_at: null,
+      overdue_seconds: null,
+    };
+  }
+
+  const ageSeconds = Math.max(0, Math.floor((now.getTime() - lastRefreshDate.getTime()) / 1000));
+  const nextExpected = computeNextExpectedRefresh(lastRefreshDate);
+  const nextExpectedDate = parseIsoTimestamp(nextExpected.at);
+  if (!nextExpectedDate) {
+    return {
+      data_age_seconds: ageSeconds,
+      ttl_state: 'unknown',
+      next_expected_refresh_at: null,
+      overdue_seconds: null,
+    };
+  }
+
+  const overdueSecondsRaw = Math.floor((now.getTime() - nextExpectedDate.getTime()) / 1000);
+  const overdueSeconds = Math.max(0, overdueSecondsRaw);
+  let ttlState: OpportunityTtlState = 'fresh';
+  if (overdueSecondsRaw > 0 && overdueSeconds <= OPPORTUNITY_REFRESH_TTL_GRACE_SECONDS) {
+    ttlState = 'stale';
+  } else if (overdueSeconds > OPPORTUNITY_REFRESH_TTL_GRACE_SECONDS) {
+    ttlState = 'overdue';
+  }
+
+  return {
+    data_age_seconds: ageSeconds,
+    ttl_state: ttlState,
+    next_expected_refresh_at: nextExpectedDate.toISOString(),
+    overdue_seconds: overdueSeconds,
   };
 }
 
@@ -4729,7 +4790,9 @@ function buildDecisionStack(args: {
 
 function evaluateOpportunityCtaState(
   projectedFeed: OpportunityFeedProjection,
-  diagnostics: CalibrationDiagnosticsSnapshot
+  diagnostics: CalibrationDiagnosticsSnapshot,
+  ttl: OpportunityTtlMetadata,
+  degradedReason: string | null,
 ): {
   cta_enabled: boolean;
   cta_disabled_reasons: OpportunityCtaDisabledReason[];
@@ -4738,7 +4801,7 @@ function evaluateOpportunityCtaState(
   const disabledReasons: OpportunityCtaDisabledReason[] = [];
 
   const actionabilityState: PlanActionabilityState = projectedFeed.items.length > 0
-    ? (projectedFeed.degraded_reason === null ? 'ACTIONABLE' : 'WATCH')
+    ? (degradedReason === null ? 'ACTIONABLE' : 'WATCH')
     : 'NO_ACTION';
 
   if (projectedFeed.items.length === 0) {
@@ -4754,6 +4817,11 @@ function evaluateOpportunityCtaState(
     disabledReasons.push('calibration_ece_unavailable');
   } else if (diagnostics.ece > OPPORTUNITY_CTA_MAX_ECE) {
     disabledReasons.push('ece_above_threshold');
+  }
+  if (ttl.ttl_state === 'overdue') {
+    disabledReasons.push('refresh_ttl_overdue');
+  } else if (ttl.ttl_state === 'unknown') {
+    disabledReasons.push('refresh_ttl_unknown');
   }
 
   return {
@@ -5552,6 +5620,44 @@ async function fetchLatestMarketProductSnapshotWrite(db: D1Database): Promise<st
   } catch {
     return null;
   }
+}
+
+async function resolveLatestRefreshTimestamp(db: D1Database): Promise<{
+  last_refresh_at_utc: string | null;
+  source: 'market_refresh_runs' | 'market_product_snapshots' | 'fetch_logs' | 'unknown';
+}> {
+  const [latestRefreshRun, latestProductSnapshotWrite, lastFetchLogRow] = await Promise.all([
+    fetchLatestSuccessfulMarketRefreshRun(db),
+    fetchLatestMarketProductSnapshotWrite(db),
+    db.prepare(`
+      SELECT MAX(completed_at) as last_refresh_at
+      FROM fetch_logs
+      WHERE completed_at IS NOT NULL
+    `).first<{ last_refresh_at: string | null }>(),
+  ]);
+
+  if (latestRefreshRun?.completed_at) {
+    return {
+      last_refresh_at_utc: latestRefreshRun.completed_at,
+      source: 'market_refresh_runs',
+    };
+  }
+  if (latestProductSnapshotWrite) {
+    return {
+      last_refresh_at_utc: latestProductSnapshotWrite,
+      source: 'market_product_snapshots',
+    };
+  }
+  if (lastFetchLogRow?.last_refresh_at) {
+    return {
+      last_refresh_at_utc: lastFetchLogRow.last_refresh_at,
+      source: 'fetch_logs',
+    };
+  }
+  return {
+    last_refresh_at_utc: null,
+    source: 'unknown',
+  };
 }
 
 async function storeOpportunitySnapshot(db: D1Database, snapshot: OpportunitySnapshot): Promise<void> {
@@ -7644,24 +7750,9 @@ export default {
           .slice(0, 3)
           .map(({ priorityScore: _priorityScore, ...offender }) => offender);
 
-        const latestRefreshRun = await fetchLatestSuccessfulMarketRefreshRun(env.DB);
-        const latestProductSnapshotWrite = await fetchLatestMarketProductSnapshotWrite(env.DB);
-        const lastFetchLogRow = await env.DB.prepare(`
-          SELECT MAX(completed_at) as last_refresh_at
-          FROM fetch_logs
-          WHERE completed_at IS NOT NULL
-        `).first<{ last_refresh_at: string | null }>();
-        const lastRefreshAtUtc = latestRefreshRun?.completed_at
-          || latestProductSnapshotWrite
-          || lastFetchLogRow?.last_refresh_at
-          || null;
-        const lastRefreshSource = latestRefreshRun?.completed_at
-          ? 'market_refresh_runs'
-          : latestProductSnapshotWrite
-            ? 'market_product_snapshots'
-            : lastFetchLogRow?.last_refresh_at
-              ? 'fetch_logs'
-              : 'unknown';
+        const latestRefresh = await resolveLatestRefreshTimestamp(env.DB);
+        const lastRefreshAtUtc = latestRefresh.last_refresh_at_utc;
+        const lastRefreshSource = latestRefresh.source;
         const nextRefresh = computeNextExpectedRefresh(new Date());
 
         const response = {
@@ -7831,6 +7922,12 @@ export default {
           'ENABLE_SIGNALS_SANITIZER',
           true,
         );
+        const unknownTtlMetadata: OpportunityTtlMetadata = {
+          data_age_seconds: null,
+          ttl_state: 'unknown',
+          next_expected_refresh_at: null,
+          overdue_seconds: null,
+        };
 
         if (!isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true)) {
           const fallback = buildOpportunityFallbackSnapshot(horizon, 'feature_disabled');
@@ -7853,6 +7950,10 @@ export default {
             actionability_reason_codes: ['no_eligible_opportunities', `opportunity_${fallback.degraded_reason}`],
             cta_enabled: false,
             cta_disabled_reasons: ['no_eligible_opportunities'],
+            data_age_seconds: unknownTtlMetadata.data_age_seconds,
+            ttl_state: unknownTtlMetadata.ttl_state,
+            next_expected_refresh_at: unknownTtlMetadata.next_expected_refresh_at,
+            overdue_seconds: unknownTtlMetadata.overdue_seconds,
           }, {
             headers: {
               ...corsHeaders,
@@ -7885,6 +7986,10 @@ export default {
             actionability_reason_codes: ['no_eligible_opportunities', `opportunity_${fallback.degraded_reason}`],
             cta_enabled: false,
             cta_disabled_reasons: ['no_eligible_opportunities'],
+            data_age_seconds: unknownTtlMetadata.data_age_seconds,
+            ttl_state: unknownTtlMetadata.ttl_state,
+            next_expected_refresh_at: unknownTtlMetadata.next_expected_refresh_at,
+            overdue_seconds: unknownTtlMetadata.overdue_seconds,
           }, {
             headers: {
               ...corsHeaders,
@@ -7946,6 +8051,10 @@ export default {
               actionability_reason_codes: ['no_eligible_opportunities', `opportunity_${fallback.degraded_reason}`],
               cta_enabled: false,
               cta_disabled_reasons: ['no_eligible_opportunities'],
+              data_age_seconds: unknownTtlMetadata.data_age_seconds,
+              ttl_state: unknownTtlMetadata.ttl_state,
+              next_expected_refresh_at: unknownTtlMetadata.next_expected_refresh_at,
+              overdue_seconds: unknownTtlMetadata.overdue_seconds,
             }, {
               headers: {
                 ...corsHeaders,
@@ -7960,10 +8069,11 @@ export default {
           }
         }
 
-        const [convictionCalibration, freshness, latestConsistencyCheck] = await Promise.all([
+        const [convictionCalibration, freshness, latestConsistencyCheck, latestRefresh] = await Promise.all([
           fetchLatestCalibrationSnapshot(env.DB, 'conviction', horizon),
           computeFreshnessStatus(env.DB),
           fetchLatestConsistencyCheck(env.DB),
+          resolveLatestRefreshTimestamp(env.DB),
         ]);
 
         let consistencyState: ConsistencyState = latestConsistencyCheck?.state ?? 'PASS';
@@ -7981,16 +8091,26 @@ export default {
           freshness,
           consistency_state: consistencyState,
         });
+        const ttlMetadata = computeOpportunityTtlMetadata(latestRefresh.last_refresh_at_utc, new Date());
+        let effectiveDegradedReason = projectedFeed.degraded_reason;
+        if (!effectiveDegradedReason && ttlMetadata.ttl_state === 'overdue') {
+          effectiveDegradedReason = 'refresh_ttl_overdue';
+        } else if (!effectiveDegradedReason && ttlMetadata.ttl_state === 'unknown') {
+          effectiveDegradedReason = 'refresh_ttl_unknown';
+        }
         const diagnostics = computeCalibrationDiagnostics(convictionCalibration);
-        const ctaState = evaluateOpportunityCtaState(projectedFeed, diagnostics);
+        const ctaState = evaluateOpportunityCtaState(projectedFeed, diagnostics, ttlMetadata, effectiveDegradedReason);
         const actionabilityReasonCodes = Array.from(new Set([
           ...(projectedFeed.items.length === 0 ? ['no_eligible_opportunities'] : []),
-          ...(projectedFeed.degraded_reason ? [`opportunity_${projectedFeed.degraded_reason}`] : []),
+          ...(effectiveDegradedReason ? [`opportunity_${effectiveDegradedReason}`] : []),
           ...(ctaState.actionability_state === 'WATCH' ? ['watch_state'] : []),
           ...(ctaState.actionability_state === 'ACTIONABLE' ? ['eligible_opportunities_available'] : []),
           ...ctaState.cta_disabled_reasons.map((reason) => `cta_${reason}`),
         ]));
         const responseItems = projectedFeed.items.slice(0, limit);
+        const cacheControl = ttlMetadata.ttl_state === 'overdue' || ttlMetadata.ttl_state === 'unknown'
+          ? 'no-store'
+          : 'public, max-age=60';
 
         return Response.json({
           as_of: snapshot.as_of,
@@ -8002,15 +8122,19 @@ export default {
           suppression_by_reason: projectedFeed.suppression_by_reason,
           quality_filter_rate: projectedFeed.quality_filter_rate,
           coherence_fail_rate: projectedFeed.coherence_fail_rate,
-          degraded_reason: projectedFeed.degraded_reason,
+          degraded_reason: effectiveDegradedReason,
           actionability_state: ctaState.actionability_state,
           actionability_reason_codes: actionabilityReasonCodes,
           cta_enabled: ctaState.cta_enabled,
           cta_disabled_reasons: ctaState.cta_disabled_reasons,
+          data_age_seconds: ttlMetadata.data_age_seconds,
+          ttl_state: ttlMetadata.ttl_state,
+          next_expected_refresh_at: ttlMetadata.next_expected_refresh_at,
+          overdue_seconds: ttlMetadata.overdue_seconds,
         }, {
           headers: {
             ...corsHeaders,
-            'Cache-Control': 'public, max-age=60',
+            'Cache-Control': cacheControl,
           },
         });
       }

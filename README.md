@@ -289,6 +289,15 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
 - Adapter-side ticker sanitation (allowlist regex, jargon stopwords, dedupe/cap) before PXI opportunity blending.
 - Signals source velocity cap tightened (`GROWTH_RATIO_CAP = 25`) with explicit `growth_ratio_capped` flag in metrics payload.
 
+8. **Opportunity TTL timebox + cache safety**
+- `/api/opportunities` now emits refresh recency metadata:
+  - `data_age_seconds`
+  - `ttl_state` (`fresh|stale|overdue|unknown`)
+  - `next_expected_refresh_at`
+  - `overdue_seconds`
+- CTA is hard-disabled when `ttl_state` is `overdue` or `unknown`.
+- Cache policy is timebox-aware: overdue/unknown states return `Cache-Control: no-store` to avoid stale hard-CTA exposure.
+
 ## Scheduler Ownership Runbook
 
 Target ownership is GitHub Actions (`Daily PXI Refresh`) only. Keep Cloudflare cron enabled during hardening, then cut over after stability validation.

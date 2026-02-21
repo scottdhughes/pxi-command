@@ -529,6 +529,10 @@ interface OpportunitiesResponse {
   actionability_reason_codes?: string[]
   cta_enabled?: boolean
   cta_disabled_reasons?: string[]
+  data_age_seconds?: number | null
+  ttl_state?: 'fresh' | 'stale' | 'overdue' | 'unknown'
+  next_expected_refresh_at?: string | null
+  overdue_seconds?: number | null
 }
 
 interface CalibrationDiagnosticsResponse {
@@ -1081,7 +1085,32 @@ function formatOpportunityDegradedReason(reason: string | null | undefined): str
   if (reason === 'suppressed_data_quality') return 'Opportunity feed is suppressed due to critical stale inputs or consistency failure.'
   if (reason === 'coherence_gate_failed') return 'No eligible opportunities (contract gate).'
   if (reason === 'quality_filtered') return 'Low-information opportunities were filtered from this feed.'
+  if (reason === 'refresh_ttl_overdue') return 'Opportunity feed is in watch mode because refresh data is overdue.'
+  if (reason === 'refresh_ttl_unknown') return 'Opportunity feed cannot verify refresh recency yet.'
   return reason.replace(/_/g, ' ')
+}
+
+function formatDataAgeSeconds(value: number | null | undefined): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 'unknown'
+  if (value < 60) return `${Math.max(0, Math.round(value))}s`
+  const minutes = value / 60
+  if (minutes < 60) return `${minutes.toFixed(0)}m`
+  const hours = minutes / 60
+  if (hours < 48) return `${hours.toFixed(1)}h`
+  const days = hours / 24
+  return `${days.toFixed(1)}d`
+}
+
+function formatTtlState(state: OpportunitiesResponse['ttl_state']): string {
+  if (!state) return 'unknown'
+  return state
+}
+
+function ttlStateClass(state: OpportunitiesResponse['ttl_state']): string {
+  if (state === 'fresh') return 'border-[#00c896]/40 text-[#00c896]'
+  if (state === 'stale') return 'border-[#f59e0b]/40 text-[#f59e0b]'
+  if (state === 'overdue') return 'border-[#ff6b6b]/40 text-[#ff6b6b]'
+  return 'border-[#949ba5]/40 text-[#949ba5]'
 }
 
 function formatActionabilityState(state: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION' | null | undefined): string {
@@ -1103,6 +1132,8 @@ function formatCtaDisabledReason(reason: string): string {
   if (reason === 'calibration_quality_not_robust') return 'calibration quality not robust'
   if (reason === 'calibration_ece_unavailable') return 'calibration ECE unavailable'
   if (reason === 'ece_above_threshold') return 'ECE above threshold'
+  if (reason === 'refresh_ttl_overdue') return 'refresh data overdue'
+  if (reason === 'refresh_ttl_unknown') return 'refresh recency unknown'
   return reason.replace(/_/g, ' ')
 }
 
@@ -1132,6 +1163,9 @@ function deriveNoActionUnlockConditions(args: {
   }
   if (hasAny('calibration_ece_unavailable')) {
     unlock.push('Calibration diagnostics must publish a valid ECE estimate.')
+  }
+  if (hasAny('refresh_ttl_overdue', 'refresh_ttl_unknown', 'opportunity_refresh_ttl_overdue', 'opportunity_refresh_ttl_unknown')) {
+    unlock.push('Latest successful refresh must be within the scheduled TTL window before action CTA unlocks.')
   }
 
   return unlock.length > 0
@@ -2954,6 +2988,9 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
   const ctaEnabled = typeof data.cta_enabled === 'boolean'
     ? data.cta_enabled
     : (top.length > 0 && ctaDisabledReasons.length === 0)
+  const ttlState = data.ttl_state || 'unknown'
+  const dataAgeText = formatDataAgeSeconds(data.data_age_seconds)
+  const nextExpectedRefresh = data.next_expected_refresh_at ? new Date(data.next_expected_refresh_at).toLocaleString() : 'unknown'
   const hasFeedState = top.length > 0 || suppressedCount > 0 || Boolean(data.degraded_reason)
   if (!hasFeedState) return null
 
@@ -2974,6 +3011,17 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
           {formatOpportunityDegradedReason(data.degraded_reason)}
         </p>
       )}
+      <div className="mb-3 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wider">
+        <span className={`px-2 py-1 border rounded ${ttlStateClass(ttlState)}`}>
+          ttl {formatTtlState(ttlState)}
+        </span>
+        <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+          data age {dataAgeText}
+        </span>
+        <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+          next refresh {nextExpectedRefresh}
+        </span>
+      </div>
       {suppressedCount > 0 && (
         <div className="mb-3 space-y-1">
           <p className="text-[9px] text-[#949ba5]/70 uppercase tracking-wider">
@@ -3174,6 +3222,10 @@ function OpportunitiesPage({
   const ctaEnabled = typeof data?.cta_enabled === 'boolean'
     ? Boolean(data.cta_enabled)
     : (Boolean(data?.items?.length) && ctaDisabledReasons.length === 0)
+  const ttlState = data?.ttl_state || 'unknown'
+  const dataAgeText = formatDataAgeSeconds(data?.data_age_seconds)
+  const nextExpectedRefresh = data?.next_expected_refresh_at ? new Date(data.next_expected_refresh_at).toLocaleString() : 'unknown'
+  const overdueSeconds = typeof data?.overdue_seconds === 'number' ? Math.max(0, data.overdue_seconds) : null
   const noActionUnlockConditions = actionabilityState === 'NO_ACTION'
     ? deriveNoActionUnlockConditions({
         actionabilityReasonCodes,
@@ -3184,6 +3236,7 @@ function OpportunitiesPage({
   const hasContractGateSuppression = degradedReason === 'coherence_gate_failed'
   const hasDataQualitySuppression = degradedReason === 'suppressed_data_quality'
   const hasQualityFilter = degradedReason === 'quality_filtered'
+  const hasRefreshTtlSuppression = degradedReason === 'refresh_ttl_overdue' || degradedReason === 'refresh_ttl_unknown'
   const edgeWindow = edgeDiagnostics?.windows.find((window) => window.horizon === horizon) || edgeDiagnostics?.windows[0] || null
 
   return (
@@ -3276,6 +3329,22 @@ function OpportunitiesPage({
             {formatOpportunityDegradedReason(degradedReason)}
           </div>
         )}
+        <div className="mb-4 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wider">
+          <span className={`px-2 py-1 border rounded ${ttlStateClass(ttlState)}`}>
+            ttl {formatTtlState(ttlState)}
+          </span>
+          <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+            data age {dataAgeText}
+          </span>
+          <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+            next refresh {nextExpectedRefresh}
+          </span>
+          {ttlState === 'overdue' && overdueSeconds !== null && (
+            <span className="px-2 py-1 border border-[#ff6b6b]/40 rounded text-[#ff6b6b]">
+              overdue {(overdueSeconds / 3600).toFixed(1)}h
+            </span>
+          )}
+        </div>
         {suppressedCount > 0 && (
           <div className="mb-4 space-y-1 text-[10px] text-[#949ba5]/80">
             <div className="uppercase tracking-wider">
@@ -3318,6 +3387,8 @@ function OpportunitiesPage({
                 ? 'Opportunities are suppressed until critical data quality recovers.'
                 : hasQualityFilter
                   ? 'No opportunities available after quality filtering.'
+                  : hasRefreshTtlSuppression
+                    ? 'No opportunities available while refresh recency is outside TTL policy.'
                   : 'No opportunities available yet.'}
           </div>
         ) : (
@@ -4633,6 +4704,8 @@ function App() {
             const qualityFilteredCount = Number.isFinite(oppJson.quality_filtered_count as number) ? Number(oppJson.quality_filtered_count) : 0
             const coherenceSuppressedCount = Number.isFinite(oppJson.coherence_suppressed_count as number) ? Number(oppJson.coherence_suppressed_count) : 0
             const suppressedCount = Number.isFinite(oppJson.suppressed_count) ? oppJson.suppressed_count : 0
+            const dataAgeSeconds = Number.isFinite(oppJson.data_age_seconds as number) ? Number(oppJson.data_age_seconds) : null
+            const overdueSeconds = Number.isFinite(oppJson.overdue_seconds as number) ? Number(oppJson.overdue_seconds) : null
             setOpportunitiesData({
               ...oppJson,
               suppressed_count: suppressedCount,
@@ -4649,6 +4722,10 @@ function App() {
               actionability_reason_codes: Array.isArray(oppJson.actionability_reason_codes) ? oppJson.actionability_reason_codes : [],
               cta_enabled: typeof oppJson.cta_enabled === 'boolean' ? oppJson.cta_enabled : oppJson.items.length > 0,
               cta_disabled_reasons: Array.isArray(oppJson.cta_disabled_reasons) ? oppJson.cta_disabled_reasons : [],
+              data_age_seconds: dataAgeSeconds,
+              ttl_state: (oppJson.ttl_state || 'unknown'),
+              next_expected_refresh_at: typeof oppJson.next_expected_refresh_at === 'string' ? oppJson.next_expected_refresh_at : null,
+              overdue_seconds: overdueSeconds,
             })
           }
         }
