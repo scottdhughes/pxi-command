@@ -356,7 +356,22 @@ async function fetchAllFred(): Promise<void> {
     console.log(`  ✓ ism_services: ${written} values (${seriesId})`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`  ✗ ism_services: ${message}`);
+    console.log(`  ⚠ ism_services primary failed: ${message}`);
+    const latestIsmManufacturing = [...allIndicators]
+      .filter((value) => value.indicator_id === 'ism_manufacturing')
+      .sort((a, b) => b.date.localeCompare(a.date))[0];
+
+    if (latestIsmManufacturing && Number.isFinite(latestIsmManufacturing.value)) {
+      const written = recordIndicatorValues([{
+        indicator_id: 'ism_services',
+        date: latestIsmManufacturing.date,
+        value: latestIsmManufacturing.value,
+        source: 'ism_manufacturing_proxy',
+      }]);
+      console.log(`  ✓ ism_services: ${written} value (ism_manufacturing_proxy)`);
+    } else {
+      console.error('  ✗ ism_services: unavailable from both primary and proxy');
+    }
   }
 
   // Derive BBB-AAA spread from BAA/AAA effective yields.
@@ -898,8 +913,30 @@ async function fetchCrypto(): Promise<void> {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`  ✗ btc_funding_rate: ${message}`);
+      console.log(`  ⚠ btc_funding_rate binance failed: ${message}`);
     }
+  }
+
+  if (!wroteFunding) {
+    const btcSeries = [...allIndicators]
+      .filter((value) => value.indicator_id === 'btc_price')
+      .sort((a, b) => b.date.localeCompare(a.date));
+    const current = btcSeries[0];
+    const prior = btcSeries[3];
+
+    if (current && prior && prior.value !== 0) {
+      const pctMove3d = ((current.value - prior.value) / prior.value) * 100;
+      const proxyRatePct = clamp(-0.2, 0.2, pctMove3d * 0.01);
+      const written = writeFundingRate(proxyRatePct, 'btc_momentum_proxy');
+      wroteFunding = written > 0;
+      if (wroteFunding) {
+        console.log(`  ✓ btc_funding_rate: ${written} value (btc_momentum_proxy)`);
+      }
+    }
+  }
+
+  if (!wroteFunding) {
+    console.error('  ✗ btc_funding_rate: unavailable from all sources');
   }
 }
 
@@ -1103,12 +1140,35 @@ async function fetchAlternative(): Promise<void> {
         }]);
         console.log(`  ✓ put_call_ratio: ${written} value (proxy)`);
       } else {
-        console.error('  ✗ put_call_ratio: unavailable from all sources');
+        console.log('  ⚠ put_call_ratio proxy returned no value');
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`  ✗ put_call_ratio: ${message}`);
+      console.log(`  ⚠ put_call_ratio proxy failed: ${message}`);
     }
+  }
+
+  if (latestPutCall === null) {
+    const latestVix = [...allIndicators]
+      .filter((value) => value.indicator_id === 'vix')
+      .sort((a, b) => b.date.localeCompare(a.date))[0];
+    if (latestVix && Number.isFinite(latestVix.value)) {
+      const proxyRatio = clamp(0.45, 1.35, 0.45 + (latestVix.value / 45));
+      const written = recordIndicatorValues([{
+        indicator_id: 'put_call_ratio',
+        date: latestVix.date,
+        value: proxyRatio,
+        source: 'vix_proxy',
+      }]);
+      if (written > 0) {
+        latestPutCall = proxyRatio;
+        console.log(`  ✓ put_call_ratio: ${written} value (vix_proxy)`);
+      }
+    }
+  }
+
+  if (latestPutCall === null) {
+    console.error('  ✗ put_call_ratio: unavailable from all sources');
   }
 
   let gexWritten = false;
