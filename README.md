@@ -132,12 +132,14 @@ pxi-command/
 | `/api/signal` | GET | PXI-Signal layer with risk allocation |
 | `/api/plan` | GET | Canonical decision object for homepage (policy state, uncertainty, consistency, trader playbook) |
 | `/api/market/consistency` | GET | Latest decision consistency score/state/violations |
+| `/api/ops/freshness-slo` | GET | Rolling 7d/30d freshness SLO attainment and recent critical stale incidents |
 
 ### Product Layer (Phase 1)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/brief` | GET | Daily market brief coherent with `/api/plan` policy state (includes contract version + consistency) |
 | `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon with calibration + expectancy + unavailable reasons |
+| `/api/diagnostics/calibration` | GET | Calibration diagnostics (Brier/ECE/log loss + quality band) for conviction and edge-quality snapshots |
 | `/api/alerts/feed` | GET | In-app alert timeline (`regime_change`, `threshold_cross`, `opportunity_spike`, `freshness_warning`) |
 | `/api/alerts/subscribe/start` | POST | Start email digest subscription with verification token |
 | `/api/alerts/subscribe/verify` | POST | Verify subscription token and activate email digest |
@@ -247,6 +249,34 @@ Run summary output is written to `/tmp/pxi-sla-summary.json` and published to Gi
 - Product summary output is written to `/tmp/pxi-market-summary.json` and appended to the Actions job summary.
 - A separate `Daily PXI Digest` workflow runs at `13:00 UTC` (8:00 AM ET standard) and calls `/api/market/send-digest`.
 - Digest summary output is written to `/tmp/pxi-digest-summary.json`.
+
+## PXI Audit Findings Remediation
+
+Taylor’s PXI audit findings are being remediated with trust-first controls:
+
+1. **Opportunity coherence gate**
+- Directional opportunities are only published when contract checks are coherent.
+- Bullish items must have non-negative expectancy and `p_correct >= 0.50` when available.
+- Bearish items must have non-positive expectancy and `p_correct >= 0.50` when available.
+- Neutral items are not published in phase 1 actionable feed.
+
+2. **Degraded-mode suppression**
+- `/api/opportunities` is hard-suppressed (`items: []`) when:
+  - `critical_stale_count > 0`, or
+  - market consistency state is `FAIL`.
+- Response includes `suppressed_count` and `degraded_reason` (for example `suppressed_data_quality`, `coherence_gate_failed`, `quality_filtered`).
+
+3. **Calibration diagnostics transparency**
+- New endpoint: `GET /api/diagnostics/calibration`
+- Includes Brier score, ECE, log loss, quality band, and insufficient-sample reasons.
+
+4. **Freshness reliability governance**
+- New endpoint: `GET /api/ops/freshness-slo`
+- Reports rolling 7d and 30d SLO attainment using `market_refresh_runs`, including recent critical stale incidents.
+
+5. **Signals sanitation + stability**
+- Adapter-side ticker sanitation (allowlist regex, jargon stopwords, dedupe/cap) before PXI opportunity blending.
+- Signals source velocity cap tightened (`GROWTH_RATIO_CAP = 25`) with explicit `growth_ratio_capped` flag in metrics payload.
 
 ## Scheduler Ownership Runbook
 

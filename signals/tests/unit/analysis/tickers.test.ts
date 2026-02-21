@@ -142,6 +142,18 @@ describe("extractTickers", () => {
       expect(stats.has("BUY")).toBe(false)
       expect(stats.has("TSLA")).toBe(true)
     })
+
+    it("filters macro/tech jargon stopwords used by PXI adapter sanitation", () => {
+      const docs: Doc[] = [
+        createDoc({ id: "1", text: "GPT LLM GPU ASIC HBM SOFR IORB METR WI SRF plus $NVDA" }),
+      ]
+      const { stats } = extractTickers(docs)
+
+      for (const token of ["GPT", "LLM", "GPU", "ASIC", "HBM", "SOFR", "IORB", "METR", "WI", "SRF"]) {
+        expect(stats.has(token)).toBe(false)
+      }
+      expect(stats.has("NVDA")).toBe(true)
+    })
   })
 
   describe("perDoc tracking", () => {

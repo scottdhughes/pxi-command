@@ -1,7 +1,7 @@
 import type { RedditDataset } from "../reddit/types"
 import type { ThemeDefinition } from "./themes"
 import { scoreSentiment } from "./sentiment"
-import { extractTickers } from "./tickers"
+import { extractTickers, STOPLIST } from "./tickers"
 import {
   SECONDS_PER_DAY,
   RATE_EPSILON,
@@ -30,6 +30,7 @@ export interface ThemeMetrics {
   current_rate: number
   baseline_rate: number
   growth_ratio: number
+  growth_ratio_capped: boolean
   daily_counts_L: number[]
   slope: number
   current_sent: number
@@ -87,6 +88,10 @@ function escapeRegex(value: string): string {
 function buildKeywordRegex(keyword: string): RegExp {
   const escaped = escapeRegex(keyword.trim().toLowerCase())
   return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, "i")
+}
+
+function isValidTickerToken(value: string): boolean {
+  return /^[A-Z]{2,5}$/.test(value) && !STOPLIST.has(value)
 }
 
 function buildDocs(dataset: RedditDataset, includeComments: boolean): Doc[] {
@@ -217,6 +222,7 @@ export function computeMetrics(dataset: RedditDataset, themes: ThemeDefinition[]
     const baselineRate = mentionsB.length / Math.max(baselineDays, 1)
     const growthRatioUncapped = (currentRate + RATE_EPSILON) / (baselineRate + RATE_EPSILON)
     const growthRatio = Math.min(growthRatioUncapped, GROWTH_RATIO_CAP)
+    const growthRatioCapped = growthRatioUncapped > GROWTH_RATIO_CAP
     const slope = linearRegressionSlope(dailyCounts)
 
     const currentSent = mentionsL.length
@@ -245,7 +251,12 @@ export function computeMetrics(dataset: RedditDataset, themes: ThemeDefinition[]
       const tks = perDoc.get(doc.id) || []
       for (const t of tks) tickersForTheme.add(t)
     }
-    for (const t of theme.seed_tickers) tickersForTheme.add(t)
+    for (const t of theme.seed_tickers) tickersForTheme.add(String(t || "").trim().toUpperCase())
+
+    const keyTickers = Array.from(tickersForTheme)
+      .map((ticker) => ticker.trim().toUpperCase())
+      .filter((ticker) => isValidTickerToken(ticker))
+      .slice(0, LIMITS.maxTickers)
 
     const evidenceLinks = pickEvidenceLinks([...mentionsL, ...mentionsB], LIMITS.maxEvidenceLinks)
 
@@ -257,6 +268,7 @@ export function computeMetrics(dataset: RedditDataset, themes: ThemeDefinition[]
       current_rate: currentRate,
       baseline_rate: baselineRate,
       growth_ratio: growthRatio,
+      growth_ratio_capped: growthRatioCapped,
       daily_counts_L: dailyCounts,
       slope,
       current_sent: currentSent,
@@ -265,7 +277,7 @@ export function computeMetrics(dataset: RedditDataset, themes: ThemeDefinition[]
       unique_subreddits: uniqueSubreddits,
       concentration,
       confirmation_score: confirmationScore,
-      key_tickers: Array.from(tickersForTheme).slice(0, LIMITS.maxTickers),
+      key_tickers: keyTickers,
       evidence_links: evidenceLinks.slice(0, LIMITS.maxEvidenceLinks),
       momentum_score: null,
       divergence_score: null,

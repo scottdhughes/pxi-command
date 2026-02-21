@@ -167,6 +167,8 @@ jobs:
           check_api_status "/api/pxi" 200
           check_api_status "/api/alerts?limit=5" 200
           check_api_status "/api/signal" 200
+          check_api_status "/api/diagnostics/calibration?metric=conviction&horizon=7d" 200
+          check_api_status "/api/ops/freshness-slo" 200
           bash scripts/api-product-contract-check.sh "$API_URL"
 
           # CORS preflight for admin endpoint (no auth check expected, only CORS response)

@@ -30,11 +30,17 @@ interface Env {
   FEATURE_ENABLE_PLAN?: string;
   FEATURE_ENABLE_ALERTS_EMAIL?: string;
   FEATURE_ENABLE_ALERTS_IN_APP?: string;
+  FEATURE_ENABLE_OPPORTUNITY_COHERENCE_GATE?: string;
+  FEATURE_ENABLE_CALIBRATION_DIAGNOSTICS?: string;
+  FEATURE_ENABLE_SIGNALS_SANITIZER?: string;
   ENABLE_BRIEF?: string;
   ENABLE_OPPORTUNITIES?: string;
   ENABLE_PLAN?: string;
   ENABLE_ALERTS_EMAIL?: string;
   ENABLE_ALERTS_IN_APP?: string;
+  ENABLE_OPPORTUNITY_COHERENCE_GATE?: string;
+  ENABLE_CALIBRATION_DIAGNOSTICS?: string;
+  ENABLE_SIGNALS_SANITIZER?: string;
 }
 
 // ============== Data Fetchers ==============
@@ -1041,6 +1047,23 @@ type EdgeQualityLabel = 'HIGH' | 'MEDIUM' | 'LOW';
 type CalibrationQuality = 'ROBUST' | 'LIMITED' | 'INSUFFICIENT';
 type CoverageQuality = CalibrationQuality;
 type OpportunityExpectancyBasis = 'theme_direction' | 'theme_direction_shrunk_prior' | 'direction_prior_proxy' | 'none';
+type OpportunityConfidenceBand = 'high' | 'medium' | 'low';
+type OpportunityEligibilityCheck =
+  | 'neutral_direction_not_actionable'
+  | 'calibration_probability_below_threshold'
+  | 'expectancy_sign_conflict'
+  | 'incomplete_contract';
+
+interface OpportunityEligibility {
+  passed: boolean;
+  failed_checks: OpportunityEligibilityCheck[];
+}
+
+interface OpportunityDecisionContract {
+  coherent: boolean;
+  confidence_band: OpportunityConfidenceBand;
+  rationale_codes: string[];
+}
 
 interface EdgeQualityCalibration {
   bin: string | null;
@@ -1079,6 +1102,15 @@ interface MarketCalibrationSnapshotPayload {
   basis: 'edge_quality_decile' | 'conviction_decile';
   bins: CalibrationBinSnapshot[];
   total_samples: number;
+}
+
+interface CalibrationDiagnosticsSnapshot {
+  brier_score: number | null;
+  ece: number | null;
+  log_loss: number | null;
+  quality_band: CalibrationQuality;
+  minimum_reliable_sample: number;
+  insufficient_reasons: string[];
 }
 
 interface FreshnessStatus {
@@ -1132,6 +1164,8 @@ interface OpportunityItem {
   sample_size: number;
   calibration: OpportunityCalibration;
   expectancy: OpportunityExpectancy;
+  eligibility: OpportunityEligibility;
+  decision_contract: OpportunityDecisionContract;
   updated_at: string;
 }
 
@@ -1254,6 +1288,23 @@ interface PlanPayload {
   uncertainty: UncertaintySnapshot;
   consistency: ConsistencySnapshot;
   trader_playbook: TraderPlaybookSnapshot;
+  brief_ref?: {
+    as_of: string;
+    regime_delta: RegimeDelta;
+    risk_posture: RiskPosture;
+  };
+  opportunity_ref?: {
+    as_of: string;
+    horizon: '7d' | '30d';
+    eligible_count: number;
+    suppressed_count: number;
+    degraded_reason: string | null;
+  };
+  alerts_ref?: {
+    as_of: string;
+    warning_count_24h: number;
+    critical_count_24h: number;
+  };
   invalidation_rules: string[];
   degraded_reason: string | null;
 }
@@ -1271,9 +1322,25 @@ const CONSISTENCY_PASS_MIN = 90;
 const CONSISTENCY_WARN_MIN = 80;
 const REFRESH_HOURS_UTC = [6, 14, 18, 22];
 const MINIMUM_RELIABLE_SAMPLE = 30;
+const CALIBRATION_DIAGNOSTICS_MIN_SAMPLE = 30;
 const CALIBRATION_ROBUST_MIN_SAMPLE = 50;
 const CALIBRATION_LIMITED_MIN_SAMPLE = 20;
 const CALIBRATION_POOL_TARGET_SAMPLE = CALIBRATION_ROBUST_MIN_SAMPLE;
+const OPPORTUNITY_COHERENCE_MIN_PROBABILITY = 0.5;
+const SIGNALS_TICKER_REGEX = /^[A-Z]{2,5}$/;
+const SIGNALS_TICKER_LIMIT = 4;
+const SIGNALS_TICKER_STOPWORDS = new Set<string>([
+  'GPT',
+  'LLM',
+  'GPU',
+  'ASIC',
+  'HBM',
+  'SOFR',
+  'IORB',
+  'METR',
+  'WI',
+  'SRF',
+]);
 const INDICATOR_FREQUENCY_HINTS = new Map<string, string>(
   INDICATORS.map((indicator) => [indicator.id, indicator.frequency])
 );
@@ -1696,6 +1763,88 @@ function parseBinStart(bin: string): number | null {
   if (!match) return null;
   const start = Number(match[1]);
   return Number.isFinite(start) ? start : null;
+}
+
+function parseBinMidpointProbability(bin: string): number | null {
+  const match = /^(\d+)-(\d+)$/.exec(bin);
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  const midpointPct = (start + end) / 2;
+  return clamp(0, 1, midpointPct / 100);
+}
+
+function computeCalibrationDiagnostics(
+  snapshot: MarketCalibrationSnapshotPayload | null
+): CalibrationDiagnosticsSnapshot {
+  if (!snapshot || snapshot.total_samples < CALIBRATION_DIAGNOSTICS_MIN_SAMPLE) {
+    const reasons = !snapshot
+      ? ['snapshot_unavailable']
+      : [`insufficient_sample_${snapshot?.total_samples ?? 0}`];
+    return {
+      brier_score: null,
+      ece: null,
+      log_loss: null,
+      quality_band: 'INSUFFICIENT',
+      minimum_reliable_sample: CALIBRATION_DIAGNOSTICS_MIN_SAMPLE,
+      insufficient_reasons: reasons,
+    };
+  }
+
+  let total = 0;
+  let brierSum = 0;
+  let logLossSum = 0;
+  let eceSum = 0;
+  let invalidBins = 0;
+
+  for (const bin of snapshot.bins) {
+    if (!bin || bin.sample_size <= 0 || bin.probability_correct === null) continue;
+    const nominal = parseBinMidpointProbability(bin.bin);
+    if (nominal === null) {
+      invalidBins += 1;
+      continue;
+    }
+    const observed = clamp(0, 1, toNumber(bin.probability_correct, 0));
+    const weight = Math.max(0, Math.floor(toNumber(bin.sample_size, 0)));
+    if (weight <= 0) continue;
+    total += weight;
+    brierSum += (nominal - observed) * (nominal - observed) * weight;
+    eceSum += Math.abs(nominal - observed) * weight;
+    const clippedObserved = clamp(1e-6, 1 - 1e-6, observed);
+    const clippedNominal = clamp(1e-6, 1 - 1e-6, nominal);
+    logLossSum += (
+      -(
+        clippedObserved * Math.log(clippedNominal) +
+        (1 - clippedObserved) * Math.log(1 - clippedNominal)
+      )
+    ) * weight;
+  }
+
+  if (total < CALIBRATION_DIAGNOSTICS_MIN_SAMPLE) {
+    const reasons = [`insufficient_scored_sample_${total}`];
+    if (invalidBins > 0) reasons.push(`invalid_bins_${invalidBins}`);
+    return {
+      brier_score: null,
+      ece: null,
+      log_loss: null,
+      quality_band: 'INSUFFICIENT',
+      minimum_reliable_sample: CALIBRATION_DIAGNOSTICS_MIN_SAMPLE,
+      insufficient_reasons: reasons,
+    };
+  }
+
+  const qualityBand = calibrationQualityForSampleSize(total);
+  const reasons: string[] = [];
+  if (invalidBins > 0) reasons.push(`invalid_bins_${invalidBins}`);
+  return {
+    brier_score: brierSum / total,
+    ece: eceSum / total,
+    log_loss: logLossSum / total,
+    quality_band: qualityBand,
+    minimum_reliable_sample: CALIBRATION_DIAGNOSTICS_MIN_SAMPLE,
+    insufficient_reasons: reasons,
+  };
 }
 
 function buildEdgeQualityCalibrationFromSnapshot(
@@ -2961,11 +3110,18 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
         calibrations_generated INTEGER DEFAULT 0,
         alerts_generated INTEGER DEFAULT 0,
         stale_count INTEGER,
+        critical_stale_count INTEGER,
         as_of TEXT,
         error TEXT,
         created_at TEXT DEFAULT (datetime('now'))
       )
     `).run();
+    const hasCriticalStaleCount = await tableHasColumn(db, 'market_refresh_runs', 'critical_stale_count');
+    if (!hasCriticalStaleCount) {
+      await db.prepare(
+        `ALTER TABLE market_refresh_runs ADD COLUMN critical_stale_count INTEGER`
+      ).run();
+    }
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
 
@@ -3016,7 +3172,27 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
   }
 }
 
-async function fetchLatestSignalsThemes(): Promise<SignalsThemeRecord[]> {
+function sanitizeSignalsTickers(values: unknown[]): string[] {
+  const sanitized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of values) {
+    const token = String(raw || '').trim().toUpperCase();
+    if (!token || seen.has(token)) continue;
+    if (!SIGNALS_TICKER_REGEX.test(token)) continue;
+    if (SIGNALS_TICKER_STOPWORDS.has(token)) continue;
+    seen.add(token);
+    sanitized.push(token);
+    if (sanitized.length >= SIGNALS_TICKER_LIMIT) break;
+  }
+
+  return sanitized;
+}
+
+async function fetchLatestSignalsThemes(
+  options?: { sanitize_tickers?: boolean }
+): Promise<SignalsThemeRecord[]> {
+  const sanitizeTickers = options?.sanitize_tickers !== false;
   try {
     const runsRes = await fetch('https://pxicommand.com/signals/api/runs?status=ok');
     if (!runsRes.ok) {
@@ -3040,7 +3216,9 @@ async function fetchLatestSignalsThemes(): Promise<SignalsThemeRecord[]> {
       theme_name: String(theme.theme_name || theme.theme_id || 'Unknown Theme'),
       score: toNumber(theme.score, 50),
       key_tickers: Array.isArray(theme.key_tickers)
-        ? theme.key_tickers.map((ticker) => String(ticker))
+        ? (sanitizeTickers
+            ? sanitizeSignalsTickers(theme.key_tickers)
+            : theme.key_tickers.map((ticker) => String(ticker).trim().toUpperCase()))
         : [],
       classification: typeof theme.classification === 'object' && theme.classification
         ? {
@@ -3295,6 +3473,65 @@ async function fetchLatestCalibrationSnapshot(
   }
 }
 
+async function fetchCalibrationSnapshotAtOrBefore(
+  db: D1Database,
+  metric: 'edge_quality' | 'conviction',
+  horizon: '7d' | '30d' | null,
+  asOf?: string | null
+): Promise<MarketCalibrationSnapshotPayload | null> {
+  try {
+    const asOfFilter = asOf && parseIsoDate(asOf) ? `${asOf.slice(0, 10)}T23:59:59.999Z` : null;
+    let row: { payload_json: string } | null = null;
+
+    if (horizon === null) {
+      if (asOfFilter) {
+        row = await db.prepare(`
+          SELECT payload_json
+          FROM market_calibration_snapshots
+          WHERE metric = ?
+            AND horizon IS NULL
+            AND as_of <= ?
+          ORDER BY as_of DESC
+          LIMIT 1
+        `).bind(metric, asOfFilter).first<{ payload_json: string }>();
+      } else {
+        row = await db.prepare(`
+          SELECT payload_json
+          FROM market_calibration_snapshots
+          WHERE metric = ?
+            AND horizon IS NULL
+          ORDER BY as_of DESC
+          LIMIT 1
+        `).bind(metric).first<{ payload_json: string }>();
+      }
+    } else if (asOfFilter) {
+      row = await db.prepare(`
+        SELECT payload_json
+        FROM market_calibration_snapshots
+        WHERE metric = ?
+          AND horizon = ?
+          AND as_of <= ?
+        ORDER BY as_of DESC
+        LIMIT 1
+      `).bind(metric, horizon, asOfFilter).first<{ payload_json: string }>();
+    } else {
+      row = await db.prepare(`
+        SELECT payload_json
+        FROM market_calibration_snapshots
+        WHERE metric = ?
+          AND horizon = ?
+        ORDER BY as_of DESC
+        LIMIT 1
+      `).bind(metric, horizon).first<{ payload_json: string }>();
+    }
+
+    return parseCalibrationSnapshotPayload(row?.payload_json) || null;
+  } catch (err) {
+    console.warn('Calibration snapshot lookup failed:', err);
+    return null;
+  }
+}
+
 async function storeCalibrationSnapshot(
   db: D1Database,
   snapshot: MarketCalibrationSnapshotPayload
@@ -3525,6 +3762,19 @@ function applyOpportunityCalibration(
     ...item,
     calibration: buildOpportunityCalibrationFromSnapshot(snapshot, item.conviction_score, item.direction),
   };
+}
+
+function normalizeOpportunityItemsForPublishing(
+  items: OpportunityItem[],
+  convictionCalibration: MarketCalibrationSnapshotPayload | null
+): OpportunityItem[] {
+  return items.map((item) => {
+    const calibrated = applyOpportunityCalibration(item, convictionCalibration);
+    return withOpportunityCoherenceMetadata({
+      ...calibrated,
+      expectancy: normalizeOpportunityExpectancy(calibrated.expectancy, calibrated.direction),
+    });
+  });
 }
 
 async function computeHistoricalHitStats(
@@ -3795,6 +4045,158 @@ function normalizeOpportunityExpectancy(
   };
 }
 
+function evaluateOpportunityCoherence(item: OpportunityItem): OpportunityEligibility {
+  const failed = new Set<OpportunityEligibilityCheck>();
+  const calibrationProbability = item.calibration.probability_correct_direction;
+  const expectedMove = item.expectancy.expected_move_pct;
+
+  if (item.direction === 'neutral') {
+    failed.add('neutral_direction_not_actionable');
+  }
+
+  if (calibrationProbability === null) {
+    if (item.calibration.quality !== 'INSUFFICIENT') {
+      failed.add('incomplete_contract');
+    }
+  } else if (calibrationProbability < OPPORTUNITY_COHERENCE_MIN_PROBABILITY) {
+    failed.add('calibration_probability_below_threshold');
+  }
+
+  if (expectedMove === null) {
+    if (item.expectancy.quality !== 'INSUFFICIENT') {
+      failed.add('incomplete_contract');
+    }
+  } else if (item.direction === 'bullish' && expectedMove <= 0) {
+    failed.add('expectancy_sign_conflict');
+  } else if (item.direction === 'bearish' && expectedMove >= 0) {
+    failed.add('expectancy_sign_conflict');
+  }
+
+  return {
+    passed: failed.size === 0,
+    failed_checks: [...failed],
+  };
+}
+
+function inferOpportunityConfidenceBand(
+  item: OpportunityItem,
+  eligibility: OpportunityEligibility
+): OpportunityConfidenceBand {
+  if (!eligibility.passed) return 'low';
+  const probability = item.calibration.probability_correct_direction;
+  if (probability === null || item.expectancy.expected_move_pct === null) return 'low';
+  if (
+    item.calibration.quality === 'ROBUST' &&
+    item.expectancy.quality === 'ROBUST' &&
+    probability >= 0.6
+  ) {
+    return 'high';
+  }
+  if (probability >= OPPORTUNITY_COHERENCE_MIN_PROBABILITY) {
+    return 'medium';
+  }
+  return 'low';
+}
+
+function buildOpportunityDecisionContract(
+  item: OpportunityItem,
+  eligibility: OpportunityEligibility
+): OpportunityDecisionContract {
+  const qualityCodes = [
+    `calibration_${item.calibration.quality.toLowerCase()}`,
+    `expectancy_${item.expectancy.quality.toLowerCase()}`,
+  ];
+
+  return {
+    coherent: eligibility.passed,
+    confidence_band: inferOpportunityConfidenceBand(item, eligibility),
+    rationale_codes: eligibility.passed
+      ? ['coherent_contract', ...qualityCodes]
+      : [...eligibility.failed_checks, ...qualityCodes],
+  };
+}
+
+function withOpportunityCoherenceMetadata(item: OpportunityItem): OpportunityItem {
+  const eligibility = evaluateOpportunityCoherence(item);
+  return {
+    ...item,
+    eligibility,
+    decision_contract: buildOpportunityDecisionContract(item, eligibility),
+  };
+}
+
+function applyOpportunityCoherenceGate(
+  items: OpportunityItem[],
+  enabled: boolean
+): {
+  items: OpportunityItem[];
+  suppressed_count: number;
+} {
+  const decorated = items.map(withOpportunityCoherenceMetadata);
+  if (!enabled) {
+    return {
+      items: decorated,
+      suppressed_count: 0,
+    };
+  }
+
+  const eligible = decorated.filter((item) => item.eligibility.passed);
+  return {
+    items: eligible,
+    suppressed_count: Math.max(0, decorated.length - eligible.length),
+  };
+}
+
+function projectOpportunityFeed(
+  items: OpportunityItem[],
+  options: {
+    coherence_gate_enabled: boolean;
+    freshness: FreshnessStatus;
+    consistency_state: ConsistencyState;
+  }
+): {
+  items: OpportunityItem[];
+  suppressed_count: number;
+  degraded_reason: string | null;
+  quality_filtered_count: number;
+  coherence_suppressed_count: number;
+  suppressed_data_quality: boolean;
+} {
+  const qualityFiltered = removeLowInformationOpportunities(items);
+  const coherenceFiltered = applyOpportunityCoherenceGate(
+    qualityFiltered.items,
+    options.coherence_gate_enabled
+  );
+  const suppressForDataQuality = options.freshness.critical_stale_count > 0 || options.consistency_state === 'FAIL';
+
+  if (suppressForDataQuality) {
+    return {
+      items: [],
+      suppressed_count: qualityFiltered.filtered_count + coherenceFiltered.suppressed_count + coherenceFiltered.items.length,
+      degraded_reason: 'suppressed_data_quality',
+      quality_filtered_count: qualityFiltered.filtered_count,
+      coherence_suppressed_count: coherenceFiltered.suppressed_count,
+      suppressed_data_quality: true,
+    };
+  }
+
+  let degradedReason: string | null = null;
+  if (coherenceFiltered.suppressed_count > 0 && options.coherence_gate_enabled) {
+    degradedReason = 'coherence_gate_failed';
+  } else if (qualityFiltered.filtered_count > 0) {
+    degradedReason = 'quality_filtered';
+  }
+
+  return {
+    items: coherenceFiltered.items,
+    suppressed_count: qualityFiltered.filtered_count + coherenceFiltered.suppressed_count,
+    degraded_reason: degradedReason,
+    quality_filtered_count: qualityFiltered.filtered_count,
+    coherence_suppressed_count: coherenceFiltered.suppressed_count,
+    suppressed_data_quality: false,
+  };
+}
+
 function calibrationQualityRank(quality: CalibrationQuality): number {
   if (quality === 'ROBUST') return 3;
   if (quality === 'LIMITED') return 2;
@@ -3845,7 +4247,10 @@ function applyQualityGateToConviction(rawConviction: number, qualityFactor: numb
 async function buildOpportunitySnapshot(
   db: D1Database,
   horizon: '7d' | '30d',
-  calibrationSnapshot?: MarketCalibrationSnapshotPayload | null
+  calibrationSnapshot?: MarketCalibrationSnapshotPayload | null,
+  options?: {
+    sanitize_signals_tickers?: boolean;
+  }
 ): Promise<OpportunitySnapshot | null> {
   const latestPxi = await db.prepare(`
     SELECT date, score, delta_7d, delta_30d
@@ -3878,7 +4283,7 @@ async function buildOpportunitySnapshot(
       confidence_30d: string | null;
     }>(),
     computeHistoricalHitStats(db, horizon),
-    fetchLatestSignalsThemes(),
+    fetchLatestSignalsThemes({ sanitize_tickers: options?.sanitize_signals_tickers !== false }),
     calibrationSnapshot ? Promise.resolve(calibrationSnapshot) : fetchLatestCalibrationSnapshot(db, 'conviction', horizon),
     computeOpportunityOutcomeHistory(db, horizon),
     computeFreshnessStatus(db),
@@ -3942,7 +4347,7 @@ async function buildOpportunitySnapshot(
     const id = buildOpportunityId(latestPxi.date, theme.theme_id, horizon);
     const rationale = `${theme.theme_name}: ${directionalSignal} setup with conviction ${conviction}/100, combining ensemble trend, historical analog hit-rate, and current signal regime.`;
 
-    return {
+    const baseItem: OpportunityItem = {
       id,
       symbol: theme.key_tickers[0] || null,
       theme_id: theme.theme_id,
@@ -3958,8 +4363,15 @@ async function buildOpportunitySnapshot(
         theme_id: theme.theme_id,
         direction: directionalSignal,
       }),
+      eligibility: { passed: false, failed_checks: ['incomplete_contract'] },
+      decision_contract: {
+        coherent: false,
+        confidence_band: 'low',
+        rationale_codes: ['incomplete_contract'],
+      },
       updated_at: asIsoDateTime(new Date()),
     };
+    return withOpportunityCoherenceMetadata(baseItem);
   });
 
   items.sort((a, b) => {
@@ -3968,12 +4380,10 @@ async function buildOpportunitySnapshot(
     return a.theme_id.localeCompare(b.theme_id);
   });
 
-  const qualityFiltered = removeLowInformationOpportunities(items);
-
   return {
     as_of: `${latestPxi.date}T00:00:00.000Z`,
     horizon,
-    items: qualityFiltered.items,
+    items,
   };
 }
 
@@ -4066,7 +4476,7 @@ async function buildHistoricalOpportunitySnapshot(
     const id = buildOpportunityId(asOfDate, theme.theme_id, horizon);
     const rationale = `${theme.theme_name}: ${directionalSignal} setup from historical backfill seed model (${conviction}/100).`;
 
-    return {
+    const baseItem: OpportunityItem = {
       id,
       symbol: null,
       theme_id: theme.theme_id,
@@ -4082,8 +4492,15 @@ async function buildHistoricalOpportunitySnapshot(
       sample_size: hitStats.sampleSize,
       calibration: buildOpportunityCalibrationFallback(),
       expectancy: buildExpectancyUnavailable(directionalSignal, 'historical_backfill_seed', 'none', 0),
+      eligibility: { passed: false, failed_checks: ['incomplete_contract'] },
+      decision_contract: {
+        coherent: false,
+        confidence_band: 'low',
+        rationale_codes: ['incomplete_contract'],
+      },
       updated_at: asIsoDateTime(new Date()),
     };
+    return withOpportunityCoherenceMetadata(baseItem);
   });
 
   items.sort((a, b) => {
@@ -4092,12 +4509,10 @@ async function buildHistoricalOpportunitySnapshot(
     return a.theme_id.localeCompare(b.theme_id);
   });
 
-  const qualityFiltered = removeLowInformationOpportunities(items);
-
   return {
     as_of: `${asOfDate}T00:00:00.000Z`,
     horizon,
-    items: qualityFiltered.items,
+    items,
   };
 }
 
@@ -4363,6 +4778,7 @@ async function recordMarketRefreshRunFinish(
     calibrations_generated?: number;
     alerts_generated?: number;
     stale_count?: number | null;
+    critical_stale_count?: number | null;
     as_of?: string | null;
     error?: string | null;
   }
@@ -4378,6 +4794,7 @@ async function recordMarketRefreshRunFinish(
           calibrations_generated = ?,
           alerts_generated = ?,
           stale_count = ?,
+          critical_stale_count = ?,
           as_of = ?,
           error = ?
       WHERE id = ?
@@ -4389,6 +4806,7 @@ async function recordMarketRefreshRunFinish(
       payload.calibrations_generated ?? 0,
       payload.alerts_generated ?? 0,
       payload.stale_count ?? null,
+      payload.critical_stale_count ?? null,
       payload.as_of ?? null,
       payload.error ?? null,
       runId,
@@ -4402,11 +4820,12 @@ async function fetchLatestSuccessfulMarketRefreshRun(db: D1Database): Promise<{
   completed_at: string | null;
   trigger: string | null;
   stale_count: number | null;
+  critical_stale_count: number | null;
   as_of: string | null;
 } | null> {
   try {
     const row = await db.prepare(`
-      SELECT completed_at, "trigger" as trigger, stale_count, as_of
+      SELECT completed_at, "trigger" as trigger, stale_count, critical_stale_count, as_of
       FROM market_refresh_runs
       WHERE status = 'success'
         AND completed_at IS NOT NULL
@@ -4416,12 +4835,77 @@ async function fetchLatestSuccessfulMarketRefreshRun(db: D1Database): Promise<{
       completed_at: string | null;
       trigger: string | null;
       stale_count: number | null;
+      critical_stale_count: number | null;
       as_of: string | null;
     }>();
     return row || null;
   } catch {
     return null;
   }
+}
+
+async function computeFreshnessSloWindow(
+  db: D1Database,
+  windowDays: number
+): Promise<{
+  days_observed: number;
+  days_with_critical_stale: number;
+  slo_attainment_pct: number;
+  recent_incidents: Array<{
+    as_of: string;
+    completed_at: string | null;
+    trigger: string | null;
+    stale_count: number;
+    critical_stale_count: number;
+  }>;
+}> {
+  const boundedDays = Math.max(1, Math.floor(windowDays));
+  const lookbackExpr = `-${Math.max(0, boundedDays - 1)} days`;
+
+  const grouped = await db.prepare(`
+    SELECT
+      COALESCE(as_of, substr(completed_at, 1, 10)) as run_date,
+      MAX(completed_at) as completed_at,
+      MAX("trigger") as trigger,
+      MAX(COALESCE(stale_count, 0)) as stale_count,
+      MAX(COALESCE(critical_stale_count, 0)) as critical_stale_count
+    FROM market_refresh_runs
+    WHERE status = 'success'
+      AND completed_at IS NOT NULL
+      AND completed_at >= datetime('now', ?)
+    GROUP BY run_date
+    ORDER BY run_date DESC
+  `).bind(lookbackExpr).all<{
+    run_date: string | null;
+    completed_at: string | null;
+    trigger: string | null;
+    stale_count: number | null;
+    critical_stale_count: number | null;
+  }>();
+
+  const rows = (grouped.results || [])
+    .filter((row) => typeof row.run_date === 'string' && row.run_date.length >= 10)
+    .map((row) => ({
+      as_of: String(row.run_date).slice(0, 10),
+      completed_at: row.completed_at || null,
+      trigger: row.trigger || null,
+      stale_count: Math.max(0, Math.floor(toNumber(row.stale_count, 0))),
+      critical_stale_count: Math.max(0, Math.floor(toNumber(row.critical_stale_count, 0))),
+    }));
+
+  const daysObserved = rows.length;
+  const incidentRows = rows.filter((row) => row.critical_stale_count > 0);
+  const daysWithCriticalStale = incidentRows.length;
+  const sloAttainment = daysObserved > 0
+    ? Number((((daysObserved - daysWithCriticalStale) / daysObserved) * 100).toFixed(2))
+    : 0;
+
+  return {
+    days_observed: daysObserved,
+    days_with_critical_stale: daysWithCriticalStale,
+    slo_attainment_pct: sloAttainment,
+    recent_incidents: incidentRows.slice(0, 20),
+  };
 }
 
 async function fetchLatestMarketProductSnapshotWrite(db: D1Database): Promise<string | null> {
@@ -6244,11 +6728,17 @@ export default {
               calibrations_generated INTEGER DEFAULT 0,
               alerts_generated INTEGER DEFAULT 0,
               stale_count INTEGER,
+              critical_stale_count INTEGER,
               as_of TEXT,
               error TEXT,
               created_at TEXT DEFAULT (datetime('now'))
             )
           `).run();
+          try {
+            await env.DB.prepare(
+              `ALTER TABLE market_refresh_runs ADD COLUMN critical_stale_count INTEGER`
+            ).run();
+          } catch (e) { /* Column already exists */ }
           await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
           await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
           migrations.push('market_refresh_runs');
@@ -6701,12 +7191,26 @@ export default {
       if (url.pathname === '/api/opportunities' && method === 'GET') {
         const horizon = (url.searchParams.get('horizon') || '7d').trim() === '30d' ? '30d' : '7d';
         const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20', 10)));
+        const coherenceGateEnabled = isFeatureEnabled(
+          env,
+          'FEATURE_ENABLE_OPPORTUNITY_COHERENCE_GATE',
+          'ENABLE_OPPORTUNITY_COHERENCE_GATE',
+          true,
+        );
+        const signalsSanitizerEnabled = isFeatureEnabled(
+          env,
+          'FEATURE_ENABLE_SIGNALS_SANITIZER',
+          'ENABLE_SIGNALS_SANITIZER',
+          true,
+        );
+
         if (!isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true)) {
           const fallback = buildOpportunityFallbackSnapshot(horizon, 'feature_disabled');
           return Response.json({
             as_of: fallback.as_of,
             horizon: fallback.horizon,
             items: fallback.items,
+            suppressed_count: 0,
             degraded_reason: fallback.degraded_reason,
           }, {
             headers: {
@@ -6725,6 +7229,7 @@ export default {
             as_of: fallback.as_of,
             horizon: fallback.horizon,
             items: fallback.items,
+            suppressed_count: 0,
             degraded_reason: fallback.degraded_reason,
           }, {
             headers: {
@@ -6759,7 +7264,9 @@ export default {
 
         if (!snapshot) {
           try {
-            snapshot = await buildOpportunitySnapshot(env.DB, horizon);
+            snapshot = await buildOpportunitySnapshot(env.DB, horizon, undefined, {
+              sanitize_signals_tickers: signalsSanitizerEnabled,
+            });
           } catch (err) {
             console.error('Failed to build opportunity snapshot:', err);
             snapshot = null;
@@ -6770,6 +7277,7 @@ export default {
               as_of: fallback.as_of,
               horizon: fallback.horizon,
               items: fallback.items,
+              suppressed_count: 0,
               degraded_reason: fallback.degraded_reason,
             }, {
               headers: {
@@ -6785,23 +7293,108 @@ export default {
           }
         }
 
-        const convictionCalibration = await fetchLatestCalibrationSnapshot(env.DB, 'conviction', horizon);
-        const calibratedItems = snapshot.items
-          .map((item) => {
-            const calibrated = applyOpportunityCalibration(item, convictionCalibration);
-            return {
-              ...calibrated,
-              expectancy: normalizeOpportunityExpectancy(calibrated.expectancy, calibrated.direction),
-            };
-          });
-        const qualityFiltered = removeLowInformationOpportunities(calibratedItems);
-        const responseItems = qualityFiltered.items.slice(0, limit);
+        const [convictionCalibration, freshness, latestConsistencyCheck] = await Promise.all([
+          fetchLatestCalibrationSnapshot(env.DB, 'conviction', horizon),
+          computeFreshnessStatus(env.DB),
+          fetchLatestConsistencyCheck(env.DB),
+        ]);
+
+        let consistencyState: ConsistencyState = latestConsistencyCheck?.state ?? 'PASS';
+        if (!latestConsistencyCheck) {
+          try {
+            consistencyState = (await buildCanonicalMarketDecision(env.DB)).consistency.state;
+          } catch {
+            consistencyState = 'PASS';
+          }
+        }
+
+        const normalizedItems = normalizeOpportunityItemsForPublishing(snapshot.items, convictionCalibration);
+        const projectedFeed = projectOpportunityFeed(normalizedItems, {
+          coherence_gate_enabled: coherenceGateEnabled,
+          freshness,
+          consistency_state: consistencyState,
+        });
+        const responseItems = projectedFeed.items.slice(0, limit);
 
         return Response.json({
           as_of: snapshot.as_of,
           horizon: snapshot.horizon,
           items: responseItems,
-          degraded_reason: qualityFiltered.filtered_count > 0 ? 'quality_filtered' : null,
+          suppressed_count: projectedFeed.suppressed_count,
+          quality_filtered_count: projectedFeed.quality_filtered_count,
+          coherence_suppressed_count: projectedFeed.coherence_suppressed_count,
+          degraded_reason: projectedFeed.degraded_reason,
+        }, {
+          headers: {
+            ...corsHeaders,
+            'Cache-Control': 'public, max-age=60',
+          },
+        });
+      }
+
+      if (url.pathname === '/api/diagnostics/calibration' && method === 'GET') {
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_CALIBRATION_DIAGNOSTICS', 'ENABLE_CALIBRATION_DIAGNOSTICS', true)) {
+          return Response.json({
+            error: 'Calibration diagnostics disabled',
+          }, { status: 503, headers: corsHeaders });
+        }
+
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Calibration diagnostics schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        const metricRaw = (url.searchParams.get('metric') || 'conviction').trim().toLowerCase();
+        if (metricRaw !== 'conviction' && metricRaw !== 'edge_quality') {
+          return Response.json({
+            error: 'Invalid metric. Use metric=conviction or metric=edge_quality',
+          }, { status: 400, headers: corsHeaders });
+        }
+        const metric = metricRaw as 'conviction' | 'edge_quality';
+
+        const horizonRaw = (url.searchParams.get('horizon') || '').trim().toLowerCase();
+        let horizon: '7d' | '30d' | null = null;
+        if (metric === 'conviction') {
+          if (horizonRaw !== '7d' && horizonRaw !== '30d') {
+            return Response.json({
+              error: 'horizon is required for metric=conviction (7d or 30d)',
+            }, { status: 400, headers: corsHeaders });
+          }
+          horizon = horizonRaw;
+        }
+
+        const asOfRaw = (url.searchParams.get('as_of') || '').trim();
+        let asOfDate: string | null = null;
+        if (asOfRaw) {
+          asOfDate = parseIsoDate(asOfRaw) || parseIsoDate(asOfRaw.slice(0, 10));
+          if (!asOfDate) {
+            return Response.json({
+              error: 'Invalid as_of. Use YYYY-MM-DD or ISO date-time.',
+            }, { status: 400, headers: corsHeaders });
+          }
+        }
+
+        const snapshot = await fetchCalibrationSnapshotAtOrBefore(env.DB, metric, horizon, asOfDate);
+        const diagnostics = computeCalibrationDiagnostics(snapshot);
+        const response = snapshot || {
+          as_of: asOfDate ? `${asOfDate}T00:00:00.000Z` : asIsoDateTime(new Date()),
+          metric,
+          horizon,
+          basis: metric === 'conviction' ? 'conviction_decile' : 'edge_quality_decile',
+          bins: [],
+          total_samples: 0,
+        };
+
+        return Response.json({
+          as_of: response.as_of,
+          metric: response.metric,
+          horizon: response.horizon,
+          basis: response.basis,
+          total_samples: response.total_samples,
+          bins: response.bins,
+          diagnostics,
         }, {
           headers: {
             ...corsHeaders,
@@ -7136,6 +7729,38 @@ export default {
         }
       }
 
+      if (url.pathname === '/api/ops/freshness-slo' && method === 'GET') {
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Freshness SLO schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        try {
+          const [window7d, window30d] = await Promise.all([
+            computeFreshnessSloWindow(env.DB, 7),
+            computeFreshnessSloWindow(env.DB, 30),
+          ]);
+
+          return Response.json({
+            as_of: asIsoDateTime(new Date()),
+            windows: {
+              '7d': window7d,
+              '30d': window30d,
+            },
+          }, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'public, max-age=300',
+            },
+          });
+        } catch (err) {
+          console.error('Freshness SLO computation failed:', err);
+          return Response.json({ error: 'Freshness SLO unavailable' }, { status: 503, headers: corsHeaders });
+        }
+      }
+
       if (url.pathname === '/api/market/refresh-products' && method === 'POST') {
         const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
         if (adminAuthFailure) {
@@ -7152,6 +7777,24 @@ export default {
         const briefEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_BRIEF', 'ENABLE_BRIEF', true);
         const opportunitiesEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_OPPORTUNITIES', 'ENABLE_OPPORTUNITIES', true);
         const inAppAlertsEnabled = isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_IN_APP', 'ENABLE_ALERTS_IN_APP', true);
+        const coherenceGateEnabled = isFeatureEnabled(
+          env,
+          'FEATURE_ENABLE_OPPORTUNITY_COHERENCE_GATE',
+          'ENABLE_OPPORTUNITY_COHERENCE_GATE',
+          true,
+        );
+        const signalsSanitizerEnabled = isFeatureEnabled(
+          env,
+          'FEATURE_ENABLE_SIGNALS_SANITIZER',
+          'ENABLE_SIGNALS_SANITIZER',
+          true,
+        );
+        const calibrationDiagnosticsEnabled = isFeatureEnabled(
+          env,
+          'FEATURE_ENABLE_CALIBRATION_DIAGNOSTICS',
+          'ENABLE_CALIBRATION_DIAGNOSTICS',
+          true,
+        );
         const triggerHeader = request.headers.get('X-Refresh-Trigger');
         const refreshTrigger = triggerHeader && triggerHeader.trim().length > 0
           ? triggerHeader.trim().slice(0, 128)
@@ -7217,27 +7860,94 @@ export default {
           let opportunities7d: OpportunitySnapshot | null = null;
           let opportunities30d: OpportunitySnapshot | null = null;
           if (opportunitiesEnabled) {
-            opportunities7d = await buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d);
-            opportunities30d = await buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d);
+            opportunities7d = await buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d, {
+              sanitize_signals_tickers: signalsSanitizerEnabled,
+            });
+            opportunities30d = await buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d, {
+              sanitize_signals_tickers: signalsSanitizerEnabled,
+            });
             if (opportunities7d) await storeOpportunitySnapshot(env.DB, opportunities7d);
             if (opportunities30d) await storeOpportunitySnapshot(env.DB, opportunities30d);
           }
 
           let alertsGenerated = 0;
           if (brief && opportunities7d) {
-            const generated = await generateMarketEvents(env.DB, brief, opportunities7d);
+            const projectedForAlerts = projectOpportunityFeed(
+              normalizeOpportunityItemsForPublishing(opportunities7d.items, convictionCalibration7d),
+              {
+                coherence_gate_enabled: coherenceGateEnabled,
+                freshness: brief.freshness_status,
+                consistency_state: brief.consistency.state,
+              }
+            );
+            const generated = await generateMarketEvents(env.DB, brief, {
+              ...opportunities7d,
+              items: projectedForAlerts.items,
+            });
             alertsGenerated = await insertMarketEvents(env.DB, generated, inAppAlertsEnabled);
           }
 
-          const staleCountForRun = brief?.freshness_status.stale_count
-            ?? (await computeFreshnessStatus(env.DB)).stale_count;
+          const freshnessForRun = brief?.freshness_status || await computeFreshnessStatus(env.DB);
+          let consistencyStateForRun: ConsistencyState = brief?.consistency.state || 'PASS';
+          if (!brief) {
+            const latestConsistency = await fetchLatestConsistencyCheck(env.DB);
+            if (latestConsistency) {
+              consistencyStateForRun = latestConsistency.state;
+            } else {
+              try {
+                consistencyStateForRun = (await buildCanonicalMarketDecision(env.DB)).consistency.state;
+              } catch {
+                consistencyStateForRun = 'PASS';
+              }
+            }
+          }
+
+          let qualityFilteredCount = 0;
+          let coherenceSuppressedCount = 0;
+          let suppressedDataQualityCount = 0;
+          const projectionTargets: Array<{
+            snapshot: OpportunitySnapshot | null;
+            calibration: MarketCalibrationSnapshotPayload | null;
+          }> = [
+            { snapshot: opportunities7d, calibration: convictionCalibration7d },
+            { snapshot: opportunities30d, calibration: convictionCalibration30d },
+          ];
+          for (const target of projectionTargets) {
+            if (!target.snapshot) continue;
+            const normalized = normalizeOpportunityItemsForPublishing(target.snapshot.items, target.calibration);
+            const projected = projectOpportunityFeed(normalized, {
+              coherence_gate_enabled: coherenceGateEnabled,
+              freshness: freshnessForRun,
+              consistency_state: consistencyStateForRun,
+            });
+            qualityFilteredCount += projected.quality_filtered_count;
+            coherenceSuppressedCount += projected.coherence_suppressed_count;
+            if (projected.suppressed_data_quality) {
+              suppressedDataQualityCount += projected.suppressed_count;
+            }
+          }
+
+          let diagnosticsSummary: {
+            edge_quality: CalibrationQuality;
+            conviction_7d: CalibrationQuality;
+            conviction_30d: CalibrationQuality;
+          } | null = null;
+          if (calibrationDiagnosticsEnabled) {
+            diagnosticsSummary = {
+              edge_quality: computeCalibrationDiagnostics(edgeCalibrationSnapshot).quality_band,
+              conviction_7d: computeCalibrationDiagnostics(convictionCalibration7d).quality_band,
+              conviction_30d: computeCalibrationDiagnostics(convictionCalibration30d).quality_band,
+            };
+          }
+
           await recordMarketRefreshRunFinish(env.DB, refreshRunId, {
             status: 'success',
             brief_generated: brief ? 1 : 0,
             opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
             calibrations_generated: calibrationsGenerated,
             alerts_generated: alertsGenerated,
-            stale_count: staleCountForRun,
+            stale_count: freshnessForRun.stale_count,
+            critical_stale_count: freshnessForRun.critical_stale_count,
             as_of: brief?.as_of || opportunities7d?.as_of || null,
             error: null,
           });
@@ -7249,9 +7959,15 @@ export default {
             calibrations_generated: calibrationsGenerated,
             alerts_generated: alertsGenerated,
             consistency_stored: consistencyStored ? 1 : 0,
-            consistency_state: brief?.consistency.state || null,
+            consistency_state: consistencyStateForRun,
             consistency_score: brief?.consistency.score ?? null,
             as_of: brief?.as_of || opportunities7d?.as_of || null,
+            stale_count: freshnessForRun.stale_count,
+            critical_stale_count: freshnessForRun.critical_stale_count,
+            quality_filtered_count: qualityFilteredCount,
+            coherence_suppressed_count: coherenceSuppressedCount,
+            suppressed_data_quality_count: suppressedDataQualityCount,
+            calibration_diagnostics: diagnosticsSummary,
             refresh_trigger: refreshTrigger,
             refresh_run_id: refreshRunId,
           }, { headers: corsHeaders });
@@ -7278,6 +7994,13 @@ export default {
           console.error('Backfill-products schema guard failed:', err);
           return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
         }
+
+        const signalsSanitizerEnabled = isFeatureEnabled(
+          env,
+          'FEATURE_ENABLE_SIGNALS_SANITIZER',
+          'ENABLE_SIGNALS_SANITIZER',
+          true,
+        );
 
         let body: {
           start?: string;
@@ -7422,8 +8145,12 @@ export default {
           }
 
           try {
-            const latest7d = await buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d);
-            const latest30d = await buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d);
+            const latest7d = await buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d, {
+              sanitize_signals_tickers: signalsSanitizerEnabled,
+            });
+            const latest30d = await buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d, {
+              sanitize_signals_tickers: signalsSanitizerEnabled,
+            });
             if (latest7d) await storeOpportunitySnapshot(env.DB, latest7d);
             if (latest30d) await storeOpportunitySnapshot(env.DB, latest30d);
           } catch (err) {
@@ -7943,6 +8670,109 @@ export default {
             : ''
         }`;
 
+        let briefRef: PlanPayload['brief_ref'] | undefined;
+        let opportunityRef: PlanPayload['opportunity_ref'] | undefined;
+        let alertsRef: PlanPayload['alerts_ref'] | undefined;
+        try {
+          await ensureMarketProductSchema(env.DB);
+
+          const [briefRow, alertsCounts] = await Promise.all([
+            env.DB.prepare(`
+              SELECT payload_json
+              FROM market_brief_snapshots
+              ORDER BY as_of DESC
+              LIMIT 1
+            `).first<{ payload_json: string }>(),
+            env.DB.prepare(`
+              SELECT
+                MAX(created_at) as latest_as_of,
+                SUM(CASE WHEN severity = 'warning' THEN 1 ELSE 0 END) as warning_count,
+                SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) as critical_count
+              FROM market_alert_events
+              WHERE created_at >= datetime('now', '-24 hours')
+            `).first<{
+              latest_as_of: string | null;
+              warning_count: number | null;
+              critical_count: number | null;
+            }>(),
+          ]);
+
+          if (briefRow?.payload_json) {
+            try {
+              const briefSnapshot = JSON.parse(briefRow.payload_json) as BriefSnapshot;
+              if (isBriefSnapshotCompatible(briefSnapshot)) {
+                briefRef = {
+                  as_of: briefSnapshot.as_of,
+                  regime_delta: briefSnapshot.regime_delta,
+                  risk_posture: briefSnapshot.risk_posture,
+                };
+              }
+            } catch {
+              briefRef = undefined;
+            }
+          }
+
+          const opportunityRow = await env.DB.prepare(`
+            SELECT payload_json
+            FROM opportunity_snapshots
+            WHERE horizon IN ('7d', '30d')
+            ORDER BY
+              CASE WHEN horizon = '7d' THEN 0 ELSE 1 END,
+              as_of DESC
+            LIMIT 1
+          `).first<{ payload_json: string }>();
+
+          if (opportunityRow?.payload_json) {
+            try {
+              const opportunitySnapshot = JSON.parse(opportunityRow.payload_json) as OpportunitySnapshot;
+              if (
+                opportunitySnapshot &&
+                (opportunitySnapshot.horizon === '7d' || opportunitySnapshot.horizon === '30d') &&
+                Array.isArray(opportunitySnapshot.items)
+              ) {
+                const coherenceGateEnabled = isFeatureEnabled(
+                  env,
+                  'FEATURE_ENABLE_OPPORTUNITY_COHERENCE_GATE',
+                  'ENABLE_OPPORTUNITY_COHERENCE_GATE',
+                  true,
+                );
+                const calibration = await fetchLatestCalibrationSnapshot(
+                  env.DB,
+                  'conviction',
+                  opportunitySnapshot.horizon
+                );
+                const normalized = normalizeOpportunityItemsForPublishing(
+                  opportunitySnapshot.items,
+                  calibration
+                );
+                const projected = projectOpportunityFeed(normalized, {
+                  coherence_gate_enabled: coherenceGateEnabled,
+                  freshness,
+                  consistency_state: canonical.consistency.state,
+                });
+
+                opportunityRef = {
+                  as_of: opportunitySnapshot.as_of,
+                  horizon: opportunitySnapshot.horizon,
+                  eligible_count: projected.items.length,
+                  suppressed_count: projected.suppressed_count,
+                  degraded_reason: projected.degraded_reason,
+                };
+              }
+            } catch {
+              opportunityRef = undefined;
+            }
+          }
+
+          alertsRef = {
+            as_of: alertsCounts?.latest_as_of || canonical.as_of,
+            warning_count_24h: Math.max(0, Math.floor(toNumber(alertsCounts?.warning_count, 0))),
+            critical_count_24h: Math.max(0, Math.floor(toNumber(alertsCounts?.critical_count, 0))),
+          };
+        } catch (err) {
+          console.warn('Failed to attach plan reference blocks:', err);
+        }
+
         const payload: PlanPayload = {
           as_of: canonical.as_of,
           setup_summary: setupSummary,
@@ -7965,6 +8795,9 @@ export default {
             regime,
             edgeQuality: edge_quality,
           }),
+          ...(briefRef ? { brief_ref: briefRef } : {}),
+          ...(opportunityRef ? { opportunity_ref: opportunityRef } : {}),
+          ...(alertsRef ? { alerts_ref: alertsRef } : {}),
           degraded_reason: degraded_reasons.length > 0 ? degraded_reasons.join(',') : null,
         };
 
