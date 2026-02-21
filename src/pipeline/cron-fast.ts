@@ -364,7 +364,7 @@ async function fetchAllFred(): Promise<void> {
     if (latestIsmManufacturing && Number.isFinite(latestIsmManufacturing.value)) {
       const written = recordIndicatorValues([{
         indicator_id: 'ism_services',
-        date: latestIsmManufacturing.date,
+        date: format(new Date(), 'yyyy-MM-dd'),
         value: latestIsmManufacturing.value,
         source: 'ism_manufacturing_proxy',
       }]);
