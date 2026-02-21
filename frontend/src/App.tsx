@@ -518,6 +518,17 @@ interface OpportunitiesResponse {
   quality_filtered_count?: number
   coherence_suppressed_count?: number
   degraded_reason?: string | null
+  suppression_by_reason?: {
+    coherence_failed: number
+    quality_filtered: number
+    data_quality_suppressed: number
+  }
+  quality_filter_rate?: number
+  coherence_fail_rate?: number
+  actionability_state?: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION'
+  actionability_reason_codes?: string[]
+  cta_enabled?: boolean
+  cta_disabled_reasons?: string[]
 }
 
 interface CalibrationDiagnosticsResponse {
@@ -565,6 +576,8 @@ interface AlertsFeedResponse {
 interface PlanData {
   as_of: string
   setup_summary: string
+  actionability_state?: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION'
+  actionability_reason_codes?: string[]
   policy_state?: {
     stance: 'RISK_ON' | 'RISK_OFF' | 'MIXED'
     risk_posture: 'risk_on' | 'neutral' | 'risk_off'
@@ -1025,6 +1038,28 @@ function formatOpportunityDegradedReason(reason: string | null | undefined): str
   return reason.replace(/_/g, ' ')
 }
 
+function formatActionabilityState(state: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION' | null | undefined): string {
+  if (!state) return 'watch'
+  if (state === 'ACTIONABLE') return 'actionable'
+  if (state === 'NO_ACTION') return 'no action'
+  return 'watch'
+}
+
+function actionabilityClass(state: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION' | null | undefined): string {
+  if (state === 'ACTIONABLE') return 'border-[#00c896]/40 text-[#00c896]'
+  if (state === 'NO_ACTION') return 'border-[#f59e0b]/40 text-[#f59e0b]'
+  return 'border-[#949ba5]/40 text-[#949ba5]'
+}
+
+function formatCtaDisabledReason(reason: string): string {
+  if (reason === 'no_eligible_opportunities') return 'no eligible opportunities'
+  if (reason === 'suppressed_data_quality') return 'suppressed data quality'
+  if (reason === 'calibration_quality_not_robust') return 'calibration quality not robust'
+  if (reason === 'calibration_ece_unavailable') return 'calibration ECE unavailable'
+  if (reason === 'ece_above_threshold') return 'ECE above threshold'
+  return reason.replace(/_/g, ' ')
+}
+
 function calibrationQualityClass(quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'): string {
   if (quality === 'ROBUST') return 'border-[#00c896]/40 text-[#00c896]'
   if (quality === 'LIMITED') return 'border-[#f59e0b]/40 text-[#f59e0b]'
@@ -1091,6 +1126,8 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
   if (!plan) return null
 
   const policyStance = derivePolicyStance(plan)
+  const actionabilityState = plan.actionability_state || (plan.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH')
+  const actionabilityReasons = (plan.actionability_reason_codes || []).filter(Boolean)
   const targetPct = Math.round(plan.action_now.risk_allocation_target * 100)
   const rawTargetPct = Math.round((plan.action_now.raw_signal_allocation_target ?? plan.action_now.risk_allocation_target) * 100)
   const qualityColor =
@@ -1142,6 +1179,9 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
             <span className={`rounded border px-2 py-1 ${policyStanceClass(policyStance)}`}>
               stance {policyStance.replace('_', ' ')}
             </span>
+            <span className={`rounded border px-2 py-1 ${actionabilityClass(actionabilityState)}`}>
+              {formatActionabilityState(actionabilityState)}
+            </span>
             <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
               tactical {plan.action_now.primary_signal.replace('_', ' ')}
             </span>
@@ -1158,6 +1198,11 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
           {opportunitySuppressed && (
             <p className="mt-2 text-[10px] text-[#f59e0b]">
               Opportunity feed currently suppressed: {formatOpportunityDegradedReason(plan.opportunity_ref?.degraded_reason)}
+            </p>
+          )}
+          {actionabilityState === 'NO_ACTION' && actionabilityReasons.length > 0 && (
+            <p className="mt-1 text-[10px] text-[#f59e0b]/90">
+              No-action mode: {actionabilityReasons.slice(0, 3).map((reason) => reason.replace(/_/g, ' ')).join(' · ')}
             </p>
           )}
         </div>
@@ -2765,6 +2810,18 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
   if (!data) return null
   const top = (data.items || []).slice(0, 3)
   const suppressedCount = Math.max(0, data.suppressed_count || 0)
+  const suppressionByReason = data.suppression_by_reason || {
+    coherence_failed: Math.max(0, data.coherence_suppressed_count || 0),
+    quality_filtered: Math.max(0, data.quality_filtered_count || 0),
+    data_quality_suppressed: data.degraded_reason === 'suppressed_data_quality' ? suppressedCount : 0,
+  }
+  const qualityFilterRate = Number.isFinite(data.quality_filter_rate as number) ? Number(data.quality_filter_rate) : 0
+  const coherenceFailRate = Number.isFinite(data.coherence_fail_rate as number) ? Number(data.coherence_fail_rate) : 0
+  const actionabilityState = data.actionability_state || (top.length === 0 ? 'NO_ACTION' : 'WATCH')
+  const ctaDisabledReasons = data.cta_disabled_reasons || []
+  const ctaEnabled = typeof data.cta_enabled === 'boolean'
+    ? data.cta_enabled
+    : (top.length > 0 && ctaDisabledReasons.length === 0)
   const hasFeedState = top.length > 0 || suppressedCount > 0 || Boolean(data.degraded_reason)
   if (!hasFeedState) return null
 
@@ -2786,8 +2843,20 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
         </p>
       )}
       {suppressedCount > 0 && (
-        <p className="mb-3 text-[9px] text-[#949ba5]/70 uppercase tracking-wider">
-          suppressed {suppressedCount}
+        <div className="mb-3 space-y-1">
+          <p className="text-[9px] text-[#949ba5]/70 uppercase tracking-wider">
+            suppressed {suppressedCount} · {formatActionabilityState(actionabilityState)}
+          </p>
+          <p className="text-[9px] text-[#949ba5]/60">
+            coherence {suppressionByReason.coherence_failed} ({(coherenceFailRate * 100).toFixed(0)}%) ·
+            {' '}quality {suppressionByReason.quality_filtered} ({(qualityFilterRate * 100).toFixed(0)}%) ·
+            {' '}data-quality {suppressionByReason.data_quality_suppressed}
+          </p>
+        </div>
+      )}
+      {!ctaEnabled && (
+        <p className="mb-3 text-[9px] text-[#f59e0b]">
+          action CTA disabled: {(ctaDisabledReasons.length > 0 ? ctaDisabledReasons : ['no_eligible_opportunities']).map(formatCtaDisabledReason).join(' · ')}
         </p>
       )}
 
@@ -2958,6 +3027,19 @@ function OpportunitiesPage({
 }) {
   const suppressedCount = Math.max(0, data?.suppressed_count || 0)
   const degradedReason = data?.degraded_reason || null
+  const suppressionByReason = data?.suppression_by_reason || {
+    coherence_failed: Math.max(0, data?.coherence_suppressed_count || 0),
+    quality_filtered: Math.max(0, data?.quality_filtered_count || 0),
+    data_quality_suppressed: degradedReason === 'suppressed_data_quality' ? suppressedCount : 0,
+  }
+  const qualityFilterRate = Number.isFinite(data?.quality_filter_rate as number) ? Number(data?.quality_filter_rate) : 0
+  const coherenceFailRate = Number.isFinite(data?.coherence_fail_rate as number) ? Number(data?.coherence_fail_rate) : 0
+  const actionabilityState = data?.actionability_state || (data?.items?.length ? 'WATCH' : 'NO_ACTION')
+  const actionabilityReasonCodes = data?.actionability_reason_codes || []
+  const ctaDisabledReasons = data?.cta_disabled_reasons || []
+  const ctaEnabled = typeof data?.cta_enabled === 'boolean'
+    ? Boolean(data.cta_enabled)
+    : (Boolean(data?.items?.length) && ctaDisabledReasons.length === 0)
   const hasContractGateSuppression = degradedReason === 'coherence_gate_failed'
   const hasDataQualitySuppression = degradedReason === 'suppressed_data_quality'
   const hasQualityFilter = degradedReason === 'quality_filtered'
@@ -3023,8 +3105,26 @@ function OpportunitiesPage({
           </div>
         )}
         {suppressedCount > 0 && (
-          <div className="mb-4 text-[10px] text-[#949ba5]/80 uppercase tracking-wider">
-            suppressed {suppressedCount}
+          <div className="mb-4 space-y-1 text-[10px] text-[#949ba5]/80">
+            <div className="uppercase tracking-wider">
+              suppressed {suppressedCount} · {formatActionabilityState(actionabilityState)}
+            </div>
+            <div className="text-[#949ba5]/70">
+              coherence {suppressionByReason.coherence_failed} ({(coherenceFailRate * 100).toFixed(0)}%) ·
+              {' '}quality {suppressionByReason.quality_filtered} ({(qualityFilterRate * 100).toFixed(0)}%) ·
+              {' '}data-quality {suppressionByReason.data_quality_suppressed}
+            </div>
+            {actionabilityReasonCodes.length > 0 && (
+              <div className="text-[#949ba5]/60">
+                reasons: {actionabilityReasonCodes.slice(0, 4).map((reason) => reason.replace(/_/g, ' ')).join(' · ')}
+              </div>
+            )}
+          </div>
+        )}
+
+        {!ctaEnabled && (
+          <div className="mb-4 text-[10px] text-[#f59e0b]">
+            action CTA disabled: {(ctaDisabledReasons.length > 0 ? ctaDisabledReasons : ['no_eligible_opportunities']).map(formatCtaDisabledReason).join(' · ')}
           </div>
         )}
 
@@ -4216,6 +4316,8 @@ function App() {
           if (planJson.setup_summary && planJson.action_now) {
             setPlanData({
               ...planJson,
+              actionability_state: planJson.actionability_state || (planJson.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH'),
+              actionability_reason_codes: Array.isArray(planJson.actionability_reason_codes) ? planJson.actionability_reason_codes : [],
               action_now: {
                 ...planJson.action_now,
                 raw_signal_allocation_target: planJson.action_now.raw_signal_allocation_target ?? planJson.action_now.risk_allocation_target,
@@ -4332,9 +4434,25 @@ function App() {
         if (oppRes?.ok) {
           const oppJson = await oppRes.json() as OpportunitiesResponse
           if (Array.isArray(oppJson.items)) {
+            const qualityFilteredCount = Number.isFinite(oppJson.quality_filtered_count as number) ? Number(oppJson.quality_filtered_count) : 0
+            const coherenceSuppressedCount = Number.isFinite(oppJson.coherence_suppressed_count as number) ? Number(oppJson.coherence_suppressed_count) : 0
+            const suppressedCount = Number.isFinite(oppJson.suppressed_count) ? oppJson.suppressed_count : 0
             setOpportunitiesData({
               ...oppJson,
-              suppressed_count: Number.isFinite(oppJson.suppressed_count) ? oppJson.suppressed_count : 0,
+              suppressed_count: suppressedCount,
+              quality_filtered_count: qualityFilteredCount,
+              coherence_suppressed_count: coherenceSuppressedCount,
+              suppression_by_reason: oppJson.suppression_by_reason || {
+                coherence_failed: coherenceSuppressedCount,
+                quality_filtered: qualityFilteredCount,
+                data_quality_suppressed: oppJson.degraded_reason === 'suppressed_data_quality' ? suppressedCount : 0,
+              },
+              quality_filter_rate: Number.isFinite(oppJson.quality_filter_rate as number) ? Number(oppJson.quality_filter_rate) : 0,
+              coherence_fail_rate: Number.isFinite(oppJson.coherence_fail_rate as number) ? Number(oppJson.coherence_fail_rate) : 0,
+              actionability_state: oppJson.actionability_state || (oppJson.items.length > 0 ? 'WATCH' : 'NO_ACTION'),
+              actionability_reason_codes: Array.isArray(oppJson.actionability_reason_codes) ? oppJson.actionability_reason_codes : [],
+              cta_enabled: typeof oppJson.cta_enabled === 'boolean' ? oppJson.cta_enabled : oppJson.items.length > 0,
+              cta_disabled_reasons: Array.isArray(oppJson.cta_disabled_reasons) ? oppJson.cta_disabled_reasons : [],
             })
           }
         }

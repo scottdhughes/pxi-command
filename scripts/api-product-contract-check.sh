@@ -165,6 +165,41 @@ check_plan_playbook_target_coherence() {
   fi
 }
 
+check_plan_actionability_contract() {
+  local plan_json
+  local actionability_state
+  local eligible_count
+  local edge_label
+  local has_override
+
+  plan_json=$(curl -sS --max-time 20 "$API_URL/api/plan")
+  actionability_state=$(echo "$plan_json" | jq -r '.actionability_state // ""')
+  edge_label=$(echo "$plan_json" | jq -r '.edge_quality.label // ""')
+  eligible_count=$(echo "$plan_json" | jq -r '.opportunity_ref.eligible_count // -1')
+  has_override=$(echo "$plan_json" | jq -r '((.actionability_reason_codes // []) | index("high_edge_override_no_eligible")) != null')
+
+  case "$actionability_state" in
+    ACTIONABLE|WATCH|NO_ACTION) ;;
+    *)
+      echo "Invalid /api/plan actionability_state: $actionability_state"
+      echo "$plan_json"
+      exit 1
+      ;;
+  esac
+
+  if [[ "$eligible_count" != "-1" && "$eligible_count" == "0" && "$actionability_state" != "NO_ACTION" ]]; then
+    echo "Plan actionability contradiction: eligible_count=0 but actionability_state is $actionability_state"
+    echo "$plan_json"
+    exit 1
+  fi
+
+  if [[ "$edge_label" == "HIGH" && "$eligible_count" == "0" && "$has_override" != "true" ]]; then
+    echo "HIGH edge with zero eligible opportunities requires explicit high_edge_override_no_eligible reason code"
+    echo "$plan_json"
+    exit 1
+  fi
+}
+
 check_refresh_recency() {
   local pxi_json
   local last_refresh
@@ -275,6 +310,39 @@ check_freshness_alert_parity() {
   fi
 }
 
+check_alert_aggregate_parity() {
+  local plan_json
+  local alerts_json
+  local warning_plan
+  local critical_plan
+  local warning_actual
+  local critical_actual
+  local since_utc
+
+  since_utc=$(python3 - <<'PY'
+import datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+cutoff = now - datetime.timedelta(hours=24)
+print(cutoff.isoformat().replace("+00:00", "Z"))
+PY
+)
+
+  plan_json=$(curl -sS --max-time 20 "$API_URL/api/plan")
+  alerts_json=$(curl -sS --max-time 20 "$API_URL/api/alerts/feed?limit=200&since=$since_utc")
+
+  warning_plan=$(echo "$plan_json" | jq -r '.alerts_ref.warning_count_24h // 0')
+  critical_plan=$(echo "$plan_json" | jq -r '.alerts_ref.critical_count_24h // 0')
+  warning_actual=$(echo "$alerts_json" | jq -r '[.alerts[]? | select(.severity=="warning")] | length')
+  critical_actual=$(echo "$alerts_json" | jq -r '[.alerts[]? | select(.severity=="critical")] | length')
+
+  if [[ "$warning_plan" != "$warning_actual" || "$critical_plan" != "$critical_actual" ]]; then
+    echo "24h alert aggregate mismatch: plan(warning=$warning_plan critical=$critical_plan) vs feed(warning=$warning_actual critical=$critical_actual)"
+    echo "plan: $plan_json"
+    echo "alerts: $alerts_json"
+    exit 1
+  fi
+}
+
 check_degraded_consistency_score() {
   local plan_json
   local degraded
@@ -316,6 +384,11 @@ check_opportunity_coherence_contract() {
   local degraded_reason
   local suppressed_count
   local item_count
+  local cta_enabled
+  local cta_reason_count
+  local actionability_state
+  local quality_filter_rate
+  local coherence_fail_rate
 
   opp_json=$(curl -sS --max-time 20 "$API_URL/api/opportunities?horizon=7d&limit=50")
 
@@ -355,6 +428,11 @@ check_opportunity_coherence_contract() {
   degraded_reason=$(echo "$opp_json" | jq -r '.degraded_reason // ""')
   suppressed_count=$(echo "$opp_json" | jq -r '.suppressed_count // 0')
   item_count=$(echo "$opp_json" | jq -r '.items | length')
+  cta_enabled=$(echo "$opp_json" | jq -r '.cta_enabled // false')
+  cta_reason_count=$(echo "$opp_json" | jq -r '(.cta_disabled_reasons // []) | length')
+  actionability_state=$(echo "$opp_json" | jq -r '.actionability_state // ""')
+  quality_filter_rate=$(echo "$opp_json" | jq -r '.quality_filter_rate // -1')
+  coherence_fail_rate=$(echo "$opp_json" | jq -r '.coherence_fail_rate // -1')
 
   if [[ -n "$degraded_reason" ]]; then
     case "$degraded_reason" in
@@ -381,10 +459,49 @@ check_opportunity_coherence_contract() {
       exit 1
     fi
   fi
+
+  case "$actionability_state" in
+    ACTIONABLE|WATCH|NO_ACTION) ;;
+    *)
+      echo "Invalid actionability_state in opportunities response: $actionability_state"
+      echo "$opp_json"
+      exit 1
+      ;;
+  esac
+
+  if [[ "$item_count" == "0" && "$actionability_state" != "NO_ACTION" ]]; then
+    echo "Expected actionability_state=NO_ACTION when no eligible opportunities are published"
+    echo "$opp_json"
+    exit 1
+  fi
+
+  if [[ "$cta_enabled" == "true" && "$cta_reason_count" != "0" ]]; then
+    echo "cta_enabled=true but cta_disabled_reasons is non-empty"
+    echo "$opp_json"
+    exit 1
+  fi
+
+  if [[ "$cta_enabled" != "true" && "$cta_reason_count" == "0" ]]; then
+    echo "cta_enabled=false requires at least one cta_disabled_reason"
+    echo "$opp_json"
+    exit 1
+  fi
+
+  if ! awk "BEGIN { exit !($quality_filter_rate >= 0 && $quality_filter_rate <= 1) }"; then
+    echo "quality_filter_rate out of bounds: $quality_filter_rate"
+    echo "$opp_json"
+    exit 1
+  fi
+
+  if ! awk "BEGIN { exit !($coherence_fail_rate >= 0 && $coherence_fail_rate <= 1) }"; then
+    echo "coherence_fail_rate out of bounds: $coherence_fail_rate"
+    echo "$opp_json"
+    exit 1
+  fi
 }
 
 check_api_json_contract "/api/plan" \
-  'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number")))' \
+  'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number")))' \
   "plan"
 
 check_api_json_contract "/api/brief?scope=market" \
@@ -392,7 +509,7 @@ check_api_json_contract "/api/brief?scope=market" \
   "brief"
 
 check_api_json_contract "/api/opportunities?horizon=7d&limit=5" \
-  'type=="object" and (.as_of|type=="string") and (.horizon|type=="string") and (.suppressed_count|type=="number") and ((.degraded_reason==null) or (.degraded_reason|type=="string")) and (.items|type=="array") and (all(.items[]?; (.id|type=="string") and (.theme_id|type=="string") and (.direction|type=="string") and (.conviction_score|type=="number") and (.calibration.quality|type=="string") and (.calibration.basis=="conviction_decile") and ((.calibration.window==null) or (.calibration.window|type=="string")) and ((.calibration.unavailable_reason==null) or (.calibration.unavailable_reason|type=="string")) and (.expectancy.sample_size|type=="number") and (.expectancy.basis|type=="string") and (.expectancy.quality|type=="string") and ((.expectancy.expected_move_pct==null) or (.expectancy.expected_move_pct|type=="number")) and ((.expectancy.max_adverse_move_pct==null) or (.expectancy.max_adverse_move_pct|type=="number")) and ((.expectancy.unavailable_reason==null) or (.expectancy.unavailable_reason|type=="string")) and (.eligibility.passed|type=="boolean") and (.eligibility.failed_checks|type=="array") and (.decision_contract.coherent|type=="boolean") and (.decision_contract.confidence_band|type=="string") and (.decision_contract.rationale_codes|type=="array")))' \
+  'type=="object" and (.as_of|type=="string") and (.horizon|type=="string") and (.suppressed_count|type=="number") and (.suppression_by_reason.coherence_failed|type=="number") and (.suppression_by_reason.quality_filtered|type=="number") and (.suppression_by_reason.data_quality_suppressed|type=="number") and (.quality_filter_rate|type=="number") and (.coherence_fail_rate|type=="number") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.cta_enabled|type=="boolean") and (.cta_disabled_reasons|type=="array") and (all(.cta_disabled_reasons[]?; type=="string")) and ((.degraded_reason==null) or (.degraded_reason|type=="string")) and (.items|type=="array") and (all(.items[]?; (.id|type=="string") and (.theme_id|type=="string") and (.direction|type=="string") and (.conviction_score|type=="number") and (.calibration.quality|type=="string") and (.calibration.basis=="conviction_decile") and ((.calibration.window==null) or (.calibration.window|type=="string")) and ((.calibration.unavailable_reason==null) or (.calibration.unavailable_reason|type=="string")) and (.expectancy.sample_size|type=="number") and (.expectancy.basis|type=="string") and (.expectancy.quality|type=="string") and ((.expectancy.expected_move_pct==null) or (.expectancy.expected_move_pct|type=="number")) and ((.expectancy.max_adverse_move_pct==null) or (.expectancy.max_adverse_move_pct|type=="number")) and ((.expectancy.unavailable_reason==null) or (.expectancy.unavailable_reason|type=="string")) and (.eligibility.passed|type=="boolean") and (.eligibility.failed_checks|type=="array") and (.decision_contract.coherent|type=="boolean") and (.decision_contract.confidence_band|type=="string") and (.decision_contract.rationale_codes|type=="array")))' \
   "opportunities"
 
 check_api_json_contract "/api/alerts/feed?limit=10" \
@@ -427,8 +544,10 @@ check_policy_state_consistency
 check_plan_brief_coherence
 check_consistency_gate
 check_plan_playbook_target_coherence
+check_plan_actionability_contract
 check_refresh_recency
 check_freshness_alert_parity
+check_alert_aggregate_parity
 check_degraded_consistency_score
 check_ml_low_sample_semantics
 check_opportunity_coherence_contract

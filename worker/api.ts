@@ -1046,6 +1046,18 @@ type ConflictState = 'ALIGNED' | 'MIXED' | 'CONFLICT';
 type EdgeQualityLabel = 'HIGH' | 'MEDIUM' | 'LOW';
 type CalibrationQuality = 'ROBUST' | 'LIMITED' | 'INSUFFICIENT';
 type CoverageQuality = CalibrationQuality;
+type PlanActionabilityState = 'ACTIONABLE' | 'WATCH' | 'NO_ACTION';
+type PlanActionabilityReasonCode =
+  | 'critical_data_quality_block'
+  | 'consistency_fail_block'
+  | 'opportunity_reference_unavailable'
+  | 'no_eligible_opportunities'
+  | 'high_edge_override_no_eligible'
+  | 'high_edge_with_eligible_opportunities'
+  | 'medium_edge_watch'
+  | 'low_edge_watch'
+  | 'fallback_degraded_mode'
+  | `opportunity_${string}`;
 type OpportunityExpectancyBasis = 'theme_direction' | 'theme_direction_shrunk_prior' | 'direction_prior_proxy' | 'none';
 type OpportunityConfidenceBand = 'high' | 'medium' | 'low';
 type OpportunityEligibilityCheck =
@@ -1053,6 +1065,12 @@ type OpportunityEligibilityCheck =
   | 'calibration_probability_below_threshold'
   | 'expectancy_sign_conflict'
   | 'incomplete_contract';
+type OpportunityCtaDisabledReason =
+  | 'no_eligible_opportunities'
+  | 'suppressed_data_quality'
+  | 'calibration_quality_not_robust'
+  | 'calibration_ece_unavailable'
+  | 'ece_above_threshold';
 
 interface OpportunityEligibility {
   passed: boolean;
@@ -1175,6 +1193,12 @@ interface OpportunitySnapshot {
   items: OpportunityItem[];
 }
 
+interface OpportunitySuppressionByReason {
+  coherence_failed: number;
+  quality_filtered: number;
+  data_quality_suppressed: number;
+}
+
 interface MarketAlertEvent {
   id: string;
   event_type: MarketAlertType;
@@ -1273,6 +1297,8 @@ interface PlanPayload {
   as_of: string;
   setup_summary: string;
   policy_state: PolicyStateSnapshot;
+  actionability_state: PlanActionabilityState;
+  actionability_reason_codes: PlanActionabilityReasonCode[];
   action_now: {
     risk_allocation_target: number;
     raw_signal_allocation_target: number;
@@ -1327,6 +1353,7 @@ const CALIBRATION_ROBUST_MIN_SAMPLE = 50;
 const CALIBRATION_LIMITED_MIN_SAMPLE = 20;
 const CALIBRATION_POOL_TARGET_SAMPLE = CALIBRATION_ROBUST_MIN_SAMPLE;
 const OPPORTUNITY_COHERENCE_MIN_PROBABILITY = 0.5;
+const OPPORTUNITY_CTA_MAX_ECE = 0.08;
 const SIGNALS_TICKER_REGEX = /^[A-Z]{2,5}$/;
 const SIGNALS_TICKER_LIMIT = 4;
 const SIGNALS_TICKER_STOPWORDS = new Set<string>([
@@ -2927,6 +2954,8 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
     as_of: asIsoDateTime(new Date()),
     setup_summary: 'Plan service is in degraded mode. Use neutral sizing until full context is restored.',
     policy_state: policyState,
+    actionability_state: 'NO_ACTION',
+    actionability_reason_codes: ['fallback_degraded_mode', `opportunity_${reason}`],
     action_now: {
       risk_allocation_target: 0.5,
       raw_signal_allocation_target: 0.5,
@@ -4147,6 +4176,19 @@ function applyOpportunityCoherenceGate(
   };
 }
 
+interface OpportunityFeedProjection {
+  items: OpportunityItem[];
+  suppressed_count: number;
+  degraded_reason: string | null;
+  quality_filtered_count: number;
+  coherence_suppressed_count: number;
+  suppressed_data_quality: boolean;
+  suppression_by_reason: OpportunitySuppressionByReason;
+  total_candidates: number;
+  quality_filter_rate: number;
+  coherence_fail_rate: number;
+}
+
 function projectOpportunityFeed(
   items: OpportunityItem[],
   options: {
@@ -4154,20 +4196,26 @@ function projectOpportunityFeed(
     freshness: FreshnessStatus;
     consistency_state: ConsistencyState;
   }
-): {
-  items: OpportunityItem[];
-  suppressed_count: number;
-  degraded_reason: string | null;
-  quality_filtered_count: number;
-  coherence_suppressed_count: number;
-  suppressed_data_quality: boolean;
-} {
+): OpportunityFeedProjection {
+  const totalCandidates = items.length;
   const qualityFiltered = removeLowInformationOpportunities(items);
   const coherenceFiltered = applyOpportunityCoherenceGate(
     qualityFiltered.items,
     options.coherence_gate_enabled
   );
   const suppressForDataQuality = options.freshness.critical_stale_count > 0 || options.consistency_state === 'FAIL';
+  const dataQualitySuppressedCount = suppressForDataQuality ? coherenceFiltered.items.length : 0;
+  const suppressionByReason: OpportunitySuppressionByReason = {
+    coherence_failed: coherenceFiltered.suppressed_count,
+    quality_filtered: qualityFiltered.filtered_count,
+    data_quality_suppressed: dataQualitySuppressedCount,
+  };
+  const qualityFilterRate = totalCandidates > 0
+    ? Number((qualityFiltered.filtered_count / totalCandidates).toFixed(4))
+    : 0;
+  const coherenceFailRate = totalCandidates > 0
+    ? Number((coherenceFiltered.suppressed_count / totalCandidates).toFixed(4))
+    : 0;
 
   if (suppressForDataQuality) {
     return {
@@ -4177,6 +4225,10 @@ function projectOpportunityFeed(
       quality_filtered_count: qualityFiltered.filtered_count,
       coherence_suppressed_count: coherenceFiltered.suppressed_count,
       suppressed_data_quality: true,
+      suppression_by_reason: suppressionByReason,
+      total_candidates: totalCandidates,
+      quality_filter_rate: qualityFilterRate,
+      coherence_fail_rate: coherenceFailRate,
     };
   }
 
@@ -4194,6 +4246,97 @@ function projectOpportunityFeed(
     quality_filtered_count: qualityFiltered.filtered_count,
     coherence_suppressed_count: coherenceFiltered.suppressed_count,
     suppressed_data_quality: false,
+    suppression_by_reason: suppressionByReason,
+    total_candidates: totalCandidates,
+    quality_filter_rate: qualityFilterRate,
+    coherence_fail_rate: coherenceFailRate,
+  };
+}
+
+function resolvePlanActionability(args: {
+  opportunity_ref?: PlanPayload['opportunity_ref'];
+  edge_quality: EdgeQualitySnapshot;
+  freshness: FreshnessStatus;
+  consistency: ConsistencySnapshot;
+}): {
+  state: PlanActionabilityState;
+  reason_codes: PlanActionabilityReasonCode[];
+} {
+  const reasonCodes: PlanActionabilityReasonCode[] = [];
+
+  if (args.freshness.critical_stale_count > 0) {
+    reasonCodes.push('critical_data_quality_block');
+    return { state: 'NO_ACTION', reason_codes: reasonCodes };
+  }
+  if (args.consistency.state === 'FAIL') {
+    reasonCodes.push('consistency_fail_block');
+    return { state: 'NO_ACTION', reason_codes: reasonCodes };
+  }
+
+  const opportunityRef = args.opportunity_ref;
+  if (!opportunityRef) {
+    reasonCodes.push('opportunity_reference_unavailable');
+    return { state: 'NO_ACTION', reason_codes: reasonCodes };
+  }
+
+  if (opportunityRef.eligible_count <= 0) {
+    reasonCodes.push('no_eligible_opportunities');
+    if (opportunityRef.degraded_reason) {
+      reasonCodes.push(`opportunity_${opportunityRef.degraded_reason}`);
+    }
+    if (args.edge_quality.label === 'HIGH') {
+      reasonCodes.push('high_edge_override_no_eligible');
+    }
+    return { state: 'NO_ACTION', reason_codes: reasonCodes };
+  }
+
+  if (args.edge_quality.label === 'HIGH') {
+    reasonCodes.push('high_edge_with_eligible_opportunities');
+    return { state: 'ACTIONABLE', reason_codes: reasonCodes };
+  }
+
+  if (args.edge_quality.label === 'MEDIUM') {
+    reasonCodes.push('medium_edge_watch');
+    return { state: 'WATCH', reason_codes: reasonCodes };
+  }
+
+  reasonCodes.push('low_edge_watch');
+  return { state: 'WATCH', reason_codes: reasonCodes };
+}
+
+function evaluateOpportunityCtaState(
+  projectedFeed: OpportunityFeedProjection,
+  diagnostics: CalibrationDiagnosticsSnapshot
+): {
+  cta_enabled: boolean;
+  cta_disabled_reasons: OpportunityCtaDisabledReason[];
+  actionability_state: PlanActionabilityState;
+} {
+  const disabledReasons: OpportunityCtaDisabledReason[] = [];
+
+  const actionabilityState: PlanActionabilityState = projectedFeed.items.length > 0
+    ? (projectedFeed.degraded_reason === null ? 'ACTIONABLE' : 'WATCH')
+    : 'NO_ACTION';
+
+  if (projectedFeed.items.length === 0) {
+    disabledReasons.push('no_eligible_opportunities');
+  }
+  if (projectedFeed.degraded_reason === 'suppressed_data_quality') {
+    disabledReasons.push('suppressed_data_quality');
+  }
+  if (diagnostics.quality_band !== 'ROBUST') {
+    disabledReasons.push('calibration_quality_not_robust');
+  }
+  if (diagnostics.ece === null) {
+    disabledReasons.push('calibration_ece_unavailable');
+  } else if (diagnostics.ece > OPPORTUNITY_CTA_MAX_ECE) {
+    disabledReasons.push('ece_above_threshold');
+  }
+
+  return {
+    cta_enabled: disabledReasons.length === 0,
+    cta_disabled_reasons: Array.from(new Set(disabledReasons)),
+    actionability_state: actionabilityState,
   };
 }
 
@@ -7211,7 +7354,20 @@ export default {
             horizon: fallback.horizon,
             items: fallback.items,
             suppressed_count: 0,
+            quality_filtered_count: 0,
+            coherence_suppressed_count: 0,
+            suppression_by_reason: {
+              coherence_failed: 0,
+              quality_filtered: 0,
+              data_quality_suppressed: 0,
+            },
+            quality_filter_rate: 0,
+            coherence_fail_rate: 0,
             degraded_reason: fallback.degraded_reason,
+            actionability_state: 'NO_ACTION',
+            actionability_reason_codes: ['no_eligible_opportunities', `opportunity_${fallback.degraded_reason}`],
+            cta_enabled: false,
+            cta_disabled_reasons: ['no_eligible_opportunities'],
           }, {
             headers: {
               ...corsHeaders,
@@ -7230,7 +7386,20 @@ export default {
             horizon: fallback.horizon,
             items: fallback.items,
             suppressed_count: 0,
+            quality_filtered_count: 0,
+            coherence_suppressed_count: 0,
+            suppression_by_reason: {
+              coherence_failed: 0,
+              quality_filtered: 0,
+              data_quality_suppressed: 0,
+            },
+            quality_filter_rate: 0,
+            coherence_fail_rate: 0,
             degraded_reason: fallback.degraded_reason,
+            actionability_state: 'NO_ACTION',
+            actionability_reason_codes: ['no_eligible_opportunities', `opportunity_${fallback.degraded_reason}`],
+            cta_enabled: false,
+            cta_disabled_reasons: ['no_eligible_opportunities'],
           }, {
             headers: {
               ...corsHeaders,
@@ -7278,7 +7447,20 @@ export default {
               horizon: fallback.horizon,
               items: fallback.items,
               suppressed_count: 0,
+              quality_filtered_count: 0,
+              coherence_suppressed_count: 0,
+              suppression_by_reason: {
+                coherence_failed: 0,
+                quality_filtered: 0,
+                data_quality_suppressed: 0,
+              },
+              quality_filter_rate: 0,
+              coherence_fail_rate: 0,
               degraded_reason: fallback.degraded_reason,
+              actionability_state: 'NO_ACTION',
+              actionability_reason_codes: ['no_eligible_opportunities', `opportunity_${fallback.degraded_reason}`],
+              cta_enabled: false,
+              cta_disabled_reasons: ['no_eligible_opportunities'],
             }, {
               headers: {
                 ...corsHeaders,
@@ -7314,6 +7496,15 @@ export default {
           freshness,
           consistency_state: consistencyState,
         });
+        const diagnostics = computeCalibrationDiagnostics(convictionCalibration);
+        const ctaState = evaluateOpportunityCtaState(projectedFeed, diagnostics);
+        const actionabilityReasonCodes = Array.from(new Set([
+          ...(projectedFeed.items.length === 0 ? ['no_eligible_opportunities'] : []),
+          ...(projectedFeed.degraded_reason ? [`opportunity_${projectedFeed.degraded_reason}`] : []),
+          ...(ctaState.actionability_state === 'WATCH' ? ['watch_state'] : []),
+          ...(ctaState.actionability_state === 'ACTIONABLE' ? ['eligible_opportunities_available'] : []),
+          ...ctaState.cta_disabled_reasons.map((reason) => `cta_${reason}`),
+        ]));
         const responseItems = projectedFeed.items.slice(0, limit);
 
         return Response.json({
@@ -7323,7 +7514,14 @@ export default {
           suppressed_count: projectedFeed.suppressed_count,
           quality_filtered_count: projectedFeed.quality_filtered_count,
           coherence_suppressed_count: projectedFeed.coherence_suppressed_count,
+          suppression_by_reason: projectedFeed.suppression_by_reason,
+          quality_filter_rate: projectedFeed.quality_filter_rate,
+          coherence_fail_rate: projectedFeed.coherence_fail_rate,
           degraded_reason: projectedFeed.degraded_reason,
+          actionability_state: ctaState.actionability_state,
+          actionability_reason_codes: actionabilityReasonCodes,
+          cta_enabled: ctaState.cta_enabled,
+          cta_disabled_reasons: ctaState.cta_disabled_reasons,
         }, {
           headers: {
             ...corsHeaders,
@@ -8773,10 +8971,19 @@ export default {
           console.warn('Failed to attach plan reference blocks:', err);
         }
 
+        const actionability = resolvePlanActionability({
+          opportunity_ref: opportunityRef,
+          edge_quality,
+          freshness,
+          consistency: canonical.consistency,
+        });
+
         const payload: PlanPayload = {
           as_of: canonical.as_of,
           setup_summary: setupSummary,
           policy_state,
+          actionability_state: actionability.state,
+          actionability_reason_codes: actionability.reason_codes,
           action_now: {
             risk_allocation_target: risk_sizing.target_pct / 100,
             raw_signal_allocation_target: risk_sizing.raw_signal_allocation_target,
