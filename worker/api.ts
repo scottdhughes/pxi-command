@@ -3130,14 +3130,57 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
 
   const freshness = canonical.freshness;
 
-  const indicatorMovers = (indicatorRows.results || [])
+  let indicatorMovers = (indicatorRows.results || [])
     .map((row) => ({
       indicator_id: row.indicator_id,
       value_change: row.current_value - (row.previous_value ?? row.current_value),
       z_impact: row.current_norm - (row.previous_norm ?? row.current_norm),
     }))
+    .filter((row) => Number.isFinite(row.value_change) && Number.isFinite(row.z_impact))
+    .filter((row) => Math.abs(row.value_change) > 1e-12 || Math.abs(row.z_impact) > 1e-12)
     .sort((a, b) => Math.abs(b.z_impact) - Math.abs(a.z_impact))
     .slice(0, 5);
+
+  if (indicatorMovers.length === 0) {
+    const indicatorValueRows = await db.prepare(`
+      WITH latest_dates AS (
+        SELECT date
+        FROM indicator_values
+        GROUP BY date
+        ORDER BY date DESC
+        LIMIT 2
+      )
+      SELECT cur.indicator_id as indicator_id,
+             cur.value as current_value,
+             prev.value as previous_value
+      FROM indicator_values cur
+      LEFT JOIN indicator_values prev
+        ON prev.indicator_id = cur.indicator_id
+        AND prev.date = (SELECT MIN(date) FROM latest_dates)
+      WHERE cur.date = (SELECT MAX(date) FROM latest_dates)
+    `).all<{
+      indicator_id: string;
+      current_value: number;
+      previous_value: number | null;
+    }>();
+
+    indicatorMovers = (indicatorValueRows.results || [])
+      .map((row) => {
+        const prev = row.previous_value ?? row.current_value;
+        const valueChange = row.current_value - prev;
+        const denominator = Math.max(1e-6, Math.abs(prev));
+        const pctImpact = valueChange / denominator;
+        return {
+          indicator_id: row.indicator_id,
+          value_change: valueChange,
+          z_impact: clamp(-10, 10, pctImpact),
+        };
+      })
+      .filter((row) => Number.isFinite(row.value_change) && Number.isFinite(row.z_impact))
+      .filter((row) => Math.abs(row.value_change) > 1e-12 || Math.abs(row.z_impact) > 1e-12)
+      .sort((a, b) => Math.abs(b.z_impact) - Math.abs(a.z_impact))
+      .slice(0, 5);
+  }
 
   const scoreDelta = previous ? latest.score - previous.score : null;
   const regimeDelta = resolveRegimeDelta(currentRegime, previousRegime, scoreDelta);
@@ -3769,6 +3812,29 @@ function calibrationPenaltyPoints(quality: CalibrationQuality): number {
   return 16;
 }
 
+function removeLowInformationOpportunities(items: OpportunityItem[]): {
+  items: OpportunityItem[];
+  filtered_count: number;
+} {
+  const filtered = items.filter((item) => {
+    const lowInformation = item.calibration.quality === 'INSUFFICIENT' && item.expectancy.quality === 'INSUFFICIENT';
+    return !(item.direction === 'neutral' && lowInformation);
+  });
+
+  if (filtered.length > 0) {
+    return {
+      items: filtered,
+      filtered_count: Math.max(0, items.length - filtered.length),
+    };
+  }
+
+  const fallbackCount = Math.min(3, items.length);
+  return {
+    items: items.slice(0, fallbackCount),
+    filtered_count: Math.max(0, items.length - fallbackCount),
+  };
+}
+
 function applyQualityGateToConviction(rawConviction: number, qualityFactor: number): number {
   const bounded = clamp(0, 100, rawConviction);
   const factor = clamp(0.55, 1, qualityFactor);
@@ -3902,10 +3968,12 @@ async function buildOpportunitySnapshot(
     return a.theme_id.localeCompare(b.theme_id);
   });
 
+  const qualityFiltered = removeLowInformationOpportunities(items);
+
   return {
     as_of: `${latestPxi.date}T00:00:00.000Z`,
     horizon,
-    items,
+    items: qualityFiltered.items,
   };
 }
 
@@ -4024,10 +4092,12 @@ async function buildHistoricalOpportunitySnapshot(
     return a.theme_id.localeCompare(b.theme_id);
   });
 
+  const qualityFiltered = removeLowInformationOpportunities(items);
+
   return {
     as_of: `${asOfDate}T00:00:00.000Z`,
     horizon,
-    items,
+    items: qualityFiltered.items,
   };
 }
 
@@ -4139,16 +4209,21 @@ async function generateMarketEvents(
     }
   }
 
-  if (brief.freshness_status.has_stale_data || brief.freshness_status.stale_count > 0) {
+  const staleCount = Math.max(0, Math.floor(toNumber(brief.freshness_status.stale_count, 0)));
+  const criticalStaleCount = Math.max(0, Math.floor(toNumber(brief.freshness_status.critical_stale_count, 0)));
+  if (brief.freshness_status.has_stale_data || staleCount > 0) {
+    const severity: AlertSeverity = criticalStaleCount > 0 ? 'critical' : 'warning';
     events.push(buildMarketEvent(
       'freshness_warning',
       runDate,
-      'critical',
+      severity,
       'Data freshness warning',
-      `${brief.freshness_status.stale_count} indicator(s) are stale and may impact confidence.`,
+      criticalStaleCount > 0
+        ? `${staleCount} indicator(s) are stale (${criticalStaleCount} critical) and may impact confidence.`
+        : `${staleCount} non-critical indicator(s) are stale and may impact confidence.`,
       'market',
       'data_freshness',
-      { stale_count: brief.freshness_status.stale_count }
+      { stale_count: staleCount, critical_stale_count: criticalStaleCount }
     ));
   }
 
@@ -6718,14 +6793,15 @@ export default {
               ...calibrated,
               expectancy: normalizeOpportunityExpectancy(calibrated.expectancy, calibrated.direction),
             };
-          })
-          .slice(0, limit);
+          });
+        const qualityFiltered = removeLowInformationOpportunities(calibratedItems);
+        const responseItems = qualityFiltered.items.slice(0, limit);
 
         return Response.json({
           as_of: snapshot.as_of,
           horizon: snapshot.horizon,
-          items: calibratedItems,
-          degraded_reason: null,
+          items: responseItems,
+          degraded_reason: qualityFiltered.filtered_count > 0 ? 'quality_filtered' : null,
         }, {
           headers: {
             ...corsHeaders,

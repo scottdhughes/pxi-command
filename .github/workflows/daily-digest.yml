@@ -6,7 +6,9 @@ concurrency:
 
 on:
   schedule:
-    - cron: '0 13 * * *' # 8:00 AM ET (standard time)
+    # Run at both 12:00 and 13:00 UTC; a gate below keeps only true 8:00 AM ET.
+    - cron: '0 12 * * *'
+    - cron: '0 13 * * *'
   workflow_dispatch:
 
 jobs:
@@ -26,7 +28,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Gate scheduled run to 8:00 AM ET
+        id: et_gate
+        if: github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          et_hour="$(TZ=America/New_York date +%H)"
+          et_minute="$(TZ=America/New_York date +%M)"
+          if [[ "$et_hour" != "08" || "$et_minute" != "00" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### PXI Daily Digest Summary"
+              echo ""
+              echo "Skipped scheduled run outside 8:00 AM ET window."
+              echo "Current ET time: $(TZ=America/New_York date '+%Y-%m-%d %H:%M %Z')"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Dispatch daily digest
+        if: github.event_name != 'schedule' || steps.et_gate.outputs.skip != 'true'
         env:
           WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
           WRITE_API_URL: ${{ secrets.WRITE_API_URL }}

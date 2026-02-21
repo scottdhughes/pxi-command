@@ -176,6 +176,98 @@ function applyRouteMetadata(route: AppRoute) {
   setJsonLd(meta.jsonLd)
 }
 
+interface RouteFetchPlan {
+  poll: boolean
+  pxi: boolean
+  signal: boolean
+  plan: boolean
+  prediction: boolean
+  ensemble: boolean
+  accuracy: boolean
+  history: boolean
+  alertsHistory: boolean
+  brief: boolean
+  opportunities: boolean
+  inbox: boolean
+  signalsDetail: boolean
+  similar: boolean
+  backtest: boolean
+}
+
+const EMPTY_FETCH_PLAN: RouteFetchPlan = {
+  poll: false,
+  pxi: false,
+  signal: false,
+  plan: false,
+  prediction: false,
+  ensemble: false,
+  accuracy: false,
+  history: false,
+  alertsHistory: false,
+  brief: false,
+  opportunities: false,
+  inbox: false,
+  signalsDetail: false,
+  similar: false,
+  backtest: false,
+}
+
+function getRouteFetchPlan(route: AppRoute): RouteFetchPlan {
+  if (route === '/') {
+    return {
+      poll: true,
+      pxi: true,
+      signal: true,
+      plan: true,
+      prediction: true,
+      ensemble: true,
+      accuracy: true,
+      history: true,
+      alertsHistory: true,
+      brief: true,
+      opportunities: true,
+      inbox: true,
+      signalsDetail: true,
+      similar: true,
+      backtest: true,
+    }
+  }
+
+  if (route === '/alerts') {
+    return {
+      ...EMPTY_FETCH_PLAN,
+      poll: true,
+      alertsHistory: true,
+    }
+  }
+
+  if (route === '/brief') {
+    return {
+      ...EMPTY_FETCH_PLAN,
+      poll: true,
+      brief: true,
+    }
+  }
+
+  if (route === '/opportunities') {
+    return {
+      ...EMPTY_FETCH_PLAN,
+      poll: true,
+      opportunities: true,
+    }
+  }
+
+  if (route === '/inbox') {
+    return {
+      ...EMPTY_FETCH_PLAN,
+      poll: true,
+      inbox: true,
+    }
+  }
+
+  return EMPTY_FETCH_PLAN
+}
+
 const API_PRIMARY = 'https://api.pxicommand.com'
 const API_ROLLBACK = 'https://pxi-api.novoamorx1.workers.dev'
 let pinnedApiBase: string | null = null
@@ -413,6 +505,7 @@ interface OpportunitiesResponse {
   as_of: string
   horizon: '7d' | '30d'
   items: OpportunityItem[]
+  degraded_reason?: string | null
 }
 
 interface MarketFeedAlert {
@@ -1397,8 +1490,19 @@ function PredictionCard({ prediction }: { prediction: PredictionData }) {
 }
 
 // ============== Onboarding / Guide ==============
-function OnboardingModal({ onClose, inPage = false }: { onClose: () => void; inPage?: boolean }) {
+function OnboardingModal({
+  onClose,
+  inPage = false,
+  exampleScore,
+}: {
+  onClose: () => void;
+  inPage?: boolean;
+  exampleScore?: number;
+}) {
   const [step, setStep] = useState(0)
+  const hasLiveScore = typeof exampleScore === 'number' && Number.isFinite(exampleScore)
+  const displayScore = hasLiveScore ? Math.round(exampleScore) : 53
+  const scoreLabel = hasLiveScore ? 'Live Score' : 'Example Score'
 
   const steps = [
     {
@@ -1410,8 +1514,8 @@ function OnboardingModal({ onClose, inPage = false }: { onClose: () => void; inP
           </p>
           <div className="bg-[#0a0a0a] rounded-lg p-4 border border-[#26272b]">
             <div className="text-center">
-              <div className="text-6xl font-extralight text-[#f3f3f3] mb-2">53</div>
-              <div className="text-[10px] text-[#949ba5]/60 uppercase tracking-widest">Example Score</div>
+              <div className="text-6xl font-extralight text-[#f3f3f3] mb-2">{displayScore}</div>
+              <div className="text-[10px] text-[#949ba5]/60 uppercase tracking-widest">{scoreLabel}</div>
             </div>
           </div>
           <p className="text-[11px] text-[#949ba5]/70">
@@ -2793,6 +2897,12 @@ function OpportunitiesPage({
           </button>
         </div>
 
+        {data?.degraded_reason === 'quality_filtered' && (
+          <div className="mb-4 text-[10px] text-[#f59e0b]">
+            Low-information neutral setups were filtered from this feed.
+          </div>
+        )}
+
         {!data || data.items.length === 0 ? (
           <div className="text-[#949ba5]">No opportunities available yet.</div>
         ) : (
@@ -3842,11 +3952,15 @@ function App() {
     applyRouteMetadata(route)
   }, [route])
 
-  // v1.4: Check for first visit on mount
+  // Keep onboarding opt-in via /guide instead of forcing a modal on first visit.
   useEffect(() => {
-    const hasSeenOnboarding = localStorage.getItem('pxi_onboarding_complete')
-    if (!hasSeenOnboarding) {
-      setShowOnboarding(true)
+    try {
+      const hasSeenOnboarding = localStorage.getItem('pxi_onboarding_complete')
+      if (!hasSeenOnboarding) {
+        localStorage.setItem('pxi_onboarding_complete', 'true')
+      }
+    } catch {
+      // Ignore localStorage failures in private browsing environments.
     }
   }, [])
 
@@ -3919,28 +4033,42 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const fetchPlan = getRouteFetchPlan(route)
+    const hasWork = Object.values(fetchPlan).some(Boolean)
+    const isHomeRoute = route === '/'
+
+    if (!hasWork) {
+      setLoading(false)
+      setError(null)
+      return
+    }
+
     const fetchData = async () => {
       try {
-        // Fetch PXI data, signal data, predictions, ML ensemble, accuracy, history, alerts, and product APIs in parallel
+        if (isHomeRoute) {
+          setLoading(true)
+        }
+
         const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, oppRes, inboxRes] = await Promise.all([
-          fetchApi('/api/pxi'),
-          fetchApi('/api/signal').catch(() => null),  // v1.1
-          fetchApi('/api/plan').catch(() => null),
-          fetchApi('/api/predict').catch(() => null),
-          fetchApi('/api/ml/ensemble').catch(() => null),  // Ensemble
-          fetchApi('/api/ml/accuracy').catch(() => null),  // v1.4: ML accuracy
-          fetchApi('/api/history?days=90').catch(() => null),  // v1.4: Historical data
-          fetchApi('/api/alerts?limit=50').catch(() => null),  // v1.5: Alert history
-          fetchApi('/api/brief?scope=market').catch(() => null),
-          fetchApi(`/api/opportunities?horizon=${opportunityHorizon}&limit=20`).catch(() => null),
-          fetchApi('/api/alerts/feed?limit=50').catch(() => null),
+          fetchPlan.pxi ? fetchApi('/api/pxi') : Promise.resolve(null),
+          fetchPlan.signal ? fetchApi('/api/signal').catch(() => null) : Promise.resolve(null),
+          fetchPlan.plan ? fetchApi('/api/plan').catch(() => null) : Promise.resolve(null),
+          fetchPlan.prediction ? fetchApi('/api/predict').catch(() => null) : Promise.resolve(null),
+          fetchPlan.ensemble ? fetchApi('/api/ml/ensemble').catch(() => null) : Promise.resolve(null),
+          fetchPlan.accuracy ? fetchApi('/api/ml/accuracy').catch(() => null) : Promise.resolve(null),
+          fetchPlan.history ? fetchApi('/api/history?days=90').catch(() => null) : Promise.resolve(null),
+          fetchPlan.alertsHistory ? fetchApi('/api/alerts?limit=50').catch(() => null) : Promise.resolve(null),
+          fetchPlan.brief ? fetchApi('/api/brief?scope=market').catch(() => null) : Promise.resolve(null),
+          fetchPlan.opportunities ? fetchApi(`/api/opportunities?horizon=${opportunityHorizon}&limit=20`).catch(() => null) : Promise.resolve(null),
+          fetchPlan.inbox ? fetchApi('/api/alerts/feed?limit=50').catch(() => null) : Promise.resolve(null),
         ])
 
-        if (!pxiRes.ok) throw new Error('Failed to fetch')
-        const pxiJson = await pxiRes.json()
-        setData(pxiJson)
+        if (fetchPlan.pxi) {
+          if (!pxiRes?.ok) throw new Error('Failed to fetch')
+          const pxiJson = await pxiRes.json()
+          setData(pxiJson)
+        }
 
-        // v1.1: Signal data
         if (signalRes?.ok) {
           const signalJson = await signalRes.json()
           if (!signalJson.error) {
@@ -4002,7 +4130,6 @@ function App() {
           }
         }
 
-        // Predictions are optional - don't fail if unavailable
         if (predRes?.ok) {
           const predJson = await predRes.json()
           if (!predJson.error) {
@@ -4010,7 +4137,6 @@ function App() {
           }
         }
 
-        // ML Ensemble predictions
         if (ensembleRes?.ok) {
           const ensembleJson = await ensembleRes.json()
           if (!ensembleJson.error) {
@@ -4018,7 +4144,6 @@ function App() {
           }
         }
 
-        // v1.4: ML accuracy data - parse API response to display format
         if (accuracyRes?.ok) {
           const accuracyJson = await accuracyRes.json() as MLAccuracyApiResponse
           if (!accuracyJson.error) {
@@ -4029,7 +4154,6 @@ function App() {
           }
         }
 
-        // v1.4: Historical data for chart - use sparkline as fallback
         if (historyRes?.ok) {
           const historyJson = await historyRes.json() as { data?: HistoryDataPoint[]; error?: string }
           if (historyJson.data && Array.isArray(historyJson.data)) {
@@ -4037,7 +4161,6 @@ function App() {
           }
         }
 
-        // v1.5: Alert history data
         if (alertsRes?.ok) {
           const alertsJson = await alertsRes.json() as AlertsApiResponse
           if (alertsJson.alerts) {
@@ -4085,84 +4208,75 @@ function App() {
           }
         }
 
-        // v1.5: Signals data - fetch latest run from signals API
-        try {
-          const signalsApiUrl = '/signals/api/runs'
-          const signalsRunsRes = await fetch(`${signalsApiUrl}?status=ok`)
-          if (signalsRunsRes.ok) {
-            const runsJson = await signalsRunsRes.json() as { runs: SignalsRunSummary[] }
-            if (runsJson.runs && runsJson.runs.length > 0) {
-              const latestRunId = runsJson.runs[0].id
-              const signalsDetailRes = await fetch(`${signalsApiUrl}/${latestRunId}`)
-              if (signalsDetailRes.ok) {
-                const signalsJson = await signalsDetailRes.json() as SignalsData
-                setSignalsData(signalsJson)
+        if (fetchPlan.signalsDetail) {
+          try {
+            const signalsApiUrl = '/signals/api/runs'
+            const signalsRunsRes = await fetch(`${signalsApiUrl}?status=ok`)
+            if (signalsRunsRes.ok) {
+              const runsJson = await signalsRunsRes.json() as { runs: SignalsRunSummary[] }
+              if (runsJson.runs && runsJson.runs.length > 0) {
+                const latestRunId = runsJson.runs[0].id
+                const signalsDetailRes = await fetch(`${signalsApiUrl}/${latestRunId}`)
+                if (signalsDetailRes.ok) {
+                  const signalsJson = await signalsDetailRes.json() as SignalsData
+                  setSignalsData(signalsJson)
+                }
               }
             }
+          } catch {
+            // Signals are optional, don't fail
           }
-        } catch {
-          // Signals are optional, don't fail
         }
 
-        // v1.6: Similar periods data
-        try {
-          const similarRes = await fetchApi('/api/similar')
-          if (similarRes.ok) {
-            const similarJson = await similarRes.json() as SimilarPeriodsData
-            if (similarJson.similar_periods) {
-              setSimilarData(similarJson)
+        if (fetchPlan.similar) {
+          try {
+            const similarRes = await fetchApi('/api/similar')
+            if (similarRes.ok) {
+              const similarJson = await similarRes.json() as SimilarPeriodsData
+              if (similarJson.similar_periods) {
+                setSimilarData(similarJson)
+              }
             }
+          } catch {
+            // Similar periods are optional
           }
-        } catch {
-          // Similar periods are optional
         }
 
-        // v1.6: Backtest data
-        try {
-          const backtestRes = await fetchApi('/api/backtest')
-          if (backtestRes.ok) {
-            const backtestJson = await backtestRes.json() as BacktestData
-            if (backtestJson.bucket_analysis) {
-              setBacktestData(backtestJson)
+        if (fetchPlan.backtest) {
+          try {
+            const backtestRes = await fetchApi('/api/backtest')
+            if (backtestRes.ok) {
+              const backtestJson = await backtestRes.json() as BacktestData
+              if (backtestJson.bucket_analysis) {
+                setBacktestData(backtestJson)
+              }
             }
+          } catch {
+            // Backtest is optional
           }
-        } catch {
-          // Backtest is optional
         }
 
         setError(null)
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Unknown error'
-        setError(message)
+        if (isHomeRoute) {
+          const message = err instanceof Error ? err.message : 'Unknown error'
+          setError(message)
+        }
       } finally {
-        setLoading(false)
+        if (isHomeRoute) {
+          setLoading(false)
+        }
       }
     }
 
     fetchData()
+    if (!fetchPlan.poll) {
+      return
+    }
+
     const interval = setInterval(fetchData, 5 * 60 * 1000)
     return () => clearInterval(interval)
-  }, [opportunityHorizon])
-
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-black flex items-center justify-center">
-        <div className="text-[#949ba5] text-sm tracking-widest uppercase animate-pulse">
-          loading
-        </div>
-      </div>
-    )
-  }
-
-  if (error || !data) {
-    return (
-      <div className="min-h-screen bg-black flex items-center justify-center">
-        <div className="text-[#949ba5] text-sm">
-          {error || 'No data available'}
-        </div>
-      </div>
-    )
-  }
+  }, [route, opportunityHorizon])
 
   if (route === '/spec') {
     return <SpecPage onClose={() => navigateTo('/')} inPage />
@@ -4191,7 +4305,7 @@ function App() {
   }
 
   if (route === '/guide') {
-    return <OnboardingModal onClose={() => navigateTo('/')} inPage />
+    return <OnboardingModal onClose={() => navigateTo('/')} inPage exampleScore={data?.score} />
   }
 
   if (route === '/brief') {
@@ -4220,6 +4334,26 @@ function App() {
     )
   }
 
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <div className="text-[#949ba5] text-sm tracking-widest uppercase animate-pulse">
+          loading
+        </div>
+      </div>
+    )
+  }
+
+  if (error || !data) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <div className="text-[#949ba5] text-sm">
+          {error || 'No data available'}
+        </div>
+      </div>
+    )
+  }
+
   // v1.4: Handler to close onboarding and persist preference
   const handleCloseOnboarding = () => {
     setShowOnboarding(false)
@@ -4243,7 +4377,7 @@ function App() {
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] flex flex-col items-center justify-center px-4 sm:px-8 py-12 sm:py-16">
       {/* v1.4: Onboarding Modal */}
-      {showOnboarding && <OnboardingModal onClose={handleCloseOnboarding} />}
+      {showOnboarding && <OnboardingModal onClose={handleCloseOnboarding} exampleScore={data.score} />}
 
       {/* v1.5: Category Deep-Dive Modal */}
       {selectedCategory && (
