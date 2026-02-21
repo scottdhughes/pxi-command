@@ -133,6 +133,7 @@ pxi-command/
 | `/api/plan` | GET | Canonical decision object for homepage (policy state, uncertainty, consistency, trader playbook) |
 | `/api/market/consistency` | GET | Latest decision consistency score/state/violations |
 | `/api/ops/freshness-slo` | GET | Rolling 7d/30d freshness SLO attainment and recent critical stale incidents |
+| `/api/ops/utility-funnel` | GET | Rolling utility funnel metrics (session -> decision views -> no-action unlock coverage) |
 
 ### Product Layer (Phase 1)
 | Endpoint | Method | Description |
@@ -145,6 +146,7 @@ pxi-command/
 | `/api/alerts/subscribe/start` | POST | Start email digest subscription with verification token |
 | `/api/alerts/subscribe/verify` | POST | Verify subscription token and activate email digest |
 | `/api/alerts/unsubscribe` | POST | Unsubscribe via token |
+| `/api/metrics/utility-event` | POST | Record lightweight product utility telemetry events (session, decision view, no-action unlock) |
 
 ### ML & Predictions
 | Endpoint | Method | Description |
@@ -297,6 +299,16 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
   - `overdue_seconds`
 - CTA is hard-disabled when `ttl_state` is `overdue` or `unknown`.
 - Cache policy is timebox-aware: overdue/unknown states return `Cache-Control: no-store` to avoid stale hard-CTA exposure.
+
+9. **Utility funnel instrumentation (Phase 3)**
+- New ingestion endpoint: `POST /api/metrics/utility-event`.
+- New ops endpoint: `GET /api/ops/utility-funnel?window=7|30`.
+- Frontend now emits additive utility events for:
+  - `session_start`
+  - `plan_view`
+  - `opportunities_view`
+  - decision-state exposures (`decision_actionable_view|decision_watch_view|decision_no_action_view`)
+  - `no_action_unlock_view` (tracks no-action days as positive threshold-communication workflow events)
 
 ## Scheduler Ownership Runbook
 

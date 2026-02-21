@@ -328,6 +328,7 @@ CREATE TABLE IF NOT EXISTS market_refresh_runs (
     calibrations_generated INTEGER DEFAULT 0,
     alerts_generated INTEGER DEFAULT 0,
     stale_count INTEGER,
+    critical_stale_count INTEGER,
     as_of TEXT,
     error TEXT,
     created_at TEXT DEFAULT (datetime('now'))
@@ -365,3 +366,17 @@ CREATE TABLE IF NOT EXISTS market_alert_deliveries (
 
 CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_event ON market_alert_deliveries(event_id, attempted_at DESC);
 CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_subscriber ON market_alert_deliveries(subscriber_id, attempted_at DESC);
+
+CREATE TABLE IF NOT EXISTS market_utility_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    route TEXT,
+    actionability_state TEXT,
+    payload_json TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_utility_events_created ON market_utility_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_utility_events_type ON market_utility_events(event_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_utility_events_session ON market_utility_events(session_id, created_at DESC);

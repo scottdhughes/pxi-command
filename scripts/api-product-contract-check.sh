@@ -4,6 +4,8 @@ set -euo pipefail
 API_URL="${1:-${API_URL:-https://api.pxicommand.com}}"
 EDGE_DIAGNOSTICS_REQUIRED="${EDGE_DIAGNOSTICS_REQUIRED:-0}"
 OPPORTUNITY_TTL_GRACE_SECONDS="${OPPORTUNITY_TTL_GRACE_SECONDS:-5400}"
+UTILITY_FUNNEL_REQUIRED="${UTILITY_FUNNEL_REQUIRED:-0}"
+UTILITY_FUNNEL_LIVE=0
 
 TMP_HEADERS="$(mktemp)"
 TMP_BODY="$(mktemp)"
@@ -51,6 +53,27 @@ edge_diagnostics_available() {
   fi
 
   echo "Unexpected status for /api/diagnostics/edge: $code"
+  cat "$TMP_BODY" || true
+  exit 1
+}
+
+utility_funnel_available() {
+  local code
+  code=$(curl -sS -o "$TMP_BODY" -w "%{http_code}" --max-time 20 "$API_URL/api/ops/utility-funnel?window=7")
+  if [[ "$code" == "200" ]]; then
+    return 0
+  fi
+
+  if [[ "$code" == "404" ]]; then
+    if [[ "$UTILITY_FUNNEL_REQUIRED" == "1" ]]; then
+      echo "Utility funnel endpoint is required but returned 404"
+      exit 1
+    fi
+    echo "Skipping utility funnel checks: /api/ops/utility-funnel is not live yet."
+    return 1
+  fi
+
+  echo "Unexpected status for /api/ops/utility-funnel: $code"
   cat "$TMP_BODY" || true
   exit 1
 }
@@ -665,6 +688,35 @@ check_edge_diagnostics_contract() {
   fi
 }
 
+check_utility_funnel_semantics() {
+  local utility_json
+  local sessions
+  local decision_total
+  local no_action_views
+  local unlock_views
+  local unlock_coverage
+
+  utility_json=$(curl -sS --max-time 20 "$API_URL/api/ops/utility-funnel?window=7")
+
+  sessions=$(echo "$utility_json" | jq -r '.funnel.unique_sessions // -1')
+  decision_total=$(echo "$utility_json" | jq -r '.funnel.decision_events_total // -1')
+  no_action_views=$(echo "$utility_json" | jq -r '.funnel.decision_no_action_views // -1')
+  unlock_views=$(echo "$utility_json" | jq -r '.funnel.no_action_unlock_views // -1')
+  unlock_coverage=$(echo "$utility_json" | jq -r '.funnel.no_action_unlock_coverage_pct // -1')
+
+  if ! awk "BEGIN { exit !($sessions >= 0 && $decision_total >= 0 && $no_action_views >= 0 && $unlock_views >= 0) }"; then
+    echo "Utility funnel counts must be non-negative"
+    echo "$utility_json"
+    exit 1
+  fi
+
+  if ! awk "BEGIN { exit !($unlock_coverage >= 0 && $unlock_coverage <= 100) }"; then
+    echo "Utility funnel coverage must be within [0,100]"
+    echo "$utility_json"
+    exit 1
+  fi
+}
+
 check_api_json_contract "/api/plan" \
   'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number"))) and ((has("cross_horizon")|not) or ((.cross_horizon.as_of|type=="string") and (.cross_horizon.state|type=="string") and (.cross_horizon.eligible_7d|type=="number") and (.cross_horizon.eligible_30d|type=="number") and ((.cross_horizon.top_direction_7d==null) or (.cross_horizon.top_direction_7d|type=="string")) and ((.cross_horizon.top_direction_30d==null) or (.cross_horizon.top_direction_30d|type=="string")) and (.cross_horizon.rationale_codes|type=="array") and (all(.cross_horizon.rationale_codes[]?; type=="string")) and ((.cross_horizon.invalidation_note==null) or (.cross_horizon.invalidation_note|type=="string")))) and ((has("decision_stack")|not) or ((.decision_stack.what_changed|type=="string") and (.decision_stack.what_to_do|type=="string") and (.decision_stack.why_now|type=="string") and (.decision_stack.confidence|type=="string") and (.decision_stack.cta_state|type=="string")))' \
   "plan"
@@ -707,6 +759,13 @@ if edge_diagnostics_available; then
     "diagnostics-edge"
 fi
 
+if utility_funnel_available; then
+  check_api_json_contract "/api/ops/utility-funnel?window=7" \
+    'type=="object" and (.as_of|type=="string") and (.funnel.window_days|type=="number") and (.funnel.days_observed|type=="number") and (.funnel.total_events|type=="number") and (.funnel.unique_sessions|type=="number") and (.funnel.plan_views|type=="number") and (.funnel.opportunities_views|type=="number") and (.funnel.decision_actionable_views|type=="number") and (.funnel.decision_watch_views|type=="number") and (.funnel.decision_no_action_views|type=="number") and (.funnel.no_action_unlock_views|type=="number") and (.funnel.decision_events_total|type=="number") and (.funnel.decision_events_per_session|type=="number") and (.funnel.no_action_unlock_coverage_pct|type=="number") and ((.funnel.last_event_at==null) or (.funnel.last_event_at|type=="string"))' \
+    "utility-funnel"
+  UTILITY_FUNNEL_LIVE=1
+fi
+
 check_api_json_contract "/api/ops/freshness-slo" \
   'type=="object" and (.as_of|type=="string") and (.windows["7d"].days_observed|type=="number") and (.windows["7d"].days_with_critical_stale|type=="number") and (.windows["7d"].slo_attainment_pct|type=="number") and (.windows["7d"].recent_incidents|type=="array") and (.windows["7d"].incident_impact.state|type=="string") and (.windows["7d"].incident_impact.stale_days|type=="number") and (.windows["7d"].incident_impact.warning_events|type=="number") and (.windows["7d"].incident_impact.critical_events|type=="number") and (.windows["7d"].incident_impact.estimated_suppressed_days|type=="number") and ((.windows["7d"].incident_impact.latest_warning_event==null) or (.windows["7d"].incident_impact.latest_warning_event.created_at|type=="string")) and ((.windows["7d"].incident_impact.latest_warning_event==null) or (.windows["7d"].incident_impact.latest_warning_event.severity|type=="string")) and (.windows["30d"].days_observed|type=="number") and (.windows["30d"].days_with_critical_stale|type=="number") and (.windows["30d"].slo_attainment_pct|type=="number") and (.windows["30d"].recent_incidents|type=="array") and (.windows["30d"].incident_impact.state|type=="string") and (.windows["30d"].incident_impact.stale_days|type=="number") and (.windows["30d"].incident_impact.warning_events|type=="number") and (.windows["30d"].incident_impact.critical_events|type=="number") and (.windows["30d"].incident_impact.estimated_suppressed_days|type=="number") and ((.windows["30d"].incident_impact.latest_warning_event==null) or (.windows["30d"].incident_impact.latest_warning_event.created_at|type=="string")) and ((.windows["30d"].incident_impact.latest_warning_event==null) or (.windows["30d"].incident_impact.latest_warning_event.severity|type=="string"))' \
   "freshness-slo"
@@ -724,6 +783,9 @@ check_ml_low_sample_semantics
 check_opportunity_coherence_contract
 if edge_diagnostics_available; then
   check_edge_diagnostics_contract
+fi
+if [[ "$UTILITY_FUNNEL_LIVE" == "1" ]]; then
+  check_utility_funnel_semantics
 fi
 
 echo "Product API contract checks passed against $API_URL"

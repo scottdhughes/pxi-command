@@ -1,7 +1,15 @@
-import { useEffect, useState, useRef } from 'react'
+import { useCallback, useEffect, useState, useRef } from 'react'
 import './App.css'
 
 type AppRoute = '/' | '/spec' | '/alerts' | '/guide' | '/brief' | '/opportunities' | '/inbox'
+type UtilityEventType =
+  | 'session_start'
+  | 'plan_view'
+  | 'opportunities_view'
+  | 'decision_actionable_view'
+  | 'decision_watch_view'
+  | 'decision_no_action_view'
+  | 'no_action_unlock_view'
 
 interface RouteMeta {
   title: string
@@ -309,6 +317,39 @@ async function fetchApi(path: string, init?: RequestInit): Promise<Response> {
   }
 
   throw lastError instanceof Error ? lastError : new Error('API fetch failed')
+}
+
+function generateUtilitySessionId(): string {
+  if (typeof window !== 'undefined' && typeof window.crypto !== 'undefined') {
+    const bytes = new Uint8Array(10)
+    window.crypto.getRandomValues(bytes)
+    const token = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')
+    return `ux_${token}`
+  }
+  return `ux_${Math.random().toString(36).slice(2, 18)}`
+}
+
+function getOrCreateUtilitySessionId(): string {
+  if (typeof window === 'undefined') {
+    return generateUtilitySessionId()
+  }
+  try {
+    const existing = window.localStorage.getItem('pxi_utility_session_id')
+    if (existing && /^ux_[A-Za-z0-9_-]{10,}$/.test(existing)) {
+      return existing
+    }
+    const next = generateUtilitySessionId()
+    window.localStorage.setItem('pxi_utility_session_id', next)
+    return next
+  } catch {
+    return generateUtilitySessionId()
+  }
+}
+
+function utilityDecisionEventForState(state: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION' | null | undefined): UtilityEventType {
+  if (state === 'ACTIONABLE') return 'decision_actionable_view'
+  if (state === 'NO_ACTION') return 'decision_no_action_view'
+  return 'decision_watch_view'
 }
 
 // ============== ML Accuracy Data Interface ==============
@@ -4424,6 +4465,42 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const utilitySessionIdRef = useRef<string>(getOrCreateUtilitySessionId())
+  const utilitySeenRef = useRef<Set<string>>(new Set())
+
+  const trackUtilityEvent = useCallback((eventType: UtilityEventType, args?: {
+    route?: AppRoute
+    actionabilityState?: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION' | null
+    metadata?: Record<string, unknown>
+    dedupeKey?: string
+  }) => {
+    const dedupeKey = args?.dedupeKey?.trim()
+    if (dedupeKey && utilitySeenRef.current.has(dedupeKey)) {
+      return
+    }
+    if (dedupeKey) {
+      utilitySeenRef.current.add(dedupeKey)
+    }
+
+    const payload = {
+      session_id: utilitySessionIdRef.current,
+      event_type: eventType,
+      route: args?.route || route,
+      actionability_state: args?.actionabilityState ?? null,
+      metadata: args?.metadata || null,
+    }
+
+    fetchApi('/api/metrics/utility-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      keepalive: true,
+    }).catch(() => {
+      if (dedupeKey) {
+        utilitySeenRef.current.delete(dedupeKey)
+      }
+    })
+  }, [route])
 
   const navigateTo = (nextRoute: AppRoute) => {
     const path = normalizeRoute(nextRoute)
@@ -4439,6 +4516,106 @@ function App() {
   useEffect(() => {
     applyRouteMetadata(route)
   }, [route])
+
+  useEffect(() => {
+    trackUtilityEvent('session_start', {
+      route,
+      metadata: { entry_route: route },
+      dedupeKey: 'session_start',
+    })
+  }, [route, trackUtilityEvent])
+
+  useEffect(() => {
+    if (route !== '/' || !planData) {
+      return
+    }
+
+    const actionabilityState = planData.actionability_state || (planData.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH')
+    const dedupeBase = `${planData.as_of}:${actionabilityState}:${route}`
+
+    trackUtilityEvent('plan_view', {
+      route,
+      actionabilityState,
+      metadata: {
+        as_of: planData.as_of,
+        cross_horizon_state: planData.cross_horizon?.state || null,
+        consistency_state: planData.consistency.state,
+      },
+      dedupeKey: `plan_view:${dedupeBase}`,
+    })
+
+    trackUtilityEvent(utilityDecisionEventForState(actionabilityState), {
+      route,
+      actionabilityState,
+      metadata: {
+        as_of: planData.as_of,
+        source: 'plan',
+      },
+      dedupeKey: `decision_view:${dedupeBase}`,
+    })
+
+    if (actionabilityState === 'NO_ACTION') {
+      trackUtilityEvent('no_action_unlock_view', {
+        route,
+        actionabilityState,
+        metadata: {
+          as_of: planData.as_of,
+          source: 'plan',
+          thresholds_communicated: true,
+          reason_codes: planData.actionability_reason_codes || [],
+        },
+        dedupeKey: `unlock_view:${dedupeBase}`,
+      })
+    }
+  }, [planData, route, trackUtilityEvent])
+
+  useEffect(() => {
+    if (route !== '/opportunities' || !opportunitiesData) {
+      return
+    }
+
+    const actionabilityState = opportunitiesData.actionability_state || (opportunitiesData.items.length > 0 ? 'WATCH' : 'NO_ACTION')
+    const dedupeBase = `${opportunitiesData.as_of}:${opportunityHorizon}:${actionabilityState}:${route}`
+
+    trackUtilityEvent('opportunities_view', {
+      route,
+      actionabilityState,
+      metadata: {
+        as_of: opportunitiesData.as_of,
+        horizon: opportunityHorizon,
+        published_count: opportunitiesData.items.length,
+        suppressed_count: opportunitiesData.suppressed_count,
+        ttl_state: opportunitiesData.ttl_state || 'unknown',
+      },
+      dedupeKey: `opportunities_view:${dedupeBase}`,
+    })
+
+    trackUtilityEvent(utilityDecisionEventForState(actionabilityState), {
+      route,
+      actionabilityState,
+      metadata: {
+        as_of: opportunitiesData.as_of,
+        horizon: opportunityHorizon,
+        source: 'opportunities',
+      },
+      dedupeKey: `decision_view:${dedupeBase}`,
+    })
+
+    if (actionabilityState === 'NO_ACTION') {
+      trackUtilityEvent('no_action_unlock_view', {
+        route,
+        actionabilityState,
+        metadata: {
+          as_of: opportunitiesData.as_of,
+          horizon: opportunityHorizon,
+          source: 'opportunities',
+          thresholds_communicated: true,
+          reason_codes: opportunitiesData.actionability_reason_codes || [],
+        },
+        dedupeKey: `unlock_view:${dedupeBase}`,
+      })
+    }
+  }, [opportunitiesData, opportunityHorizon, route, trackUtilityEvent])
 
   // Keep onboarding opt-in via /guide instead of forcing a modal on first visit.
   useEffect(() => {

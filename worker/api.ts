@@ -1048,6 +1048,14 @@ type CalibrationQuality = 'ROBUST' | 'LIMITED' | 'INSUFFICIENT';
 type CoverageQuality = CalibrationQuality;
 type PlanActionabilityState = 'ACTIONABLE' | 'WATCH' | 'NO_ACTION';
 type OpportunityTtlState = 'fresh' | 'stale' | 'overdue' | 'unknown';
+type UtilityEventType =
+  | 'session_start'
+  | 'plan_view'
+  | 'opportunities_view'
+  | 'decision_actionable_view'
+  | 'decision_watch_view'
+  | 'decision_no_action_view'
+  | 'no_action_unlock_view';
 type PlanActionabilityReasonCode =
   | 'critical_data_quality_block'
   | 'consistency_fail_block'
@@ -1279,6 +1287,32 @@ interface OpportunityTtlMetadata {
   overdue_seconds: number | null;
 }
 
+interface UtilityEventInsertPayload {
+  session_id: string;
+  event_type: UtilityEventType;
+  route: string | null;
+  actionability_state: PlanActionabilityState | null;
+  payload_json: string | null;
+  created_at: string;
+}
+
+interface UtilityFunnelSummary {
+  window_days: number;
+  days_observed: number;
+  total_events: number;
+  unique_sessions: number;
+  plan_views: number;
+  opportunities_views: number;
+  decision_actionable_views: number;
+  decision_watch_views: number;
+  decision_no_action_views: number;
+  no_action_unlock_views: number;
+  decision_events_total: number;
+  decision_events_per_session: number;
+  no_action_unlock_coverage_pct: number;
+  last_event_at: string | null;
+}
+
 interface MarketAlertEvent {
   id: string;
   event_type: MarketAlertType;
@@ -1485,6 +1519,27 @@ const RATE_WINDOW = 60 * 1000;
 const ADMIN_RATE_LIMIT = 20;
 const ADMIN_RATE_WINDOW = 60 * 1000;
 const MAX_BACKFILL_LIMIT = 365;
+const UTILITY_EVENT_TYPES: UtilityEventType[] = [
+  'session_start',
+  'plan_view',
+  'opportunities_view',
+  'decision_actionable_view',
+  'decision_watch_view',
+  'decision_no_action_view',
+  'no_action_unlock_view',
+];
+const UTILITY_ROUTE_ALLOWLIST = new Set<string>([
+  '/',
+  '/brief',
+  '/opportunities',
+  '/inbox',
+  '/alerts',
+  '/spec',
+  '/guide',
+]);
+const UTILITY_SESSION_ID_RE = /^[A-Za-z0-9_-]{12,96}$/;
+const UTILITY_PAYLOAD_MAX_CHARS = 2000;
+const UTILITY_WINDOW_DAY_OPTIONS = new Set<number>([7, 30]);
 
 function checkRateLimitStore(
   ip: string,
@@ -2928,6 +2983,52 @@ async function parseJsonBody<T>(request: Request): Promise<T | null> {
   }
 }
 
+function normalizeUtilityEventType(value: unknown): UtilityEventType | null {
+  if (typeof value !== 'string') return null;
+  const candidate = value.trim() as UtilityEventType;
+  if (!UTILITY_EVENT_TYPES.includes(candidate)) {
+    return null;
+  }
+  return candidate;
+}
+
+function normalizeUtilitySessionId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const sessionId = value.trim();
+  if (!UTILITY_SESSION_ID_RE.test(sessionId)) {
+    return null;
+  }
+  return sessionId;
+}
+
+function normalizeUtilityRoute(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const route = value.trim();
+  if (!route || route.length > 64) return null;
+  if (!UTILITY_ROUTE_ALLOWLIST.has(route)) return null;
+  return route;
+}
+
+function normalizeUtilityActionabilityState(value: unknown): PlanActionabilityState | null {
+  if (value === 'ACTIONABLE' || value === 'WATCH' || value === 'NO_ACTION') {
+    return value;
+  }
+  return null;
+}
+
+function sanitizeUtilityPayload(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized.length > UTILITY_PAYLOAD_MAX_CHARS) {
+      return serialized.slice(0, UTILITY_PAYLOAD_MAX_CHARS);
+    }
+    return serialized;
+  } catch {
+    return null;
+  }
+}
+
 function indicatorName(indicatorId: string): string {
   const map: Record<string, string> = {
     vix: 'VIX',
@@ -3510,6 +3611,21 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
     }
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS market_utility_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        route TEXT,
+        actionability_state TEXT,
+        payload_json TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_utility_events_created ON market_utility_events(created_at DESC)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_utility_events_type ON market_utility_events(event_type, created_at DESC)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_utility_events_session ON market_utility_events(session_id, created_at DESC)`).run();
 
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS email_subscribers (
@@ -5604,6 +5720,94 @@ async function computeFreshnessSloWindow(
   };
 }
 
+async function insertUtilityEvent(db: D1Database, payload: UtilityEventInsertPayload): Promise<void> {
+  await db.prepare(`
+    INSERT INTO market_utility_events
+      (session_id, event_type, route, actionability_state, payload_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(
+    payload.session_id,
+    payload.event_type,
+    payload.route,
+    payload.actionability_state,
+    payload.payload_json,
+    payload.created_at,
+  ).run();
+}
+
+async function computeUtilityFunnelSummary(
+  db: D1Database,
+  windowDays: number,
+): Promise<UtilityFunnelSummary> {
+  const boundedWindowDays = UTILITY_WINDOW_DAY_OPTIONS.has(windowDays) ? windowDays : 7;
+  const lookbackExpr = `-${Math.max(0, boundedWindowDays - 1)} days`;
+
+  const [aggregate, daysRow] = await Promise.all([
+    db.prepare(`
+      SELECT
+        COUNT(*) as total_events,
+        COUNT(DISTINCT session_id) as unique_sessions,
+        SUM(CASE WHEN event_type = 'plan_view' THEN 1 ELSE 0 END) as plan_views,
+        SUM(CASE WHEN event_type = 'opportunities_view' THEN 1 ELSE 0 END) as opportunities_views,
+        SUM(CASE WHEN event_type = 'decision_actionable_view' THEN 1 ELSE 0 END) as decision_actionable_views,
+        SUM(CASE WHEN event_type = 'decision_watch_view' THEN 1 ELSE 0 END) as decision_watch_views,
+        SUM(CASE WHEN event_type = 'decision_no_action_view' THEN 1 ELSE 0 END) as decision_no_action_views,
+        SUM(CASE WHEN event_type = 'no_action_unlock_view' THEN 1 ELSE 0 END) as no_action_unlock_views,
+        MAX(created_at) as last_event_at
+      FROM market_utility_events
+      WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
+    `).bind(lookbackExpr).first<{
+      total_events: number | null;
+      unique_sessions: number | null;
+      plan_views: number | null;
+      opportunities_views: number | null;
+      decision_actionable_views: number | null;
+      decision_watch_views: number | null;
+      decision_no_action_views: number | null;
+      no_action_unlock_views: number | null;
+      last_event_at: string | null;
+    }>(),
+    db.prepare(`
+      SELECT COUNT(DISTINCT substr(replace(created_at, 'T', ' '), 1, 10)) as days_observed
+      FROM market_utility_events
+      WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
+    `).bind(lookbackExpr).first<{ days_observed: number | null }>(),
+  ]);
+
+  const totalEvents = Math.max(0, Math.floor(toNumber(aggregate?.total_events, 0)));
+  const uniqueSessions = Math.max(0, Math.floor(toNumber(aggregate?.unique_sessions, 0)));
+  const planViews = Math.max(0, Math.floor(toNumber(aggregate?.plan_views, 0)));
+  const opportunitiesViews = Math.max(0, Math.floor(toNumber(aggregate?.opportunities_views, 0)));
+  const decisionActionableViews = Math.max(0, Math.floor(toNumber(aggregate?.decision_actionable_views, 0)));
+  const decisionWatchViews = Math.max(0, Math.floor(toNumber(aggregate?.decision_watch_views, 0)));
+  const decisionNoActionViews = Math.max(0, Math.floor(toNumber(aggregate?.decision_no_action_views, 0)));
+  const noActionUnlockViews = Math.max(0, Math.floor(toNumber(aggregate?.no_action_unlock_views, 0)));
+  const decisionEventsTotal = decisionActionableViews + decisionWatchViews + decisionNoActionViews;
+  const decisionEventsPerSession = uniqueSessions > 0
+    ? Number((decisionEventsTotal / uniqueSessions).toFixed(4))
+    : 0;
+  const noActionUnlockCoverage = decisionNoActionViews > 0
+    ? Number(((noActionUnlockViews / decisionNoActionViews) * 100).toFixed(2))
+    : 0;
+
+  return {
+    window_days: boundedWindowDays,
+    days_observed: Math.max(0, Math.floor(toNumber(daysRow?.days_observed, 0))),
+    total_events: totalEvents,
+    unique_sessions: uniqueSessions,
+    plan_views: planViews,
+    opportunities_views: opportunitiesViews,
+    decision_actionable_views: decisionActionableViews,
+    decision_watch_views: decisionWatchViews,
+    decision_no_action_views: decisionNoActionViews,
+    no_action_unlock_views: noActionUnlockViews,
+    decision_events_total: decisionEventsTotal,
+    decision_events_per_session: decisionEventsPerSession,
+    no_action_unlock_coverage_pct: noActionUnlockCoverage,
+    last_event_at: aggregate?.last_event_at || null,
+  };
+}
+
 async function fetchLatestMarketProductSnapshotWrite(db: D1Database): Promise<string | null> {
   try {
     const row = await db.prepare(`
@@ -7522,6 +7726,26 @@ export default {
           console.error('market_alert_deliveries migration failed:', e);
         }
 
+        try {
+          await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS market_utility_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              route TEXT,
+              actionability_state TEXT,
+              payload_json TEXT,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_utility_events_created ON market_utility_events(created_at DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_utility_events_type ON market_utility_events(event_type, created_at DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_utility_events_session ON market_utility_events(session_id, created_at DESC)`).run();
+          migrations.push('market_utility_events');
+        } catch (e) {
+          console.error('market_utility_events migration failed:', e);
+        }
+
         return Response.json({
           success: true,
           tables_created: migrations,
@@ -8538,6 +8762,94 @@ export default {
         `).bind(subscriberId).run();
 
         return Response.json({ ok: true }, { headers: corsHeaders });
+      }
+
+      if (url.pathname === '/api/metrics/utility-event' && method === 'POST') {
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Utility-event schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        const body = await parseJsonBody<{
+          session_id?: unknown;
+          event_type?: unknown;
+          route?: unknown;
+          actionability_state?: unknown;
+          metadata?: unknown;
+        }>(request);
+
+        const sessionId = normalizeUtilitySessionId(body?.session_id);
+        if (!sessionId) {
+          return Response.json({ error: 'Invalid session_id' }, { status: 400, headers: corsHeaders });
+        }
+
+        const eventType = normalizeUtilityEventType(body?.event_type);
+        if (!eventType) {
+          return Response.json({ error: 'Invalid event_type' }, { status: 400, headers: corsHeaders });
+        }
+
+        const route = normalizeUtilityRoute(body?.route);
+        const actionabilityState = normalizeUtilityActionabilityState(body?.actionability_state);
+        const payloadJson = sanitizeUtilityPayload(body?.metadata);
+        const createdAt = asIsoDateTime(new Date());
+
+        try {
+          await insertUtilityEvent(env.DB, {
+            session_id: sessionId,
+            event_type: eventType,
+            route,
+            actionability_state: actionabilityState,
+            payload_json: payloadJson,
+            created_at: createdAt,
+          });
+        } catch (err) {
+          console.error('Utility-event insert failed:', err);
+          return Response.json({ error: 'Failed to record utility event' }, { status: 503, headers: corsHeaders });
+        }
+
+        return Response.json({
+          ok: true,
+          accepted: {
+            event_type: eventType,
+            route,
+            actionability_state: actionabilityState,
+          },
+        }, {
+          headers: {
+            ...corsHeaders,
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
+
+      if (url.pathname === '/api/ops/utility-funnel' && method === 'GET') {
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Utility-funnel schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        const windowRaw = Number.parseInt((url.searchParams.get('window') || '7').trim(), 10);
+        const windowDays = UTILITY_WINDOW_DAY_OPTIONS.has(windowRaw) ? windowRaw : 7;
+
+        try {
+          const funnel = await computeUtilityFunnelSummary(env.DB, windowDays);
+          return Response.json({
+            as_of: asIsoDateTime(new Date()),
+            funnel,
+          }, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'public, max-age=120',
+            },
+          });
+        } catch (err) {
+          console.error('Utility-funnel computation failed:', err);
+          return Response.json({ error: 'Utility funnel unavailable' }, { status: 503, headers: corsHeaders });
+        }
       }
 
       if (url.pathname === '/api/market/consistency' && method === 'GET') {
