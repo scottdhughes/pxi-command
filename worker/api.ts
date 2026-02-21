@@ -2227,9 +2227,10 @@ async function buildCanonicalMarketDecision(
 
   const divergence = await detectDivergence(db, pxi.score, regime);
   const conflictState = resolveConflictState(regime, signal);
+  const staleCountRaw = Math.max(0, Math.floor(toNumber(freshness.stale_count, 0)));
   const stalePenaltyUnits = freshnessPenaltyCount(freshness);
   const edgeQuality = computeEdgeQualitySnapshot({
-    staleCount: stalePenaltyUnits,
+    staleCount: staleCountRaw,
     mlSampleSize,
     regime,
     conflictState,
@@ -2532,7 +2533,8 @@ function computeEdgeQualitySnapshot(params: {
 }): EdgeQualitySnapshot {
   const { staleCount, mlSampleSize, regime, conflictState, divergenceCount } = params;
 
-  const dataQuality = Math.round(clamp(0, 100, 100 - staleCount * 4));
+  const stalePenaltyUnits = staleCount <= 1 ? 0 : staleCount - 1;
+  const dataQuality = Math.round(clamp(0, 100, 100 - stalePenaltyUnits * 4));
 
   let modelAgreement = 78;
   if (mlSampleSize < 5) modelAgreement -= 35;
