@@ -1271,8 +1271,9 @@ const CONSISTENCY_PASS_MIN = 90;
 const CONSISTENCY_WARN_MIN = 80;
 const REFRESH_HOURS_UTC = [6, 14, 18, 22];
 const MINIMUM_RELIABLE_SAMPLE = 30;
-const CALIBRATION_ROBUST_MIN_SAMPLE = 60;
+const CALIBRATION_ROBUST_MIN_SAMPLE = 50;
 const CALIBRATION_LIMITED_MIN_SAMPLE = 20;
+const CALIBRATION_POOL_TARGET_SAMPLE = CALIBRATION_ROBUST_MIN_SAMPLE;
 const INDICATOR_FREQUENCY_HINTS = new Map<string, string>(
   INDICATORS.map((indicator) => [indicator.id, indicator.frequency])
 );
@@ -1730,7 +1731,7 @@ function buildEdgeQualityCalibrationFromSnapshot(
     pooledCorrect += Math.max(0, Math.min(candidate.sample_size, candidate.correct_count));
     minStart = minStart === null ? candidate.start : Math.min(minStart, candidate.start);
     maxStart = maxStart === null ? candidate.start : Math.max(maxStart, candidate.start);
-    if (pooledSamples >= MINIMUM_RELIABLE_SAMPLE) {
+    if (pooledSamples >= CALIBRATION_POOL_TARGET_SAMPLE) {
       break;
     }
   }
@@ -1799,7 +1800,7 @@ function buildOpportunityCalibrationFromSnapshot(
     pooledCorrect += Math.max(0, Math.min(candidate.sample_size, candidate.correct_count));
     minStart = minStart === null ? candidate.start : Math.min(minStart, candidate.start);
     maxStart = maxStart === null ? candidate.start : Math.max(maxStart, candidate.start);
-    if (pooledSamples >= MINIMUM_RELIABLE_SAMPLE) {
+    if (pooledSamples >= CALIBRATION_POOL_TARGET_SAMPLE) {
       break;
     }
   }
@@ -1851,8 +1852,9 @@ function policyStanceToRiskPosture(stance: PolicyStance): RiskPosture {
 function freshnessPenaltyCount(freshness: FreshnessStatus): number {
   const critical = Math.max(0, Math.floor(toNumber(freshness.critical_stale_count, 0)));
   const nonCritical = Math.max(0, Math.floor(toNumber(freshness.stale_count, 0)) - critical);
-  // Non-critical stale inputs still matter, but with lower penalty weight than critical inputs.
-  return critical + Math.ceil(nonCritical * 0.35);
+  // One non-critical stale input (typically source-lagged monthly) should not degrade plan quality.
+  const nonCriticalPenalty = nonCritical <= 1 ? 0 : Math.ceil((nonCritical - 1) * 0.35);
+  return critical + nonCriticalPenalty;
 }
 
 function buildPolicyStateSnapshot(params: {
