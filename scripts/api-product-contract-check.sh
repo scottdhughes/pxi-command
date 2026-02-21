@@ -260,7 +260,7 @@ check_freshness_alert_parity() {
   fi
 
   if [[ -n "$alert_body" ]]; then
-    if [[ "$alert_body" =~ ([0-9]+)[[:space:]]+indicator ]]; then
+    if [[ "$alert_body" =~ ([0-9]+) ]]; then
       alert_stale="${BASH_REMATCH[1]}"
       if [[ "$alert_stale" != "$plan_stale" ]]; then
         echo "Freshness alert parity mismatch: alert=$alert_stale plan=$plan_stale"
