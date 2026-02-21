@@ -43,4 +43,56 @@ describe("computeMetrics", () => {
     expect(m.baseline_rate).toBe(0)
     expect(m.growth_ratio).toBe(GROWTH_RATIO_CAP)
   })
+
+  it("uses word-boundary matching for short keywords", () => {
+    const now = 1_700_000_000
+    const themes: ThemeDefinition[] = [
+      {
+        theme_id: "midstream",
+        display_name: "Midstream",
+        keywords: ["lng"],
+        seed_tickers: [],
+      },
+    ]
+
+    const falsePositiveDataset: RedditDataset = {
+      generated_at_utc: new Date(now * 1000).toISOString(),
+      subreddits: ["stocks"],
+      posts: [
+        {
+          id: "p1",
+          subreddit: "stocks",
+          created_utc: now,
+          title: "Sling TV update",
+          selftext: "No energy discussion here",
+          permalink: "/r/stocks/comments/p1",
+          score: 5,
+          num_comments: 0,
+        },
+      ],
+    }
+
+    const truePositiveDataset: RedditDataset = {
+      generated_at_utc: new Date(now * 1000).toISOString(),
+      subreddits: ["stocks"],
+      posts: [
+        {
+          id: "p2",
+          subreddit: "stocks",
+          created_utc: now,
+          title: "LNG exports keep growing",
+          selftext: "Terminal buildout discussion",
+          permalink: "/r/stocks/comments/p2",
+          score: 5,
+          num_comments: 0,
+        },
+      ],
+    }
+
+    const falsePositiveResult = computeMetrics(falsePositiveDataset, themes, 7, 30, false)
+    const truePositiveResult = computeMetrics(truePositiveDataset, themes, 7, 30, false)
+
+    expect(falsePositiveResult.metrics[0].mentions_L).toBe(0)
+    expect(truePositiveResult.metrics[0].mentions_L).toBe(1)
+  })
 })

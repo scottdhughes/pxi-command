@@ -80,6 +80,15 @@ function linearRegressionSlope(values: number[]): number {
   return (n * sumXY - sumX * sumY) / denom
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function buildKeywordRegex(keyword: string): RegExp {
+  const escaped = escapeRegex(keyword.trim().toLowerCase())
+  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, "i")
+}
+
 function buildDocs(dataset: RedditDataset, includeComments: boolean): Doc[] {
   const docs: Doc[] = []
   for (const post of dataset.posts) {
@@ -173,7 +182,7 @@ export function computeMetrics(dataset: RedditDataset, themes: ThemeDefinition[]
   const metrics: ThemeMetrics[] = []
 
   for (const theme of themes) {
-    const keywords = theme.keywords.map((k) => k.toLowerCase())
+    const keywordRegexes = theme.keywords.map((k) => buildKeywordRegex(k))
     const seedTickers = new Set(theme.seed_tickers.map((t) => t.toUpperCase()))
 
     const mentionsL: Doc[] = []
@@ -182,7 +191,7 @@ export function computeMetrics(dataset: RedditDataset, themes: ThemeDefinition[]
     for (const doc of docs) {
       const textLower = doc.text.toLowerCase()
       const tickers = perDoc.get(doc.id) || []
-      const hasKeyword = keywords.some((k) => textLower.includes(k))
+      const hasKeyword = keywordRegexes.some((re) => re.test(textLower))
       const hasSeedTicker = tickers.some((t) => seedTickers.has(t))
       const hasCooccurringTicker = hasKeyword && tickers.length > 0
 
