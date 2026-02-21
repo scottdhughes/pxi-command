@@ -1137,6 +1137,39 @@ interface FreshnessStatus {
   critical_stale_count: number;
 }
 
+interface FreshnessSloIncident {
+  as_of: string;
+  completed_at: string | null;
+  trigger: string | null;
+  stale_count: number;
+  critical_stale_count: number;
+}
+
+interface FreshnessImpactEventSummary {
+  created_at: string;
+  severity: AlertSeverity;
+  title: string;
+  body: string;
+}
+
+interface FreshnessSloImpactSummary {
+  state: 'none' | 'monitor' | 'degraded';
+  stale_days: number;
+  warning_events: number;
+  critical_events: number;
+  estimated_suppressed_days: number;
+  latest_warning_event: FreshnessImpactEventSummary | null;
+  latest_critical_event: FreshnessImpactEventSummary | null;
+}
+
+interface FreshnessSloWindowSummary {
+  days_observed: number;
+  days_with_critical_stale: number;
+  slo_attainment_pct: number;
+  recent_incidents: FreshnessSloIncident[];
+  incident_impact: FreshnessSloImpactSummary;
+}
+
 interface BriefSnapshot {
   as_of: string;
   summary: string;
@@ -4990,41 +5023,71 @@ async function fetchLatestSuccessfulMarketRefreshRun(db: D1Database): Promise<{
 async function computeFreshnessSloWindow(
   db: D1Database,
   windowDays: number
-): Promise<{
-  days_observed: number;
-  days_with_critical_stale: number;
-  slo_attainment_pct: number;
-  recent_incidents: Array<{
-    as_of: string;
-    completed_at: string | null;
-    trigger: string | null;
-    stale_count: number;
-    critical_stale_count: number;
-  }>;
-}> {
+): Promise<FreshnessSloWindowSummary> {
   const boundedDays = Math.max(1, Math.floor(windowDays));
   const lookbackExpr = `-${Math.max(0, boundedDays - 1)} days`;
 
-  const grouped = await db.prepare(`
-    SELECT
-      COALESCE(as_of, substr(completed_at, 1, 10)) as run_date,
-      MAX(completed_at) as completed_at,
-      MAX("trigger") as trigger,
-      MAX(COALESCE(stale_count, 0)) as stale_count,
-      MAX(COALESCE(critical_stale_count, 0)) as critical_stale_count
-    FROM market_refresh_runs
-    WHERE status = 'success'
-      AND completed_at IS NOT NULL
-      AND completed_at >= datetime('now', ?)
-    GROUP BY run_date
-    ORDER BY run_date DESC
-  `).bind(lookbackExpr).all<{
-    run_date: string | null;
-    completed_at: string | null;
-    trigger: string | null;
-    stale_count: number | null;
-    critical_stale_count: number | null;
-  }>();
+  const [grouped, impactCounts, latestWarningEvent, latestCriticalEvent] = await Promise.all([
+    db.prepare(`
+      SELECT
+        COALESCE(as_of, substr(completed_at, 1, 10)) as run_date,
+        MAX(completed_at) as completed_at,
+        MAX("trigger") as trigger,
+        MAX(COALESCE(stale_count, 0)) as stale_count,
+        MAX(COALESCE(critical_stale_count, 0)) as critical_stale_count
+      FROM market_refresh_runs
+      WHERE status = 'success'
+        AND completed_at IS NOT NULL
+        AND completed_at >= datetime('now', ?)
+      GROUP BY run_date
+      ORDER BY run_date DESC
+    `).bind(lookbackExpr).all<{
+      run_date: string | null;
+      completed_at: string | null;
+      trigger: string | null;
+      stale_count: number | null;
+      critical_stale_count: number | null;
+    }>(),
+    db.prepare(`
+      SELECT
+        SUM(CASE WHEN severity = 'warning' THEN 1 ELSE 0 END) as warning_events,
+        SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) as critical_events
+      FROM market_alert_events
+      WHERE event_type = 'freshness_warning'
+        AND datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
+    `).bind(lookbackExpr).first<{
+      warning_events: number | null;
+      critical_events: number | null;
+    }>(),
+    db.prepare(`
+      SELECT created_at, severity, title, body
+      FROM market_alert_events
+      WHERE event_type = 'freshness_warning'
+        AND severity = 'warning'
+        AND datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).bind(lookbackExpr).first<{
+      created_at: string | null;
+      severity: AlertSeverity | null;
+      title: string | null;
+      body: string | null;
+    }>(),
+    db.prepare(`
+      SELECT created_at, severity, title, body
+      FROM market_alert_events
+      WHERE event_type = 'freshness_warning'
+        AND severity = 'critical'
+        AND datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).bind(lookbackExpr).first<{
+      created_at: string | null;
+      severity: AlertSeverity | null;
+      title: string | null;
+      body: string | null;
+    }>(),
+  ]);
 
   const rows = (grouped.results || [])
     .filter((row) => typeof row.run_date === 'string' && row.run_date.length >= 10)
@@ -5037,17 +5100,49 @@ async function computeFreshnessSloWindow(
     }));
 
   const daysObserved = rows.length;
+  const staleDays = rows.filter((row) => row.stale_count > 0).length;
   const incidentRows = rows.filter((row) => row.critical_stale_count > 0);
   const daysWithCriticalStale = incidentRows.length;
   const sloAttainment = daysObserved > 0
     ? Number((((daysObserved - daysWithCriticalStale) / daysObserved) * 100).toFixed(2))
     : 0;
+  const warningEvents = Math.max(0, Math.floor(toNumber(impactCounts?.warning_events, 0)));
+  const criticalEvents = Math.max(0, Math.floor(toNumber(impactCounts?.critical_events, 0)));
+  const impactState: FreshnessSloImpactSummary['state'] = (daysWithCriticalStale > 0 || criticalEvents > 0)
+    ? 'degraded'
+    : ((staleDays > 0 || warningEvents > 0) ? 'monitor' : 'none');
+
+  const mapImpactEvent = (event: {
+    created_at: string | null;
+    severity: AlertSeverity | null;
+    title: string | null;
+    body: string | null;
+  } | null): FreshnessImpactEventSummary | null => {
+    if (!event?.created_at || !event.severity || !event.title || !event.body) {
+      return null;
+    }
+    return {
+      created_at: event.created_at,
+      severity: event.severity,
+      title: event.title,
+      body: event.body,
+    };
+  };
 
   return {
     days_observed: daysObserved,
     days_with_critical_stale: daysWithCriticalStale,
     slo_attainment_pct: sloAttainment,
     recent_incidents: incidentRows.slice(0, 20),
+    incident_impact: {
+      state: impactState,
+      stale_days: staleDays,
+      warning_events: warningEvents,
+      critical_events: criticalEvents,
+      estimated_suppressed_days: daysWithCriticalStale,
+      latest_warning_event: mapImpactEvent(latestWarningEvent),
+      latest_critical_event: mapImpactEvent(latestCriticalEvent),
+    },
   };
 }
 
