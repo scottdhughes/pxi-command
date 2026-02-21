@@ -7647,7 +7647,7 @@ export default {
         const params: (string | number)[] = [];
 
         if (since) {
-          query += ' AND created_at >= ?';
+          query += ` AND datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime(?)`;
           params.push(since);
         }
 
@@ -8417,7 +8417,7 @@ export default {
           env.DB.prepare(`
             SELECT id, event_type, severity, title, body, entity_type, entity_id, dedupe_key, payload_json, created_at
             FROM market_alert_events
-            WHERE created_at >= datetime('now', '-24 hours')
+            WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', '-24 hours')
             ORDER BY created_at DESC
             LIMIT 200
           `).all<MarketAlertEvent>(),
@@ -8887,7 +8887,7 @@ export default {
                 SUM(CASE WHEN severity = 'warning' THEN 1 ELSE 0 END) as warning_count,
                 SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) as critical_count
               FROM market_alert_events
-              WHERE created_at >= datetime('now', '-24 hours')
+              WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', '-24 hours')
             `).first<{
               latest_as_of: string | null;
               warning_count: number | null;
