@@ -47,10 +47,38 @@ jobs:
         run: |
           set -euo pipefail
           BASE_URL="${WRITE_API_URL%/api/write}"
-          RESPONSE="$(curl -fsS -X POST "${BASE_URL}/api/market/refresh-products" \
-            -H "Authorization: Bearer ${WRITE_API_KEY}" \
-            -H "X-Refresh-Trigger: github_actions_daily_refresh" \
-            -H "Content-Type: application/json")"
+          RESPONSE=""
+          MAX_ATTEMPTS=4
+          for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+            http_code="$(curl -sS -o /tmp/pxi-market-refresh-response.json -w '%{http_code}' -X POST "${BASE_URL}/api/market/refresh-products" \
+              -H "Authorization: Bearer ${WRITE_API_KEY}" \
+              -H "X-Refresh-Trigger: github_actions_daily_refresh" \
+              -H "Content-Type: application/json")"
+
+            if [[ "${http_code}" == "200" ]]; then
+              RESPONSE="$(cat /tmp/pxi-market-refresh-response.json)"
+              break
+            fi
+
+            if [[ "${http_code}" == "429" || "${http_code}" == "500" || "${http_code}" == "502" || "${http_code}" == "503" || "${http_code}" == "504" ]]; then
+              if [[ "${attempt}" -lt "${MAX_ATTEMPTS}" ]]; then
+                sleep_seconds=$((attempt * 2))
+                echo "Market refresh returned ${http_code}; retrying in ${sleep_seconds}s (attempt ${attempt}/${MAX_ATTEMPTS})..."
+                sleep "${sleep_seconds}"
+                continue
+              fi
+            fi
+
+            echo "Market refresh failed with status ${http_code}"
+            cat /tmp/pxi-market-refresh-response.json || true
+            exit 1
+          done
+
+          if [[ -z "${RESPONSE}" ]]; then
+            echo "Market refresh failed after ${MAX_ATTEMPTS} attempts."
+            cat /tmp/pxi-market-refresh-response.json || true
+            exit 1
+          fi
           jq -n \
             --arg generated_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson result "${RESPONSE}" \
