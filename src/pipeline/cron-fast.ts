@@ -226,6 +226,11 @@ async function fetchSentimentProxy(): Promise<number | null> {
   return fetchSentimentFromFearGreed();
 }
 
+async function fetchPutCallProxy(): Promise<number | null> {
+  const { fetchPutCallFromYahoo } = await import('../fetchers/alternative-sources.js');
+  return fetchPutCallFromYahoo();
+}
+
 async function fetchAaiiPrimary(): Promise<Array<{ date: Date; value: number }>> {
   const { fetchAAIISentiment } = await import('../fetchers/scrapers.js');
   return fetchAAIISentiment();
@@ -288,15 +293,16 @@ async function fetchAllFred(): Promise<void> {
     { ticker: 'WALCL', id: 'fed_balance_sheet' },
     { ticker: 'RRPONTSYD', id: 'reverse_repo' },
     { ticker: 'WTREGEN', id: 'treasury_general_account' },
-    { ticker: 'BAMLH0A0HYM2', id: 'high_yield_spread' },
-    { ticker: 'BAMLC0A4CBBB', id: 'investment_grade_spread' },
-    { ticker: 'T10Y2Y', id: 'yield_curve' },
-    { ticker: 'DGS10', id: 'ten_year_yield' },
+    { ticker: 'BAMLH0A0HYM2', id: 'hy_oas_spread' },
+    { ticker: 'BAMLC0A4CBBBEY', id: 'ig_oas_spread' },
+    { ticker: 'T10Y2Y', id: 'yield_curve_2s10s' },
     { ticker: 'DCOILWTICO', id: 'wti_crude' },
     { ticker: 'DTWEXBGS', id: 'dollar_index' },
     { ticker: 'IC4WSA', id: 'jobless_claims' },
+    { ticker: 'BAMLEMCBPIOAS', id: 'em_spread' },
     { ticker: 'CFNAI', id: 'cfnai' },
     { ticker: 'MANEMP', id: 'ism_manufacturing' },
+    { ticker: 'NMFCI', id: 'ism_services' },
   ];
 
   for (const { ticker, id } of fredIndicators) {
@@ -309,6 +315,33 @@ async function fetchAllFred(): Promise<void> {
       console.error(`  ✗ ${id}: ${message}`);
     }
     await sleep(200);
+  }
+
+  // Derive BBB-AAA spread from BAA/AAA effective yields.
+  try {
+    const [bbbSeries, aaaSeries] = await Promise.all([
+      fetchFredSeries('BAMLC0A4CBBBEY', 'bbb_temp'),
+      fetchFredSeries('BAMLC0A1CAAAEY', 'aaa_temp'),
+    ]);
+
+    const aaaByDate = new Map(aaaSeries.map((row) => [row.date, row.value]));
+    const derived: IndicatorValue[] = [];
+    for (const bbb of bbbSeries) {
+      const aaa = aaaByDate.get(bbb.date);
+      if (aaa === undefined) continue;
+      derived.push({
+        indicator_id: 'bbb_aaa_spread',
+        date: bbb.date,
+        value: bbb.value - aaa,
+        source: 'fred',
+      });
+    }
+
+    const written = recordIndicatorValues(derived);
+    console.log(`  ✓ bbb_aaa_spread: ${written} values`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ bbb_aaa_spread: ${message}`);
   }
 
   // Derive M2 YoY from M2SL series.
@@ -488,6 +521,153 @@ async function fetchAllYahoo(): Promise<void> {
       console.error(`  ✗ ${id}: ${message}`);
     }
     await sleep(250);
+  }
+
+  // Small cap strength (IWM vs SPY).
+  try {
+    const [iwm, spy] = await Promise.all([
+      fetchYahooSeriesWithFallback('IWM', 'iwm_temp'),
+      Promise.resolve(allIndicators.filter((v) => v.indicator_id === 'spy_close')),
+    ]);
+
+    const spyMap = toDateSourceMap(spy);
+    const derived: IndicatorValue[] = [];
+    for (const row of iwm) {
+      const spyValue = spyMap.get(row.date);
+      if (!spyValue || spyValue.value === 0) continue;
+      derived.push({
+        indicator_id: 'small_cap_strength',
+        date: row.date,
+        value: (row.value / spyValue.value) * 100,
+        source: row.source === 'yahoo_direct' || spyValue.source === 'yahoo_direct' ? 'yahoo_direct' : 'yahoo',
+      });
+    }
+    const written = recordIndicatorValues(derived);
+    console.log(`  ✓ small_cap_strength: ${written} values`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ small_cap_strength: ${message}`);
+  }
+
+  // Mid cap strength (IJH vs SPY).
+  try {
+    const [ijh, spy] = await Promise.all([
+      fetchYahooSeriesWithFallback('IJH', 'ijh_temp'),
+      Promise.resolve(allIndicators.filter((v) => v.indicator_id === 'spy_close')),
+    ]);
+
+    const spyMap = toDateSourceMap(spy);
+    const derived: IndicatorValue[] = [];
+    for (const row of ijh) {
+      const spyValue = spyMap.get(row.date);
+      if (!spyValue || spyValue.value === 0) continue;
+      derived.push({
+        indicator_id: 'midcap_strength',
+        date: row.date,
+        value: (row.value / spyValue.value) * 100,
+        source: row.source === 'yahoo_direct' || spyValue.source === 'yahoo_direct' ? 'yahoo_direct' : 'yahoo',
+      });
+    }
+    const written = recordIndicatorValues(derived);
+    console.log(`  ✓ midcap_strength: ${written} values`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ midcap_strength: ${message}`);
+  }
+
+  // Sector breadth (% sector ETFs above 50-day moving average).
+  try {
+    const sectorEtfs = ['XLB', 'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY'];
+    const sectorSeries = await Promise.all(
+      sectorEtfs.map((ticker) => fetchYahooSeriesWithFallback(ticker, `${ticker.toLowerCase()}_temp`))
+    );
+
+    const allDates = new Set<string>();
+    const sectorMaps = sectorSeries.map((series) => {
+      const dateMap = toDateSourceMap(series);
+      for (const date of dateMap.keys()) allDates.add(date);
+      return dateMap;
+    });
+    const sortedDates = [...allDates].sort();
+
+    const derived: IndicatorValue[] = [];
+    for (let i = 50; i < sortedDates.length; i += 1) {
+      const date = sortedDates[i];
+      let above = 0;
+      let total = 0;
+      let hasDirectSource = false;
+
+      for (const sectorMap of sectorMaps) {
+        const current = sectorMap.get(date);
+        if (!current) continue;
+
+        let sum = 0;
+        let count = 0;
+        let sectorDirect = current.source === 'yahoo_direct';
+        for (let j = i - 50; j < i; j += 1) {
+          const past = sectorMap.get(sortedDates[j]);
+          if (!past) continue;
+          sum += past.value;
+          count += 1;
+          if (past.source === 'yahoo_direct') sectorDirect = true;
+        }
+
+        if (count >= 40) {
+          const ma50 = sum / count;
+          if (current.value > ma50) above += 1;
+          total += 1;
+          hasDirectSource = hasDirectSource || sectorDirect;
+        }
+      }
+
+      if (total >= 8) {
+        derived.push({
+          indicator_id: 'sector_breadth',
+          date,
+          value: (above / total) * 100,
+          source: hasDirectSource ? 'yahoo_direct' : 'yahoo',
+        });
+      }
+    }
+
+    const written = recordIndicatorValues(derived);
+    console.log(`  ✓ sector_breadth: ${written} values`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ sector_breadth: ${message}`);
+  }
+
+  // BTC vs 200-day moving average.
+  try {
+    const btc = [...allIndicators]
+      .filter((value) => value.indicator_id === 'btc_price')
+      .sort((a, b) => a.date.localeCompare(b.date));
+    const derived: IndicatorValue[] = [];
+
+    for (let i = 200; i < btc.length; i += 1) {
+      let rolling = 0;
+      for (let j = i - 200; j < i; j += 1) {
+        rolling += btc[j].value;
+      }
+      const ma200 = rolling / 200;
+      if (!Number.isFinite(ma200) || ma200 === 0) continue;
+
+      const pctAbove = ((btc[i].value - ma200) / ma200) * 100;
+      if (!Number.isFinite(pctAbove)) continue;
+
+      derived.push({
+        indicator_id: 'btc_vs_200dma',
+        date: btc[i].date,
+        value: pctAbove,
+        source: btc[i].source,
+      });
+    }
+
+    const written = recordIndicatorValues(derived);
+    console.log(`  ✓ btc_vs_200dma: ${written} values`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ btc_vs_200dma: ${message}`);
   }
 
   // VIX term structure.
@@ -812,6 +992,24 @@ async function fetchAlternative(): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`  ✗ gex: ${message}`);
+  }
+
+  try {
+    const putCall = await fetchPutCallProxy();
+    if (putCall !== null && Number.isFinite(putCall)) {
+      const written = recordIndicatorValues([{
+        indicator_id: 'put_call_ratio',
+        date: format(new Date(), 'yyyy-MM-dd'),
+        value: putCall,
+        source: 'yahoo_proxy',
+      }]);
+      console.log(`  ✓ put_call_ratio: ${written} value (proxy)`);
+    } else {
+      console.error('  ✗ put_call_ratio: unavailable from proxy');
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ put_call_ratio: ${message}`);
   }
 }
 

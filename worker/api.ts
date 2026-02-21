@@ -2,7 +2,15 @@
 // Uses D1 (SQLite), Vectorize, and Workers AI
 // Includes scheduled cron handler for daily data refresh
 
-import { getStaleThresholdDays, isChronicStaleness, resolveStalePolicy } from '../src/config/indicator-sla';
+import { EmailMessage } from 'cloudflare:email';
+import {
+  MONITORED_SLA_INDICATORS,
+  evaluateSla,
+  isChronicStaleness,
+  resolveIndicatorSla,
+  resolveStalePolicy,
+} from '../src/config/indicator-sla';
+import { INDICATORS } from '../src/config/indicators.js';
 
 interface Env {
   DB: D1Database;
@@ -12,8 +20,10 @@ interface Env {
   RATE_LIMIT_KV?: KVNamespace;
   FRED_API_KEY?: string;
   WRITE_API_KEY?: string;
-  RESEND_API_KEY?: string;
-  RESEND_FROM_EMAIL?: string;
+  EMAIL_OUTBOUND?: {
+    send(message: EmailMessage): Promise<void>;
+  };
+  ALERTS_FROM_EMAIL?: string;
   ALERTS_SIGNING_SECRET?: string;
   FEATURE_ENABLE_BRIEF?: string;
   FEATURE_ENABLE_OPPORTUNITIES?: string;
@@ -1071,6 +1081,12 @@ interface MarketCalibrationSnapshotPayload {
   total_samples: number;
 }
 
+interface FreshnessStatus {
+  has_stale_data: boolean;
+  stale_count: number;
+  critical_stale_count: number;
+}
+
 interface BriefSnapshot {
   as_of: string;
   summary: string;
@@ -1088,6 +1104,7 @@ interface BriefSnapshot {
   freshness_status: {
     has_stale_data: boolean;
     stale_count: number;
+    critical_stale_count: number;
   };
   updated_at: string;
   degraded_reason: string | null;
@@ -1254,6 +1271,15 @@ const CONSISTENCY_PASS_MIN = 90;
 const CONSISTENCY_WARN_MIN = 80;
 const REFRESH_HOURS_UTC = [6, 14, 18, 22];
 const MINIMUM_RELIABLE_SAMPLE = 30;
+const CALIBRATION_ROBUST_MIN_SAMPLE = 60;
+const CALIBRATION_LIMITED_MIN_SAMPLE = 20;
+const INDICATOR_FREQUENCY_HINTS = new Map<string, string>(
+  INDICATORS.map((indicator) => [indicator.id, indicator.frequency])
+);
+const FRESHNESS_MONITORED_INDICATORS = new Set<string>([
+  ...INDICATORS.map((indicator) => indicator.id),
+  ...MONITORED_SLA_INDICATORS,
+]);
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -1563,8 +1589,8 @@ function buildDecileBinLabel(score: number): string {
 }
 
 function calibrationQualityForSampleSize(sampleSize: number): CalibrationQuality {
-  if (sampleSize >= 100) return 'ROBUST';
-  if (sampleSize >= 30) return 'LIMITED';
+  if (sampleSize >= CALIBRATION_ROBUST_MIN_SAMPLE) return 'ROBUST';
+  if (sampleSize >= CALIBRATION_LIMITED_MIN_SAMPLE) return 'LIMITED';
   return 'INSUFFICIENT';
 }
 
@@ -1664,15 +1690,6 @@ function parseCalibrationSnapshotPayload(raw: string | null | undefined): Market
   }
 }
 
-function pickCalibrationBin(
-  snapshot: MarketCalibrationSnapshotPayload | null,
-  score: number
-): CalibrationBinSnapshot | null {
-  if (!snapshot || !Array.isArray(snapshot.bins) || snapshot.bins.length === 0) return null;
-  const bin = buildDecileBinLabel(score);
-  return snapshot.bins.find((entry) => entry.bin === bin) || null;
-}
-
 function parseBinStart(bin: string): number | null {
   const match = /^(\d+)-(\d+)$/.exec(bin);
   if (!match) return null;
@@ -1685,20 +1702,54 @@ function buildEdgeQualityCalibrationFromSnapshot(
   edgeScore: number
 ): EdgeQualityCalibration {
   const binLabel = buildDecileBinLabel(edgeScore);
-  if (!snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.bins) || snapshot.bins.length === 0) {
     return buildEdgeCalibrationFallback(null);
   }
-  const bin = pickCalibrationBin(snapshot, edgeScore);
-  if (!bin) {
+
+  const targetStart = parseBinStart(binLabel) ?? 0;
+  const candidates = snapshot.bins
+    .map((entry) => ({
+      ...entry,
+      start: parseBinStart(entry.bin),
+    }))
+    .filter((entry): entry is CalibrationBinSnapshot & { start: number } => entry.start !== null)
+    .sort((a, b) => {
+      const distanceA = Math.abs(a.start - targetStart);
+      const distanceB = Math.abs(b.start - targetStart);
+      if (distanceA !== distanceB) return distanceA - distanceB;
+      return a.start - b.start;
+    });
+
+  let pooledSamples = 0;
+  let pooledCorrect = 0;
+  let minStart: number | null = null;
+  let maxStart: number | null = null;
+  for (const candidate of candidates) {
+    if (candidate.sample_size <= 0) continue;
+    pooledSamples += candidate.sample_size;
+    pooledCorrect += Math.max(0, Math.min(candidate.sample_size, candidate.correct_count));
+    minStart = minStart === null ? candidate.start : Math.min(minStart, candidate.start);
+    maxStart = maxStart === null ? candidate.start : Math.max(maxStart, candidate.start);
+    if (pooledSamples >= MINIMUM_RELIABLE_SAMPLE) {
+      break;
+    }
+  }
+
+  if (pooledSamples <= 0) {
     return buildEdgeCalibrationFallback(binLabel);
   }
+
+  const interval = computeWilson95(pooledCorrect, pooledSamples);
+  const pooledBin = minStart !== null && maxStart !== null
+    ? `${minStart}-${maxStart === 90 ? 100 : maxStart + 9}`
+    : binLabel;
   return {
-    bin: bin.bin,
-    probability_correct_7d: bin.sample_size > 0 ? bin.probability_correct : null,
-    ci95_low_7d: bin.sample_size > 0 ? bin.ci95_low : null,
-    ci95_high_7d: bin.sample_size > 0 ? bin.ci95_high : null,
-    sample_size_7d: bin.sample_size,
-    quality: bin.quality,
+    bin: pooledBin,
+    probability_correct_7d: interval.probability,
+    ci95_low_7d: interval.ci95_low,
+    ci95_high_7d: interval.ci95_high,
+    sample_size_7d: pooledSamples,
+    quality: calibrationQualityForSampleSize(pooledSamples),
   };
 }
 
@@ -1797,11 +1848,18 @@ function policyStanceToRiskPosture(stance: PolicyStance): RiskPosture {
   return 'neutral';
 }
 
+function freshnessPenaltyCount(freshness: FreshnessStatus): number {
+  const critical = Math.max(0, Math.floor(toNumber(freshness.critical_stale_count, 0)));
+  const nonCritical = Math.max(0, Math.floor(toNumber(freshness.stale_count, 0)) - critical);
+  // Non-critical stale inputs still matter, but with lower penalty weight than critical inputs.
+  return critical + Math.ceil(nonCritical * 0.35);
+}
+
 function buildPolicyStateSnapshot(params: {
   signal: PXISignal;
   regime: RegimeResult | null;
   edgeQuality: EdgeQualitySnapshot;
-  freshness: { stale_count: number };
+  freshness: FreshnessStatus;
   calibrationQuality?: CalibrationQuality | null;
 }): PolicyStateSnapshot {
   const { signal, regime, edgeQuality, freshness, calibrationQuality } = params;
@@ -1814,7 +1872,7 @@ function buildPolicyStateSnapshot(params: {
   if (edgeQuality.label === 'LOW') {
     reasons.push('low_edge_quality');
   }
-  if (freshness.stale_count > 0) {
+  if (freshnessPenaltyCount(freshness) > 0) {
     reasons.push('stale_inputs');
   }
   if (calibrationQuality && calibrationQuality !== 'ROBUST') {
@@ -1884,13 +1942,14 @@ function computeRiskSizingSnapshot(params: {
   signal: PXISignal;
   policyState: PolicyStateSnapshot;
   edgeQuality: EdgeQualitySnapshot;
-  freshness: { stale_count: number };
+  freshness: FreshnessStatus;
 }): RiskSizingSnapshot {
   const { signal, policyState, edgeQuality, freshness } = params;
   const rawTarget = clamp(0, 1, signal.risk_allocation);
   const baseTargetPct = Math.round(rawTarget * 100);
   const conflictPenalty = policyState.conflict_state === 'CONFLICT' ? 8 : 0;
-  const freshnessPenalty = freshness.stale_count > 0 ? Math.min(15, Math.round(freshness.stale_count * 0.5)) : 0;
+  const freshnessPenaltyUnits = freshnessPenaltyCount(freshness);
+  const freshnessPenalty = freshnessPenaltyUnits > 0 ? Math.min(15, Math.round(freshnessPenaltyUnits * 0.6)) : 0;
   const calibrationPenalty = edgeQuality.calibration.quality === 'ROBUST'
     ? 0
     : edgeQuality.calibration.quality === 'LIMITED' ? 5 : 10;
@@ -2033,7 +2092,7 @@ async function buildTraderPlaybookSnapshot(
     signal: PXISignal;
     policyState: PolicyStateSnapshot;
     edgeQuality: EdgeQualitySnapshot;
-    freshness: { stale_count: number };
+    freshness: FreshnessStatus;
     sizing?: RiskSizingSnapshot;
   }
 ): Promise<TraderPlaybookSnapshot> {
@@ -2047,6 +2106,7 @@ async function buildTraderPlaybookSnapshot(
   const target = sizing.target_pct;
   const min = sizing.min_pct;
   const max = sizing.max_pct;
+  const staleThreshold = Math.max(2, freshnessPenaltyCount(freshness));
 
   const benchmark = await buildBenchmarkFollowThrough7d(db);
   const scenarios: TraderPlaybookSnapshot['scenarios'] = [
@@ -2056,7 +2116,7 @@ async function buildTraderPlaybookSnapshot(
       invalidation: 'Exit scenario when conflict clears and volatility normalizes.',
     },
     {
-      condition: 'Calibration improves to ROBUST and stale indicator count drops below 3.',
+      condition: `Calibration improves to ROBUST and stale-input pressure drops below ${staleThreshold}.`,
       action: `Increase toward ${max}% risk in one tier increments.`,
       invalidation: 'Stop increasing if edge quality drops to LOW.',
     },
@@ -2125,7 +2185,7 @@ async function buildCanonicalMarketDecision(
   signal: PXISignal;
   risk_sizing: RiskSizingSnapshot;
   regime: RegimeResult | null;
-  freshness: { has_stale_data: boolean; stale_count: number };
+  freshness: FreshnessStatus;
   risk_band: { d7: PlanRiskBand; d30: PlanRiskBand };
   edge_quality: EdgeQualitySnapshot;
   policy_state: PolicyStateSnapshot;
@@ -2165,8 +2225,9 @@ async function buildCanonicalMarketDecision(
 
   const divergence = await detectDivergence(db, pxi.score, regime);
   const conflictState = resolveConflictState(regime, signal);
+  const stalePenaltyUnits = freshnessPenaltyCount(freshness);
   const edgeQuality = computeEdgeQualitySnapshot({
-    staleCount: freshness.stale_count,
+    staleCount: stalePenaltyUnits,
     mlSampleSize,
     regime,
     conflictState,
@@ -2187,9 +2248,14 @@ async function buildCanonicalMarketDecision(
 
   const degradedReasons: string[] = [];
   if (riskBand.d7.sample_size < 20 || riskBand.d30.sample_size < 20) degradedReasons.push('limited_scenario_sample');
-  if (freshness.stale_count > 0) degradedReasons.push('stale_inputs');
+  if (stalePenaltyUnits > 0) degradedReasons.push('stale_inputs');
   if (edgeQualityWithCalibration.label === 'LOW') degradedReasons.push('low_edge_quality');
-  if (edgeQualityWithCalibration.calibration.quality !== 'ROBUST') degradedReasons.push('limited_calibration_sample');
+  if (
+    edgeQualityWithCalibration.calibration.quality === 'INSUFFICIENT' ||
+    (edgeQualityWithCalibration.calibration.quality === 'LIMITED' && stalePenaltyUnits > 0)
+  ) {
+    degradedReasons.push('limited_calibration_sample');
+  }
 
   const uncertainty = buildUncertaintySnapshot(degradedReasons);
   const riskSizing = computeRiskSizingSnapshot({
@@ -2208,7 +2274,7 @@ async function buildCanonicalMarketDecision(
   const limitedScenarioSample = riskBand.d7.sample_size < 20 || riskBand.d30.sample_size < 20;
   const allocationTargetMismatch = Math.abs(traderPlaybook.recommended_size_pct.target - riskSizing.target_pct) > 0.5;
   const consistency = buildConsistencySnapshot(policyState, {
-    stale_count: freshness.stale_count,
+    stale_count: stalePenaltyUnits,
     calibration_quality: edgeQualityWithCalibration.calibration.quality,
     limited_scenario_sample: limitedScenarioSample,
     conflict_state: policyState.conflict_state,
@@ -2349,23 +2415,75 @@ function buildOpportunityId(asOfDate: string, themeId: string, horizon: '7d' | '
   return `${asOfDate}-${themeId}-${horizon}-${stableHash(`${asOfDate}:${themeId}:${horizon}`)}`;
 }
 
-async function computeFreshnessStatus(db: D1Database): Promise<{ has_stale_data: boolean; stale_count: number }> {
-  const freshnessResult = await db.prepare(`
-    SELECT indicator_id, MAX(date) as last_date,
-           julianday('now') - julianday(MAX(date)) as days_old
+interface FreshnessIndicatorStatus {
+  indicator_id: string;
+  latest_date: string | null;
+  days_old: number | null;
+  max_age_days: number;
+  critical: boolean;
+  status: 'stale' | 'missing';
+}
+
+interface FreshnessDiagnostics {
+  status: FreshnessStatus;
+  stale_indicators: FreshnessIndicatorStatus[];
+}
+
+async function computeFreshnessDiagnostics(db: D1Database): Promise<FreshnessDiagnostics> {
+  const latestResult = await db.prepare(`
+    SELECT indicator_id, MAX(date) as last_date
     FROM indicator_values
     GROUP BY indicator_id
-  `).all<{ indicator_id: string; last_date: string; days_old: number }>();
+  `).all<{ indicator_id: string; last_date: string | null }>();
 
-  const staleCount = (freshnessResult.results || []).filter((row) => {
-    const threshold = getStaleThresholdDays(row.indicator_id);
-    return Number.isFinite(row.days_old) && row.days_old > threshold;
-  }).length;
+  const latestByIndicator = new Map<string, string | null>();
+  for (const row of latestResult.results || []) {
+    latestByIndicator.set(row.indicator_id, row.last_date ?? null);
+  }
 
+  const now = new Date();
+  const staleIndicators: FreshnessIndicatorStatus[] = [];
+  for (const indicatorId of [...FRESHNESS_MONITORED_INDICATORS].sort()) {
+    const frequency = INDICATOR_FREQUENCY_HINTS.get(indicatorId) ?? null;
+    const policy = resolveIndicatorSla(indicatorId, frequency);
+    const evaluation = evaluateSla(latestByIndicator.get(indicatorId) ?? null, now, policy);
+    if (!evaluation.stale && !evaluation.missing) {
+      continue;
+    }
+    staleIndicators.push({
+      indicator_id: indicatorId,
+      latest_date: evaluation.latest_date,
+      days_old: evaluation.days_old,
+      max_age_days: evaluation.max_age_days,
+      critical: evaluation.critical,
+      status: evaluation.missing ? 'missing' : 'stale',
+    });
+  }
+
+  staleIndicators.sort((a, b) => {
+    if (a.critical !== b.critical) return a.critical ? -1 : 1;
+    if (a.status !== b.status) return a.status === 'missing' ? -1 : 1;
+    const aDays = a.days_old ?? Number.POSITIVE_INFINITY;
+    const bDays = b.days_old ?? Number.POSITIVE_INFINITY;
+    if (aDays !== bDays) return bDays - aDays;
+    return a.indicator_id.localeCompare(b.indicator_id);
+  });
+
+  const staleCount = staleIndicators.length;
+  const criticalStaleCount = staleIndicators.filter((indicator) => indicator.critical).length;
   return {
-    has_stale_data: staleCount > 0,
-    stale_count: staleCount,
+    status: {
+      has_stale_data: staleCount > 0,
+      stale_count: staleCount,
+      critical_stale_count: criticalStaleCount,
+    },
+    stale_indicators: staleIndicators,
   };
+}
+
+async function computeFreshnessStatus(db: D1Database): Promise<FreshnessStatus> {
+  const diagnostics = await computeFreshnessDiagnostics(db);
+  return diagnostics.status;
 }
 
 function resolveConflictState(regime: RegimeResult | null, signal: PXISignal): ConflictState {
@@ -2559,7 +2677,7 @@ function resolveHorizonBias(signal: PXISignal, regime: RegimeResult | null, edge
 
 function buildInvalidationRules(params: {
   pxi: PXIRow;
-  freshness: { stale_count: number };
+  freshness: FreshnessStatus;
   regime: RegimeResult | null;
   edgeQuality: EdgeQualitySnapshot;
 }): string[] {
@@ -2572,9 +2690,10 @@ function buildInvalidationRules(params: {
     rules.push('If PXI closes below 45 for two consecutive sessions, reduce risk by one tier.');
   }
 
-  if (freshness.stale_count > 0) {
-    const capThreshold = Math.max(3, freshness.stale_count);
-    rules.push(`If stale indicator count remains above ${capThreshold}, keep risk allocation capped until freshness improves.`);
+  const stalePenalty = freshnessPenaltyCount(freshness);
+  if (stalePenalty > 0) {
+    const capThreshold = Math.max(2, stalePenalty);
+    rules.push(`If stale-input pressure remains above ${capThreshold}, keep risk allocation capped until freshness improves.`);
   }
 
   if (regime?.regime === 'RISK_ON') {
@@ -2621,6 +2740,7 @@ function buildBriefFallbackSnapshot(reason: string): BriefSnapshot & { degraded_
     freshness_status: {
       has_stale_data: false,
       stale_count: 0,
+      critical_stale_count: 0,
     },
     updated_at: now,
     degraded_reason: reason,
@@ -2845,6 +2965,43 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
 
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS email_subscribers (
+        id TEXT PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'unsubscribed', 'bounced')),
+        cadence TEXT NOT NULL DEFAULT 'daily_8am_et',
+        types_json TEXT NOT NULL,
+        timezone TEXT NOT NULL DEFAULT 'America/New_York',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_subscribers_status ON email_subscribers(status)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_subscribers_updated ON email_subscribers(updated_at DESC)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_verification_email_expires ON email_verification_tokens(email, expires_at DESC)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_verification_hash ON email_verification_tokens(token_hash)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS email_unsubscribe_tokens (
+        subscriber_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_unsubscribe_hash ON email_unsubscribe_tokens(token_hash)`).run();
+
     marketSchemaInitializedAt = Date.now();
   })();
 
@@ -2996,7 +3153,9 @@ async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null>
   }
 
   const summary = `PXI ${latest.score.toFixed(1)} (${latest.label}), ${deltaText} vs prior reading. Regime ${regimeLabel(currentRegime)}; posture ${riskPosture.replace('_', '-')} (${canonical.policy_state.stance.replace('_', ' ')}).${
-    freshness.has_stale_data ? ` ${freshness.stale_count} indicator(s) stale.` : ''
+    freshness.has_stale_data
+      ? ` ${freshness.stale_count} indicator(s) stale (${freshness.critical_stale_count} critical).`
+      : ''
   }`;
 
   return {
@@ -3585,6 +3744,30 @@ function normalizeOpportunityExpectancy(
   };
 }
 
+function calibrationQualityRank(quality: CalibrationQuality): number {
+  if (quality === 'ROBUST') return 3;
+  if (quality === 'LIMITED') return 2;
+  return 1;
+}
+
+function worstCalibrationQuality(...qualities: CalibrationQuality[]): CalibrationQuality {
+  if (qualities.length === 0) return 'INSUFFICIENT';
+  return [...qualities].sort((a, b) => calibrationQualityRank(a) - calibrationQualityRank(b))[0];
+}
+
+function calibrationPenaltyPoints(quality: CalibrationQuality): number {
+  if (quality === 'ROBUST') return 0;
+  if (quality === 'LIMITED') return 8;
+  return 16;
+}
+
+function applyQualityGateToConviction(rawConviction: number, qualityFactor: number): number {
+  const bounded = clamp(0, 100, rawConviction);
+  const factor = clamp(0.55, 1, qualityFactor);
+  // Shrink conviction toward neutral when data quality/calibration is degraded.
+  return Math.round(clamp(0, 100, 50 + (bounded - 50) * factor));
+}
+
 async function buildOpportunitySnapshot(
   db: D1Database,
   horizon: '7d' | '30d',
@@ -3601,7 +3784,7 @@ async function buildOpportunitySnapshot(
     return null;
   }
 
-  const [latestSignal, latestEnsemble, hitStats, themes, convictionCalibration, opportunityHistory] = await Promise.all([
+  const [latestSignal, latestEnsemble, hitStats, themes, convictionCalibration, opportunityHistory, freshness, edgeCalibration] = await Promise.all([
     db.prepare(`
       SELECT date, risk_allocation, signal_type, regime
       FROM pxi_signal
@@ -3624,7 +3807,19 @@ async function buildOpportunitySnapshot(
     fetchLatestSignalsThemes(),
     calibrationSnapshot ? Promise.resolve(calibrationSnapshot) : fetchLatestCalibrationSnapshot(db, 'conviction', horizon),
     computeOpportunityOutcomeHistory(db, horizon),
+    computeFreshnessStatus(db),
+    fetchLatestCalibrationSnapshot(db, 'edge_quality', null),
   ]);
+
+  const freshnessPenalty = freshnessPenaltyCount(freshness);
+  const convictionCalibrationQuality = calibrationQualityForSampleSize(convictionCalibration?.total_samples ?? 0);
+  const edgeCalibrationQuality = calibrationQualityForSampleSize(edgeCalibration?.total_samples ?? 0);
+  const qualityFloor = worstCalibrationQuality(convictionCalibrationQuality, edgeCalibrationQuality);
+  const qualityPenalty = Math.min(
+    30,
+    freshnessPenalty * 3 + calibrationPenaltyPoints(qualityFloor)
+  );
+  const convictionQualityFactor = clamp(0.55, 1, 1 - qualityPenalty / 100);
 
   const themeSource = themes.length > 0
     ? themes
@@ -3654,18 +3849,20 @@ async function buildOpportunitySnapshot(
   const items: OpportunityItem[] = themeSource.map((theme) => {
     const confidenceScore = confidenceTextToScore(theme.classification?.confidence);
     const themeComponent = clamp(0, 100, theme.score * 0.75 + confidenceScore * 0.25);
-    const conviction = clamp(0, 100, Math.round(
+    const rawConviction = clamp(0, 100, Math.round(
       0.35 * mlComponent +
       0.25 * similarComponent +
       0.20 * signalComponent +
       0.20 * themeComponent
     ));
+    const conviction = applyQualityGateToConviction(rawConviction, convictionQualityFactor);
 
     const directionalSignal = parseSignalDirection(ensembleValue + (theme.score - 50) * 0.06 + deltaBias * 0.08);
     const supportingFactors = [
       ...(theme.classification?.signal_type ? [theme.classification.signal_type] : []),
       ...(theme.key_tickers.slice(0, 3)),
       latestSignal?.signal_type || 'signal_context',
+      conviction < rawConviction ? 'quality_gate_applied' : null,
     ].filter(Boolean);
 
     const id = buildOpportunityId(latestPxi.date, theme.theme_id, horizon);
@@ -4099,37 +4296,60 @@ async function insertMarketEvents(db: D1Database, events: MarketAlertEvent[], in
   return inserted;
 }
 
-async function sendResendEmail(
+function canSendEmail(env: Env): boolean {
+  return Boolean(env.EMAIL_OUTBOUND);
+}
+
+function resolveFromAddress(env: Env): string {
+  return (env.ALERTS_FROM_EMAIL || 'alerts@pxicommand.com').trim();
+}
+
+function buildMimeMessage(payload: { from: string; to: string; subject: string; html: string; text: string }): string {
+  const boundary = `pxi-${stableHash(`${payload.to}:${payload.subject}:${Date.now()}`)}`;
+  return [
+    `From: ${payload.from}`,
+    `To: ${payload.to}`,
+    `Subject: ${payload.subject}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    payload.text,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    payload.html,
+    '',
+    `--${boundary}--`,
+    '',
+  ].join('\r\n');
+}
+
+async function sendCloudflareEmail(
   env: Env,
   payload: { to: string; subject: string; html: string; text: string }
 ): Promise<{ ok: boolean; providerId?: string; error?: string }> {
-  if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
-    return { ok: false, error: 'Resend not configured' };
+  if (!env.EMAIL_OUTBOUND) {
+    return { ok: false, error: 'Cloudflare email binding not configured' };
   }
 
   try {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${env.RESEND_API_KEY}`,
-      },
-      body: JSON.stringify({
-        from: env.RESEND_FROM_EMAIL,
-        to: [payload.to],
-        subject: payload.subject,
-        html: payload.html,
-        text: payload.text,
-      }),
+    const from = resolveFromAddress(env);
+    const rawMime = buildMimeMessage({
+      from,
+      to: payload.to,
+      subject: payload.subject,
+      html: payload.html,
+      text: payload.text,
     });
-
-    const body = await response.json().catch(() => ({} as Record<string, unknown>));
-    if (!response.ok) {
-      const message = String((body as { message?: string }).message || `Resend API ${response.status}`);
-      return { ok: false, error: message };
-    }
-
-    const providerId = String((body as { id?: string }).id || '');
+    const message = new EmailMessage(from, payload.to, rawMime);
+    await env.EMAIL_OUTBOUND.send(message);
+    const providerId = `cf-email:${stableHash(`${from}:${payload.to}:${payload.subject}`)}`;
     return { ok: true, providerId };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -4189,7 +4409,7 @@ async function sendDigestToSubscriber(
   `;
 
   const subject = `PXI Daily Digest • ${asIsoDate(new Date())}`;
-  return sendResendEmail(env, { to: email, subject, html, text });
+  return sendCloudflareEmail(env, { to: email, subject, html, text });
 }
 
 // ============== PXI Calculation ==============
@@ -6072,38 +6292,34 @@ export default {
         // Detect divergences
         const divergence = await detectDivergence(env.DB, pxi.score, regime);
 
-        // v1.4: Check data freshness - get stale indicators
-        const freshnessResult = await env.DB.prepare(`
-          SELECT indicator_id, MAX(date) as last_date,
-                 julianday('now') - julianday(MAX(date)) as days_old
-          FROM indicator_values
-          GROUP BY indicator_id
-          ORDER BY days_old DESC
-        `).all<{ indicator_id: string; last_date: string | null; days_old: number | null }>();
-
-        const staleIndicators = (freshnessResult.results || []).filter((r) => {
-          const threshold = getStaleThresholdDays(r.indicator_id);
-          return r.days_old !== null && Number.isFinite(r.days_old) && r.days_old > threshold;
-        });
-        const hasStaleData = staleIndicators.length > 0;
+        // v1.4: Check data freshness - SLA-driven, monitored indicator set only.
+        const freshnessDiagnostics = await computeFreshnessDiagnostics(env.DB);
+        const staleIndicators = freshnessDiagnostics.stale_indicators;
+        const hasStaleData = freshnessDiagnostics.status.has_stale_data;
         const topOffenders = staleIndicators
           .map((stale) => {
-            const threshold = getStaleThresholdDays(stale.indicator_id);
-            const stalePolicy = resolveStalePolicy(stale.indicator_id);
+            const stalePolicy = resolveStalePolicy(
+              stale.indicator_id,
+              INDICATOR_FREQUENCY_HINTS.get(stale.indicator_id) ?? null
+            );
             return {
               id: stale.indicator_id,
-              lastUpdate: stale.last_date,
+              status: stale.status,
+              critical: stale.critical,
+              lastUpdate: stale.latest_date,
               daysOld: stale.days_old === null || !Number.isFinite(stale.days_old) ? null : Math.round(stale.days_old),
-              maxAgeDays: threshold,
-              chronic: isChronicStaleness(stale.days_old, threshold),
+              maxAgeDays: stale.max_age_days,
+              chronic: isChronicStaleness(stale.days_old, stale.max_age_days),
               owner: stalePolicy.owner,
               escalation: stalePolicy.escalation,
-              excessDays: stale.days_old === null || !Number.isFinite(stale.days_old) ? Number.POSITIVE_INFINITY : stale.days_old - threshold,
+              priorityScore: (stale.critical ? 1000 : 0) +
+                (stale.status === 'missing' ? 500 : 0) +
+                (stale.days_old === null || !Number.isFinite(stale.days_old) ? 250 : stale.days_old - stale.max_age_days),
             };
           })
-          .sort((a, b) => b.excessDays - a.excessDays)
+          .sort((a, b) => b.priorityScore - a.priorityScore)
           .slice(0, 3)
-          .map(({ excessDays: _excessDays, ...offender }) => offender);
+          .map(({ priorityScore: _priorityScore, ...offender }) => offender);
 
         const latestRefreshRun = await fetchLatestSuccessfulMarketRefreshRun(env.DB);
         const latestProductSnapshotWrite = await fetchLatestMarketProductSnapshotWrite(env.DB);
@@ -6155,11 +6371,15 @@ export default {
           // v1.4: Data freshness info
           dataFreshness: {
             hasStaleData,
-            staleCount: staleIndicators.length,
+            staleCount: freshnessDiagnostics.status.stale_count,
+            criticalStaleCount: freshnessDiagnostics.status.critical_stale_count,
             staleIndicators: hasStaleData ? staleIndicators.slice(0, 5).map(s => ({
               id: s.indicator_id,
-              lastUpdate: s.last_date,
+              status: s.status,
+              critical: s.critical,
+              lastUpdate: s.latest_date,
               daysOld: s.days_old === null || !Number.isFinite(s.days_old) ? null : Math.round(s.days_old),
+              maxAgeDays: s.max_age_days,
             })) : [],
             topOffenders,
             lastRefreshAtUtc,
@@ -6493,8 +6713,14 @@ export default {
         if (!isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_EMAIL', 'ENABLE_ALERTS_EMAIL', true)) {
           return Response.json({ error: 'Email alerts disabled' }, { status: 404, headers: corsHeaders });
         }
-        if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
+        if (!canSendEmail(env)) {
           return Response.json({ error: 'Email service unavailable' }, { status: 503, headers: corsHeaders });
+        }
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Subscribe-start schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
         }
 
         const body = await parseJsonBody<{ email?: string; types?: string[]; cadence?: string }>(request);
@@ -6531,7 +6757,7 @@ export default {
         `).bind(email, tokenHash, expiresAt).run();
 
         const verifyUrl = `https://pxicommand.com/inbox?verify_token=${encodeURIComponent(verifyToken)}`;
-        const verificationEmail = await sendResendEmail(env, {
+        const verificationEmail = await sendCloudflareEmail(env, {
           to: email,
           subject: 'Verify your PXI alert subscription',
           text: `Verify your PXI alerts subscription by opening: ${verifyUrl}\n\nThis link expires in 15 minutes.`,
@@ -6555,6 +6781,12 @@ export default {
       if (url.pathname === '/api/alerts/subscribe/verify' && method === 'POST') {
         if (!isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_EMAIL', 'ENABLE_ALERTS_EMAIL', true)) {
           return Response.json({ error: 'Email alerts disabled' }, { status: 404, headers: corsHeaders });
+        }
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Subscribe-verify schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
         }
 
         const body = await parseJsonBody<{ token?: string }>(request);
@@ -6618,6 +6850,13 @@ export default {
       }
 
       if (url.pathname === '/api/alerts/unsubscribe' && method === 'POST') {
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Unsubscribe schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
         const body = await parseJsonBody<{ token?: string }>(request);
         const token = String(body?.token || '').trim();
         const subscriberId = token.split('.')[0];
@@ -6842,7 +7081,7 @@ export default {
           }, { headers: corsHeaders });
         }
 
-        if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
+        if (!canSendEmail(env)) {
           return Response.json({ error: 'Email service unavailable' }, { status: 503, headers: corsHeaders });
         }
 
@@ -7217,8 +7456,9 @@ export default {
           fetchLatestCalibrationSnapshot(env.DB, 'edge_quality', null),
         ]);
         const conflictState = resolveConflictState(regime, signal);
+        const stalePenaltyUnits = freshnessPenaltyCount(freshness);
         const edgeQuality = computeEdgeQualitySnapshot({
-          staleCount: freshness.stale_count,
+          staleCount: stalePenaltyUnits,
           mlSampleSize,
           regime,
           conflictState,
@@ -7300,8 +7540,11 @@ export default {
         }
 
         const { pxi, signal, regime, freshness, risk_band, edge_quality, policy_state, degraded_reasons, risk_sizing } = canonical;
+        const stalePenaltyUnits = freshnessPenaltyCount(freshness);
         const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policy_state.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} tactical posture at ${risk_sizing.target_pct}% risk budget (raw ${Math.round(signal.risk_allocation * 100)}%).${
-          freshness.stale_count > 0 ? ` ${freshness.stale_count} stale indicator(s) are penalizing confidence.` : ''
+          stalePenaltyUnits > 0
+            ? ` stale-input pressure ${stalePenaltyUnits} (critical stale: ${freshness.critical_stale_count}).`
+            : ''
         }`;
 
         const payload: PlanPayload = {
