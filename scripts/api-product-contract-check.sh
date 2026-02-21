@@ -309,8 +309,82 @@ check_ml_low_sample_semantics() {
   fi
 }
 
+check_opportunity_coherence_contract() {
+  local opp_json
+  local contradictions
+  local bad_contract
+  local degraded_reason
+  local suppressed_count
+  local item_count
+
+  opp_json=$(curl -sS --max-time 20 "$API_URL/api/opportunities?horizon=7d&limit=50")
+
+  contradictions=$(echo "$opp_json" | jq -r '
+    any(.items[]?;
+      (.direction == "bullish" and (
+        ((.calibration.probability_correct_direction != null) and (.calibration.probability_correct_direction < 0.5)) or
+        ((.expectancy.expected_move_pct != null) and (.expectancy.expected_move_pct <= 0))
+      )) or
+      (.direction == "bearish" and (
+        ((.calibration.probability_correct_direction != null) and (.calibration.probability_correct_direction < 0.5)) or
+        ((.expectancy.expected_move_pct != null) and (.expectancy.expected_move_pct >= 0))
+      )) or
+      (.direction == "neutral")
+    )
+  ')
+
+  if [[ "$contradictions" == "true" ]]; then
+    echo "Opportunity coherence contradiction found in published feed"
+    echo "$opp_json"
+    exit 1
+  fi
+
+  bad_contract=$(echo "$opp_json" | jq -r '
+    any(.items[]?;
+      (.eligibility.passed != true) or
+      (.eligibility.failed_checks | length != 0) or
+      (.decision_contract.coherent != true)
+    )
+  ')
+  if [[ "$bad_contract" == "true" ]]; then
+    echo "Published opportunity includes failed eligibility/decision contract"
+    echo "$opp_json"
+    exit 1
+  fi
+
+  degraded_reason=$(echo "$opp_json" | jq -r '.degraded_reason // ""')
+  suppressed_count=$(echo "$opp_json" | jq -r '.suppressed_count // 0')
+  item_count=$(echo "$opp_json" | jq -r '.items | length')
+
+  if [[ -n "$degraded_reason" ]]; then
+    case "$degraded_reason" in
+      quality_filtered|coherence_gate_failed|suppressed_data_quality|feature_disabled|migration_guard_failed|snapshot_unavailable|snapshot_rebuilt)
+        ;;
+      *)
+        echo "Invalid opportunities degraded_reason: $degraded_reason"
+        echo "$opp_json"
+        exit 1
+        ;;
+    esac
+  fi
+
+  if [[ "$degraded_reason" == "suppressed_data_quality" && "$item_count" != "0" ]]; then
+    echo "suppressed_data_quality must return an empty items array"
+    echo "$opp_json"
+    exit 1
+  fi
+
+  if [[ "$degraded_reason" == "coherence_gate_failed" || "$degraded_reason" == "quality_filtered" || "$degraded_reason" == "suppressed_data_quality" ]]; then
+    if ! awk "BEGIN { exit !($suppressed_count > 0) }"; then
+      echo "degraded_reason=$degraded_reason requires suppressed_count > 0"
+      echo "$opp_json"
+      exit 1
+    fi
+  fi
+}
+
 check_api_json_contract "/api/plan" \
-  'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string"))' \
+  'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number")))' \
   "plan"
 
 check_api_json_contract "/api/brief?scope=market" \
@@ -318,7 +392,7 @@ check_api_json_contract "/api/brief?scope=market" \
   "brief"
 
 check_api_json_contract "/api/opportunities?horizon=7d&limit=5" \
-  'type=="object" and (.as_of|type=="string") and (.horizon|type=="string") and (.items|type=="array") and (all(.items[]?; (.id|type=="string") and (.theme_id|type=="string") and (.direction|type=="string") and (.conviction_score|type=="number") and (.calibration.quality|type=="string") and (.calibration.basis=="conviction_decile") and ((.calibration.window==null) or (.calibration.window|type=="string")) and ((.calibration.unavailable_reason==null) or (.calibration.unavailable_reason|type=="string")) and (.expectancy.sample_size|type=="number") and (.expectancy.basis|type=="string") and (.expectancy.quality|type=="string") and ((.expectancy.expected_move_pct==null) or (.expectancy.expected_move_pct|type=="number")) and ((.expectancy.max_adverse_move_pct==null) or (.expectancy.max_adverse_move_pct|type=="number")) and ((.expectancy.unavailable_reason==null) or (.expectancy.unavailable_reason|type=="string"))))' \
+  'type=="object" and (.as_of|type=="string") and (.horizon|type=="string") and (.suppressed_count|type=="number") and ((.degraded_reason==null) or (.degraded_reason|type=="string")) and (.items|type=="array") and (all(.items[]?; (.id|type=="string") and (.theme_id|type=="string") and (.direction|type=="string") and (.conviction_score|type=="number") and (.calibration.quality|type=="string") and (.calibration.basis=="conviction_decile") and ((.calibration.window==null) or (.calibration.window|type=="string")) and ((.calibration.unavailable_reason==null) or (.calibration.unavailable_reason|type=="string")) and (.expectancy.sample_size|type=="number") and (.expectancy.basis|type=="string") and (.expectancy.quality|type=="string") and ((.expectancy.expected_move_pct==null) or (.expectancy.expected_move_pct|type=="number")) and ((.expectancy.max_adverse_move_pct==null) or (.expectancy.max_adverse_move_pct|type=="number")) and ((.expectancy.unavailable_reason==null) or (.expectancy.unavailable_reason|type=="string")) and (.eligibility.passed|type=="boolean") and (.eligibility.failed_checks|type=="array") and (.decision_contract.coherent|type=="boolean") and (.decision_contract.confidence_band|type=="string") and (.decision_contract.rationale_codes|type=="array")))' \
   "opportunities"
 
 check_api_json_contract "/api/alerts/feed?limit=10" \
@@ -341,6 +415,14 @@ check_api_json_contract "/api/accuracy" \
   'type=="object" and (.as_of|type=="string") and (.coverage.total_predictions|type=="number") and (.coverage.evaluated_count|type=="number") and (.coverage.pending_count|type=="number") and (.coverage_quality|type=="string") and (.minimum_reliable_sample|type=="number") and (.unavailable_reasons|type=="array")' \
   "accuracy"
 
+check_api_json_contract "/api/diagnostics/calibration?metric=conviction&horizon=7d" \
+  'type=="object" and (.as_of|type=="string") and (.metric=="conviction") and (.horizon=="7d") and (.basis|type=="string") and (.total_samples|type=="number") and (.bins|type=="array") and (.diagnostics.quality_band|type=="string") and (.diagnostics.minimum_reliable_sample|type=="number") and (.diagnostics.insufficient_reasons|type=="array") and ((.diagnostics.brier_score==null) or (.diagnostics.brier_score|type=="number")) and ((.diagnostics.ece==null) or (.diagnostics.ece|type=="number")) and ((.diagnostics.log_loss==null) or (.diagnostics.log_loss|type=="number"))' \
+  "diagnostics-calibration"
+
+check_api_json_contract "/api/ops/freshness-slo" \
+  'type=="object" and (.as_of|type=="string") and (.windows["7d"].days_observed|type=="number") and (.windows["7d"].days_with_critical_stale|type=="number") and (.windows["7d"].slo_attainment_pct|type=="number") and (.windows["7d"].recent_incidents|type=="array") and (.windows["30d"].days_observed|type=="number") and (.windows["30d"].days_with_critical_stale|type=="number") and (.windows["30d"].slo_attainment_pct|type=="number") and (.windows["30d"].recent_incidents|type=="array")' \
+  "freshness-slo"
+
 check_policy_state_consistency
 check_plan_brief_coherence
 check_consistency_gate
@@ -349,5 +431,6 @@ check_refresh_recency
 check_freshness_alert_parity
 check_degraded_consistency_score
 check_ml_low_sample_semantics
+check_opportunity_coherence_contract
 
 echo "Product API contract checks passed against $API_URL"

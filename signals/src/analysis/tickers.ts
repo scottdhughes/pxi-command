@@ -31,6 +31,7 @@ const MARKET_ABBREVS = [
   "NYSE", "DOW", "SP", "GDP", "CPI", "PPI", "PCE",
   "SPAC", "REIT", "ADR", "AUM", "EBITDA", "PE", "PB",
   "RSI", "MACD", "EMA", "SMA", "VWAP", "TA", "FA",
+  "SOFR", "IORB", "METR", "WI", "SRF",
 ]
 
 /** Currency codes and geographical abbreviations */
@@ -46,6 +47,7 @@ const TECH_ABBREVS = [
   "B2B", "B2C", "D2C", "CAGR", "MRR", "ARR", "LTV",
   "CAC", "NPS", "OKR", "KPI", "QA", "R&D", "M&A",
   "ESG", "DEI", "WFH", "RTO", "BYOD",
+  "GPT", "LLM", "GPU", "ASIC", "HBM",
 ]
 
 /** Social media and Reddit-specific terms */

@@ -119,9 +119,13 @@ jobs:
               echo ""
               echo "### PXI Market Products Summary"
               echo ""
-              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | As of |"
-              echo "|---:|---:|---:|---:|---|"
-              jq -r '"| \(.result.brief_generated // 0) | \(.result.opportunities_generated // 0) | \(.result.calibrations_generated // 0) | \(.result.alerts_generated // 0) | \(.result.as_of // "n/a") |"' /tmp/pxi-market-summary.json
+              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | Coherence suppressed | Quality filtered | Data-quality suppressed | Critical stale | As of |"
+              echo "|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+              jq -r '"| \(.result.brief_generated // 0) | \(.result.opportunities_generated // 0) | \(.result.calibrations_generated // 0) | \(.result.alerts_generated // 0) | \(.result.coherence_suppressed_count // 0) | \(.result.quality_filtered_count // 0) | \(.result.suppressed_data_quality_count // 0) | \(.result.critical_stale_count // 0) | \(.result.as_of // "n/a") |"' /tmp/pxi-market-summary.json
+              echo ""
+              echo "| Calibration diagnostic bands |"
+              echo "|---|"
+              jq -r '"| edge=\(.result.calibration_diagnostics.edge_quality // "n/a"), conviction_7d=\(.result.calibration_diagnostics.conviction_7d // "n/a"), conviction_30d=\(.result.calibration_diagnostics.conviction_30d // "n/a") |"' /tmp/pxi-market-summary.json
             } >> "$GITHUB_STEP_SUMMARY"
           else
             {

@@ -19,7 +19,7 @@ export const RATE_EPSILON = 1e-6;
  * Hard cap on growth_ratio to prevent pathological "baseline≈0" explosions
  * from dominating scores and rendering absurd UI values.
  */
-export const GROWTH_RATIO_CAP = 1000;
+export const GROWTH_RATIO_CAP = 25;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scoring Weights

@@ -498,6 +498,15 @@ interface OpportunityItem {
     quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
     unavailable_reason: string | null
   }
+  eligibility?: {
+    passed: boolean
+    failed_checks: string[]
+  }
+  decision_contract?: {
+    coherent: boolean
+    confidence_band: 'high' | 'medium' | 'low'
+    rationale_codes: string[]
+  }
   updated_at: string
 }
 
@@ -505,7 +514,35 @@ interface OpportunitiesResponse {
   as_of: string
   horizon: '7d' | '30d'
   items: OpportunityItem[]
+  suppressed_count: number
+  quality_filtered_count?: number
+  coherence_suppressed_count?: number
   degraded_reason?: string | null
+}
+
+interface CalibrationDiagnosticsResponse {
+  as_of: string
+  metric: 'conviction' | 'edge_quality'
+  horizon: '7d' | '30d' | null
+  basis: string
+  total_samples: number
+  bins: Array<{
+    bin: string
+    correct_count: number
+    probability_correct: number | null
+    ci95_low: number | null
+    ci95_high: number | null
+    sample_size: number
+    quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+  }>
+  diagnostics: {
+    brier_score: number | null
+    ece: number | null
+    log_loss: number | null
+    quality_band: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+    minimum_reliable_sample: number
+    insufficient_reasons: string[]
+  }
 }
 
 interface MarketFeedAlert {
@@ -594,6 +631,23 @@ interface PlanData {
       sample_size: number
       unavailable_reason: string | null
     }
+  }
+  brief_ref?: {
+    as_of: string
+    regime_delta: 'UNCHANGED' | 'SHIFTED' | 'STRENGTHENED' | 'WEAKENED'
+    risk_posture: 'risk_on' | 'neutral' | 'risk_off'
+  }
+  opportunity_ref?: {
+    as_of: string
+    horizon: '7d' | '30d'
+    eligible_count: number
+    suppressed_count: number
+    degraded_reason: string | null
+  }
+  alerts_ref?: {
+    as_of: string
+    warning_count_24h: number
+    critical_count_24h: number
   }
   invalidation_rules: string[]
   degraded_reason: string | null
@@ -963,6 +1017,14 @@ function formatUnavailableReason(reason: string | null | undefined): string {
   return reason.replace(/_/g, ' ')
 }
 
+function formatOpportunityDegradedReason(reason: string | null | undefined): string {
+  if (!reason) return ''
+  if (reason === 'suppressed_data_quality') return 'Opportunity feed is suppressed due to critical stale inputs or consistency failure.'
+  if (reason === 'coherence_gate_failed') return 'No eligible opportunities (contract gate).'
+  if (reason === 'quality_filtered') return 'Low-information opportunities were filtered from this feed.'
+  return reason.replace(/_/g, ' ')
+}
+
 function calibrationQualityClass(quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'): string {
   if (quality === 'ROBUST') return 'border-[#00c896]/40 text-[#00c896]'
   if (quality === 'LIMITED') return 'border-[#f59e0b]/40 text-[#f59e0b]'
@@ -1057,6 +1119,10 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
     plan.uncertainty?.flags.stale_inputs ||
     plan.uncertainty?.flags.limited_calibration ||
     plan.uncertainty?.flags.limited_scenario_sample
+  const opportunitySuppressed = Boolean(
+    plan.opportunity_ref?.degraded_reason === 'suppressed_data_quality' ||
+    plan.opportunity_ref?.degraded_reason === 'coherence_gate_failed'
+  )
 
   return (
     <section className="w-full mb-6 rounded border border-[#26272b] bg-[#0a0a0a]/80 p-4">
@@ -1089,6 +1155,11 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
             </p>
           )}
           <p className="mt-2 text-[12px] leading-relaxed text-[#e4e8ee]">{plan.setup_summary}</p>
+          {opportunitySuppressed && (
+            <p className="mt-2 text-[10px] text-[#f59e0b]">
+              Opportunity feed currently suppressed: {formatOpportunityDegradedReason(plan.opportunity_ref?.degraded_reason)}
+            </p>
+          )}
         </div>
         <div className="shrink-0 text-right">
           <p className={`text-[11px] font-medium uppercase tracking-wide ${qualityColor}`}>
@@ -2691,8 +2762,11 @@ function BriefCompactCard({
 }
 
 function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | null; onOpen: () => void }) {
-  if (!data || !data.items || data.items.length === 0) return null
-  const top = data.items.slice(0, 3)
+  if (!data) return null
+  const top = (data.items || []).slice(0, 3)
+  const suppressedCount = Math.max(0, data.suppressed_count || 0)
+  const hasFeedState = top.length > 0 || suppressedCount > 0 || Boolean(data.degraded_reason)
+  if (!hasFeedState) return null
 
   return (
     <div className="w-full mt-6 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
@@ -2706,49 +2780,64 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
         </button>
       </div>
 
-      <div className="space-y-2">
-        {top.map((item) => {
-          const calibration = item.calibration ?? fallbackOpportunityCalibration()
-          const expectancy = item.expectancy ?? fallbackOpportunityExpectancy()
-          return (
-          <div key={item.id} className="p-3 bg-[#0f0f0f] border border-[#1a1a1a] rounded">
-            <div className="flex items-start justify-between gap-2">
-              <div>
-                <div className="text-[12px] text-[#f3f3f3]">{item.theme_name}</div>
-                <div className="text-[9px] text-[#949ba5]/60 uppercase tracking-wider">
-                  {item.direction} · {item.sample_size} samples
+      {data.degraded_reason && (
+        <p className="mb-3 text-[10px] text-[#f59e0b]">
+          {formatOpportunityDegradedReason(data.degraded_reason)}
+        </p>
+      )}
+      {suppressedCount > 0 && (
+        <p className="mb-3 text-[9px] text-[#949ba5]/70 uppercase tracking-wider">
+          suppressed {suppressedCount}
+        </p>
+      )}
+
+      {top.length === 0 ? (
+        <div className="text-[10px] text-[#949ba5]">No eligible opportunities currently published.</div>
+      ) : (
+        <div className="space-y-2">
+          {top.map((item) => {
+            const calibration = item.calibration ?? fallbackOpportunityCalibration()
+            const expectancy = item.expectancy ?? fallbackOpportunityExpectancy()
+            return (
+            <div key={item.id} className="p-3 bg-[#0f0f0f] border border-[#1a1a1a] rounded">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-[12px] text-[#f3f3f3]">{item.theme_name}</div>
+                  <div className="text-[9px] text-[#949ba5]/60 uppercase tracking-wider">
+                    {item.direction} · {item.sample_size} samples
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[18px] leading-none font-mono text-[#f3f3f3]">{item.conviction_score}</div>
+                  <div className="text-[8px] text-[#949ba5]/50 uppercase tracking-wider">conviction</div>
+                  <div className={`mt-1 inline-block rounded border px-1.5 py-0.5 text-[8px] uppercase tracking-wider ${calibrationQualityClass(calibration.quality)}`}>
+                    {calibration.quality.toLowerCase()}
+                  </div>
                 </div>
               </div>
-              <div className="text-right">
-                <div className="text-[18px] leading-none font-mono text-[#f3f3f3]">{item.conviction_score}</div>
-                <div className="text-[8px] text-[#949ba5]/50 uppercase tracking-wider">conviction</div>
-                <div className={`mt-1 inline-block rounded border px-1.5 py-0.5 text-[8px] uppercase tracking-wider ${calibrationQualityClass(calibration.quality)}`}>
-                  {calibration.quality.toLowerCase()}
-                </div>
-              </div>
-            </div>
-            <p className="mt-2 text-[10px] text-[#b8bec8]">{item.rationale}</p>
-            <p className="mt-1 text-[9px] text-[#949ba5]/70">
-              calibrated hit {formatProbability(calibration.probability_correct_direction)} ·
-              {' '}95% CI {formatProbability(calibration.ci95_low)}-{formatProbability(calibration.ci95_high)} ·
-              {' '}n={calibration.sample_size} · window {calibration.window || 'n/a'}
-            </p>
-            <p className="mt-1 text-[9px] text-[#949ba5]/70">
-              expectancy {formatMaybePercent(expectancy.expected_move_pct)} ·
-              {' '}max adverse {formatMaybePercent(expectancy.max_adverse_move_pct)} ·
-              {' '}n={expectancy.sample_size} · {expectancy.basis.replace(/_/g, ' ')} · {expectancy.quality.toLowerCase()}
-            </p>
-            {(calibration.unavailable_reason || expectancy.unavailable_reason) && (
+              <p className="mt-2 text-[10px] text-[#b8bec8]">{item.rationale}</p>
               <p className="mt-1 text-[9px] text-[#949ba5]/70">
-                unavailable: {[calibration.unavailable_reason, expectancy.unavailable_reason].filter(Boolean).map((r) => formatUnavailableReason(r)).join(' · ')}
+                calibrated hit {formatProbability(calibration.probability_correct_direction)} ·
+                {' '}95% CI {formatProbability(calibration.ci95_low)}-{formatProbability(calibration.ci95_high)} ·
+                {' '}n={calibration.sample_size} · window {calibration.window || 'n/a'}
               </p>
-            )}
-            {calibration.quality !== 'ROBUST' && (
-              <p className="mt-1 text-[9px] text-[#f59e0b]">Use reduced sizing until calibration quality improves.</p>
-            )}
-          </div>
-        )})}
-      </div>
+              <p className="mt-1 text-[9px] text-[#949ba5]/70">
+                expectancy {formatMaybePercent(expectancy.expected_move_pct)} ·
+                {' '}max adverse {formatMaybePercent(expectancy.max_adverse_move_pct)} ·
+                {' '}n={expectancy.sample_size} · {expectancy.basis.replace(/_/g, ' ')} · {expectancy.quality.toLowerCase()}
+              </p>
+              {(calibration.unavailable_reason || expectancy.unavailable_reason) && (
+                <p className="mt-1 text-[9px] text-[#949ba5]/70">
+                  unavailable: {[calibration.unavailable_reason, expectancy.unavailable_reason].filter(Boolean).map((r) => formatUnavailableReason(r)).join(' · ')}
+                </p>
+              )}
+              {calibration.quality !== 'ROBUST' && (
+                <p className="mt-1 text-[9px] text-[#f59e0b]">Use reduced sizing until calibration quality improves.</p>
+              )}
+            </div>
+          )})}
+        </div>
+      )}
     </div>
   )
 }
@@ -2856,15 +2945,23 @@ function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => v
 
 function OpportunitiesPage({
   data,
+  diagnostics,
   horizon,
   onHorizonChange,
   onBack,
 }: {
   data: OpportunitiesResponse | null
+  diagnostics: CalibrationDiagnosticsResponse | null
   horizon: '7d' | '30d'
   onHorizonChange: (h: '7d' | '30d') => void
   onBack: () => void
 }) {
+  const suppressedCount = Math.max(0, data?.suppressed_count || 0)
+  const degradedReason = data?.degraded_reason || null
+  const hasContractGateSuppression = degradedReason === 'coherence_gate_failed'
+  const hasDataQualitySuppression = degradedReason === 'suppressed_data_quality'
+  const hasQualityFilter = degradedReason === 'quality_filtered'
+
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
       <div className="max-w-5xl mx-auto">
@@ -2897,14 +2994,50 @@ function OpportunitiesPage({
           </button>
         </div>
 
-        {data?.degraded_reason === 'quality_filtered' && (
-          <div className="mb-4 text-[10px] text-[#f59e0b]">
-            Low-information neutral setups were filtered from this feed.
+        {diagnostics && (
+          <div className="mb-4 p-3 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">Calibration diagnostics</div>
+              <span className={`rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${calibrationQualityClass(diagnostics.diagnostics.quality_band)}`}>
+                {diagnostics.diagnostics.quality_band.toLowerCase()}
+              </span>
+            </div>
+            <div className="mt-2 text-[10px] text-[#d7dbe1]">
+              samples {diagnostics.total_samples} · as_of {new Date(diagnostics.as_of).toLocaleString()}
+            </div>
+            {diagnostics.diagnostics.quality_band !== 'INSUFFICIENT' ? (
+              <div className="mt-1 text-[10px] text-[#949ba5]">
+                brier {diagnostics.diagnostics.brier_score?.toFixed(4)} · ece {diagnostics.diagnostics.ece?.toFixed(4)}
+              </div>
+            ) : (
+              <div className="mt-1 text-[10px] text-[#f59e0b]">
+                Insufficient sample for stable numeric calibration diagnostics.
+              </div>
+            )}
+          </div>
+        )}
+
+        {degradedReason && (
+          <div className={`mb-4 text-[10px] ${hasDataQualitySuppression || hasContractGateSuppression ? 'text-[#f59e0b]' : 'text-[#949ba5]'}`}>
+            {formatOpportunityDegradedReason(degradedReason)}
+          </div>
+        )}
+        {suppressedCount > 0 && (
+          <div className="mb-4 text-[10px] text-[#949ba5]/80 uppercase tracking-wider">
+            suppressed {suppressedCount}
           </div>
         )}
 
         {!data || data.items.length === 0 ? (
-          <div className="text-[#949ba5]">No opportunities available yet.</div>
+          <div className="text-[#949ba5]">
+            {hasContractGateSuppression
+              ? 'No eligible opportunities (contract gate).'
+              : hasDataQualitySuppression
+                ? 'Opportunities are suppressed until critical data quality recovers.'
+                : hasQualityFilter
+                  ? 'No opportunities available after quality filtering.'
+                  : 'No opportunities available yet.'}
+          </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {data.items.map((item) => {
@@ -3928,6 +4061,7 @@ function App() {
   const [planData, setPlanData] = useState<PlanData | null>(null)
   const [briefData, setBriefData] = useState<BriefData | null>(null)
   const [opportunitiesData, setOpportunitiesData] = useState<OpportunitiesResponse | null>(null)
+  const [opportunityDiagnostics, setOpportunityDiagnostics] = useState<CalibrationDiagnosticsResponse | null>(null)
   const [opportunityHorizon, setOpportunityHorizon] = useState<'7d' | '30d'>('7d')
   const [alertsFeed, setAlertsFeed] = useState<AlertsFeedResponse | null>(null)
   const [showSubscribeModal, setShowSubscribeModal] = useState(false)
@@ -4049,7 +4183,7 @@ function App() {
           setLoading(true)
         }
 
-        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, oppRes, inboxRes] = await Promise.all([
+        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, oppRes, oppDiagRes, inboxRes] = await Promise.all([
           fetchPlan.pxi ? fetchApi('/api/pxi') : Promise.resolve(null),
           fetchPlan.signal ? fetchApi('/api/signal').catch(() => null) : Promise.resolve(null),
           fetchPlan.plan ? fetchApi('/api/plan').catch(() => null) : Promise.resolve(null),
@@ -4060,6 +4194,7 @@ function App() {
           fetchPlan.alertsHistory ? fetchApi('/api/alerts?limit=50').catch(() => null) : Promise.resolve(null),
           fetchPlan.brief ? fetchApi('/api/brief?scope=market').catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/opportunities?horizon=${opportunityHorizon}&limit=20`).catch(() => null) : Promise.resolve(null),
+          fetchPlan.opportunities ? fetchApi(`/api/diagnostics/calibration?metric=conviction&horizon=${opportunityHorizon}`).catch(() => null) : Promise.resolve(null),
           fetchPlan.inbox ? fetchApi('/api/alerts/feed?limit=50').catch(() => null) : Promise.resolve(null),
         ])
 
@@ -4197,8 +4332,20 @@ function App() {
         if (oppRes?.ok) {
           const oppJson = await oppRes.json() as OpportunitiesResponse
           if (Array.isArray(oppJson.items)) {
-            setOpportunitiesData(oppJson)
+            setOpportunitiesData({
+              ...oppJson,
+              suppressed_count: Number.isFinite(oppJson.suppressed_count) ? oppJson.suppressed_count : 0,
+            })
           }
+        }
+
+        if (oppDiagRes?.ok) {
+          const diagnosticsJson = await oppDiagRes.json() as CalibrationDiagnosticsResponse
+          if (diagnosticsJson?.diagnostics && typeof diagnosticsJson.total_samples === 'number') {
+            setOpportunityDiagnostics(diagnosticsJson)
+          }
+        } else if (fetchPlan.opportunities) {
+          setOpportunityDiagnostics(null)
         }
 
         if (inboxRes?.ok) {
@@ -4316,6 +4463,7 @@ function App() {
     return (
       <OpportunitiesPage
         data={opportunitiesData}
+        diagnostics={opportunityDiagnostics}
         horizon={opportunityHorizon}
         onHorizonChange={setOpportunityHorizon}
         onBack={() => navigateTo('/')}
