@@ -92,6 +92,29 @@ interface MarketRefreshSummary {
   };
 }
 
+interface EdgeDiagnosticsWindow {
+  horizon: '7d' | '30d';
+  sample_size: number;
+  uplift_vs_baseline: number | null;
+  uplift_ci95_low: number | null;
+  uplift_ci95_high: number | null;
+  leakage_sentinel?: {
+    pass: boolean;
+    violation_count: number;
+    reasons: string[];
+  };
+}
+
+interface EdgeDiagnosticsReport {
+  as_of: string;
+  basis: string;
+  windows: EdgeDiagnosticsWindow[];
+  promotion_gate?: {
+    pass: boolean;
+    reasons: string[];
+  };
+}
+
 interface YahooChartPayload {
   chart?: {
     result?: Array<{
@@ -213,6 +236,50 @@ export function parseYahooChartResponse(
   }
 
   return values;
+}
+
+export function evaluateEdgePromotionGate(report: EdgeDiagnosticsReport | null | undefined): {
+  pass: boolean;
+  reasons: string[];
+} {
+  if (!report || !Array.isArray(report.windows)) {
+    return {
+      pass: false,
+      reasons: ['edge_diagnostics_unavailable'],
+    };
+  }
+
+  const reasons: string[] = [];
+  for (const window of report.windows) {
+    const leakage = window?.leakage_sentinel;
+    if (!leakage) {
+      reasons.push(`${window.horizon}:leakage_sentinel_missing`);
+      continue;
+    }
+    if (!leakage.pass || leakage.violation_count > 0) {
+      if (Array.isArray(leakage.reasons) && leakage.reasons.length > 0) {
+        for (const reason of leakage.reasons) {
+          reasons.push(`${window.horizon}:${reason}`);
+        }
+      } else {
+        reasons.push(`${window.horizon}:leakage_sentinel_failed`);
+      }
+    }
+  }
+
+  if (report.promotion_gate?.pass === false) {
+    const gateReasons = Array.isArray(report.promotion_gate.reasons) ? report.promotion_gate.reasons : [];
+    if (gateReasons.length > 0) {
+      reasons.push(...gateReasons.map((reason) => `gate:${reason}`));
+    } else {
+      reasons.push('gate:promotion_gate_failed');
+    }
+  }
+
+  return {
+    pass: reasons.length === 0,
+    reasons: Array.from(new Set(reasons)),
+  };
 }
 
 function recordIndicatorValues(values: IndicatorValue[]): number {
@@ -1461,6 +1528,39 @@ async function evaluatePredictions(): Promise<void> {
   console.log(`  ✓ Evaluated: ${result.evaluated}`);
 }
 
+async function enforceEdgePromotionGate(): Promise<void> {
+  const { baseUrl } = getWriteConfig();
+  console.log('\n━━━ Edge Promotion Gate ━━━');
+
+  const response = await fetch(`${baseUrl}/api/diagnostics/edge?horizon=all`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Edge diagnostics error ${response.status}: ${errorText}`);
+  }
+
+  const report = (await response.json()) as EdgeDiagnosticsReport;
+  const evaluation = evaluateEdgePromotionGate(report);
+
+  for (const window of report.windows || []) {
+    const uplift = window.uplift_vs_baseline === null ? 'n/a' : `${(window.uplift_vs_baseline * 100).toFixed(2)}%`;
+    const ciLow = window.uplift_ci95_low === null ? 'n/a' : `${(window.uplift_ci95_low * 100).toFixed(2)}%`;
+    const ciHigh = window.uplift_ci95_high === null ? 'n/a' : `${(window.uplift_ci95_high * 100).toFixed(2)}%`;
+    console.log(`  • ${window.horizon}: n=${window.sample_size}, uplift=${uplift}, ci95=[${ciLow}, ${ciHigh}], leakage_pass=${window.leakage_sentinel?.pass ?? false}`);
+  }
+
+  if (!evaluation.pass) {
+    throw new Error(`Edge promotion gate failed: ${evaluation.reasons.join(',')}`);
+  }
+
+  console.log('  ✓ Promotion gate passed');
+}
+
 async function triggerMarketProductsRefresh(): Promise<void> {
   const { writeApiKey, baseUrl } = getWriteConfig();
   console.log('\n━━━ Refreshing Market Products ━━━');
@@ -1515,6 +1615,7 @@ export async function main(): Promise<void> {
     await postToWorkerAPI();
     await triggerRecalculation();
     await evaluatePredictions();
+    await enforceEdgePromotionGate();
     await triggerMarketProductsRefresh();
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);

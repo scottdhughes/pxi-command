@@ -119,13 +119,24 @@ jobs:
               echo ""
               echo "### PXI Market Products Summary"
               echo ""
-              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | Coherence suppressed | Quality filtered | Data-quality suppressed | Critical stale | As of |"
-              echo "|---:|---:|---:|---:|---:|---:|---:|---:|---|"
-              jq -r '"| \(.result.brief_generated // 0) | \(.result.opportunities_generated // 0) | \(.result.calibrations_generated // 0) | \(.result.alerts_generated // 0) | \(.result.coherence_suppressed_count // 0) | \(.result.quality_filtered_count // 0) | \(.result.suppressed_data_quality_count // 0) | \(.result.critical_stale_count // 0) | \(.result.as_of // "n/a") |"' /tmp/pxi-market-summary.json
+              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | Coherence suppressed | Quality filtered | Data-quality suppressed | Critical stale | Edge gate | As of |"
+              echo "|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"
+              jq -r '"| \(.result.brief_generated // 0) | \(.result.opportunities_generated // 0) | \(.result.calibrations_generated // 0) | \(.result.alerts_generated // 0) | \(.result.coherence_suppressed_count // 0) | \(.result.quality_filtered_count // 0) | \(.result.suppressed_data_quality_count // 0) | \(.result.critical_stale_count // 0) | \((.result.edge_diagnostics.promotion_gate.pass // "n/a") | tostring) | \(.result.as_of // "n/a") |"' /tmp/pxi-market-summary.json
               echo ""
               echo "| Calibration diagnostic bands |"
               echo "|---|"
               jq -r '"| edge=\(.result.calibration_diagnostics.edge_quality // "n/a"), conviction_7d=\(.result.calibration_diagnostics.conviction_7d // "n/a"), conviction_30d=\(.result.calibration_diagnostics.conviction_30d // "n/a") |"' /tmp/pxi-market-summary.json
+              if jq -e '.result.edge_diagnostics != null' /tmp/pxi-market-summary.json >/dev/null 2>&1; then
+                echo ""
+                echo "| Edge uplift diagnostics |"
+                echo "|---|"
+                jq -r '
+                  (.result.edge_diagnostics.windows // [])
+                  | map("h=\(.horizon), n=\(.sample_size), uplift=\((.uplift_vs_baseline // "n/a")|tostring), ci_low=\((.uplift_ci95_low // "n/a")|tostring), ci_high=\((.uplift_ci95_high // "n/a")|tostring), leakage_pass=\(.leakage_sentinel.pass)")
+                  | "| " + (if length > 0 then join(" ; ") else "n/a" end) + " |"
+                ' /tmp/pxi-market-summary.json
+                jq -r '"| gate_reasons=\((.result.edge_diagnostics.promotion_gate.reasons // []) | join(",")) |"' /tmp/pxi-market-summary.json
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
           else
             {

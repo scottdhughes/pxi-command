@@ -140,6 +140,7 @@ pxi-command/
 | `/api/brief` | GET | Daily market brief coherent with `/api/plan` policy state (includes contract version + consistency) |
 | `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon with calibration + expectancy + unavailable reasons |
 | `/api/diagnostics/calibration` | GET | Calibration diagnostics (Brier/ECE/log loss + quality band) for conviction and edge-quality snapshots |
+| `/api/diagnostics/edge` | GET | Forward-chaining edge evidence (model vs lagged baseline uplift, CI, leakage sentinel, promotion gate) |
 | `/api/alerts/feed` | GET | In-app alert timeline (`regime_change`, `threshold_cross`, `opportunity_spike`, `freshness_warning`) |
 | `/api/alerts/subscribe/start` | POST | Start email digest subscription with verification token |
 | `/api/alerts/subscribe/verify` | POST | Verify subscription token and activate email digest |
@@ -274,7 +275,12 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
 - New endpoint: `GET /api/ops/freshness-slo`
 - Reports rolling 7d and 30d SLO attainment using `market_refresh_runs`, including recent critical stale incidents.
 
-5. **Signals sanitation + stability**
+5. **Edge-proof diagnostics + promotion gate**
+- New endpoint: `GET /api/diagnostics/edge`
+- Reports forward-chaining directional uplift vs lagged baseline, CI bounds, and leakage sentinel health per horizon.
+- `/api/market/refresh-products` now fails closed when leakage sentinel checks fail, blocking publish/promotion.
+
+6. **Signals sanitation + stability**
 - Adapter-side ticker sanitation (allowlist regex, jargon stopwords, dedupe/cap) before PXI opportunity blending.
 - Signals source velocity cap tightened (`GROWTH_RATIO_CAP = 25`) with explicit `growth_ratio_capped` flag in metrics payload.
 
@@ -332,6 +338,7 @@ curl -I https://api.pxicommand.com/health
 curl -I https://api.pxicommand.com/api/pxi
 curl -I https://api.pxicommand.com/api/alerts
 curl -I https://api.pxicommand.com/api/signal
+curl -I https://api.pxicommand.com/api/diagnostics/edge?horizon=all
 
 # CORS preflight check
 curl -X OPTIONS https://api.pxicommand.com/api/refresh \
