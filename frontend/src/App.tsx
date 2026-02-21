@@ -691,6 +691,23 @@ interface PlanData {
     warning_count_24h: number
     critical_count_24h: number
   }
+  cross_horizon?: {
+    as_of: string
+    state: 'ALIGNED' | 'MIXED' | 'CONFLICT' | 'INSUFFICIENT'
+    eligible_7d: number
+    eligible_30d: number
+    top_direction_7d: 'bullish' | 'bearish' | 'neutral' | null
+    top_direction_30d: 'bullish' | 'bearish' | 'neutral' | null
+    rationale_codes: string[]
+    invalidation_note: string | null
+  }
+  decision_stack?: {
+    what_changed: string
+    what_to_do: string
+    why_now: string
+    confidence: string
+    cta_state: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION'
+  }
   invalidation_rules: string[]
   degraded_reason: string | null
 }
@@ -1225,6 +1242,23 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
     plan.opportunity_ref?.degraded_reason === 'suppressed_data_quality' ||
     plan.opportunity_ref?.degraded_reason === 'coherence_gate_failed'
   )
+  const crossHorizonState = plan.cross_horizon?.state || null
+  const crossHorizonClass =
+    crossHorizonState === 'ALIGNED' ? 'border-[#00c896]/40 text-[#00c896]' :
+    crossHorizonState === 'MIXED' ? 'border-[#f59e0b]/40 text-[#f59e0b]' :
+    crossHorizonState === 'CONFLICT' ? 'border-[#ff6b6b]/40 text-[#ff6b6b]' :
+    'border-[#26272b] text-[#949ba5]'
+  const decisionStack = plan.decision_stack || {
+    what_changed: plan.setup_summary,
+    what_to_do: actionabilityState === 'ACTIONABLE'
+      ? 'Execute with playbook risk controls.'
+      : actionabilityState === 'WATCH'
+        ? 'Hold watch posture until confirmation.'
+        : 'No action; wait for unlock conditions.',
+    why_now: `${plan.edge_quality.label} edge with ${plan.consistency.state} consistency.`,
+    confidence: `edge=${plan.edge_quality.label} | consistency=${plan.consistency.state}`,
+    cta_state: actionabilityState,
+  }
 
   return (
     <section className="w-full mb-6 rounded border border-[#26272b] bg-[#0a0a0a]/80 p-4">
@@ -1236,6 +1270,19 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
           </p>
         </div>
       )}
+
+      <div className="mb-3 rounded border border-[#26272b] bg-[#050608]/70 px-3 py-2">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-[9px] uppercase tracking-wider text-[#949ba5]">Decision Stack</p>
+          <span className={`rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${actionabilityClass(decisionStack.cta_state)}`}>
+            {formatActionabilityState(decisionStack.cta_state)}
+          </span>
+        </div>
+        <p className="mt-1 text-[10px] text-[#d7dbe1]"><span className="text-[#949ba5]">changed:</span> {decisionStack.what_changed}</p>
+        <p className="mt-1 text-[10px] text-[#d7dbe1]"><span className="text-[#949ba5]">do:</span> {decisionStack.what_to_do}</p>
+        <p className="mt-1 text-[10px] text-[#d7dbe1]"><span className="text-[#949ba5]">why:</span> {decisionStack.why_now}</p>
+        <p className="mt-1 text-[9px] text-[#949ba5]/80">{decisionStack.confidence}</p>
+      </div>
 
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
@@ -1253,10 +1300,20 @@ function TodayPlanCard({ plan }: { plan: PlanData | null }) {
             <span className="rounded border border-[#26272b] px-2 py-1 text-[#d7dbe1]">
               target {targetPct}%
             </span>
+            {crossHorizonState && (
+              <span className={`rounded border px-2 py-1 ${crossHorizonClass}`}>
+                cross-horizon {crossHorizonState.toLowerCase()}
+              </span>
+            )}
           </div>
           {rawTargetPct !== targetPct && (
             <p className="mt-1 text-[9px] text-[#949ba5]/75">
               raw {rawTargetPct}% · {plan.action_now.risk_allocation_basis.replace(/_/g, ' ')}
+            </p>
+          )}
+          {plan.cross_horizon?.invalidation_note && (
+            <p className="mt-1 text-[10px] text-[#f59e0b]">
+              {plan.cross_horizon.invalidation_note}
             </p>
           )}
           <p className="mt-2 text-[12px] leading-relaxed text-[#e4e8ee]">{plan.setup_summary}</p>
@@ -4490,6 +4547,18 @@ function App() {
                   unavailable_reason: 'insufficient_sample',
                 },
               },
+              cross_horizon: planJson.cross_horizon
+                ? {
+                    ...planJson.cross_horizon,
+                    rationale_codes: planJson.cross_horizon.rationale_codes || [],
+                  }
+                : undefined,
+              decision_stack: planJson.decision_stack
+                ? {
+                    ...planJson.decision_stack,
+                    cta_state: planJson.decision_stack.cta_state || (planJson.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH'),
+                  }
+                : undefined,
             })
           }
         }
