@@ -556,6 +556,35 @@ interface CalibrationDiagnosticsResponse {
   }
 }
 
+interface EdgeDiagnosticsResponse {
+  as_of: string
+  basis: string
+  windows: Array<{
+    horizon: '7d' | '30d'
+    as_of: string | null
+    sample_size: number
+    model_direction_accuracy: number | null
+    baseline_direction_accuracy: number | null
+    uplift_vs_baseline: number | null
+    uplift_ci95_low: number | null
+    uplift_ci95_high: number | null
+    lower_bound_positive: boolean
+    minimum_reliable_sample: number
+    quality_band: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+    baseline_strategy: 'lagged_actual_direction'
+    leakage_sentinel: {
+      pass: boolean
+      violation_count: number
+      reasons: string[]
+    }
+    calibration_diagnostics: CalibrationDiagnosticsResponse['diagnostics']
+  }>
+  promotion_gate: {
+    pass: boolean
+    reasons: string[]
+  }
+}
+
 interface MarketFeedAlert {
   id: string
   event_type: 'regime_change' | 'threshold_cross' | 'opportunity_spike' | 'freshness_warning'
@@ -3061,12 +3090,14 @@ function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => v
 function OpportunitiesPage({
   data,
   diagnostics,
+  edgeDiagnostics,
   horizon,
   onHorizonChange,
   onBack,
 }: {
   data: OpportunitiesResponse | null
   diagnostics: CalibrationDiagnosticsResponse | null
+  edgeDiagnostics: EdgeDiagnosticsResponse | null
   horizon: '7d' | '30d'
   onHorizonChange: (h: '7d' | '30d') => void
   onBack: () => void
@@ -3096,6 +3127,7 @@ function OpportunitiesPage({
   const hasContractGateSuppression = degradedReason === 'coherence_gate_failed'
   const hasDataQualitySuppression = degradedReason === 'suppressed_data_quality'
   const hasQualityFilter = degradedReason === 'quality_filtered'
+  const edgeWindow = edgeDiagnostics?.windows.find((window) => window.horizon === horizon) || edgeDiagnostics?.windows[0] || null
 
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
@@ -3147,6 +3179,36 @@ function OpportunitiesPage({
             ) : (
               <div className="mt-1 text-[10px] text-[#f59e0b]">
                 Insufficient sample for stable numeric calibration diagnostics.
+              </div>
+            )}
+          </div>
+        )}
+
+        {edgeDiagnostics && edgeWindow && (
+          <div className="mb-4 p-3 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">Edge diagnostics</div>
+              <span className={`rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${
+                edgeDiagnostics.promotion_gate.pass
+                  ? 'border-[#00c896]/40 text-[#00c896]'
+                  : 'border-[#f59e0b]/40 text-[#f59e0b]'
+              }`}>
+                {edgeDiagnostics.promotion_gate.pass ? 'gate pass' : 'gate blocked'}
+              </span>
+            </div>
+            <div className="mt-2 text-[10px] text-[#d7dbe1]">
+              n={edgeWindow.sample_size} · model {formatProbability(edgeWindow.model_direction_accuracy)} ·
+              {' '}baseline {formatProbability(edgeWindow.baseline_direction_accuracy)}
+            </div>
+            <div className="mt-1 text-[10px] text-[#949ba5]">
+              uplift {(edgeWindow.uplift_vs_baseline === null ? 'n/a' : `${(edgeWindow.uplift_vs_baseline * 100).toFixed(2)}%`)} ·
+              {' '}ci95 [{edgeWindow.uplift_ci95_low === null ? 'n/a' : `${(edgeWindow.uplift_ci95_low * 100).toFixed(2)}%`},
+              {' '}{edgeWindow.uplift_ci95_high === null ? 'n/a' : `${(edgeWindow.uplift_ci95_high * 100).toFixed(2)}%`}] ·
+              {' '}lower-bound {edgeWindow.lower_bound_positive ? '>0' : '<=0'}
+            </div>
+            {!edgeWindow.leakage_sentinel.pass && (
+              <div className="mt-1 text-[10px] text-[#f59e0b]">
+                leakage sentinel: {edgeWindow.leakage_sentinel.reasons.join(', ')}
               </div>
             )}
           </div>
@@ -4225,6 +4287,7 @@ function App() {
   const [briefData, setBriefData] = useState<BriefData | null>(null)
   const [opportunitiesData, setOpportunitiesData] = useState<OpportunitiesResponse | null>(null)
   const [opportunityDiagnostics, setOpportunityDiagnostics] = useState<CalibrationDiagnosticsResponse | null>(null)
+  const [edgeDiagnostics, setEdgeDiagnostics] = useState<EdgeDiagnosticsResponse | null>(null)
   const [opportunityHorizon, setOpportunityHorizon] = useState<'7d' | '30d'>('7d')
   const [alertsFeed, setAlertsFeed] = useState<AlertsFeedResponse | null>(null)
   const [showSubscribeModal, setShowSubscribeModal] = useState(false)
@@ -4346,7 +4409,7 @@ function App() {
           setLoading(true)
         }
 
-        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, oppRes, oppDiagRes, inboxRes] = await Promise.all([
+        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, oppRes, oppDiagRes, edgeDiagRes, inboxRes] = await Promise.all([
           fetchPlan.pxi ? fetchApi('/api/pxi') : Promise.resolve(null),
           fetchPlan.signal ? fetchApi('/api/signal').catch(() => null) : Promise.resolve(null),
           fetchPlan.plan ? fetchApi('/api/plan').catch(() => null) : Promise.resolve(null),
@@ -4358,6 +4421,7 @@ function App() {
           fetchPlan.brief ? fetchApi('/api/brief?scope=market').catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/opportunities?horizon=${opportunityHorizon}&limit=20`).catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/diagnostics/calibration?metric=conviction&horizon=${opportunityHorizon}`).catch(() => null) : Promise.resolve(null),
+          fetchPlan.opportunities ? fetchApi(`/api/diagnostics/edge?horizon=${opportunityHorizon}`).catch(() => null) : Promise.resolve(null),
           fetchPlan.inbox ? fetchApi('/api/alerts/feed?limit=50').catch(() => null) : Promise.resolve(null),
         ])
 
@@ -4529,6 +4593,15 @@ function App() {
           setOpportunityDiagnostics(null)
         }
 
+        if (edgeDiagRes?.ok) {
+          const edgeJson = await edgeDiagRes.json() as EdgeDiagnosticsResponse
+          if (Array.isArray(edgeJson.windows) && edgeJson.promotion_gate) {
+            setEdgeDiagnostics(edgeJson)
+          }
+        } else if (fetchPlan.opportunities) {
+          setEdgeDiagnostics(null)
+        }
+
         if (inboxRes?.ok) {
           const inboxJson = await inboxRes.json() as AlertsFeedResponse
           if (Array.isArray(inboxJson.alerts)) {
@@ -4645,6 +4718,7 @@ function App() {
       <OpportunitiesPage
         data={opportunitiesData}
         diagnostics={opportunityDiagnostics}
+        edgeDiagnostics={edgeDiagnostics}
         horizon={opportunityHorizon}
         onHorizonChange={setOpportunityHorizon}
         onBack={() => navigateTo('/')}

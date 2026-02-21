@@ -2,6 +2,7 @@
 set -euo pipefail
 
 API_URL="${1:-${API_URL:-https://api.pxicommand.com}}"
+EDGE_DIAGNOSTICS_REQUIRED="${EDGE_DIAGNOSTICS_REQUIRED:-0}"
 
 TMP_HEADERS="$(mktemp)"
 TMP_BODY="$(mktemp)"
@@ -30,6 +31,27 @@ check_api_json_contract() {
     cat "$TMP_BODY"
     exit 1
   fi
+}
+
+edge_diagnostics_available() {
+  local code
+  code=$(curl -sS -o "$TMP_BODY" -w "%{http_code}" --max-time 20 "$API_URL/api/diagnostics/edge?horizon=all")
+  if [[ "$code" == "200" ]]; then
+    return 0
+  fi
+
+  if [[ "$code" == "404" ]]; then
+    if [[ "$EDGE_DIAGNOSTICS_REQUIRED" == "1" ]]; then
+      echo "Edge diagnostics endpoint is required but returned 404"
+      exit 1
+    fi
+    echo "Skipping edge diagnostics checks: /api/diagnostics/edge is not live yet."
+    return 1
+  fi
+
+  echo "Unexpected status for /api/diagnostics/edge: $code"
+  cat "$TMP_BODY" || true
+  exit 1
 }
 
 check_policy_state_consistency() {
@@ -500,6 +522,65 @@ check_opportunity_coherence_contract() {
   fi
 }
 
+check_edge_diagnostics_contract() {
+  local edge_json
+  local promotion_pass
+  local malformed_windows
+  local sentinel_invariant_broken
+  local lower_bound_invariant_broken
+
+  edge_json=$(curl -sS --max-time 20 "$API_URL/api/diagnostics/edge?horizon=all")
+  promotion_pass=$(echo "$edge_json" | jq -r '.promotion_gate.pass // false')
+
+  if [[ "$promotion_pass" != "true" ]]; then
+    echo "Edge diagnostics promotion gate failed"
+    echo "$edge_json"
+    exit 1
+  fi
+
+  malformed_windows=$(echo "$edge_json" | jq -r '
+    any(.windows[]?;
+      ((.horizon != "7d") and (.horizon != "30d")) or
+      (.sample_size | type != "number") or
+      ((.model_direction_accuracy != null) and ((.model_direction_accuracy < 0) or (.model_direction_accuracy > 1))) or
+      ((.baseline_direction_accuracy != null) and ((.baseline_direction_accuracy < 0) or (.baseline_direction_accuracy > 1))) or
+      ((.uplift_ci95_low != null and .uplift_ci95_high != null) and (.uplift_ci95_low > .uplift_ci95_high)) or
+      (.leakage_sentinel.pass | type != "boolean") or
+      (.leakage_sentinel.violation_count | type != "number") or
+      (.leakage_sentinel.reasons | type != "array")
+    )
+  ')
+  if [[ "$malformed_windows" == "true" ]]; then
+    echo "Malformed edge diagnostics window payload"
+    echo "$edge_json"
+    exit 1
+  fi
+
+  sentinel_invariant_broken=$(echo "$edge_json" | jq -r '
+    any(.windows[]?;
+      ((.leakage_sentinel.pass == true) and ((.leakage_sentinel.violation_count != 0) or ((.leakage_sentinel.reasons | length) != 0))) or
+      ((.leakage_sentinel.pass == false) and ((.leakage_sentinel.violation_count == 0) or ((.leakage_sentinel.reasons | length) == 0)))
+    )
+  ')
+  if [[ "$sentinel_invariant_broken" == "true" ]]; then
+    echo "Leakage sentinel invariants failed in edge diagnostics payload"
+    echo "$edge_json"
+    exit 1
+  fi
+
+  lower_bound_invariant_broken=$(echo "$edge_json" | jq -r '
+    any(.windows[]?;
+      (.lower_bound_positive == true and (.uplift_ci95_low == null or .uplift_ci95_low <= 0)) or
+      (.lower_bound_positive == false and (.uplift_ci95_low != null and .uplift_ci95_low > 0))
+    )
+  ')
+  if [[ "$lower_bound_invariant_broken" == "true" ]]; then
+    echo "lower_bound_positive invariant failed in edge diagnostics payload"
+    echo "$edge_json"
+    exit 1
+  fi
+}
+
 check_api_json_contract "/api/plan" \
   'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number")))' \
   "plan"
@@ -536,6 +617,12 @@ check_api_json_contract "/api/diagnostics/calibration?metric=conviction&horizon=
   'type=="object" and (.as_of|type=="string") and (.metric=="conviction") and (.horizon=="7d") and (.basis|type=="string") and (.total_samples|type=="number") and (.bins|type=="array") and (.diagnostics.quality_band|type=="string") and (.diagnostics.minimum_reliable_sample|type=="number") and (.diagnostics.insufficient_reasons|type=="array") and ((.diagnostics.brier_score==null) or (.diagnostics.brier_score|type=="number")) and ((.diagnostics.ece==null) or (.diagnostics.ece|type=="number")) and ((.diagnostics.log_loss==null) or (.diagnostics.log_loss|type=="number"))' \
   "diagnostics-calibration"
 
+if edge_diagnostics_available; then
+  check_api_json_contract "/api/diagnostics/edge?horizon=all" \
+    'type=="object" and (.as_of|type=="string") and (.basis|type=="string") and (.windows|type=="array") and ((.windows|length) >= 1) and (.promotion_gate.pass|type=="boolean") and (.promotion_gate.reasons|type=="array") and (all(.promotion_gate.reasons[]?; type=="string")) and (all(.windows[]?; (.horizon|type=="string") and ((.as_of==null) or (.as_of|type=="string")) and (.sample_size|type=="number") and ((.model_direction_accuracy==null) or (.model_direction_accuracy|type=="number")) and ((.baseline_direction_accuracy==null) or (.baseline_direction_accuracy|type=="number")) and ((.uplift_vs_baseline==null) or (.uplift_vs_baseline|type=="number")) and ((.uplift_ci95_low==null) or (.uplift_ci95_low|type=="number")) and ((.uplift_ci95_high==null) or (.uplift_ci95_high|type=="number")) and (.lower_bound_positive|type=="boolean") and (.minimum_reliable_sample|type=="number") and (.quality_band|type=="string") and (.baseline_strategy=="lagged_actual_direction") and (.leakage_sentinel.pass|type=="boolean") and (.leakage_sentinel.violation_count|type=="number") and (.leakage_sentinel.reasons|type=="array") and (.calibration_diagnostics.quality_band|type=="string")))' \
+    "diagnostics-edge"
+fi
+
 check_api_json_contract "/api/ops/freshness-slo" \
   'type=="object" and (.as_of|type=="string") and (.windows["7d"].days_observed|type=="number") and (.windows["7d"].days_with_critical_stale|type=="number") and (.windows["7d"].slo_attainment_pct|type=="number") and (.windows["7d"].recent_incidents|type=="array") and (.windows["7d"].incident_impact.state|type=="string") and (.windows["7d"].incident_impact.stale_days|type=="number") and (.windows["7d"].incident_impact.warning_events|type=="number") and (.windows["7d"].incident_impact.critical_events|type=="number") and (.windows["7d"].incident_impact.estimated_suppressed_days|type=="number") and ((.windows["7d"].incident_impact.latest_warning_event==null) or (.windows["7d"].incident_impact.latest_warning_event.created_at|type=="string")) and ((.windows["7d"].incident_impact.latest_warning_event==null) or (.windows["7d"].incident_impact.latest_warning_event.severity|type=="string")) and (.windows["30d"].days_observed|type=="number") and (.windows["30d"].days_with_critical_stale|type=="number") and (.windows["30d"].slo_attainment_pct|type=="number") and (.windows["30d"].recent_incidents|type=="array") and (.windows["30d"].incident_impact.state|type=="string") and (.windows["30d"].incident_impact.stale_days|type=="number") and (.windows["30d"].incident_impact.warning_events|type=="number") and (.windows["30d"].incident_impact.critical_events|type=="number") and (.windows["30d"].incident_impact.estimated_suppressed_days|type=="number") and ((.windows["30d"].incident_impact.latest_warning_event==null) or (.windows["30d"].incident_impact.latest_warning_event.created_at|type=="string")) and ((.windows["30d"].incident_impact.latest_warning_event==null) or (.windows["30d"].incident_impact.latest_warning_event.severity|type=="string"))' \
   "freshness-slo"
@@ -551,5 +638,8 @@ check_alert_aggregate_parity
 check_degraded_consistency_score
 check_ml_low_sample_semantics
 check_opportunity_coherence_contract
+if edge_diagnostics_available; then
+  check_edge_diagnostics_contract
+fi
 
 echo "Product API contract checks passed against $API_URL"

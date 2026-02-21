@@ -1131,6 +1131,41 @@ interface CalibrationDiagnosticsSnapshot {
   insufficient_reasons: string[];
 }
 
+type EdgeDiagnosticsHorizon = '7d' | '30d';
+
+interface EdgeLeakageSentinel {
+  pass: boolean;
+  violation_count: number;
+  reasons: string[];
+}
+
+interface EdgeDiagnosticsWindow {
+  horizon: EdgeDiagnosticsHorizon;
+  as_of: string | null;
+  sample_size: number;
+  model_direction_accuracy: number | null;
+  baseline_direction_accuracy: number | null;
+  uplift_vs_baseline: number | null;
+  uplift_ci95_low: number | null;
+  uplift_ci95_high: number | null;
+  lower_bound_positive: boolean;
+  minimum_reliable_sample: number;
+  quality_band: CalibrationQuality;
+  baseline_strategy: 'lagged_actual_direction';
+  leakage_sentinel: EdgeLeakageSentinel;
+  calibration_diagnostics: CalibrationDiagnosticsSnapshot;
+}
+
+interface EdgeDiagnosticsReport {
+  as_of: string;
+  basis: string;
+  windows: EdgeDiagnosticsWindow[];
+  promotion_gate: {
+    pass: boolean;
+    reasons: string[];
+  };
+}
+
 interface FreshnessStatus {
   has_stale_data: boolean;
   stale_count: number;
@@ -1387,6 +1422,7 @@ const CALIBRATION_LIMITED_MIN_SAMPLE = 20;
 const CALIBRATION_POOL_TARGET_SAMPLE = CALIBRATION_ROBUST_MIN_SAMPLE;
 const OPPORTUNITY_COHERENCE_MIN_PROBABILITY = 0.5;
 const OPPORTUNITY_CTA_MAX_ECE = 0.08;
+const EDGE_DIAGNOSTICS_MAX_ROWS = 5000;
 const SIGNALS_TICKER_REGEX = /^[A-Z]{2,5}$/;
 const SIGNALS_TICKER_LIMIT = 4;
 const SIGNALS_TICKER_STOPWORDS = new Set<string>([
@@ -1904,6 +1940,214 @@ function computeCalibrationDiagnostics(
     quality_band: qualityBand,
     minimum_reliable_sample: CALIBRATION_DIAGNOSTICS_MIN_SAMPLE,
     insufficient_reasons: reasons,
+  };
+}
+
+function directionSign(value: number): -1 | 0 | 1 {
+  if (value > 0) return 1;
+  if (value < 0) return -1;
+  return 0;
+}
+
+function computeDifferenceCi95(
+  modelCorrect: number,
+  modelTotal: number,
+  baselineCorrect: number,
+  baselineTotal: number
+): {
+  uplift: number | null;
+  ci95_low: number | null;
+  ci95_high: number | null;
+  lower_bound_positive: boolean;
+} {
+  if (modelTotal <= 0 || baselineTotal <= 0) {
+    return {
+      uplift: null,
+      ci95_low: null,
+      ci95_high: null,
+      lower_bound_positive: false,
+    };
+  }
+
+  const modelRate = clamp(0, 1, modelCorrect / modelTotal);
+  const baselineRate = clamp(0, 1, baselineCorrect / baselineTotal);
+  const uplift = modelRate - baselineRate;
+  const variance =
+    (modelRate * (1 - modelRate)) / modelTotal +
+    (baselineRate * (1 - baselineRate)) / baselineTotal;
+  const stdErr = Math.sqrt(Math.max(0, variance));
+  const margin = 1.96 * stdErr;
+  const ciLow = uplift - margin;
+  const ciHigh = uplift + margin;
+
+  return {
+    uplift,
+    ci95_low: ciLow,
+    ci95_high: ciHigh,
+    lower_bound_positive: ciLow > 0,
+  };
+}
+
+function resolvePredictionColumns(horizon: EdgeDiagnosticsHorizon): {
+  predicted: 'predicted_change_7d' | 'predicted_change_30d';
+  actual: 'actual_change_7d' | 'actual_change_30d';
+  target: 'target_date_7d' | 'target_date_30d';
+} {
+  if (horizon === '30d') {
+    return {
+      predicted: 'predicted_change_30d',
+      actual: 'actual_change_30d',
+      target: 'target_date_30d',
+    };
+  }
+  return {
+    predicted: 'predicted_change_7d',
+    actual: 'actual_change_7d',
+    target: 'target_date_7d',
+  };
+}
+
+async function computeEdgeLeakageSentinel(
+  db: D1Database,
+  horizon: EdgeDiagnosticsHorizon
+): Promise<EdgeLeakageSentinel> {
+  const columns = resolvePredictionColumns(horizon);
+  const row = await db.prepare(`
+    SELECT
+      SUM(CASE
+        WHEN ${columns.actual} IS NOT NULL
+         AND ${columns.target} IS NOT NULL
+         AND ${columns.target} > date('now')
+        THEN 1 ELSE 0 END) AS future_target_evaluated,
+      SUM(CASE
+        WHEN ${columns.actual} IS NOT NULL
+         AND ${columns.target} IS NOT NULL
+         AND prediction_date >= ${columns.target}
+        THEN 1 ELSE 0 END) AS non_forward_target,
+      SUM(CASE
+        WHEN ${columns.actual} IS NOT NULL
+         AND ${columns.target} IS NOT NULL
+         AND evaluated_at IS NOT NULL
+         AND datetime(replace(replace(evaluated_at, 'T', ' '), 'Z', '')) < datetime(${columns.target} || ' 00:00:00')
+        THEN 1 ELSE 0 END) AS evaluated_before_target
+    FROM prediction_log
+    WHERE ${columns.actual} IS NOT NULL
+  `).first<{
+    future_target_evaluated: number | null;
+    non_forward_target: number | null;
+    evaluated_before_target: number | null;
+  }>();
+
+  const futureTargetEvaluated = Math.max(0, Math.floor(toNumber(row?.future_target_evaluated, 0)));
+  const nonForwardTarget = Math.max(0, Math.floor(toNumber(row?.non_forward_target, 0)));
+  const evaluatedBeforeTarget = Math.max(0, Math.floor(toNumber(row?.evaluated_before_target, 0)));
+  const reasons: string[] = [];
+  if (futureTargetEvaluated > 0) reasons.push(`future_target_evaluated_${futureTargetEvaluated}`);
+  if (nonForwardTarget > 0) reasons.push(`non_forward_target_${nonForwardTarget}`);
+  if (evaluatedBeforeTarget > 0) reasons.push(`evaluated_before_target_${evaluatedBeforeTarget}`);
+  const violationCount = futureTargetEvaluated + nonForwardTarget + evaluatedBeforeTarget;
+
+  return {
+    pass: violationCount === 0,
+    violation_count: violationCount,
+    reasons,
+  };
+}
+
+async function buildEdgeDiagnosticsWindow(
+  db: D1Database,
+  horizon: EdgeDiagnosticsHorizon
+): Promise<EdgeDiagnosticsWindow> {
+  const columns = resolvePredictionColumns(horizon);
+  const rows = await db.prepare(`
+    SELECT prediction_date, ${columns.predicted} AS predicted_change, ${columns.actual} AS actual_change
+    FROM prediction_log
+    WHERE ${columns.predicted} IS NOT NULL
+      AND ${columns.actual} IS NOT NULL
+    ORDER BY prediction_date ASC
+    LIMIT ${EDGE_DIAGNOSTICS_MAX_ROWS}
+  `).all<{
+    prediction_date: string;
+    predicted_change: number;
+    actual_change: number;
+  }>();
+
+  let modelCorrect = 0;
+  let baselineCorrect = 0;
+  let comparableSamples = 0;
+  let previousActualDirection: -1 | 0 | 1 | null = null;
+
+  for (const row of rows.results || []) {
+    const predicted = toNumber(row.predicted_change, 0);
+    const actual = toNumber(row.actual_change, 0);
+    if (!Number.isFinite(predicted) || !Number.isFinite(actual)) continue;
+    const actualDirection = directionSign(actual);
+    const predictedDirection = directionSign(predicted);
+
+    if (previousActualDirection !== null) {
+      comparableSamples += 1;
+      if (predictedDirection === actualDirection) modelCorrect += 1;
+      if (previousActualDirection === actualDirection) baselineCorrect += 1;
+    }
+
+    previousActualDirection = actualDirection;
+  }
+
+  const delta = computeDifferenceCi95(
+    modelCorrect,
+    comparableSamples,
+    baselineCorrect,
+    comparableSamples,
+  );
+  const calibrationSnapshot = await fetchLatestCalibrationSnapshot(db, 'conviction', horizon);
+  const calibrationDiagnostics = computeCalibrationDiagnostics(calibrationSnapshot);
+  const leakageSentinel = await computeEdgeLeakageSentinel(db, horizon);
+  const lastRow = rows.results && rows.results.length > 0
+    ? rows.results[rows.results.length - 1]
+    : null;
+
+  return {
+    horizon,
+    as_of: lastRow ? `${lastRow.prediction_date}T00:00:00.000Z` : null,
+    sample_size: comparableSamples,
+    model_direction_accuracy: comparableSamples > 0 ? modelCorrect / comparableSamples : null,
+    baseline_direction_accuracy: comparableSamples > 0 ? baselineCorrect / comparableSamples : null,
+    uplift_vs_baseline: delta.uplift,
+    uplift_ci95_low: delta.ci95_low,
+    uplift_ci95_high: delta.ci95_high,
+    lower_bound_positive: delta.lower_bound_positive,
+    minimum_reliable_sample: MINIMUM_RELIABLE_SAMPLE,
+    quality_band: calibrationQualityForSampleSize(comparableSamples),
+    baseline_strategy: 'lagged_actual_direction',
+    leakage_sentinel: leakageSentinel,
+    calibration_diagnostics: calibrationDiagnostics,
+  };
+}
+
+async function buildEdgeDiagnosticsReport(
+  db: D1Database,
+  horizons: EdgeDiagnosticsHorizon[]
+): Promise<EdgeDiagnosticsReport> {
+  const uniqueHorizons = Array.from(new Set(horizons));
+  const windows = await Promise.all(uniqueHorizons.map((horizon) => buildEdgeDiagnosticsWindow(db, horizon)));
+  const gateReasons = windows.flatMap((window) =>
+    window.leakage_sentinel.pass
+      ? []
+      : window.leakage_sentinel.reasons.map((reason) => `${window.horizon}:${reason}`)
+  );
+  const asOfCandidates = windows
+    .map((window) => window.as_of)
+    .filter((value): value is string => Boolean(value))
+    .sort();
+
+  return {
+    as_of: asOfCandidates.length > 0 ? asOfCandidates[asOfCandidates.length - 1] : asIsoDateTime(new Date()),
+    basis: 'prediction_log_forward_chain_vs_lagged_actual_baseline',
+    windows,
+    promotion_gate: {
+      pass: gateReasons.length === 0,
+      reasons: gateReasons,
+    },
   };
 }
 
@@ -7696,6 +7940,46 @@ export default {
         });
       }
 
+      if (url.pathname === '/api/diagnostics/edge' && method === 'GET') {
+        if (!isFeatureEnabled(env, 'FEATURE_ENABLE_EDGE_DIAGNOSTICS', 'ENABLE_EDGE_DIAGNOSTICS', true)) {
+          return Response.json({
+            error: 'Edge diagnostics disabled',
+          }, { status: 503, headers: corsHeaders });
+        }
+
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Edge diagnostics schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        const horizonParam = (url.searchParams.get('horizon') || 'all').trim().toLowerCase();
+        let horizons: EdgeDiagnosticsHorizon[];
+        if (horizonParam === 'all') {
+          horizons = ['7d', '30d'];
+        } else if (horizonParam === '7d' || horizonParam === '30d') {
+          horizons = [horizonParam];
+        } else {
+          return Response.json({
+            error: 'Invalid horizon. Use horizon=7d, horizon=30d, or horizon=all',
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        try {
+          const report = await buildEdgeDiagnosticsReport(env.DB, horizons);
+          return Response.json(report, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'public, max-age=60',
+            },
+          });
+        } catch (err) {
+          console.error('Edge diagnostics failed:', err);
+          return Response.json({ error: 'Edge diagnostics unavailable' }, { status: 503, headers: corsHeaders });
+        }
+      }
+
       if (url.pathname === '/api/alerts/feed' && method === 'GET') {
         if (!isFeatureEnabled(env, 'FEATURE_ENABLE_ALERTS_IN_APP', 'ENABLE_ALERTS_IN_APP', true)) {
           return Response.json({
@@ -8088,6 +8372,12 @@ export default {
           'ENABLE_CALIBRATION_DIAGNOSTICS',
           true,
         );
+        const edgeDiagnosticsEnabled = isFeatureEnabled(
+          env,
+          'FEATURE_ENABLE_EDGE_DIAGNOSTICS',
+          'ENABLE_EDGE_DIAGNOSTICS',
+          true,
+        );
         const triggerHeader = request.headers.get('X-Refresh-Trigger');
         const refreshTrigger = triggerHeader && triggerHeader.trim().length > 0
           ? triggerHeader.trim().slice(0, 128)
@@ -8095,6 +8385,14 @@ export default {
         const refreshRunId = await recordMarketRefreshRunStart(env.DB, refreshTrigger);
 
         try {
+          let edgeDiagnosticsReport: EdgeDiagnosticsReport | null = null;
+          if (edgeDiagnosticsEnabled) {
+            edgeDiagnosticsReport = await buildEdgeDiagnosticsReport(env.DB, ['7d', '30d']);
+            if (!edgeDiagnosticsReport.promotion_gate.pass) {
+              throw new Error(`promotion_gate_failed:${edgeDiagnosticsReport.promotion_gate.reasons.join(',')}`);
+            }
+          }
+
           let edgeCalibrationSnapshot: MarketCalibrationSnapshotPayload | null = null;
           let convictionCalibration7d: MarketCalibrationSnapshotPayload | null = null;
           let convictionCalibration30d: MarketCalibrationSnapshotPayload | null = null;
@@ -8261,6 +8559,24 @@ export default {
             coherence_suppressed_count: coherenceSuppressedCount,
             suppressed_data_quality_count: suppressedDataQualityCount,
             calibration_diagnostics: diagnosticsSummary,
+            edge_diagnostics: edgeDiagnosticsReport
+              ? {
+                  as_of: edgeDiagnosticsReport.as_of,
+                  promotion_gate: edgeDiagnosticsReport.promotion_gate,
+                  windows: edgeDiagnosticsReport.windows.map((window) => ({
+                    horizon: window.horizon,
+                    sample_size: window.sample_size,
+                    model_direction_accuracy: window.model_direction_accuracy,
+                    baseline_direction_accuracy: window.baseline_direction_accuracy,
+                    uplift_vs_baseline: window.uplift_vs_baseline,
+                    uplift_ci95_low: window.uplift_ci95_low,
+                    uplift_ci95_high: window.uplift_ci95_high,
+                    lower_bound_positive: window.lower_bound_positive,
+                    leakage_sentinel: window.leakage_sentinel,
+                    quality_band: window.quality_band,
+                  })),
+                }
+              : null,
             refresh_trigger: refreshTrigger,
             refresh_run_id: refreshRunId,
           }, { headers: corsHeaders });
