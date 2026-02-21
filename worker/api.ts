@@ -3482,25 +3482,29 @@ function applyOpportunityCalibration(
 
 async function computeHistoricalHitStats(
   db: D1Database,
-  horizon: '7d' | '30d'
+  horizon: '7d' | '30d',
+  asOfDate?: string
 ): Promise<{ hitRate: number; sampleSize: number }> {
+  const dateFilter = asOfDate ? 'AND prediction_date <= ?' : '';
   const rows = horizon === '7d'
     ? await db.prepare(`
       SELECT predicted_change_7d as predicted_change, actual_change_7d as actual_change
       FROM prediction_log
       WHERE predicted_change_7d IS NOT NULL
         AND actual_change_7d IS NOT NULL
+        ${dateFilter}
       ORDER BY prediction_date DESC
       LIMIT 500
-    `).all<{ predicted_change: number; actual_change: number }>()
+    `).bind(...(asOfDate ? [asOfDate] : [])).all<{ predicted_change: number; actual_change: number }>()
     : await db.prepare(`
       SELECT predicted_change_30d as predicted_change, actual_change_30d as actual_change
       FROM prediction_log
       WHERE predicted_change_30d IS NOT NULL
         AND actual_change_30d IS NOT NULL
+        ${dateFilter}
       ORDER BY prediction_date DESC
       LIMIT 500
-    `).all<{ predicted_change: number; actual_change: number }>();
+    `).bind(...(asOfDate ? [asOfDate] : [])).all<{ predicted_change: number; actual_change: number }>();
 
   const samples = rows.results || [];
   if (samples.length === 0) {
@@ -3896,6 +3900,128 @@ async function buildOpportunitySnapshot(
 
   return {
     as_of: `${latestPxi.date}T00:00:00.000Z`,
+    horizon,
+    items,
+  };
+}
+
+async function buildHistoricalOpportunitySnapshot(
+  db: D1Database,
+  asOfDate: string,
+  horizon: '7d' | '30d'
+): Promise<OpportunitySnapshot | null> {
+  const latestPxi = await db.prepare(`
+    SELECT date, score, delta_7d, delta_30d
+    FROM pxi_scores
+    WHERE date = ?
+    LIMIT 1
+  `).bind(asOfDate).first<{
+    date: string;
+    score: number;
+    delta_7d: number | null;
+    delta_30d: number | null;
+  }>();
+
+  if (!latestPxi) {
+    return null;
+  }
+
+  const [latestSignal, latestEnsemble, hitStats, themeRows] = await Promise.all([
+    db.prepare(`
+      SELECT date, risk_allocation, signal_type, regime
+      FROM pxi_signal
+      WHERE date <= ?
+      ORDER BY date DESC
+      LIMIT 1
+    `).bind(asOfDate).first<{
+      date: string;
+      risk_allocation: number;
+      signal_type: string;
+      regime: string;
+    }>(),
+    db.prepare(`
+      SELECT prediction_date, ensemble_7d, ensemble_30d, confidence_7d, confidence_30d
+      FROM ensemble_predictions
+      WHERE prediction_date <= ?
+      ORDER BY prediction_date DESC
+      LIMIT 1
+    `).bind(asOfDate).first<{
+      prediction_date: string;
+      ensemble_7d: number | null;
+      ensemble_30d: number | null;
+      confidence_7d: string | null;
+      confidence_30d: string | null;
+    }>(),
+    computeHistoricalHitStats(db, horizon, asOfDate),
+    db.prepare(`
+      SELECT category as theme_id, category as theme_name, score
+      FROM category_scores
+      WHERE date = ?
+      ORDER BY score DESC
+      LIMIT 12
+    `).bind(asOfDate).all<{ theme_id: string; theme_name: string; score: number }>(),
+  ]);
+
+  const themeSource = (themeRows.results || [])
+    .map((row) => ({
+      theme_id: row.theme_id,
+      theme_name: row.theme_name,
+      score: row.score,
+      key_tickers: [] as string[],
+    }));
+
+  if (themeSource.length === 0) {
+    return null;
+  }
+
+  const ensembleValue = horizon === '7d' ? (latestEnsemble?.ensemble_7d ?? 0) : (latestEnsemble?.ensemble_30d ?? 0);
+  const ensembleConfidence = horizon === '7d' ? latestEnsemble?.confidence_7d : latestEnsemble?.confidence_30d;
+  const deltaBias = horizon === '7d' ? (latestPxi.delta_7d ?? 0) : (latestPxi.delta_30d ?? 0);
+
+  const mlComponent = clamp(0, 100, 50 + ensembleValue * 6 + confidenceTextToScore(ensembleConfidence) * 0.3 + deltaBias * 0.4);
+  const similarComponent = clamp(0, 100, hitStats.hitRate * 100 + Math.min(20, Math.log10(hitStats.sampleSize + 1) * 10));
+  const signalComponent = clamp(0, 100, (latestSignal?.risk_allocation ?? 0.5) * 100);
+
+  const items: OpportunityItem[] = themeSource.map((theme) => {
+    const themeComponent = clamp(0, 100, theme.score * 0.85 + 50 * 0.15);
+    const conviction = clamp(0, 100, Math.round(
+      0.35 * mlComponent +
+      0.25 * similarComponent +
+      0.20 * signalComponent +
+      0.20 * themeComponent
+    ));
+    const directionalSignal = parseSignalDirection(ensembleValue + (theme.score - 50) * 0.06 + deltaBias * 0.08);
+    const id = buildOpportunityId(asOfDate, theme.theme_id, horizon);
+    const rationale = `${theme.theme_name}: ${directionalSignal} setup from historical backfill seed model (${conviction}/100).`;
+
+    return {
+      id,
+      symbol: null,
+      theme_id: theme.theme_id,
+      theme_name: theme.theme_name,
+      direction: directionalSignal,
+      conviction_score: conviction,
+      rationale,
+      supporting_factors: [
+        latestSignal?.signal_type || 'signal_context',
+        'historical_backfill_seed',
+      ],
+      historical_hit_rate: hitStats.hitRate,
+      sample_size: hitStats.sampleSize,
+      calibration: buildOpportunityCalibrationFallback(),
+      expectancy: buildExpectancyUnavailable(directionalSignal, 'historical_backfill_seed', 'none', 0),
+      updated_at: asIsoDateTime(new Date()),
+    };
+  });
+
+  items.sort((a, b) => {
+    if (b.conviction_score !== a.conviction_score) return b.conviction_score - a.conviction_score;
+    if (b.sample_size !== a.sample_size) return b.sample_size - a.sample_size;
+    return a.theme_id.localeCompare(b.theme_id);
+  });
+
+  return {
+    as_of: `${asOfDate}T00:00:00.000Z`,
     horizon,
     items,
   };
@@ -7058,6 +7184,196 @@ export default {
           console.error('Refresh-products failed:', err);
           return Response.json({ error: 'Refresh products failed', detail: errorMessage }, { status: 500, headers: corsHeaders });
         }
+      }
+
+      if (url.pathname === '/api/market/backfill-products' && method === 'POST') {
+        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
+        if (adminAuthFailure) {
+          return adminAuthFailure;
+        }
+
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Backfill-products schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        let body: {
+          start?: string;
+          end?: string;
+          limit?: number;
+          overwrite?: boolean;
+          dry_run?: boolean;
+          recalibrate?: boolean;
+        } = {};
+        try {
+          body = await request.json() as {
+            start?: string;
+            end?: string;
+            limit?: number;
+            overwrite?: boolean;
+            dry_run?: boolean;
+            recalibrate?: boolean;
+          };
+        } catch {
+          body = {};
+        }
+
+        let dateFilter: ReturnType<typeof parseBackfillDateRange>;
+        try {
+          dateFilter = parseBackfillDateRange(body.start, body.end);
+        } catch (err) {
+          return Response.json({
+            error: err instanceof Error ? err.message : 'Invalid date range',
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        const limit = parseBackfillLimit(body.limit);
+        const today = asIsoDate(new Date());
+        const startDate = dateFilter.start || addCalendarDays(today, -540);
+        const endDate = dateFilter.end || today;
+        const overwrite = body.overwrite === true;
+        const dryRun = body.dry_run === true;
+        const recalibrate = body.recalibrate !== false;
+
+        const dateRows = await env.DB.prepare(`
+          SELECT p.date as date, COUNT(c.category) as category_count
+          FROM pxi_scores p
+          JOIN category_scores c ON c.date = p.date
+          WHERE p.date >= ?
+            AND p.date <= ?
+          GROUP BY p.date
+          HAVING COUNT(c.category) >= 3
+          ORDER BY p.date DESC
+          LIMIT ?
+        `).bind(startDate, endDate, limit).all<{ date: string; category_count: number }>();
+
+        const candidateDates = (dateRows.results || []).map((row) => row.date);
+        const existingByDate = new Map<string, Set<'7d' | '30d'>>();
+        if (!overwrite && candidateDates.length > 0) {
+          const asOfDates = candidateDates.map((date) => `${date}T00:00:00.000Z`);
+          const placeholders = asOfDates.map(() => '?').join(',');
+          const existingRows = await env.DB.prepare(`
+            SELECT as_of, horizon
+            FROM opportunity_snapshots
+            WHERE as_of IN (${placeholders})
+              AND horizon IN ('7d', '30d')
+          `).bind(...asOfDates).all<{ as_of: string; horizon: '7d' | '30d' }>();
+
+          for (const row of existingRows.results || []) {
+            const date = row.as_of.slice(0, 10);
+            const set = existingByDate.get(date) || new Set<'7d' | '30d'>();
+            set.add(row.horizon);
+            existingByDate.set(date, set);
+          }
+        }
+
+        const processDates = [...candidateDates].sort((a, b) => a.localeCompare(b));
+        let seededSnapshots = 0;
+        let processedDates = 0;
+        let skippedDates = 0;
+        const skippedExisting: string[] = [];
+        const failedDates: Array<{ date: string; error: string }> = [];
+
+        for (const date of processDates) {
+          const existing = existingByDate.get(date);
+          if (!overwrite && existing?.has('7d') && existing?.has('30d')) {
+            skippedDates += 1;
+            if (skippedExisting.length < 20) {
+              skippedExisting.push(date);
+            }
+            continue;
+          }
+
+          processedDates += 1;
+          try {
+            const [snapshot7d, snapshot30d] = await Promise.all([
+              buildHistoricalOpportunitySnapshot(env.DB, date, '7d'),
+              buildHistoricalOpportunitySnapshot(env.DB, date, '30d'),
+            ]);
+
+            if (!dryRun) {
+              if (snapshot7d) {
+                await storeOpportunitySnapshot(env.DB, snapshot7d);
+                seededSnapshots += 1;
+              }
+              if (snapshot30d) {
+                await storeOpportunitySnapshot(env.DB, snapshot30d);
+                seededSnapshots += 1;
+              }
+            } else {
+              if (snapshot7d) seededSnapshots += 1;
+              if (snapshot30d) seededSnapshots += 1;
+            }
+          } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            failedDates.push({ date, error: errorMessage.slice(0, 300) });
+          }
+        }
+
+        let calibrationsGenerated = 0;
+        let convictionCalibration7d: MarketCalibrationSnapshotPayload | null = null;
+        let convictionCalibration30d: MarketCalibrationSnapshotPayload | null = null;
+        let edgeCalibration: MarketCalibrationSnapshotPayload | null = null;
+        if (!dryRun && recalibrate) {
+          try {
+            convictionCalibration7d = await buildConvictionCalibrationSnapshot(env.DB, '7d');
+            await storeCalibrationSnapshot(env.DB, convictionCalibration7d);
+            calibrationsGenerated += 1;
+          } catch (err) {
+            console.error('Backfill 7d conviction calibration failed:', err);
+          }
+
+          try {
+            convictionCalibration30d = await buildConvictionCalibrationSnapshot(env.DB, '30d');
+            await storeCalibrationSnapshot(env.DB, convictionCalibration30d);
+            calibrationsGenerated += 1;
+          } catch (err) {
+            console.error('Backfill 30d conviction calibration failed:', err);
+          }
+
+          try {
+            edgeCalibration = await buildEdgeQualityCalibrationSnapshot(env.DB);
+            await storeCalibrationSnapshot(env.DB, edgeCalibration);
+            calibrationsGenerated += 1;
+          } catch (err) {
+            console.error('Backfill edge calibration failed:', err);
+          }
+
+          try {
+            const latest7d = await buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d);
+            const latest30d = await buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d);
+            if (latest7d) await storeOpportunitySnapshot(env.DB, latest7d);
+            if (latest30d) await storeOpportunitySnapshot(env.DB, latest30d);
+          } catch (err) {
+            console.error('Backfill latest opportunity refresh failed:', err);
+          }
+        }
+
+        return Response.json({
+          ok: true,
+          dry_run: dryRun,
+          requested: {
+            start: startDate,
+            end: endDate,
+            limit,
+            overwrite,
+            recalibrate,
+          },
+          scanned_dates: candidateDates.length,
+          processed_dates: processedDates,
+          skipped_dates: skippedDates,
+          seeded_snapshots: seededSnapshots,
+          calibrations_generated: calibrationsGenerated,
+          calibration_samples: {
+            edge_total_samples: edgeCalibration?.total_samples ?? null,
+            conviction_7d_total_samples: convictionCalibration7d?.total_samples ?? null,
+            conviction_30d_total_samples: convictionCalibration30d?.total_samples ?? null,
+          },
+          skipped_existing_dates: skippedExisting,
+          failed_dates: failedDates.slice(0, 20),
+        }, { headers: corsHeaders });
       }
 
       if (url.pathname === '/api/market/send-digest' && method === 'POST') {

@@ -120,6 +120,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function clamp(min: number, max: number, value: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
 export function isRetryableYahooError(error: unknown): boolean {
   if (!error) return false;
 
@@ -236,6 +240,11 @@ async function fetchAaiiPrimary(): Promise<Array<{ date: Date; value: number }>>
   return fetchAAIISentiment();
 }
 
+async function fetchCboePutCallPrimary(): Promise<Array<{ date: Date; value: number }>> {
+  const { fetchCboePutCallRatio } = await import('../fetchers/scrapers.js');
+  return fetchCboePutCallRatio();
+}
+
 function getWriteConfig(): { writeApiUrl: string; writeApiKey: string; baseUrl: string } {
   if (!WRITE_API_URL) {
     throw new Error('WRITE_API_URL environment variable is required');
@@ -286,6 +295,27 @@ async function fetchFredSeries(seriesId: string, indicatorId: string): Promise<I
   return values;
 }
 
+async function fetchFredSeriesWithFallback(
+  seriesIds: string[],
+  indicatorId: string
+): Promise<{ values: IndicatorValue[]; seriesId: string }> {
+  let lastError: unknown = null;
+  for (const seriesId of seriesIds) {
+    try {
+      const values = await fetchFredSeries(seriesId, indicatorId);
+      if (values.length > 0) {
+        return { values, seriesId };
+      }
+      lastError = new Error(`FRED series ${seriesId} returned no rows`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(message || `Failed to fetch ${indicatorId} from FRED fallback series`);
+}
+
 async function fetchAllFred(): Promise<void> {
   console.log('\n━━━ FRED Data ━━━');
 
@@ -302,7 +332,6 @@ async function fetchAllFred(): Promise<void> {
     { ticker: 'BAMLEMCBPIOAS', id: 'em_spread' },
     { ticker: 'CFNAI', id: 'cfnai' },
     { ticker: 'MANEMP', id: 'ism_manufacturing' },
-    { ticker: 'NMFCI', id: 'ism_services' },
   ];
 
   for (const { ticker, id } of fredIndicators) {
@@ -315,6 +344,19 @@ async function fetchAllFred(): Promise<void> {
       console.error(`  ✗ ${id}: ${message}`);
     }
     await sleep(200);
+  }
+
+  // ISM services can drift between FRED aliases; try known fallbacks.
+  try {
+    const { values, seriesId } = await fetchFredSeriesWithFallback(
+      ['NAPMNOI', 'NMFCI'],
+      'ism_services'
+    );
+    const written = recordIndicatorValues(values);
+    console.log(`  ✓ ism_services: ${written} values (${seriesId})`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`  ✗ ism_services: ${message}`);
   }
 
   // Derive BBB-AAA spread from BAA/AAA effective yields.
@@ -791,6 +833,16 @@ async function fetchCrypto(): Promise<void> {
     console.error(`  ✗ stablecoin_mcap: ${message}`);
   }
 
+  const writeFundingRate = (ratePct: number, source: string): number => {
+    return recordIndicatorValues([{
+      indicator_id: 'btc_funding_rate',
+      date: format(new Date(), 'yyyy-MM-dd'),
+      value: ratePct,
+      source,
+    }]);
+  };
+
+  let wroteFunding = false;
   try {
     const response = await axios.get('https://open-api.coinglass.com/public/v2/funding', {
       params: { symbol: 'BTC' },
@@ -801,18 +853,53 @@ async function fetchCrypto(): Promise<void> {
       const rates = response.data.data.uMarginList;
       const avgRate = rates.reduce((sum: number, row: { rate?: number }) => sum + (row.rate || 0), 0) /
         Math.max(rates.length, 1);
-
-      const written = recordIndicatorValues([{
-        indicator_id: 'btc_funding_rate',
-        date: format(new Date(), 'yyyy-MM-dd'),
-        value: avgRate * 100,
-        source: 'coinglass',
-      }]);
-      console.log(`  ✓ btc_funding_rate: ${written} value`);
+      const written = writeFundingRate(avgRate * 100, 'coinglass');
+      wroteFunding = written > 0;
+      if (wroteFunding) {
+        console.log(`  ✓ btc_funding_rate: ${written} value (coinglass)`);
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`  ✗ btc_funding_rate: ${message}`);
+    console.log(`  ⚠ btc_funding_rate coinglass failed: ${message}`);
+  }
+
+  if (!wroteFunding) {
+    try {
+      const response = await axios.get('https://fapi.binance.com/fapi/v1/fundingRate', {
+        params: {
+          symbol: 'BTCUSDT',
+          limit: 40,
+        },
+        timeout: 20000,
+        validateStatus: () => true,
+      });
+
+      if (response.status >= 400) {
+        throw new Error(`Binance funding API error ${response.status}`);
+      }
+
+      const rows = Array.isArray(response.data)
+        ? response.data as Array<{ fundingRate?: string }>
+        : [];
+      const rates = rows
+        .map((row) => Number.parseFloat(String(row.fundingRate ?? '')))
+        .filter((rate) => Number.isFinite(rate));
+
+      if (rates.length === 0) {
+        throw new Error('No Binance funding rows');
+      }
+
+      const avgRatePct = (rates.reduce((sum, rate) => sum + rate, 0) / rates.length) * 100;
+      const written = writeFundingRate(avgRatePct, 'binance_futures');
+      wroteFunding = written > 0;
+      if (wroteFunding) {
+        console.log(`  ✓ btc_funding_rate: ${written} value (binance_futures)`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`  ✗ btc_funding_rate: ${message}`);
+    }
   }
 }
 
@@ -978,38 +1065,96 @@ async function fetchAlternative(): Promise<void> {
     console.error(`  ✗ fear_greed: ${message}`);
   }
 
+  let latestPutCall: number | null = null;
+  try {
+    const cboeValues = await fetchCboePutCallPrimary();
+    if (cboeValues.length > 0) {
+      const latest = [...cboeValues]
+        .filter((value) => value.date instanceof Date && Number.isFinite(value.value))
+        .sort((a, b) => b.date.getTime() - a.date.getTime())[0];
+      if (latest) {
+        latestPutCall = latest.value;
+        const written = recordIndicatorValues([{
+          indicator_id: 'put_call_ratio',
+          date: format(latest.date, 'yyyy-MM-dd'),
+          value: latest.value,
+          source: 'cboe',
+        }]);
+        if (written > 0) {
+          console.log(`  ✓ put_call_ratio: ${written} value (cboe)`);
+        }
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`  ⚠ put_call_ratio CBOE scrape failed: ${message}`);
+  }
+
+  if (latestPutCall === null) {
+    try {
+      const putCall = await fetchPutCallProxy();
+      if (putCall !== null && Number.isFinite(putCall)) {
+        latestPutCall = putCall;
+        const written = recordIndicatorValues([{
+          indicator_id: 'put_call_ratio',
+          date: format(new Date(), 'yyyy-MM-dd'),
+          value: putCall,
+          source: 'yahoo_proxy',
+        }]);
+        console.log(`  ✓ put_call_ratio: ${written} value (proxy)`);
+      } else {
+        console.error('  ✗ put_call_ratio: unavailable from all sources');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`  ✗ put_call_ratio: ${message}`);
+    }
+  }
+
+  let gexWritten = false;
   try {
     const gex = await fetchGEX();
-    if (gex !== null) {
+    if (gex !== null && Number.isFinite(gex)) {
       const written = recordIndicatorValues([{
         indicator_id: 'gex',
         date: format(new Date(), 'yyyy-MM-dd'),
         value: gex,
         source: 'cboe',
       }]);
-      console.log(`  ✓ gex: ${written} value`);
+      gexWritten = written > 0;
+      if (gexWritten) {
+        console.log(`  ✓ gex: ${written} value (cboe)`);
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`  ✗ gex: ${message}`);
+    console.log(`  ⚠ gex primary failed: ${message}`);
   }
 
-  try {
-    const putCall = await fetchPutCallProxy();
-    if (putCall !== null && Number.isFinite(putCall)) {
+  if (!gexWritten) {
+    const latestVix = [...allIndicators]
+      .filter((value) => value.indicator_id === 'vix')
+      .sort((a, b) => b.date.localeCompare(a.date))[0];
+    const latestDate = latestVix?.date || format(new Date(), 'yyyy-MM-dd');
+    if (latestVix && Number.isFinite(latestVix.value)) {
+      const putCallForProxy = latestPutCall ?? 0.9;
+      // Positive in calmer regimes, negative in stressed regimes.
+      const proxy = clamp(-25, 25, ((20 - latestVix.value) * 1.2) + ((1 - putCallForProxy) * 18));
       const written = recordIndicatorValues([{
-        indicator_id: 'put_call_ratio',
-        date: format(new Date(), 'yyyy-MM-dd'),
-        value: putCall,
-        source: 'yahoo_proxy',
+        indicator_id: 'gex',
+        date: latestDate,
+        value: proxy,
+        source: 'proxy_vol_surface',
       }]);
-      console.log(`  ✓ put_call_ratio: ${written} value (proxy)`);
-    } else {
-      console.error('  ✗ put_call_ratio: unavailable from proxy');
+      if (written > 0) {
+        gexWritten = true;
+        console.log(`  ✓ gex: ${written} value (proxy_vol_surface)`);
+      }
     }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`  ✗ put_call_ratio: ${message}`);
+  }
+
+  if (!gexWritten) {
+    console.error('  ✗ gex: unavailable from both primary and proxy fallback');
   }
 }
 
