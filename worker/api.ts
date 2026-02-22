@@ -1470,6 +1470,17 @@ interface DecisionGradeResponse {
   score: number;
   grade: 'GREEN' | 'YELLOW' | 'RED';
   go_live_ready: boolean;
+  go_live_blockers: string[];
+  readiness: {
+    decision_impact_window_days: 30 | 90;
+    decision_impact_enforce_ready: boolean;
+    decision_impact_breaches: string[];
+    decision_impact_market_7d_sample_size: number;
+    decision_impact_market_30d_sample_size: number;
+    decision_impact_actionable_sessions: number;
+    minimum_samples_required: number;
+    minimum_actionable_sessions_required: number;
+  };
   components: {
     freshness: {
       score: number;
@@ -6606,6 +6617,9 @@ async function computeDecisionImpact(
     asIsoDate(new Date());
   const startDate = addCalendarDays(effectiveAsOfDate, -(windowDays - 1));
   const horizonDays = args.horizon === '7d' ? 7 : 30;
+  // Window semantics are based on maturity date, not signal publish date.
+  // Pull a wider as_of range so horizon=30d with window=30d can include matured outcomes.
+  const asOfStartDate = addCalendarDays(startDate, -horizonDays);
 
   const ledgerRows = await db.prepare(`
     SELECT as_of, theme_id, theme_name, direction
@@ -6615,7 +6629,7 @@ async function computeDecisionImpact(
       AND substr(as_of, 1, 10) >= ?
       AND substr(as_of, 1, 10) <= ?
     ORDER BY as_of DESC, id DESC
-  `).bind(args.horizon, startDate, effectiveAsOfDate).all<{
+  `).bind(args.horizon, asOfStartDate, effectiveAsOfDate).all<{
     as_of: string;
     theme_id: string;
     theme_name: string;
@@ -6694,6 +6708,9 @@ async function computeDecisionImpact(
     }
 
     const maturityDate = addCalendarDays(asOfDate, horizonDays);
+    if (maturityDate < startDate || maturityDate > effectiveAsOfDate) {
+      continue;
+    }
     if (maturityDate > latestReferenceDate) {
       continue;
     }
@@ -6839,6 +6856,8 @@ function evaluateDecisionImpactObserveMode(
 
   if (market7.sample_size <= 0) {
     breaches.push('market_7d_insufficient_samples');
+  } else if (market7.sample_size < governance.min_sample_size) {
+    breaches.push('market_7d_below_enforce_min_sample');
   } else {
     if (market7.hit_rate < DECISION_IMPACT_OBSERVE_THRESHOLDS.market_7d_hit_rate_min) {
       breaches.push('market_7d_hit_rate_breach');
@@ -6858,6 +6877,8 @@ function evaluateDecisionImpactObserveMode(
 
   if (market30.sample_size <= 0) {
     breaches.push('market_30d_insufficient_samples');
+  } else if (market30.sample_size < governance.min_sample_size) {
+    breaches.push('market_30d_below_enforce_min_sample');
   } else {
     if (market30.hit_rate < DECISION_IMPACT_OBSERVE_THRESHOLDS.market_30d_hit_rate_min) {
       breaches.push('market_30d_hit_rate_breach');
@@ -6877,6 +6898,8 @@ function evaluateDecisionImpactObserveMode(
 
   if (utilityFunnel.actionable_sessions <= 0) {
     breaches.push('cta_action_insufficient_sessions');
+  } else if (utilityFunnel.actionable_sessions < governance.min_actionable_sessions) {
+    breaches.push('cta_action_below_enforce_min_sessions');
   } else if (utilityFunnel.cta_action_rate_pct < DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min) {
     breaches.push('cta_action_rate_breach');
   }
@@ -7137,11 +7160,17 @@ async function computeOpportunityLedgerWindowMetrics(
 async function computeDecisionGradeScorecard(
   db: D1Database,
   windowDays: number,
+  governance?: DecisionImpactGovernanceOptions,
 ): Promise<DecisionGradeResponse> {
   const boundedWindowDays = UTILITY_WINDOW_DAY_OPTIONS.has(windowDays) ? windowDays : 30;
   const lookbackExpr = `-${Math.max(0, boundedWindowDays - 1)} days`;
+  const appliedGovernance: DecisionImpactGovernanceOptions = governance || {
+    enforce_enabled: false,
+    min_sample_size: DECISION_IMPACT_ENFORCE_MIN_SAMPLE_DEFAULT,
+    min_actionable_sessions: DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS_DEFAULT,
+  };
 
-  const [freshnessWindow, utilityFunnel, opportunityMetrics, consistencyRows, conviction7d, conviction30d, edgeCalibration] = await Promise.all([
+  const [freshnessWindow, utilityFunnel, opportunityMetrics, consistencyRows, conviction7d, conviction30d, edgeCalibration, decisionImpactOps] = await Promise.all([
     computeFreshnessSloWindow(db, boundedWindowDays),
     computeUtilityFunnelSummary(db, boundedWindowDays),
     computeOpportunityLedgerWindowMetrics(db, boundedWindowDays),
@@ -7154,6 +7183,7 @@ async function computeDecisionGradeScorecard(
     fetchLatestCalibrationSnapshot(db, 'conviction', '7d'),
     fetchLatestCalibrationSnapshot(db, 'conviction', '30d'),
     fetchLatestCalibrationSnapshot(db, 'edge_quality', null),
+    buildDecisionImpactOpsResponse(db, 30, appliedGovernance),
   ]);
 
   let edgeReport: EdgeDiagnosticsReport | null = null;
@@ -7282,12 +7312,24 @@ async function computeDecisionGradeScorecard(
     utilityScore * 0.05
   ).toFixed(2));
   const grade = decisionGradeFromScore(weightedScore);
-  const goLiveReady = weightedScore >= 85
-    && freshnessStatus === 'pass'
-    && consistencyStatus !== 'fail'
-    && calibrationStatus !== 'fail'
-    && edgeStatus === 'pass'
-    && opportunityHygieneStatus !== 'fail';
+  const goLiveBlockers = new Set<string>();
+  if (weightedScore < 85) goLiveBlockers.add('score_below_threshold');
+  if (freshnessStatus !== 'pass') goLiveBlockers.add('freshness_not_pass');
+  if (consistencyStatus === 'fail') goLiveBlockers.add('consistency_fail');
+  if (calibrationStatus === 'fail') goLiveBlockers.add('calibration_fail');
+  if (edgeStatus !== 'pass') goLiveBlockers.add('edge_not_pass');
+  if (opportunityHygieneStatus === 'fail') goLiveBlockers.add('opportunity_hygiene_fail');
+  if (utilityStatus === 'fail') goLiveBlockers.add('utility_signal_weak');
+  if (utilityStatus === 'insufficient') goLiveBlockers.add('utility_signal_insufficient');
+  if (!decisionImpactOps.observe_mode.enforce_ready) {
+    goLiveBlockers.add('decision_impact_not_enforce_ready');
+  }
+  for (const breach of decisionImpactOps.observe_mode.breaches) {
+    goLiveBlockers.add(`decision_impact_${breach}`);
+  }
+
+  const blockers = [...goLiveBlockers];
+  const goLiveReady = blockers.length === 0;
 
   return {
     as_of: asIsoDateTime(new Date()),
@@ -7295,6 +7337,17 @@ async function computeDecisionGradeScorecard(
     score: weightedScore,
     grade,
     go_live_ready: goLiveReady,
+    go_live_blockers: blockers,
+    readiness: {
+      decision_impact_window_days: decisionImpactOps.window_days,
+      decision_impact_enforce_ready: decisionImpactOps.observe_mode.enforce_ready,
+      decision_impact_breaches: decisionImpactOps.observe_mode.breaches,
+      decision_impact_market_7d_sample_size: decisionImpactOps.market_7d.sample_size,
+      decision_impact_market_30d_sample_size: decisionImpactOps.market_30d.sample_size,
+      decision_impact_actionable_sessions: decisionImpactOps.utility_attribution.actionable_sessions,
+      minimum_samples_required: decisionImpactOps.observe_mode.minimum_samples_required,
+      minimum_actionable_sessions_required: decisionImpactOps.observe_mode.minimum_actionable_sessions_required,
+    },
     components: {
       freshness: {
         score: freshnessScore,
@@ -10689,7 +10742,11 @@ export default {
         }
 
         try {
-          const scorecard = await computeDecisionGradeScorecard(env.DB, windowRaw);
+          const scorecard = await computeDecisionGradeScorecard(
+            env.DB,
+            windowRaw,
+            resolveDecisionImpactGovernance(env),
+          );
           return Response.json(scorecard, {
             headers: {
               ...corsHeaders,
@@ -10699,6 +10756,52 @@ export default {
         } catch (err) {
           console.error('Decision-grade computation failed:', err);
           return Response.json({ error: 'Decision grade unavailable' }, { status: 503, headers: corsHeaders });
+        }
+      }
+
+      if (url.pathname === '/api/ops/go-live-readiness' && method === 'GET') {
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Go-live readiness schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        const windowRaw = Number.parseInt((url.searchParams.get('window') || '30').trim(), 10);
+        if (windowRaw !== 30) {
+          return Response.json({
+            error: 'Invalid window. Supported values: 30',
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        const scoreWindow = 30;
+        try {
+          const scorecard = await computeDecisionGradeScorecard(
+            env.DB,
+            scoreWindow,
+            resolveDecisionImpactGovernance(env),
+          );
+          return Response.json({
+            as_of: asIsoDateTime(new Date()),
+            window_days: windowRaw,
+            score_window_days: scoreWindow,
+            go_live_ready: scorecard.go_live_ready,
+            blockers: scorecard.go_live_blockers,
+            grade: {
+              score: scorecard.score,
+              grade: scorecard.grade,
+            },
+            readiness: scorecard.readiness,
+            components: scorecard.components,
+          }, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'public, max-age=300',
+            },
+          });
+        } catch (err) {
+          console.error('Go-live readiness computation failed:', err);
+          return Response.json({ error: 'Go-live readiness unavailable' }, { status: 503, headers: corsHeaders });
         }
       }
 
@@ -11014,6 +11117,17 @@ export default {
             score: number;
             grade: 'GREEN' | 'YELLOW' | 'RED';
             go_live_ready: boolean;
+            go_live_blockers: string[];
+            readiness: {
+              decision_impact_window_days: 30 | 90;
+              decision_impact_enforce_ready: boolean;
+              decision_impact_breaches: string[];
+              decision_impact_market_7d_sample_size: number;
+              decision_impact_market_30d_sample_size: number;
+              decision_impact_actionable_sessions: number;
+              minimum_samples_required: number;
+              minimum_actionable_sessions_required: number;
+            };
             opportunity_hygiene: {
               over_suppression_rate_pct: number;
               cross_horizon_conflict_rate_pct: number;
@@ -11021,11 +11135,17 @@ export default {
             };
           } | null = null;
           try {
-            const scorecard = await computeDecisionGradeScorecard(env.DB, 30);
+            const scorecard = await computeDecisionGradeScorecard(
+              env.DB,
+              30,
+              decisionImpactGovernance,
+            );
             decisionGradeSnapshot = {
               score: scorecard.score,
               grade: scorecard.grade,
               go_live_ready: scorecard.go_live_ready,
+              go_live_blockers: scorecard.go_live_blockers,
+              readiness: scorecard.readiness,
               opportunity_hygiene: {
                 over_suppression_rate_pct: scorecard.components.opportunity_hygiene.over_suppression_rate_pct,
                 cross_horizon_conflict_rate_pct: scorecard.components.opportunity_hygiene.cross_horizon_conflict_rate_pct,

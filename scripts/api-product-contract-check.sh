@@ -7,9 +7,11 @@ OPPORTUNITY_TTL_GRACE_SECONDS="${OPPORTUNITY_TTL_GRACE_SECONDS:-5400}"
 UTILITY_FUNNEL_REQUIRED="${UTILITY_FUNNEL_REQUIRED:-0}"
 DECISION_GRADE_REQUIRED="${DECISION_GRADE_REQUIRED:-0}"
 DECISION_IMPACT_REQUIRED="${DECISION_IMPACT_REQUIRED:-0}"
+GO_LIVE_READINESS_REQUIRED="${GO_LIVE_READINESS_REQUIRED:-0}"
 UTILITY_FUNNEL_LIVE=0
 DECISION_GRADE_LIVE=0
 DECISION_IMPACT_LIVE=0
+GO_LIVE_READINESS_LIVE=0
 
 TMP_HEADERS="$(mktemp)"
 TMP_BODY="$(mktemp)"
@@ -120,6 +122,27 @@ decision_impact_available() {
   fi
 
   echo "Unexpected status for /api/decision-impact: $code"
+  cat "$TMP_BODY" || true
+  exit 1
+}
+
+go_live_readiness_available() {
+  local code
+  code=$(curl -sS -o "$TMP_BODY" -w "%{http_code}" --max-time 20 "$API_URL/api/ops/go-live-readiness?window=30")
+  if [[ "$code" == "200" ]]; then
+    return 0
+  fi
+
+  if [[ "$code" == "404" ]]; then
+    if [[ "$GO_LIVE_READINESS_REQUIRED" == "1" ]]; then
+      echo "Go-live readiness endpoint is required but returned 404"
+      exit 1
+    fi
+    echo "Skipping go-live readiness checks: /api/ops/go-live-readiness is not live yet."
+    return 1
+  fi
+
+  echo "Unexpected status for /api/ops/go-live-readiness: $code"
   cat "$TMP_BODY" || true
   exit 1
 }
@@ -811,6 +834,9 @@ check_decision_grade_semantics() {
   local over_suppression
   local conflict_rate
   local unlock_coverage
+  local blockers_len
+  local enforce_ready
+  local enforce_breaches_len
 
   grade_json=$(curl -sS --max-time 20 "$API_URL/api/ops/decision-grade?window=30")
   score=$(echo "$grade_json" | jq -r '.score // -1')
@@ -820,6 +846,9 @@ check_decision_grade_semantics() {
   over_suppression=$(echo "$grade_json" | jq -r '.components.opportunity_hygiene.over_suppression_rate_pct // -1')
   conflict_rate=$(echo "$grade_json" | jq -r '.components.opportunity_hygiene.cross_horizon_conflict_rate_pct // -1')
   unlock_coverage=$(echo "$grade_json" | jq -r '.components.utility.no_action_unlock_coverage_pct // -1')
+  blockers_len=$(echo "$grade_json" | jq -r '(.go_live_blockers // [] | length)')
+  enforce_ready=$(echo "$grade_json" | jq -r '.readiness.decision_impact_enforce_ready // false')
+  enforce_breaches_len=$(echo "$grade_json" | jq -r '(.readiness.decision_impact_breaches // [] | length)')
 
   if ! awk "BEGIN { exit !($score >= 0 && $score <= 100) }"; then
     echo "Decision-grade score must be in [0,100]"
@@ -866,6 +895,24 @@ check_decision_grade_semantics() {
     exit 1
   fi
 
+  if [[ "$go_live_ready" == "true" && "$blockers_len" != "0" ]]; then
+    echo "go_live_ready=true cannot have go-live blockers"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if [[ "$go_live_ready" == "false" && "$blockers_len" == "0" ]]; then
+    echo "go_live_ready=false requires at least one go-live blocker"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if [[ "$enforce_ready" == "true" && "$enforce_breaches_len" != "0" ]]; then
+    echo "decision impact readiness cannot be enforce-ready with active breaches"
+    echo "$grade_json"
+    exit 1
+  fi
+
   bad_status=$(echo "$grade_json" | jq -r '
     any([
       .components.freshness.status,
@@ -897,6 +944,48 @@ check_decision_grade_semantics() {
   if ! awk "BEGIN { exit !($unlock_coverage >= 0 && $unlock_coverage <= 100) }"; then
     echo "Decision-grade utility coverage must be in [0,100]"
     echo "$grade_json"
+    exit 1
+  fi
+}
+
+check_go_live_readiness_semantics() {
+  local readiness_json
+  local score_window_days
+  local go_live_ready
+  local blockers_len
+  local breach_len
+  local enforce_ready
+  local grade_value
+
+  readiness_json=$(curl -sS --max-time 20 "$API_URL/api/ops/go-live-readiness?window=30")
+  score_window_days=$(echo "$readiness_json" | jq -r '.score_window_days // -1')
+  go_live_ready=$(echo "$readiness_json" | jq -r '.go_live_ready // false')
+  blockers_len=$(echo "$readiness_json" | jq -r '(.blockers // [] | length)')
+  breach_len=$(echo "$readiness_json" | jq -r '(.readiness.decision_impact_breaches // [] | length)')
+  enforce_ready=$(echo "$readiness_json" | jq -r '.readiness.decision_impact_enforce_ready // false')
+  grade_value=$(echo "$readiness_json" | jq -r '.grade.grade // ""')
+
+  if [[ "$score_window_days" != "30" ]]; then
+    echo "Go-live readiness score window should be fixed at 30 days"
+    echo "$readiness_json"
+    exit 1
+  fi
+
+  if [[ "$go_live_ready" == "true" && "$blockers_len" != "0" ]]; then
+    echo "go_live_ready=true cannot have blockers"
+    echo "$readiness_json"
+    exit 1
+  fi
+
+  if [[ "$go_live_ready" == "true" && "$grade_value" != "GREEN" ]]; then
+    echo "go_live_readiness requires GREEN grade"
+    echo "$readiness_json"
+    exit 1
+  fi
+
+  if [[ "$enforce_ready" == "true" && "$breach_len" != "0" ]]; then
+    echo "decision impact enforce ready cannot have active breaches"
+    echo "$readiness_json"
     exit 1
   fi
 }
@@ -1027,9 +1116,16 @@ check_api_json_contract "/api/ops/freshness-slo" \
 
 if decision_grade_available; then
   check_api_json_contract "/api/ops/decision-grade?window=30" \
-    'type=="object" and (.as_of|type=="string") and (.window_days|type=="number") and (.score|type=="number") and (.grade|type=="string") and (.go_live_ready|type=="boolean") and (.components.freshness.score|type=="number") and (.components.freshness.status|type=="string") and (.components.freshness.slo_attainment_pct|type=="number") and (.components.freshness.days_with_critical_stale|type=="number") and (.components.freshness.days_observed|type=="number") and (.components.consistency.score|type=="number") and (.components.consistency.status|type=="string") and (.components.consistency.pass_count|type=="number") and (.components.consistency.warn_count|type=="number") and (.components.consistency.fail_count|type=="number") and (.components.consistency.total|type=="number") and (.components.calibration.score|type=="number") and (.components.calibration.status|type=="string") and (.components.calibration.conviction_7d|type=="string") and (.components.calibration.conviction_30d|type=="string") and (.components.calibration.edge_quality|type=="string") and (.components.edge.score|type=="number") and (.components.edge.status|type=="string") and (.components.edge.promotion_gate_pass|type=="boolean") and (.components.edge.lower_bound_positive_horizons|type=="number") and (.components.edge.horizons_observed|type=="number") and (.components.edge.reasons|type=="array") and (all(.components.edge.reasons[]?; type=="string")) and (.components.opportunity_hygiene.score|type=="number") and (.components.opportunity_hygiene.status|type=="string") and (.components.opportunity_hygiene.publish_rate_pct|type=="number") and (.components.opportunity_hygiene.over_suppression_rate_pct|type=="number") and (.components.opportunity_hygiene.cross_horizon_conflict_rate_pct|type=="number") and (.components.opportunity_hygiene.conflict_persistence_days|type=="number") and (.components.opportunity_hygiene.rows_observed|type=="number") and (.components.utility.score|type=="number") and (.components.utility.status|type=="string") and (.components.utility.decision_events_total|type=="number") and (.components.utility.no_action_unlock_coverage_pct|type=="number") and (.components.utility.unique_sessions|type=="number")' \
+    'type=="object" and (.as_of|type=="string") and (.window_days|type=="number") and (.score|type=="number") and (.grade|type=="string") and (.go_live_ready|type=="boolean") and (.go_live_blockers|type=="array") and (all(.go_live_blockers[]?; type=="string")) and (.readiness.decision_impact_window_days|type=="number") and (.readiness.decision_impact_enforce_ready|type=="boolean") and (.readiness.decision_impact_breaches|type=="array") and (all(.readiness.decision_impact_breaches[]?; type=="string")) and (.readiness.decision_impact_market_7d_sample_size|type=="number") and (.readiness.decision_impact_market_30d_sample_size|type=="number") and (.readiness.decision_impact_actionable_sessions|type=="number") and (.readiness.minimum_samples_required|type=="number") and (.readiness.minimum_actionable_sessions_required|type=="number") and (.components.freshness.score|type=="number") and (.components.freshness.status|type=="string") and (.components.freshness.slo_attainment_pct|type=="number") and (.components.freshness.days_with_critical_stale|type=="number") and (.components.freshness.days_observed|type=="number") and (.components.consistency.score|type=="number") and (.components.consistency.status|type=="string") and (.components.consistency.pass_count|type=="number") and (.components.consistency.warn_count|type=="number") and (.components.consistency.fail_count|type=="number") and (.components.consistency.total|type=="number") and (.components.calibration.score|type=="number") and (.components.calibration.status|type=="string") and (.components.calibration.conviction_7d|type=="string") and (.components.calibration.conviction_30d|type=="string") and (.components.calibration.edge_quality|type=="string") and (.components.edge.score|type=="number") and (.components.edge.status|type=="string") and (.components.edge.promotion_gate_pass|type=="boolean") and (.components.edge.lower_bound_positive_horizons|type=="number") and (.components.edge.horizons_observed|type=="number") and (.components.edge.reasons|type=="array") and (all(.components.edge.reasons[]?; type=="string")) and (.components.opportunity_hygiene.score|type=="number") and (.components.opportunity_hygiene.status|type=="string") and (.components.opportunity_hygiene.publish_rate_pct|type=="number") and (.components.opportunity_hygiene.over_suppression_rate_pct|type=="number") and (.components.opportunity_hygiene.cross_horizon_conflict_rate_pct|type=="number") and (.components.opportunity_hygiene.conflict_persistence_days|type=="number") and (.components.opportunity_hygiene.rows_observed|type=="number") and (.components.utility.score|type=="number") and (.components.utility.status|type=="string") and (.components.utility.decision_events_total|type=="number") and (.components.utility.no_action_unlock_coverage_pct|type=="number") and (.components.utility.unique_sessions|type=="number")' \
     "decision-grade"
   DECISION_GRADE_LIVE=1
+fi
+
+if go_live_readiness_available; then
+  check_api_json_contract "/api/ops/go-live-readiness?window=30" \
+    'type=="object" and (.as_of|type=="string") and (.window_days==30) and (.score_window_days==30) and (.go_live_ready|type=="boolean") and (.blockers|type=="array") and (all(.blockers[]?; type=="string")) and (.grade.score|type=="number") and (.grade.grade|type=="string") and (.readiness.decision_impact_window_days|type=="number") and (.readiness.decision_impact_enforce_ready|type=="boolean") and (.readiness.decision_impact_breaches|type=="array") and (.readiness.decision_impact_market_7d_sample_size|type=="number") and (.readiness.decision_impact_market_30d_sample_size|type=="number") and (.readiness.decision_impact_actionable_sessions|type=="number") and (.readiness.minimum_samples_required|type=="number") and (.readiness.minimum_actionable_sessions_required|type=="number") and (.components.freshness.status|type=="string") and (.components.edge.status|type=="string") and (.components.utility.status|type=="string")' \
+    "go-live-readiness"
+  GO_LIVE_READINESS_LIVE=1
 fi
 
 if decision_impact_available; then
@@ -1067,6 +1163,9 @@ if [[ "$UTILITY_FUNNEL_LIVE" == "1" ]]; then
 fi
 if [[ "$DECISION_GRADE_LIVE" == "1" ]]; then
   check_decision_grade_semantics
+fi
+if [[ "$GO_LIVE_READINESS_LIVE" == "1" ]]; then
+  check_go_live_readiness_semantics
 fi
 if [[ "$DECISION_IMPACT_LIVE" == "1" ]]; then
   check_decision_impact_semantics

@@ -136,6 +136,7 @@ pxi-command/
 | `/api/ops/utility-funnel` | GET | Rolling utility funnel metrics (session -> decision views -> no-action unlock coverage + CTA intent rate) |
 | `/api/ops/decision-impact` | GET | Decision-impact ops view (7d/30d market outcome proxy, theme summary, utility attribution, governance mode with observe + enforce readiness) |
 | `/api/ops/decision-grade` | GET | Rolling governance scorecard (freshness, consistency, calibration, edge evidence, opportunity hygiene, utility) |
+| `/api/ops/go-live-readiness` | GET | Explicit go-live readiness snapshot (blockers + decision-impact enforce readiness context) |
 
 ### Product Layer (Phase 1)
 | Endpoint | Method | Description |
@@ -349,6 +350,11 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
 - Theme attribution basis upgraded from pure SPY proxy to theme proxy blend (credit/vol/global/crypto mappings) with explicit SPY fallback when proxy coverage is unavailable.
 - Utility funnel CTA denominator now uses actionable sessions including CTA-click sessions (not only explicit actionable-view events) to reduce denominator undercount.
 - `POST /api/market/backfill-products` can now rebuild opportunity ledgers and regenerate decision-impact snapshots from historical opportunity snapshots (`rebuild_ledgers`, default `true`).
+
+13. **Go-live readiness + maturity-window correction (Phase 7)**
+- Decision-impact sampling now uses maturity-window semantics (outcome date in-window) instead of raw `as_of` filtering, so 30d attribution no longer collapses to zero in a 30d window.
+- `/api/ops/decision-grade` now emits explicit `go_live_blockers[]` plus readiness context (`decision_impact_enforce_ready`, sample counts, minimum thresholds).
+- New endpoint: `GET /api/ops/go-live-readiness?window=30` for a compact operator view of readiness blockers and score context.
 
 ## Scheduler Ownership Runbook
 
