@@ -10075,13 +10075,16 @@ export default {
           }
         }
 
-        let payload = await fetchDecisionImpactSnapshotAtOrBefore(
-          env.DB,
-          horizon,
-          scope,
-          windowDays,
-          asOfDate,
-        );
+        let payload: DecisionImpactResponsePayload | null = null;
+        if (asOfDate) {
+          payload = await fetchDecisionImpactSnapshotAtOrBefore(
+            env.DB,
+            horizon,
+            scope,
+            windowDays,
+            asOfDate,
+          );
+        }
 
         if (!payload) {
           payload = await computeDecisionImpact(env.DB, {
@@ -10089,6 +10092,7 @@ export default {
             scope,
             window_days: windowDays,
             limit,
+            as_of: asOfDate,
           });
         }
 
