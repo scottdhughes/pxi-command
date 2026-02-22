@@ -119,13 +119,31 @@ jobs:
               echo ""
               echo "### PXI Market Products Summary"
               echo ""
-              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | Coherence suppressed | Quality filtered | Data-quality suppressed | Critical stale | Edge gate | As of |"
-              echo "|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"
-              jq -r '"| \(.result.brief_generated // 0) | \(.result.opportunities_generated // 0) | \(.result.calibrations_generated // 0) | \(.result.alerts_generated // 0) | \(.result.coherence_suppressed_count // 0) | \(.result.quality_filtered_count // 0) | \(.result.suppressed_data_quality_count // 0) | \(.result.critical_stale_count // 0) | \((.result.edge_diagnostics.promotion_gate.pass // "n/a") | tostring) | \(.result.as_of // "n/a") |"' /tmp/pxi-market-summary.json
+              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | Coherence suppressed | Quality filtered | Data-quality suppressed | Over-suppressed | Critical stale | Cross-horizon state | Impact snapshots | Market 7d hit (n) | Market 30d hit (n) | CTA action rate | Actionable sessions | Governance mode | Enforce ready | Enforce breaches | Observe breaches | Edge gate | Decision grade | Go-live ready | As of |"
+              echo "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|---:|---|---|---:|---:|---|---|---|---|"
+              jq -r '"| \(.result.brief_generated // 0) | \(.result.opportunities_generated // 0) | \(.result.calibrations_generated // 0) | \(.result.alerts_generated // 0) | \(.result.coherence_suppressed_count // 0) | \(.result.quality_filtered_count // 0) | \(.result.suppressed_data_quality_count // 0) | \(.result.over_suppressed_count // 0) | \(.result.critical_stale_count // 0) | \(.result.cross_horizon_state // "n/a") | \(.result.decision_impact_snapshots_generated // 0) | \((.result.decision_impact.market_7d_hit_rate // "n/a") | tostring) n=\((.result.decision_impact.market_7d_sample_size // "n/a") | tostring) | \((.result.decision_impact.market_30d_hit_rate // "n/a") | tostring) n=\((.result.decision_impact.market_30d_sample_size // "n/a") | tostring) | \((.result.decision_impact.cta_action_rate_pct // "n/a") | tostring) | \((.result.decision_impact.actionable_sessions // "n/a") | tostring) | \((.result.decision_impact.governance_mode // "n/a") | tostring) | \((.result.decision_impact.enforce_ready // "n/a") | tostring) | \((.result.decision_impact.enforce_breach_count // "n/a") | tostring) | \((.result.decision_impact.observe_breach_count // "n/a") | tostring) | \((.result.edge_diagnostics.promotion_gate.pass // "n/a") | tostring) | \((.result.decision_grade_snapshot.grade // "n/a") | tostring) | \((.result.decision_grade_snapshot.go_live_ready // "n/a") | tostring) | \(.result.as_of // "n/a") |"' /tmp/pxi-market-summary.json
+              if jq -e '.result.decision_impact.observe_breaches != null and (.result.decision_impact.observe_breaches | length > 0)' /tmp/pxi-market-summary.json >/dev/null 2>&1; then
+                echo ""
+                echo "| Decision-impact observe breaches |"
+                echo "|---|"
+                jq -r '"| " + ((.result.decision_impact.observe_breaches // []) | join(", ")) + " |"' /tmp/pxi-market-summary.json
+              fi
+              if jq -e '.result.decision_impact.enforce_breaches != null and (.result.decision_impact.enforce_breaches | length > 0)' /tmp/pxi-market-summary.json >/dev/null 2>&1; then
+                echo ""
+                echo "| Decision-impact enforce breaches |"
+                echo "|---|"
+                jq -r '"| " + ((.result.decision_impact.enforce_breaches // []) | join(", ")) + " |"' /tmp/pxi-market-summary.json
+              fi
               echo ""
               echo "| Calibration diagnostic bands |"
               echo "|---|"
               jq -r '"| edge=\(.result.calibration_diagnostics.edge_quality // "n/a"), conviction_7d=\(.result.calibration_diagnostics.conviction_7d // "n/a"), conviction_30d=\(.result.calibration_diagnostics.conviction_30d // "n/a") |"' /tmp/pxi-market-summary.json
+              if jq -e '.result.decision_grade_snapshot != null' /tmp/pxi-market-summary.json >/dev/null 2>&1; then
+                echo ""
+                echo "| Decision-grade snapshot (from refresh run) |"
+                echo "|---|"
+                jq -r '"| score=\((.result.decision_grade_snapshot.score // "n/a")|tostring), grade=\(.result.decision_grade_snapshot.grade // "n/a"), go_live_ready=\((.result.decision_grade_snapshot.go_live_ready // "n/a")|tostring), blockers=\(((.result.decision_grade_snapshot.go_live_blockers // []) | length)|tostring), over_suppression_rate=\((.result.decision_grade_snapshot.opportunity_hygiene.over_suppression_rate_pct // "n/a")|tostring), cross_horizon_conflict_rate=\((.result.decision_grade_snapshot.opportunity_hygiene.cross_horizon_conflict_rate_pct // "n/a")|tostring), conflict_persistence_days=\((.result.decision_grade_snapshot.opportunity_hygiene.conflict_persistence_days // "n/a")|tostring) |"' /tmp/pxi-market-summary.json
+              fi
               if jq -e '.result.edge_diagnostics != null' /tmp/pxi-market-summary.json >/dev/null 2>&1; then
                 echo ""
                 echo "| Edge uplift diagnostics |"
@@ -136,6 +154,15 @@ jobs:
                   | "| " + (if length > 0 then join(" ; ") else "n/a" end) + " |"
                 ' /tmp/pxi-market-summary.json
                 jq -r '"| gate_reasons=\((.result.edge_diagnostics.promotion_gate.reasons // []) | join(",")) |"' /tmp/pxi-market-summary.json
+              fi
+              decision_code="$(curl -sS -o /tmp/pxi-decision-grade.json -w '%{http_code}' --max-time 20 "https://api.pxicommand.com/api/ops/decision-grade?window=30")"
+              echo ""
+              echo "| Decision-grade endpoint (30d) |"
+              echo "|---|"
+              if [[ "${decision_code}" == "200" ]]; then
+                jq -r '"| score=\(.score), grade=\(.grade), go_live_ready=\(.go_live_ready), blockers=\(((.go_live_blockers // []) | length)|tostring), freshness=\(.components.freshness.status), consistency=\(.components.consistency.status), calibration=\(.components.calibration.status), edge=\(.components.edge.status), opp_hygiene=\(.components.opportunity_hygiene.status), utility=\(.components.utility.status), over_suppression_rate=\(.components.opportunity_hygiene.over_suppression_rate_pct), cross_horizon_conflict_rate=\(.components.opportunity_hygiene.cross_horizon_conflict_rate_pct), conflict_persistence_days=\(.components.opportunity_hygiene.conflict_persistence_days) |"' /tmp/pxi-decision-grade.json
+              else
+                echo "| unavailable (status ${decision_code}) |"
               fi
             } >> "$GITHUB_STEP_SUMMARY"
           else

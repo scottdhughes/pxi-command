@@ -169,6 +169,11 @@ jobs:
           check_api_status "/api/signal" 200
           check_api_status "/api/diagnostics/calibration?metric=conviction&horizon=7d" 200
           check_api_status "/api/ops/freshness-slo" 200
+          DECISION_IMPACT_REQUIRED=1 \
+          GO_LIVE_READINESS_REQUIRED=1 \
+          DECISION_GRADE_REQUIRED=1 \
+          UTILITY_FUNNEL_REQUIRED=1 \
+          EDGE_DIAGNOSTICS_REQUIRED=1 \
           bash scripts/api-product-contract-check.sh "$API_URL"
 
           # CORS preflight for admin endpoint (no auth check expected, only CORS response)

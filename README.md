@@ -133,18 +133,24 @@ pxi-command/
 | `/api/plan` | GET | Canonical decision object for homepage (policy state, uncertainty, consistency, trader playbook) |
 | `/api/market/consistency` | GET | Latest decision consistency score/state/violations |
 | `/api/ops/freshness-slo` | GET | Rolling 7d/30d freshness SLO attainment and recent critical stale incidents |
+| `/api/ops/utility-funnel` | GET | Rolling utility funnel metrics (session -> decision views -> no-action unlock coverage + CTA intent rate) |
+| `/api/ops/decision-impact` | GET | Decision-impact ops view (7d/30d market outcome proxy, theme summary, utility attribution, governance mode with observe + enforce readiness) |
+| `/api/ops/decision-grade` | GET | Rolling governance scorecard (freshness, consistency, calibration, edge evidence, opportunity hygiene, utility) |
+| `/api/ops/go-live-readiness` | GET | Explicit go-live readiness snapshot (blockers + decision-impact enforce readiness context) |
 
 ### Product Layer (Phase 1)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/brief` | GET | Daily market brief coherent with `/api/plan` policy state (includes contract version + consistency) |
 | `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon with calibration + expectancy + unavailable reasons |
+| `/api/decision-impact` | GET | Outcome attribution using matured opportunity ledger rows (market uses SPY forward proxy; theme uses proxy blend with SPY fallback, 30/90d windows) |
 | `/api/diagnostics/calibration` | GET | Calibration diagnostics (Brier/ECE/log loss + quality band) for conviction and edge-quality snapshots |
 | `/api/diagnostics/edge` | GET | Forward-chaining edge evidence (model vs lagged baseline uplift, CI, leakage sentinel, promotion gate) |
 | `/api/alerts/feed` | GET | In-app alert timeline (`regime_change`, `threshold_cross`, `opportunity_spike`, `freshness_warning`) |
 | `/api/alerts/subscribe/start` | POST | Start email digest subscription with verification token |
 | `/api/alerts/subscribe/verify` | POST | Verify subscription token and activate email digest |
 | `/api/alerts/unsubscribe` | POST | Unsubscribe via token |
+| `/api/metrics/utility-event` | POST | Record lightweight product utility telemetry events (session, decision view, no-action unlock, `cta_action_click`) |
 
 ### ML & Predictions
 | Endpoint | Method | Description |
@@ -288,6 +294,73 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
 7. **Signals sanitation + stability**
 - Adapter-side ticker sanitation (allowlist regex, jargon stopwords, dedupe/cap) before PXI opportunity blending.
 - Signals source velocity cap tightened (`GROWTH_RATIO_CAP = 25`) with explicit `growth_ratio_capped` flag in metrics payload.
+
+8. **Opportunity TTL timebox + cache safety**
+- `/api/opportunities` now emits refresh recency metadata:
+  - `data_age_seconds`
+  - `ttl_state` (`fresh|stale|overdue|unknown`)
+  - `next_expected_refresh_at`
+  - `overdue_seconds`
+- CTA is hard-disabled when `ttl_state` is `overdue` or `unknown`.
+- Cache policy is timebox-aware: overdue/unknown states return `Cache-Control: no-store` to avoid stale hard-CTA exposure.
+
+9. **Utility funnel instrumentation (Phase 3)**
+- New ingestion endpoint: `POST /api/metrics/utility-event`.
+- New ops endpoint: `GET /api/ops/utility-funnel?window=7|30`.
+- Frontend now emits additive utility events for:
+  - `session_start`
+  - `plan_view`
+  - `opportunities_view`
+  - decision-state exposures (`decision_actionable_view|decision_watch_view|decision_no_action_view`)
+  - `no_action_unlock_view` (tracks no-action days as positive threshold-communication workflow events)
+  - `cta_action_click` (anonymous action intent from `/opportunities`)
+
+10. **Decision-grade governance (Phase 4)**
+- Immutable opportunity ledger tracks candidate-vs-published counts per horizon on every product refresh.
+- New ops endpoint: `GET /api/ops/decision-grade?window=7|30`.
+- Scorecard components:
+  - freshness SLO reliability
+  - consistency-state quality
+  - calibration quality band health
+  - edge-promotion evidence
+  - opportunity hygiene (over-suppression + cross-horizon conflict persistence)
+  - utility funnel adoption
+
+11. **Outcome attribution + utility lift (Phase 5)**
+- New endpoint: `GET /api/decision-impact?horizon=7d|30d&scope=market|theme&window=30|90`
+- New endpoint: `GET /api/ops/decision-impact?window=30|90`
+- Refresh pipeline persists:
+  - item-level publish/suppression ledger (`market_opportunity_item_ledger`)
+  - decision-impact snapshots (`market_decision_impact_snapshots`)
+- Attribution basis is `spy_forward_proxy` (market and theme scope in this phase).
+- Governance is **observe-only** in this phase. Breaches are surfaced in ops/workflow summaries but do not fail refresh runs.
+- Observe thresholds:
+  - `market_7d.hit_rate >= 0.52`
+  - `market_30d.hit_rate >= 0.50`
+  - `market_7d.avg_signed_return_pct > 0`
+  - `market_30d.avg_signed_return_pct > 0`
+  - `cta_action_rate_pct >= 2.0`
+
+12. **Decision-impact enforcement + attribution hardening (Phase 6)**
+- `ops/decision-impact` now reports governance mode (`observe|enforce`), enforce readiness, and enforce breach list/count.
+- Enforce mode is sample-gated and disabled by default:
+  - `FEATURE_ENABLE_DECISION_IMPACT_ENFORCE=false`
+  - `DECISION_IMPACT_ENFORCE_MIN_SAMPLE=30`
+  - `DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS=10`
+- Theme attribution basis upgraded from pure SPY proxy to theme proxy blend (credit/vol/global/crypto mappings) with explicit SPY fallback when proxy coverage is unavailable.
+- Utility funnel CTA denominator now uses actionable sessions including CTA-click sessions (not only explicit actionable-view events) to reduce denominator undercount.
+- `POST /api/market/backfill-products` can now rebuild opportunity ledgers and regenerate decision-impact snapshots from historical opportunity snapshots (`rebuild_ledgers`, default `true`).
+
+13. **Go-live readiness + maturity-window correction (Phase 7)**
+- Decision-impact sampling now uses maturity-window semantics (outcome date in-window) instead of raw `as_of` filtering, so 30d attribution no longer collapses to zero in a 30d window.
+- `/api/ops/decision-grade` now emits explicit `go_live_blockers[]` plus readiness context (`decision_impact_enforce_ready`, sample counts, minimum thresholds).
+- New endpoint: `GET /api/ops/go-live-readiness?window=30` for a compact operator view of readiness blockers and score context.
+
+14. **Go-live blocker reduction + enforce readiness normalization (Phase 8)**
+- Utility decision target now scales by observed days in-window (instead of fixed full-window counts), improving early-window status stability.
+- Decision-impact actionable-session minimum is normalized by observed days (with configured minimum still reported) to avoid false readiness negatives during partial windows.
+- Go-live blocker logic now keys edge on promotion-gate safety (`edge_promotion_gate_fail`) rather than strict edge component `pass/watch` state.
+- Enforcement should be flipped only when `/api/ops/go-live-readiness` shows `go_live_ready=true` and no blockers.
 
 ## Scheduler Ownership Runbook
 

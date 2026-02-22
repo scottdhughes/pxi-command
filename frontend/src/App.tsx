@@ -1,7 +1,16 @@
-import { useEffect, useState, useRef } from 'react'
+import { useCallback, useEffect, useState, useRef } from 'react'
 import './App.css'
 
 type AppRoute = '/' | '/spec' | '/alerts' | '/guide' | '/brief' | '/opportunities' | '/inbox'
+type UtilityEventType =
+  | 'session_start'
+  | 'plan_view'
+  | 'opportunities_view'
+  | 'decision_actionable_view'
+  | 'decision_watch_view'
+  | 'decision_no_action_view'
+  | 'no_action_unlock_view'
+  | 'cta_action_click'
 
 interface RouteMeta {
   title: string
@@ -311,6 +320,39 @@ async function fetchApi(path: string, init?: RequestInit): Promise<Response> {
   throw lastError instanceof Error ? lastError : new Error('API fetch failed')
 }
 
+function generateUtilitySessionId(): string {
+  if (typeof window !== 'undefined' && typeof window.crypto !== 'undefined') {
+    const bytes = new Uint8Array(10)
+    window.crypto.getRandomValues(bytes)
+    const token = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')
+    return `ux_${token}`
+  }
+  return `ux_${Math.random().toString(36).slice(2, 18)}`
+}
+
+function getOrCreateUtilitySessionId(): string {
+  if (typeof window === 'undefined') {
+    return generateUtilitySessionId()
+  }
+  try {
+    const existing = window.localStorage.getItem('pxi_utility_session_id')
+    if (existing && /^ux_[A-Za-z0-9_-]{10,}$/.test(existing)) {
+      return existing
+    }
+    const next = generateUtilitySessionId()
+    window.localStorage.setItem('pxi_utility_session_id', next)
+    return next
+  } catch {
+    return generateUtilitySessionId()
+  }
+}
+
+function utilityDecisionEventForState(state: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION' | null | undefined): UtilityEventType {
+  if (state === 'ACTIONABLE') return 'decision_actionable_view'
+  if (state === 'NO_ACTION') return 'decision_no_action_view'
+  return 'decision_watch_view'
+}
+
 // ============== ML Accuracy Data Interface ==============
 // Matches the /api/ml/accuracy response format
 interface MLAccuracyApiResponse {
@@ -529,6 +571,90 @@ interface OpportunitiesResponse {
   actionability_reason_codes?: string[]
   cta_enabled?: boolean
   cta_disabled_reasons?: string[]
+  data_age_seconds?: number | null
+  ttl_state?: 'fresh' | 'stale' | 'overdue' | 'unknown'
+  next_expected_refresh_at?: string | null
+  overdue_seconds?: number | null
+}
+
+interface DecisionImpactMarketStats {
+  sample_size: number
+  hit_rate: number
+  avg_forward_return_pct: number
+  avg_signed_return_pct: number
+  win_rate: number
+  downside_p10_pct: number
+  max_loss_pct: number
+  quality_band: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+}
+
+interface DecisionImpactThemeStats {
+  theme_id: string
+  theme_name: string
+  sample_size: number
+  hit_rate: number
+  avg_signed_return_pct: number
+  avg_forward_return_pct: number
+  win_rate: number
+  quality_band: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+  last_as_of: string
+}
+
+interface DecisionImpactResponse {
+  as_of: string
+  horizon: '7d' | '30d'
+  scope: 'market' | 'theme'
+  window_days: 30 | 90
+  outcome_basis: 'spy_forward_proxy' | 'theme_proxy_blend'
+  market: DecisionImpactMarketStats
+  themes: DecisionImpactThemeStats[]
+  coverage: {
+    matured_items: number
+    eligible_items: number
+    coverage_ratio: number
+    insufficient_reasons: string[]
+    theme_proxy_eligible_items?: number
+    spy_fallback_items?: number
+  }
+}
+
+interface OpsDecisionImpactResponse {
+  as_of: string
+  window_days: 30 | 90
+  market_7d: DecisionImpactMarketStats
+  market_30d: DecisionImpactMarketStats
+  theme_summary: {
+    themes_with_samples: number
+    themes_robust: number
+    top_positive: DecisionImpactThemeStats[]
+    top_negative: DecisionImpactThemeStats[]
+  }
+  utility_attribution: {
+    actionable_views: number
+    actionable_sessions: number
+    cta_action_clicks: number
+    cta_action_rate_pct: number
+    no_action_unlock_views: number
+    decision_events_total: number
+  }
+  observe_mode: {
+    enabled: boolean
+    mode: 'observe' | 'enforce'
+    thresholds: {
+      market_7d_hit_rate_min: number
+      market_30d_hit_rate_min: number
+      market_7d_avg_signed_return_min: number
+      market_30d_avg_signed_return_min: number
+      cta_action_rate_pct_min: number
+    }
+    minimum_samples_required: number
+    minimum_actionable_sessions_required: number
+    enforce_ready: boolean
+    enforce_breaches: string[]
+    enforce_breach_count: number
+    breaches: string[]
+    breach_count: number
+  }
 }
 
 interface CalibrationDiagnosticsResponse {
@@ -1071,6 +1197,11 @@ function formatMaybePercent(value: number | null, digits = 1): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}%`
 }
 
+function formatDecisionImpactBasis(value: DecisionImpactResponse['outcome_basis'] | null | undefined): string {
+  if (value === 'theme_proxy_blend') return 'theme proxy blend'
+  return 'SPY proxy'
+}
+
 function formatUnavailableReason(reason: string | null | undefined): string {
   if (!reason) return ''
   return reason.replace(/_/g, ' ')
@@ -1081,7 +1212,32 @@ function formatOpportunityDegradedReason(reason: string | null | undefined): str
   if (reason === 'suppressed_data_quality') return 'Opportunity feed is suppressed due to critical stale inputs or consistency failure.'
   if (reason === 'coherence_gate_failed') return 'No eligible opportunities (contract gate).'
   if (reason === 'quality_filtered') return 'Low-information opportunities were filtered from this feed.'
+  if (reason === 'refresh_ttl_overdue') return 'Opportunity feed is in watch mode because refresh data is overdue.'
+  if (reason === 'refresh_ttl_unknown') return 'Opportunity feed cannot verify refresh recency yet.'
   return reason.replace(/_/g, ' ')
+}
+
+function formatDataAgeSeconds(value: number | null | undefined): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 'unknown'
+  if (value < 60) return `${Math.max(0, Math.round(value))}s`
+  const minutes = value / 60
+  if (minutes < 60) return `${minutes.toFixed(0)}m`
+  const hours = minutes / 60
+  if (hours < 48) return `${hours.toFixed(1)}h`
+  const days = hours / 24
+  return `${days.toFixed(1)}d`
+}
+
+function formatTtlState(state: OpportunitiesResponse['ttl_state']): string {
+  if (!state) return 'unknown'
+  return state
+}
+
+function ttlStateClass(state: OpportunitiesResponse['ttl_state']): string {
+  if (state === 'fresh') return 'border-[#00c896]/40 text-[#00c896]'
+  if (state === 'stale') return 'border-[#f59e0b]/40 text-[#f59e0b]'
+  if (state === 'overdue') return 'border-[#ff6b6b]/40 text-[#ff6b6b]'
+  return 'border-[#949ba5]/40 text-[#949ba5]'
 }
 
 function formatActionabilityState(state: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION' | null | undefined): string {
@@ -1103,6 +1259,8 @@ function formatCtaDisabledReason(reason: string): string {
   if (reason === 'calibration_quality_not_robust') return 'calibration quality not robust'
   if (reason === 'calibration_ece_unavailable') return 'calibration ECE unavailable'
   if (reason === 'ece_above_threshold') return 'ECE above threshold'
+  if (reason === 'refresh_ttl_overdue') return 'refresh data overdue'
+  if (reason === 'refresh_ttl_unknown') return 'refresh recency unknown'
   return reason.replace(/_/g, ' ')
 }
 
@@ -1132,6 +1290,9 @@ function deriveNoActionUnlockConditions(args: {
   }
   if (hasAny('calibration_ece_unavailable')) {
     unlock.push('Calibration diagnostics must publish a valid ECE estimate.')
+  }
+  if (hasAny('refresh_ttl_overdue', 'refresh_ttl_unknown', 'opportunity_refresh_ttl_overdue', 'opportunity_refresh_ttl_unknown')) {
+    unlock.push('Latest successful refresh must be within the scheduled TTL window before action CTA unlocks.')
   }
 
   return unlock.length > 0
@@ -2954,6 +3115,9 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
   const ctaEnabled = typeof data.cta_enabled === 'boolean'
     ? data.cta_enabled
     : (top.length > 0 && ctaDisabledReasons.length === 0)
+  const ttlState = data.ttl_state || 'unknown'
+  const dataAgeText = formatDataAgeSeconds(data.data_age_seconds)
+  const nextExpectedRefresh = data.next_expected_refresh_at ? new Date(data.next_expected_refresh_at).toLocaleString() : 'unknown'
   const hasFeedState = top.length > 0 || suppressedCount > 0 || Boolean(data.degraded_reason)
   if (!hasFeedState) return null
 
@@ -2974,6 +3138,17 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
           {formatOpportunityDegradedReason(data.degraded_reason)}
         </p>
       )}
+      <div className="mb-3 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wider">
+        <span className={`px-2 py-1 border rounded ${ttlStateClass(ttlState)}`}>
+          ttl {formatTtlState(ttlState)}
+        </span>
+        <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+          data age {dataAgeText}
+        </span>
+        <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+          next refresh {nextExpectedRefresh}
+        </span>
+      </div>
       {suppressedCount > 0 && (
         <div className="mb-3 space-y-1">
           <p className="text-[9px] text-[#949ba5]/70 uppercase tracking-wider">
@@ -3043,7 +3218,15 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
   )
 }
 
-function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => void }) {
+function BriefPage({
+  brief,
+  decisionImpact,
+  onBack,
+}: {
+  brief: BriefData | null
+  decisionImpact: DecisionImpactResponse | null
+  onBack: () => void
+}) {
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
       <div className="max-w-4xl mx-auto">
@@ -3100,6 +3283,39 @@ function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => v
               )}
             </div>
 
+            {decisionImpact && (
+              <div className="impact-card p-4 border rounded-lg">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">
+                    Market impact ({formatDecisionImpactBasis(decisionImpact.outcome_basis)})
+                  </div>
+                  <span className={`impact-quality-chip rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${calibrationQualityClass(decisionImpact.market.quality_band)}`}>
+                    {decisionImpact.market.quality_band.toLowerCase()}
+                  </span>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+                  <div className="impact-row">
+                    <span className="text-[#949ba5]">hit rate</span>
+                    <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.market.hit_rate)}</span>
+                  </div>
+                  <div className="impact-row">
+                    <span className="text-[#949ba5]">avg signed</span>
+                    <span className={`font-mono ${decisionImpact.market.avg_signed_return_pct >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
+                      {formatMaybePercent(decisionImpact.market.avg_signed_return_pct)}
+                    </span>
+                  </div>
+                  <div className="impact-row">
+                    <span className="text-[#949ba5]">sample size</span>
+                    <span className="font-mono text-[#d7dbe1]">{decisionImpact.market.sample_size}</span>
+                  </div>
+                  <div className="impact-row">
+                    <span className="text-[#949ba5]">coverage</span>
+                    <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.coverage.coverage_ratio)}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
                 <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-3">Category Movers</div>
@@ -3146,17 +3362,27 @@ function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => v
 
 function OpportunitiesPage({
   data,
+  decisionImpact,
+  opsDecisionImpact,
   diagnostics,
   edgeDiagnostics,
   horizon,
   onHorizonChange,
+  onLogActionIntent,
   onBack,
 }: {
   data: OpportunitiesResponse | null
+  decisionImpact: DecisionImpactResponse | null
+  opsDecisionImpact: OpsDecisionImpactResponse | null
   diagnostics: CalibrationDiagnosticsResponse | null
   edgeDiagnostics: EdgeDiagnosticsResponse | null
   horizon: '7d' | '30d'
   onHorizonChange: (h: '7d' | '30d') => void
+  onLogActionIntent: (args: {
+    asOf: string
+    horizon: '7d' | '30d'
+    actionabilityState: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION'
+  }) => void
   onBack: () => void
 }) {
   const suppressedCount = Math.max(0, data?.suppressed_count || 0)
@@ -3174,6 +3400,10 @@ function OpportunitiesPage({
   const ctaEnabled = typeof data?.cta_enabled === 'boolean'
     ? Boolean(data.cta_enabled)
     : (Boolean(data?.items?.length) && ctaDisabledReasons.length === 0)
+  const ttlState = data?.ttl_state || 'unknown'
+  const dataAgeText = formatDataAgeSeconds(data?.data_age_seconds)
+  const nextExpectedRefresh = data?.next_expected_refresh_at ? new Date(data.next_expected_refresh_at).toLocaleString() : 'unknown'
+  const overdueSeconds = typeof data?.overdue_seconds === 'number' ? Math.max(0, data.overdue_seconds) : null
   const noActionUnlockConditions = actionabilityState === 'NO_ACTION'
     ? deriveNoActionUnlockConditions({
         actionabilityReasonCodes,
@@ -3184,7 +3414,11 @@ function OpportunitiesPage({
   const hasContractGateSuppression = degradedReason === 'coherence_gate_failed'
   const hasDataQualitySuppression = degradedReason === 'suppressed_data_quality'
   const hasQualityFilter = degradedReason === 'quality_filtered'
+  const hasRefreshTtlSuppression = degradedReason === 'refresh_ttl_overdue' || degradedReason === 'refresh_ttl_unknown'
   const edgeWindow = edgeDiagnostics?.windows.find((window) => window.horizon === horizon) || edgeDiagnostics?.windows[0] || null
+  const [ctaLoggedKey, setCtaLoggedKey] = useState<string | null>(null)
+  const currentCtaKey = data ? `${data.as_of}:${horizon}` : null
+  const ctaLogged = currentCtaKey !== null && ctaLoggedKey === currentCtaKey
 
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
@@ -3271,11 +3505,91 @@ function OpportunitiesPage({
           </div>
         )}
 
+        {decisionImpact && (
+          <div className="impact-card mb-4 p-4 border rounded-lg">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">
+                What happened after similar setups ({formatDecisionImpactBasis(decisionImpact.outcome_basis)})
+              </div>
+              <span className={`impact-quality-chip rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${calibrationQualityClass(decisionImpact.market.quality_band)}`}>
+                market {decisionImpact.market.quality_band.toLowerCase()}
+              </span>
+            </div>
+            <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px]">
+              <div className="impact-row">
+                <span className="text-[#949ba5]">hit rate</span>
+                <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.market.hit_rate)}</span>
+              </div>
+              <div className="impact-row">
+                <span className="text-[#949ba5]">avg signed</span>
+                <span className={`font-mono ${decisionImpact.market.avg_signed_return_pct >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
+                  {formatMaybePercent(decisionImpact.market.avg_signed_return_pct)}
+                </span>
+              </div>
+              <div className="impact-row">
+                <span className="text-[#949ba5]">sample</span>
+                <span className="font-mono text-[#d7dbe1]">{decisionImpact.market.sample_size}</span>
+              </div>
+              <div className="impact-row">
+                <span className="text-[#949ba5]">coverage</span>
+                <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.coverage.coverage_ratio)}</span>
+              </div>
+            </div>
+            {decisionImpact.scope === 'theme' && (
+              <div className="mt-2 text-[9px] text-[#949ba5]/70">
+                theme-proxy eligible {decisionImpact.coverage.theme_proxy_eligible_items ?? 0} ·
+                {' '}SPY fallback {decisionImpact.coverage.spy_fallback_items ?? 0}
+              </div>
+            )}
+            {decisionImpact.themes.length > 0 && (
+              <div className="mt-3">
+                <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/55">Top themes</div>
+                <div className="mt-2 space-y-1.5">
+                  {decisionImpact.themes.slice(0, 5).map((theme) => (
+                    <div key={theme.theme_id} className="impact-row text-[10px]">
+                      <span className="text-[#cfd5de]">{theme.theme_name}</span>
+                      <span className="font-mono text-[#949ba5]">
+                        hit {formatProbability(theme.hit_rate)} · signed {formatMaybePercent(theme.avg_signed_return_pct)} · n={theme.sample_size}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {opsDecisionImpact && (
+          <div className="mb-4 text-[10px] text-[#949ba5]/80">
+            {opsDecisionImpact.observe_mode.mode} mode ·
+            {' '}observe breaches {opsDecisionImpact.observe_mode.breach_count} ·
+            {' '}enforce breaches {opsDecisionImpact.observe_mode.enforce_breach_count} ·
+            {' '}enforce ready {opsDecisionImpact.observe_mode.enforce_ready ? 'yes' : 'no'} ·
+            {' '}cta action rate {opsDecisionImpact.utility_attribution.cta_action_rate_pct.toFixed(2)}%
+            {' '}({opsDecisionImpact.utility_attribution.cta_action_clicks}/{opsDecisionImpact.utility_attribution.actionable_sessions} sessions)
+          </div>
+        )}
+
         {degradedReason && (
           <div className={`mb-4 text-[10px] ${hasDataQualitySuppression || hasContractGateSuppression ? 'text-[#f59e0b]' : 'text-[#949ba5]'}`}>
             {formatOpportunityDegradedReason(degradedReason)}
           </div>
         )}
+        <div className="mb-4 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wider">
+          <span className={`px-2 py-1 border rounded ${ttlStateClass(ttlState)}`}>
+            ttl {formatTtlState(ttlState)}
+          </span>
+          <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+            data age {dataAgeText}
+          </span>
+          <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+            next refresh {nextExpectedRefresh}
+          </span>
+          {ttlState === 'overdue' && overdueSeconds !== null && (
+            <span className="px-2 py-1 border border-[#ff6b6b]/40 rounded text-[#ff6b6b]">
+              overdue {(overdueSeconds / 3600).toFixed(1)}h
+            </span>
+          )}
+        </div>
         {suppressedCount > 0 && (
           <div className="mb-4 space-y-1 text-[10px] text-[#949ba5]/80">
             <div className="uppercase tracking-wider">
@@ -3309,6 +3623,26 @@ function OpportunitiesPage({
             </div>
           </div>
         )}
+        {ctaEnabled && actionabilityState !== 'NO_ACTION' && data && (
+          <div className="mb-4 flex flex-wrap items-center gap-3 rounded border border-[#1f3e56] bg-[#081521]/70 px-3 py-2">
+            <button
+              onClick={() => {
+                onLogActionIntent({
+                  asOf: data.as_of,
+                  horizon,
+                  actionabilityState,
+                })
+                setCtaLoggedKey(currentCtaKey)
+              }}
+              className="px-3 py-1.5 border border-[#00a3ff] text-[#00a3ff] rounded text-[10px] uppercase tracking-[0.18em] hover:text-[#7ccfff] hover:border-[#7ccfff]"
+            >
+              Log Action Intent
+            </button>
+            <span className="text-[10px] text-[#9ec5e2]">
+              {ctaLogged ? 'Action intent logged for this session/horizon.' : 'Use this when you act on the current opportunity setup.'}
+            </span>
+          </div>
+        )}
 
         {!data || data.items.length === 0 ? (
           <div className="text-[#949ba5]">
@@ -3318,6 +3652,8 @@ function OpportunitiesPage({
                 ? 'Opportunities are suppressed until critical data quality recovers.'
                 : hasQualityFilter
                   ? 'No opportunities available after quality filtering.'
+                  : hasRefreshTtlSuppression
+                    ? 'No opportunities available while refresh recency is outside TTL policy.'
                   : 'No opportunities available yet.'}
           </div>
         ) : (
@@ -4342,7 +4678,10 @@ function App() {
   const [backtestData, setBacktestData] = useState<BacktestData | null>(null)  // v1.6: Backtest performance
   const [planData, setPlanData] = useState<PlanData | null>(null)
   const [briefData, setBriefData] = useState<BriefData | null>(null)
+  const [briefDecisionImpact, setBriefDecisionImpact] = useState<DecisionImpactResponse | null>(null)
   const [opportunitiesData, setOpportunitiesData] = useState<OpportunitiesResponse | null>(null)
+  const [opportunitiesDecisionImpact, setOpportunitiesDecisionImpact] = useState<DecisionImpactResponse | null>(null)
+  const [opsDecisionImpact, setOpsDecisionImpact] = useState<OpsDecisionImpactResponse | null>(null)
   const [opportunityDiagnostics, setOpportunityDiagnostics] = useState<CalibrationDiagnosticsResponse | null>(null)
   const [edgeDiagnostics, setEdgeDiagnostics] = useState<EdgeDiagnosticsResponse | null>(null)
   const [opportunityHorizon, setOpportunityHorizon] = useState<'7d' | '30d'>('7d')
@@ -4353,6 +4692,63 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const utilitySessionIdRef = useRef<string>(getOrCreateUtilitySessionId())
+  const utilitySeenRef = useRef<Set<string>>(new Set())
+
+  const trackUtilityEvent = useCallback((eventType: UtilityEventType, args?: {
+    route?: AppRoute
+    actionabilityState?: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION' | null
+    metadata?: Record<string, unknown>
+    dedupeKey?: string
+  }) => {
+    const dedupeKey = args?.dedupeKey?.trim()
+    if (dedupeKey && utilitySeenRef.current.has(dedupeKey)) {
+      return
+    }
+    if (dedupeKey) {
+      utilitySeenRef.current.add(dedupeKey)
+    }
+
+    const payload = {
+      session_id: utilitySessionIdRef.current,
+      event_type: eventType,
+      route: args?.route || route,
+      actionability_state: args?.actionabilityState ?? null,
+      metadata: args?.metadata || null,
+    }
+
+    fetchApi('/api/metrics/utility-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      keepalive: true,
+    }).catch(() => {
+      if (dedupeKey) {
+        utilitySeenRef.current.delete(dedupeKey)
+      }
+    })
+  }, [route])
+
+  const handleOpportunityCtaIntent = useCallback((args: {
+    asOf: string
+    horizon: '7d' | '30d'
+    actionabilityState: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION'
+  }) => {
+    const dedupeKey = `cta_action_click:${utilitySessionIdRef.current}:${args.asOf}:${args.horizon}`
+    trackUtilityEvent('cta_action_click', {
+      route: '/opportunities',
+      actionabilityState: args.actionabilityState,
+      metadata: {
+        as_of: args.asOf,
+        horizon: args.horizon,
+        route: '/opportunities',
+        actionability_state: args.actionabilityState,
+        scope: 'market_theme',
+        source: 'opportunities',
+      },
+      dedupeKey,
+    })
+  }, [trackUtilityEvent])
 
   const navigateTo = (nextRoute: AppRoute) => {
     const path = normalizeRoute(nextRoute)
@@ -4368,6 +4764,106 @@ function App() {
   useEffect(() => {
     applyRouteMetadata(route)
   }, [route])
+
+  useEffect(() => {
+    trackUtilityEvent('session_start', {
+      route,
+      metadata: { entry_route: route },
+      dedupeKey: 'session_start',
+    })
+  }, [route, trackUtilityEvent])
+
+  useEffect(() => {
+    if (route !== '/' || !planData) {
+      return
+    }
+
+    const actionabilityState = planData.actionability_state || (planData.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH')
+    const dedupeBase = `${planData.as_of}:${actionabilityState}:${route}`
+
+    trackUtilityEvent('plan_view', {
+      route,
+      actionabilityState,
+      metadata: {
+        as_of: planData.as_of,
+        cross_horizon_state: planData.cross_horizon?.state || null,
+        consistency_state: planData.consistency.state,
+      },
+      dedupeKey: `plan_view:${dedupeBase}`,
+    })
+
+    trackUtilityEvent(utilityDecisionEventForState(actionabilityState), {
+      route,
+      actionabilityState,
+      metadata: {
+        as_of: planData.as_of,
+        source: 'plan',
+      },
+      dedupeKey: `decision_view:${dedupeBase}`,
+    })
+
+    if (actionabilityState === 'NO_ACTION') {
+      trackUtilityEvent('no_action_unlock_view', {
+        route,
+        actionabilityState,
+        metadata: {
+          as_of: planData.as_of,
+          source: 'plan',
+          thresholds_communicated: true,
+          reason_codes: planData.actionability_reason_codes || [],
+        },
+        dedupeKey: `unlock_view:${dedupeBase}`,
+      })
+    }
+  }, [planData, route, trackUtilityEvent])
+
+  useEffect(() => {
+    if (route !== '/opportunities' || !opportunitiesData) {
+      return
+    }
+
+    const actionabilityState = opportunitiesData.actionability_state || (opportunitiesData.items.length > 0 ? 'WATCH' : 'NO_ACTION')
+    const dedupeBase = `${opportunitiesData.as_of}:${opportunityHorizon}:${actionabilityState}:${route}`
+
+    trackUtilityEvent('opportunities_view', {
+      route,
+      actionabilityState,
+      metadata: {
+        as_of: opportunitiesData.as_of,
+        horizon: opportunityHorizon,
+        published_count: opportunitiesData.items.length,
+        suppressed_count: opportunitiesData.suppressed_count,
+        ttl_state: opportunitiesData.ttl_state || 'unknown',
+      },
+      dedupeKey: `opportunities_view:${dedupeBase}`,
+    })
+
+    trackUtilityEvent(utilityDecisionEventForState(actionabilityState), {
+      route,
+      actionabilityState,
+      metadata: {
+        as_of: opportunitiesData.as_of,
+        horizon: opportunityHorizon,
+        source: 'opportunities',
+      },
+      dedupeKey: `decision_view:${dedupeBase}`,
+    })
+
+    if (actionabilityState === 'NO_ACTION') {
+      trackUtilityEvent('no_action_unlock_view', {
+        route,
+        actionabilityState,
+        metadata: {
+          as_of: opportunitiesData.as_of,
+          horizon: opportunityHorizon,
+          source: 'opportunities',
+          thresholds_communicated: true,
+          reason_codes: opportunitiesData.actionability_reason_codes || [],
+        },
+        dedupeKey: `unlock_view:${dedupeBase}`,
+      })
+    }
+  }, [opportunitiesData, opportunityHorizon, route, trackUtilityEvent])
 
   // Keep onboarding opt-in via /guide instead of forcing a modal on first visit.
   useEffect(() => {
@@ -4466,7 +4962,7 @@ function App() {
           setLoading(true)
         }
 
-        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, oppRes, oppDiagRes, edgeDiagRes, inboxRes] = await Promise.all([
+        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, briefImpactRes, oppRes, oppImpactRes, oppOpsImpactRes, oppDiagRes, edgeDiagRes, inboxRes] = await Promise.all([
           fetchPlan.pxi ? fetchApi('/api/pxi') : Promise.resolve(null),
           fetchPlan.signal ? fetchApi('/api/signal').catch(() => null) : Promise.resolve(null),
           fetchPlan.plan ? fetchApi('/api/plan').catch(() => null) : Promise.resolve(null),
@@ -4476,7 +4972,10 @@ function App() {
           fetchPlan.history ? fetchApi('/api/history?days=90').catch(() => null) : Promise.resolve(null),
           fetchPlan.alertsHistory ? fetchApi('/api/alerts?limit=50').catch(() => null) : Promise.resolve(null),
           fetchPlan.brief ? fetchApi('/api/brief?scope=market').catch(() => null) : Promise.resolve(null),
+          fetchPlan.brief ? fetchApi('/api/decision-impact?horizon=7d&scope=market&window=30').catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/opportunities?horizon=${opportunityHorizon}&limit=20`).catch(() => null) : Promise.resolve(null),
+          fetchPlan.opportunities ? fetchApi(`/api/decision-impact?horizon=${opportunityHorizon}&scope=theme&window=30&limit=10`).catch(() => null) : Promise.resolve(null),
+          fetchPlan.opportunities ? fetchApi('/api/ops/decision-impact?window=30').catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/diagnostics/calibration?metric=conviction&horizon=${opportunityHorizon}`).catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/diagnostics/edge?horizon=${opportunityHorizon}`).catch(() => null) : Promise.resolve(null),
           fetchPlan.inbox ? fetchApi('/api/alerts/feed?limit=50').catch(() => null) : Promise.resolve(null),
@@ -4626,6 +5125,14 @@ function App() {
             })
           }
         }
+        if (briefImpactRes?.ok) {
+          const impactJson = await briefImpactRes.json() as DecisionImpactResponse
+          if (impactJson?.market && impactJson.scope === 'market') {
+            setBriefDecisionImpact(impactJson)
+          }
+        } else if (fetchPlan.brief) {
+          setBriefDecisionImpact(null)
+        }
 
         if (oppRes?.ok) {
           const oppJson = await oppRes.json() as OpportunitiesResponse
@@ -4633,6 +5140,8 @@ function App() {
             const qualityFilteredCount = Number.isFinite(oppJson.quality_filtered_count as number) ? Number(oppJson.quality_filtered_count) : 0
             const coherenceSuppressedCount = Number.isFinite(oppJson.coherence_suppressed_count as number) ? Number(oppJson.coherence_suppressed_count) : 0
             const suppressedCount = Number.isFinite(oppJson.suppressed_count) ? oppJson.suppressed_count : 0
+            const dataAgeSeconds = Number.isFinite(oppJson.data_age_seconds as number) ? Number(oppJson.data_age_seconds) : null
+            const overdueSeconds = Number.isFinite(oppJson.overdue_seconds as number) ? Number(oppJson.overdue_seconds) : null
             setOpportunitiesData({
               ...oppJson,
               suppressed_count: suppressedCount,
@@ -4649,8 +5158,28 @@ function App() {
               actionability_reason_codes: Array.isArray(oppJson.actionability_reason_codes) ? oppJson.actionability_reason_codes : [],
               cta_enabled: typeof oppJson.cta_enabled === 'boolean' ? oppJson.cta_enabled : oppJson.items.length > 0,
               cta_disabled_reasons: Array.isArray(oppJson.cta_disabled_reasons) ? oppJson.cta_disabled_reasons : [],
+              data_age_seconds: dataAgeSeconds,
+              ttl_state: (oppJson.ttl_state || 'unknown'),
+              next_expected_refresh_at: typeof oppJson.next_expected_refresh_at === 'string' ? oppJson.next_expected_refresh_at : null,
+              overdue_seconds: overdueSeconds,
             })
           }
+        }
+        if (oppImpactRes?.ok) {
+          const impactJson = await oppImpactRes.json() as DecisionImpactResponse
+          if (impactJson?.market && impactJson.scope === 'theme') {
+            setOpportunitiesDecisionImpact(impactJson)
+          }
+        } else if (fetchPlan.opportunities) {
+          setOpportunitiesDecisionImpact(null)
+        }
+        if (oppOpsImpactRes?.ok) {
+          const opsImpactJson = await oppOpsImpactRes.json() as OpsDecisionImpactResponse
+          if (opsImpactJson?.observe_mode && opsImpactJson?.utility_attribution) {
+            setOpsDecisionImpact(opsImpactJson)
+          }
+        } else if (fetchPlan.opportunities) {
+          setOpsDecisionImpact(null)
         }
 
         if (oppDiagRes?.ok) {
@@ -4779,17 +5308,20 @@ function App() {
   }
 
   if (route === '/brief') {
-    return <BriefPage brief={briefData} onBack={() => navigateTo('/')} />
+    return <BriefPage brief={briefData} decisionImpact={briefDecisionImpact} onBack={() => navigateTo('/')} />
   }
 
   if (route === '/opportunities') {
     return (
       <OpportunitiesPage
         data={opportunitiesData}
+        decisionImpact={opportunitiesDecisionImpact}
+        opsDecisionImpact={opsDecisionImpact}
         diagnostics={opportunityDiagnostics}
         edgeDiagnostics={edgeDiagnostics}
         horizon={opportunityHorizon}
         onHorizonChange={setOpportunityHorizon}
+        onLogActionIntent={handleOpportunityCtaIntent}
         onBack={() => navigateTo('/')}
       />
     )
