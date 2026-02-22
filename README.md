@@ -134,6 +134,7 @@ pxi-command/
 | `/api/market/consistency` | GET | Latest decision consistency score/state/violations |
 | `/api/ops/freshness-slo` | GET | Rolling 7d/30d freshness SLO attainment and recent critical stale incidents |
 | `/api/ops/utility-funnel` | GET | Rolling utility funnel metrics (session -> decision views -> no-action unlock coverage) |
+| `/api/ops/decision-grade` | GET | Rolling governance scorecard (freshness, consistency, calibration, edge evidence, opportunity hygiene, utility) |
 
 ### Product Layer (Phase 1)
 | Endpoint | Method | Description |
@@ -309,6 +310,17 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
   - `opportunities_view`
   - decision-state exposures (`decision_actionable_view|decision_watch_view|decision_no_action_view`)
   - `no_action_unlock_view` (tracks no-action days as positive threshold-communication workflow events)
+
+10. **Decision-grade governance (Phase 4)**
+- Immutable opportunity ledger tracks candidate-vs-published counts per horizon on every product refresh.
+- New ops endpoint: `GET /api/ops/decision-grade?window=7|30`.
+- Scorecard components:
+  - freshness SLO reliability
+  - consistency-state quality
+  - calibration quality band health
+  - edge-promotion evidence
+  - opportunity hygiene (over-suppression + cross-horizon conflict persistence)
+  - utility funnel adoption
 
 ## Scheduler Ownership Runbook
 

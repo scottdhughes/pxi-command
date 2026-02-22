@@ -5,7 +5,9 @@ API_URL="${1:-${API_URL:-https://api.pxicommand.com}}"
 EDGE_DIAGNOSTICS_REQUIRED="${EDGE_DIAGNOSTICS_REQUIRED:-0}"
 OPPORTUNITY_TTL_GRACE_SECONDS="${OPPORTUNITY_TTL_GRACE_SECONDS:-5400}"
 UTILITY_FUNNEL_REQUIRED="${UTILITY_FUNNEL_REQUIRED:-0}"
+DECISION_GRADE_REQUIRED="${DECISION_GRADE_REQUIRED:-0}"
 UTILITY_FUNNEL_LIVE=0
+DECISION_GRADE_LIVE=0
 
 TMP_HEADERS="$(mktemp)"
 TMP_BODY="$(mktemp)"
@@ -74,6 +76,27 @@ utility_funnel_available() {
   fi
 
   echo "Unexpected status for /api/ops/utility-funnel: $code"
+  cat "$TMP_BODY" || true
+  exit 1
+}
+
+decision_grade_available() {
+  local code
+  code=$(curl -sS -o "$TMP_BODY" -w "%{http_code}" --max-time 20 "$API_URL/api/ops/decision-grade?window=30")
+  if [[ "$code" == "200" ]]; then
+    return 0
+  fi
+
+  if [[ "$code" == "404" ]]; then
+    if [[ "$DECISION_GRADE_REQUIRED" == "1" ]]; then
+      echo "Decision-grade endpoint is required but returned 404"
+      exit 1
+    fi
+    echo "Skipping decision-grade checks: /api/ops/decision-grade is not live yet."
+    return 1
+  fi
+
+  echo "Unexpected status for /api/ops/decision-grade: $code"
   cat "$TMP_BODY" || true
   exit 1
 }
@@ -717,6 +740,106 @@ check_utility_funnel_semantics() {
   fi
 }
 
+check_decision_grade_semantics() {
+  local grade_json
+  local score
+  local grade
+  local go_live_ready
+  local window_days
+  local bad_status
+  local over_suppression
+  local conflict_rate
+  local unlock_coverage
+
+  grade_json=$(curl -sS --max-time 20 "$API_URL/api/ops/decision-grade?window=30")
+  score=$(echo "$grade_json" | jq -r '.score // -1')
+  grade=$(echo "$grade_json" | jq -r '.grade // ""')
+  go_live_ready=$(echo "$grade_json" | jq -r '.go_live_ready // false')
+  window_days=$(echo "$grade_json" | jq -r '.window_days // -1')
+  over_suppression=$(echo "$grade_json" | jq -r '.components.opportunity_hygiene.over_suppression_rate_pct // -1')
+  conflict_rate=$(echo "$grade_json" | jq -r '.components.opportunity_hygiene.cross_horizon_conflict_rate_pct // -1')
+  unlock_coverage=$(echo "$grade_json" | jq -r '.components.utility.no_action_unlock_coverage_pct // -1')
+
+  if ! awk "BEGIN { exit !($score >= 0 && $score <= 100) }"; then
+    echo "Decision-grade score must be in [0,100]"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if [[ "$window_days" != "30" ]]; then
+    echo "Decision-grade window_days should echo requested value 30"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  case "$grade" in
+    GREEN|YELLOW|RED) ;;
+    *)
+      echo "Invalid decision-grade grade: $grade"
+      echo "$grade_json"
+      exit 1
+      ;;
+  esac
+
+  if awk "BEGIN { exit !($score >= 85) }" && [[ "$grade" != "GREEN" ]]; then
+    echo "Decision-grade threshold mismatch: score>=85 must map to GREEN"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if awk "BEGIN { exit !($score >= 70 && $score < 85) }" && [[ "$grade" != "YELLOW" ]]; then
+    echo "Decision-grade threshold mismatch: score in [70,85) must map to YELLOW"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if awk "BEGIN { exit !($score < 70) }" && [[ "$grade" != "RED" ]]; then
+    echo "Decision-grade threshold mismatch: score<70 must map to RED"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if [[ "$go_live_ready" == "true" && "$grade" != "GREEN" ]]; then
+    echo "go_live_ready=true requires GREEN grade"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  bad_status=$(echo "$grade_json" | jq -r '
+    any([
+      .components.freshness.status,
+      .components.consistency.status,
+      .components.calibration.status,
+      .components.edge.status,
+      .components.opportunity_hygiene.status,
+      .components.utility.status
+    ][]; . != "pass" and . != "watch" and . != "fail" and . != "insufficient")
+  ')
+  if [[ "$bad_status" == "true" ]]; then
+    echo "Decision-grade includes invalid component status"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if ! awk "BEGIN { exit !($over_suppression >= 0 && $over_suppression <= 100) }"; then
+    echo "Decision-grade over_suppression_rate_pct must be in [0,100]"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if ! awk "BEGIN { exit !($conflict_rate >= 0 && $conflict_rate <= 100) }"; then
+    echo "Decision-grade cross_horizon_conflict_rate_pct must be in [0,100]"
+    echo "$grade_json"
+    exit 1
+  fi
+
+  if ! awk "BEGIN { exit !($unlock_coverage >= 0 && $unlock_coverage <= 100) }"; then
+    echo "Decision-grade utility coverage must be in [0,100]"
+    echo "$grade_json"
+    exit 1
+  fi
+}
+
 check_api_json_contract "/api/plan" \
   'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number"))) and ((has("cross_horizon")|not) or ((.cross_horizon.as_of|type=="string") and (.cross_horizon.state|type=="string") and (.cross_horizon.eligible_7d|type=="number") and (.cross_horizon.eligible_30d|type=="number") and ((.cross_horizon.top_direction_7d==null) or (.cross_horizon.top_direction_7d|type=="string")) and ((.cross_horizon.top_direction_30d==null) or (.cross_horizon.top_direction_30d|type=="string")) and (.cross_horizon.rationale_codes|type=="array") and (all(.cross_horizon.rationale_codes[]?; type=="string")) and ((.cross_horizon.invalidation_note==null) or (.cross_horizon.invalidation_note|type=="string")))) and ((has("decision_stack")|not) or ((.decision_stack.what_changed|type=="string") and (.decision_stack.what_to_do|type=="string") and (.decision_stack.why_now|type=="string") and (.decision_stack.confidence|type=="string") and (.decision_stack.cta_state|type=="string")))' \
   "plan"
@@ -770,6 +893,13 @@ check_api_json_contract "/api/ops/freshness-slo" \
   'type=="object" and (.as_of|type=="string") and (.windows["7d"].days_observed|type=="number") and (.windows["7d"].days_with_critical_stale|type=="number") and (.windows["7d"].slo_attainment_pct|type=="number") and (.windows["7d"].recent_incidents|type=="array") and (.windows["7d"].incident_impact.state|type=="string") and (.windows["7d"].incident_impact.stale_days|type=="number") and (.windows["7d"].incident_impact.warning_events|type=="number") and (.windows["7d"].incident_impact.critical_events|type=="number") and (.windows["7d"].incident_impact.estimated_suppressed_days|type=="number") and ((.windows["7d"].incident_impact.latest_warning_event==null) or (.windows["7d"].incident_impact.latest_warning_event.created_at|type=="string")) and ((.windows["7d"].incident_impact.latest_warning_event==null) or (.windows["7d"].incident_impact.latest_warning_event.severity|type=="string")) and (.windows["30d"].days_observed|type=="number") and (.windows["30d"].days_with_critical_stale|type=="number") and (.windows["30d"].slo_attainment_pct|type=="number") and (.windows["30d"].recent_incidents|type=="array") and (.windows["30d"].incident_impact.state|type=="string") and (.windows["30d"].incident_impact.stale_days|type=="number") and (.windows["30d"].incident_impact.warning_events|type=="number") and (.windows["30d"].incident_impact.critical_events|type=="number") and (.windows["30d"].incident_impact.estimated_suppressed_days|type=="number") and ((.windows["30d"].incident_impact.latest_warning_event==null) or (.windows["30d"].incident_impact.latest_warning_event.created_at|type=="string")) and ((.windows["30d"].incident_impact.latest_warning_event==null) or (.windows["30d"].incident_impact.latest_warning_event.severity|type=="string"))' \
   "freshness-slo"
 
+if decision_grade_available; then
+  check_api_json_contract "/api/ops/decision-grade?window=30" \
+    'type=="object" and (.as_of|type=="string") and (.window_days|type=="number") and (.score|type=="number") and (.grade|type=="string") and (.go_live_ready|type=="boolean") and (.components.freshness.score|type=="number") and (.components.freshness.status|type=="string") and (.components.freshness.slo_attainment_pct|type=="number") and (.components.freshness.days_with_critical_stale|type=="number") and (.components.freshness.days_observed|type=="number") and (.components.consistency.score|type=="number") and (.components.consistency.status|type=="string") and (.components.consistency.pass_count|type=="number") and (.components.consistency.warn_count|type=="number") and (.components.consistency.fail_count|type=="number") and (.components.consistency.total|type=="number") and (.components.calibration.score|type=="number") and (.components.calibration.status|type=="string") and (.components.calibration.conviction_7d|type=="string") and (.components.calibration.conviction_30d|type=="string") and (.components.calibration.edge_quality|type=="string") and (.components.edge.score|type=="number") and (.components.edge.status|type=="string") and (.components.edge.promotion_gate_pass|type=="boolean") and (.components.edge.lower_bound_positive_horizons|type=="number") and (.components.edge.horizons_observed|type=="number") and (.components.edge.reasons|type=="array") and (all(.components.edge.reasons[]?; type=="string")) and (.components.opportunity_hygiene.score|type=="number") and (.components.opportunity_hygiene.status|type=="string") and (.components.opportunity_hygiene.publish_rate_pct|type=="number") and (.components.opportunity_hygiene.over_suppression_rate_pct|type=="number") and (.components.opportunity_hygiene.cross_horizon_conflict_rate_pct|type=="number") and (.components.opportunity_hygiene.conflict_persistence_days|type=="number") and (.components.opportunity_hygiene.rows_observed|type=="number") and (.components.utility.score|type=="number") and (.components.utility.status|type=="string") and (.components.utility.decision_events_total|type=="number") and (.components.utility.no_action_unlock_coverage_pct|type=="number") and (.components.utility.unique_sessions|type=="number")' \
+    "decision-grade"
+  DECISION_GRADE_LIVE=1
+fi
+
 check_policy_state_consistency
 check_plan_brief_coherence
 check_consistency_gate
@@ -786,6 +916,9 @@ if edge_diagnostics_available; then
 fi
 if [[ "$UTILITY_FUNNEL_LIVE" == "1" ]]; then
   check_utility_funnel_semantics
+fi
+if [[ "$DECISION_GRADE_LIVE" == "1" ]]; then
+  check_decision_grade_semantics
 fi
 
 echo "Product API contract checks passed against $API_URL"

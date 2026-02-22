@@ -293,6 +293,27 @@ CREATE TABLE IF NOT EXISTS opportunity_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_opportunity_snapshots_lookup ON opportunity_snapshots(as_of DESC, horizon);
 
+CREATE TABLE IF NOT EXISTS market_opportunity_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    refresh_run_id INTEGER,
+    as_of TEXT NOT NULL,
+    horizon TEXT NOT NULL CHECK(horizon IN ('7d', '30d')),
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    published_count INTEGER NOT NULL DEFAULT 0,
+    suppressed_count INTEGER NOT NULL DEFAULT 0,
+    quality_filtered_count INTEGER NOT NULL DEFAULT 0,
+    coherence_suppressed_count INTEGER NOT NULL DEFAULT 0,
+    data_quality_suppressed_count INTEGER NOT NULL DEFAULT 0,
+    degraded_reason TEXT,
+    top_direction_candidate TEXT CHECK(top_direction_candidate IN ('bullish', 'bearish', 'neutral')),
+    top_direction_published TEXT CHECK(top_direction_published IN ('bullish', 'bearish', 'neutral')),
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_created ON market_opportunity_ledger(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_as_of ON market_opportunity_ledger(as_of DESC, horizon);
+CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_run ON market_opportunity_ledger(refresh_run_id, horizon);
+
 CREATE TABLE IF NOT EXISTS market_calibration_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     as_of TEXT NOT NULL,

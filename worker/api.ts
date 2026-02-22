@@ -1313,6 +1313,99 @@ interface UtilityFunnelSummary {
   last_event_at: string | null;
 }
 
+interface OpportunityLedgerInsertPayload {
+  refresh_run_id: number | null;
+  as_of: string;
+  horizon: '7d' | '30d';
+  candidate_count: number;
+  published_count: number;
+  suppressed_count: number;
+  quality_filtered_count: number;
+  coherence_suppressed_count: number;
+  data_quality_suppressed_count: number;
+  degraded_reason: string | null;
+  top_direction_candidate: OpportunityDirection | null;
+  top_direction_published: OpportunityDirection | null;
+}
+
+interface OpportunityLedgerRow extends OpportunityLedgerInsertPayload {
+  created_at: string;
+}
+
+interface OpportunityLedgerWindowMetrics {
+  window_days: number;
+  rows_observed: number;
+  candidate_count_total: number;
+  published_count_total: number;
+  publish_rate_pct: number;
+  suppressed_count_total: number;
+  over_suppressed_rows: number;
+  over_suppression_rate_pct: number;
+  paired_days: number;
+  cross_horizon_conflict_days: number;
+  cross_horizon_conflict_rate_pct: number;
+  conflict_persistence_days: number;
+  last_as_of: string | null;
+}
+
+type DecisionGradeComponentStatus = 'pass' | 'watch' | 'fail' | 'insufficient';
+
+interface DecisionGradeResponse {
+  as_of: string;
+  window_days: number;
+  score: number;
+  grade: 'GREEN' | 'YELLOW' | 'RED';
+  go_live_ready: boolean;
+  components: {
+    freshness: {
+      score: number;
+      status: DecisionGradeComponentStatus;
+      slo_attainment_pct: number;
+      days_with_critical_stale: number;
+      days_observed: number;
+    };
+    consistency: {
+      score: number;
+      status: DecisionGradeComponentStatus;
+      pass_count: number;
+      warn_count: number;
+      fail_count: number;
+      total: number;
+    };
+    calibration: {
+      score: number;
+      status: DecisionGradeComponentStatus;
+      conviction_7d: CalibrationQuality;
+      conviction_30d: CalibrationQuality;
+      edge_quality: CalibrationQuality;
+    };
+    edge: {
+      score: number;
+      status: DecisionGradeComponentStatus;
+      promotion_gate_pass: boolean;
+      lower_bound_positive_horizons: number;
+      horizons_observed: number;
+      reasons: string[];
+    };
+    opportunity_hygiene: {
+      score: number;
+      status: DecisionGradeComponentStatus;
+      publish_rate_pct: number;
+      over_suppression_rate_pct: number;
+      cross_horizon_conflict_rate_pct: number;
+      conflict_persistence_days: number;
+      rows_observed: number;
+    };
+    utility: {
+      score: number;
+      status: DecisionGradeComponentStatus;
+      decision_events_total: number;
+      no_action_unlock_coverage_pct: number;
+      unique_sessions: number;
+    };
+  };
+}
+
 interface MarketAlertEvent {
   id: string;
   event_type: MarketAlertType;
@@ -3520,6 +3613,28 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
       )
     `).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_opportunity_snapshots_lookup ON opportunity_snapshots(as_of DESC, horizon)`).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS market_opportunity_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        refresh_run_id INTEGER,
+        as_of TEXT NOT NULL,
+        horizon TEXT NOT NULL CHECK(horizon IN ('7d', '30d')),
+        candidate_count INTEGER NOT NULL DEFAULT 0,
+        published_count INTEGER NOT NULL DEFAULT 0,
+        suppressed_count INTEGER NOT NULL DEFAULT 0,
+        quality_filtered_count INTEGER NOT NULL DEFAULT 0,
+        coherence_suppressed_count INTEGER NOT NULL DEFAULT 0,
+        data_quality_suppressed_count INTEGER NOT NULL DEFAULT 0,
+        degraded_reason TEXT,
+        top_direction_candidate TEXT CHECK(top_direction_candidate IN ('bullish', 'bearish', 'neutral')),
+        top_direction_published TEXT CHECK(top_direction_published IN ('bullish', 'bearish', 'neutral')),
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_created ON market_opportunity_ledger(created_at DESC)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_as_of ON market_opportunity_ledger(as_of DESC, horizon)`).run();
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_run ON market_opportunity_ledger(refresh_run_id, horizon)`).run();
 
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS market_calibration_snapshots (
@@ -5808,6 +5923,404 @@ async function computeUtilityFunnelSummary(
   };
 }
 
+async function insertOpportunityLedgerRow(
+  db: D1Database,
+  payload: OpportunityLedgerInsertPayload,
+): Promise<void> {
+  await db.prepare(`
+    INSERT INTO market_opportunity_ledger (
+      refresh_run_id,
+      as_of,
+      horizon,
+      candidate_count,
+      published_count,
+      suppressed_count,
+      quality_filtered_count,
+      coherence_suppressed_count,
+      data_quality_suppressed_count,
+      degraded_reason,
+      top_direction_candidate,
+      top_direction_published,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `).bind(
+    payload.refresh_run_id,
+    payload.as_of,
+    payload.horizon,
+    payload.candidate_count,
+    payload.published_count,
+    payload.suppressed_count,
+    payload.quality_filtered_count,
+    payload.coherence_suppressed_count,
+    payload.data_quality_suppressed_count,
+    payload.degraded_reason,
+    payload.top_direction_candidate,
+    payload.top_direction_published,
+  ).run();
+}
+
+function calibrationQualityScore(quality: CalibrationQuality): number {
+  if (quality === 'ROBUST') return 100;
+  if (quality === 'LIMITED') return 70;
+  return 35;
+}
+
+function decisionGradeFromScore(score: number): 'GREEN' | 'YELLOW' | 'RED' {
+  if (score >= 85) return 'GREEN';
+  if (score >= 70) return 'YELLOW';
+  return 'RED';
+}
+
+async function computeOpportunityLedgerWindowMetrics(
+  db: D1Database,
+  windowDays: number,
+): Promise<OpportunityLedgerWindowMetrics> {
+  const boundedWindowDays = UTILITY_WINDOW_DAY_OPTIONS.has(windowDays) ? windowDays : 30;
+  const lookbackExpr = `-${Math.max(0, boundedWindowDays - 1)} days`;
+  const rows = await db.prepare(`
+    SELECT
+      as_of,
+      horizon,
+      candidate_count,
+      published_count,
+      suppressed_count,
+      quality_filtered_count,
+      coherence_suppressed_count,
+      data_quality_suppressed_count,
+      degraded_reason,
+      top_direction_candidate,
+      top_direction_published,
+      created_at
+    FROM market_opportunity_ledger
+    WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
+    ORDER BY as_of ASC, created_at ASC, id ASC
+  `).bind(lookbackExpr).all<{
+    as_of: string;
+    horizon: string;
+    candidate_count: number | null;
+    published_count: number | null;
+    suppressed_count: number | null;
+    quality_filtered_count: number | null;
+    coherence_suppressed_count: number | null;
+    data_quality_suppressed_count: number | null;
+    degraded_reason: string | null;
+    top_direction_candidate: string | null;
+    top_direction_published: string | null;
+    created_at: string | null;
+  }>();
+
+  const latestByDateHorizon = new Map<string, OpportunityLedgerRow>();
+  for (const row of rows.results || []) {
+    const horizon = row.horizon === '30d' ? '30d' : row.horizon === '7d' ? '7d' : null;
+    if (!horizon || !row.as_of) continue;
+    const asOfDate = row.as_of.slice(0, 10);
+    const key = `${asOfDate}:${horizon}`;
+    latestByDateHorizon.set(key, {
+      refresh_run_id: null,
+      as_of: row.as_of,
+      horizon,
+      candidate_count: Math.max(0, Math.floor(toNumber(row.candidate_count, 0))),
+      published_count: Math.max(0, Math.floor(toNumber(row.published_count, 0))),
+      suppressed_count: Math.max(0, Math.floor(toNumber(row.suppressed_count, 0))),
+      quality_filtered_count: Math.max(0, Math.floor(toNumber(row.quality_filtered_count, 0))),
+      coherence_suppressed_count: Math.max(0, Math.floor(toNumber(row.coherence_suppressed_count, 0))),
+      data_quality_suppressed_count: Math.max(0, Math.floor(toNumber(row.data_quality_suppressed_count, 0))),
+      degraded_reason: row.degraded_reason || null,
+      top_direction_candidate:
+        row.top_direction_candidate === 'bullish' || row.top_direction_candidate === 'bearish' || row.top_direction_candidate === 'neutral'
+          ? row.top_direction_candidate
+          : null,
+      top_direction_published:
+        row.top_direction_published === 'bullish' || row.top_direction_published === 'bearish' || row.top_direction_published === 'neutral'
+          ? row.top_direction_published
+          : null,
+      created_at: row.created_at || row.as_of,
+    });
+  }
+
+  const normalizedRows = [...latestByDateHorizon.values()];
+  const candidateCountTotal = normalizedRows.reduce((acc, row) => acc + row.candidate_count, 0);
+  const publishedCountTotal = normalizedRows.reduce((acc, row) => acc + row.published_count, 0);
+  const suppressedCountTotal = normalizedRows.reduce((acc, row) => acc + row.suppressed_count, 0);
+  const overSuppressedRows = normalizedRows.filter((row) =>
+    row.candidate_count > 0 &&
+    row.published_count === 0 &&
+    row.data_quality_suppressed_count === 0
+  ).length;
+
+  const byDate = new Map<string, { d7: OpportunityLedgerRow | null; d30: OpportunityLedgerRow | null }>();
+  for (const row of normalizedRows) {
+    const dateKey = row.as_of.slice(0, 10);
+    const current = byDate.get(dateKey) || { d7: null, d30: null };
+    if (row.horizon === '7d') current.d7 = row;
+    if (row.horizon === '30d') current.d30 = row;
+    byDate.set(dateKey, current);
+  }
+
+  const orderedDates = [...byDate.keys()].sort();
+  let pairedDays = 0;
+  let crossHorizonConflictDays = 0;
+  let conflictPersistenceDays = 0;
+  for (const dateKey of orderedDates) {
+    const pair = byDate.get(dateKey);
+    const isPaired = Boolean(pair?.d7 && pair?.d30);
+    const hasDirectionalConflict = Boolean(
+      pair?.d7 &&
+      pair?.d30 &&
+      pair.d7.published_count > 0 &&
+      pair.d30.published_count > 0 &&
+      pair.d7.top_direction_published &&
+      pair.d30.top_direction_published &&
+      pair.d7.top_direction_published !== pair.d30.top_direction_published
+    );
+    if (isPaired) {
+      pairedDays += 1;
+    }
+    if (hasDirectionalConflict) {
+      crossHorizonConflictDays += 1;
+      conflictPersistenceDays += 1;
+    } else {
+      conflictPersistenceDays = 0;
+    }
+  }
+
+  return {
+    window_days: boundedWindowDays,
+    rows_observed: normalizedRows.length,
+    candidate_count_total: candidateCountTotal,
+    published_count_total: publishedCountTotal,
+    publish_rate_pct: candidateCountTotal > 0
+      ? Number(((publishedCountTotal / candidateCountTotal) * 100).toFixed(2))
+      : 0,
+    suppressed_count_total: suppressedCountTotal,
+    over_suppressed_rows: overSuppressedRows,
+    over_suppression_rate_pct: normalizedRows.length > 0
+      ? Number(((overSuppressedRows / normalizedRows.length) * 100).toFixed(2))
+      : 0,
+    paired_days: pairedDays,
+    cross_horizon_conflict_days: crossHorizonConflictDays,
+    cross_horizon_conflict_rate_pct: pairedDays > 0
+      ? Number(((crossHorizonConflictDays / pairedDays) * 100).toFixed(2))
+      : 0,
+    conflict_persistence_days: conflictPersistenceDays,
+    last_as_of: normalizedRows.length > 0
+      ? [...normalizedRows].sort((a, b) => a.as_of.localeCompare(b.as_of))[normalizedRows.length - 1].as_of
+      : null,
+  };
+}
+
+async function computeDecisionGradeScorecard(
+  db: D1Database,
+  windowDays: number,
+): Promise<DecisionGradeResponse> {
+  const boundedWindowDays = UTILITY_WINDOW_DAY_OPTIONS.has(windowDays) ? windowDays : 30;
+  const lookbackExpr = `-${Math.max(0, boundedWindowDays - 1)} days`;
+
+  const [freshnessWindow, utilityFunnel, opportunityMetrics, consistencyRows, conviction7d, conviction30d, edgeCalibration] = await Promise.all([
+    computeFreshnessSloWindow(db, boundedWindowDays),
+    computeUtilityFunnelSummary(db, boundedWindowDays),
+    computeOpportunityLedgerWindowMetrics(db, boundedWindowDays),
+    db.prepare(`
+      SELECT state, COUNT(*) as count
+      FROM market_consistency_checks
+      WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
+      GROUP BY state
+    `).bind(lookbackExpr).all<{ state: string; count: number | null }>(),
+    fetchLatestCalibrationSnapshot(db, 'conviction', '7d'),
+    fetchLatestCalibrationSnapshot(db, 'conviction', '30d'),
+    fetchLatestCalibrationSnapshot(db, 'edge_quality', null),
+  ]);
+
+  let edgeReport: EdgeDiagnosticsReport | null = null;
+  try {
+    edgeReport = await buildEdgeDiagnosticsReport(db, ['7d', '30d']);
+  } catch (err) {
+    console.warn('Decision-grade edge diagnostics unavailable:', err);
+    edgeReport = null;
+  }
+
+  const freshnessScore = Number(clamp(0, 100, freshnessWindow.slo_attainment_pct).toFixed(2));
+  const freshnessStatus: DecisionGradeComponentStatus =
+    freshnessWindow.days_observed <= 0
+      ? 'insufficient'
+      : freshnessWindow.days_with_critical_stale === 0 && freshnessWindow.slo_attainment_pct >= 95
+        ? 'pass'
+        : freshnessWindow.days_with_critical_stale <= 1 && freshnessWindow.slo_attainment_pct >= 90
+          ? 'watch'
+          : 'fail';
+
+  let passCount = 0;
+  let warnCount = 0;
+  let failCount = 0;
+  for (const row of consistencyRows.results || []) {
+    const count = Math.max(0, Math.floor(toNumber(row.count, 0)));
+    if (row.state === 'PASS') passCount += count;
+    else if (row.state === 'WARN') warnCount += count;
+    else if (row.state === 'FAIL') failCount += count;
+  }
+  const consistencyTotal = passCount + warnCount + failCount;
+  const consistencyScore = consistencyTotal > 0
+    ? Number(clamp(
+      0,
+      100,
+      100 - ((failCount / consistencyTotal) * 100) - ((warnCount / consistencyTotal) * 35)
+    ).toFixed(2))
+    : 40;
+  const consistencyStatus: DecisionGradeComponentStatus =
+    consistencyTotal <= 0
+      ? 'insufficient'
+      : failCount > 0
+        ? 'fail'
+        : warnCount > 0
+          ? 'watch'
+          : 'pass';
+
+  const conviction7dQuality = computeCalibrationDiagnostics(conviction7d).quality_band;
+  const conviction30dQuality = computeCalibrationDiagnostics(conviction30d).quality_band;
+  const edgeCalibrationQuality = computeCalibrationDiagnostics(edgeCalibration).quality_band;
+  const calibrationScore = Number((
+    (calibrationQualityScore(conviction7dQuality) +
+      calibrationQualityScore(conviction30dQuality) +
+      calibrationQualityScore(edgeCalibrationQuality)) / 3
+  ).toFixed(2));
+  const calibrationStatus: DecisionGradeComponentStatus =
+    conviction7dQuality === 'INSUFFICIENT' || conviction30dQuality === 'INSUFFICIENT' || edgeCalibrationQuality === 'INSUFFICIENT'
+      ? 'fail'
+      : conviction7dQuality === 'LIMITED' || conviction30dQuality === 'LIMITED' || edgeCalibrationQuality === 'LIMITED'
+        ? 'watch'
+        : 'pass';
+
+  let edgeScore = 35;
+  let edgeStatus: DecisionGradeComponentStatus = 'insufficient';
+  let lowerBoundPositiveHorizons = 0;
+  let horizonsObserved = 0;
+  let edgeReasons: string[] = [];
+  if (edgeReport) {
+    horizonsObserved = edgeReport.windows.length;
+    lowerBoundPositiveHorizons = edgeReport.windows.filter((window) => window.lower_bound_positive).length;
+    const leakageFailures = edgeReport.windows.filter((window) => !window.leakage_sentinel.pass).length;
+    edgeScore = Number(clamp(
+      0,
+      100,
+      50 +
+      (edgeReport.promotion_gate.pass ? 25 : -20) +
+      (lowerBoundPositiveHorizons * 12) -
+      (leakageFailures * 10)
+    ).toFixed(2));
+    edgeReasons = edgeReport.promotion_gate.reasons;
+    edgeStatus = edgeReport.promotion_gate.pass && lowerBoundPositiveHorizons > 0
+      ? 'pass'
+      : edgeReport.promotion_gate.pass
+        ? 'watch'
+        : 'fail';
+  }
+
+  let opportunityHygieneScore = 100;
+  if (opportunityMetrics.publish_rate_pct < 10) opportunityHygieneScore -= 35;
+  else if (opportunityMetrics.publish_rate_pct < 20) opportunityHygieneScore -= 20;
+  if (opportunityMetrics.over_suppression_rate_pct > 35) opportunityHygieneScore -= 35;
+  else if (opportunityMetrics.over_suppression_rate_pct > 20) opportunityHygieneScore -= 20;
+  else if (opportunityMetrics.over_suppression_rate_pct > 10) opportunityHygieneScore -= 10;
+  if (opportunityMetrics.cross_horizon_conflict_rate_pct > 50) opportunityHygieneScore -= 25;
+  else if (opportunityMetrics.cross_horizon_conflict_rate_pct > 30) opportunityHygieneScore -= 15;
+  else if (opportunityMetrics.cross_horizon_conflict_rate_pct > 15) opportunityHygieneScore -= 8;
+  if (opportunityMetrics.conflict_persistence_days >= 3) opportunityHygieneScore -= 15;
+  else if (opportunityMetrics.conflict_persistence_days >= 2) opportunityHygieneScore -= 8;
+  const boundedOpportunityHygieneScore = Number(clamp(0, 100, opportunityHygieneScore).toFixed(2));
+  const opportunityHygieneStatus: DecisionGradeComponentStatus =
+    opportunityMetrics.rows_observed <= 0
+      ? 'insufficient'
+      : opportunityMetrics.over_suppression_rate_pct > 35 || opportunityMetrics.cross_horizon_conflict_rate_pct > 45
+        ? 'fail'
+        : opportunityMetrics.over_suppression_rate_pct > 20 || opportunityMetrics.cross_horizon_conflict_rate_pct > 30 || opportunityMetrics.publish_rate_pct < 10
+          ? 'watch'
+          : 'pass';
+
+  const utilityTarget = boundedWindowDays === 30 ? 25 : 8;
+  const utilityScoreRaw = Math.min(70, utilityFunnel.decision_events_total * 2) + (utilityFunnel.no_action_unlock_coverage_pct * 0.3);
+  const utilityScore = Number(clamp(0, 100, utilityScoreRaw).toFixed(2));
+  const utilityStatus: DecisionGradeComponentStatus =
+    utilityFunnel.decision_events_total <= 0
+      ? 'insufficient'
+      : utilityFunnel.decision_events_total >= utilityTarget && utilityFunnel.no_action_unlock_coverage_pct >= 80
+        ? 'pass'
+        : utilityFunnel.decision_events_total >= Math.ceil(utilityTarget / 2) && utilityFunnel.no_action_unlock_coverage_pct >= 60
+          ? 'watch'
+          : 'fail';
+
+  const weightedScore = Number((
+    freshnessScore * 0.25 +
+    consistencyScore * 0.20 +
+    calibrationScore * 0.20 +
+    edgeScore * 0.15 +
+    boundedOpportunityHygieneScore * 0.15 +
+    utilityScore * 0.05
+  ).toFixed(2));
+  const grade = decisionGradeFromScore(weightedScore);
+  const goLiveReady = weightedScore >= 85
+    && freshnessStatus === 'pass'
+    && consistencyStatus !== 'fail'
+    && calibrationStatus !== 'fail'
+    && edgeStatus === 'pass'
+    && opportunityHygieneStatus !== 'fail';
+
+  return {
+    as_of: asIsoDateTime(new Date()),
+    window_days: boundedWindowDays,
+    score: weightedScore,
+    grade,
+    go_live_ready: goLiveReady,
+    components: {
+      freshness: {
+        score: freshnessScore,
+        status: freshnessStatus,
+        slo_attainment_pct: freshnessWindow.slo_attainment_pct,
+        days_with_critical_stale: freshnessWindow.days_with_critical_stale,
+        days_observed: freshnessWindow.days_observed,
+      },
+      consistency: {
+        score: consistencyScore,
+        status: consistencyStatus,
+        pass_count: passCount,
+        warn_count: warnCount,
+        fail_count: failCount,
+        total: consistencyTotal,
+      },
+      calibration: {
+        score: calibrationScore,
+        status: calibrationStatus,
+        conviction_7d: conviction7dQuality,
+        conviction_30d: conviction30dQuality,
+        edge_quality: edgeCalibrationQuality,
+      },
+      edge: {
+        score: edgeScore,
+        status: edgeStatus,
+        promotion_gate_pass: edgeReport?.promotion_gate.pass ?? false,
+        lower_bound_positive_horizons: lowerBoundPositiveHorizons,
+        horizons_observed: horizonsObserved,
+        reasons: edgeReasons,
+      },
+      opportunity_hygiene: {
+        score: boundedOpportunityHygieneScore,
+        status: opportunityHygieneStatus,
+        publish_rate_pct: opportunityMetrics.publish_rate_pct,
+        over_suppression_rate_pct: opportunityMetrics.over_suppression_rate_pct,
+        cross_horizon_conflict_rate_pct: opportunityMetrics.cross_horizon_conflict_rate_pct,
+        conflict_persistence_days: opportunityMetrics.conflict_persistence_days,
+        rows_observed: opportunityMetrics.rows_observed,
+      },
+      utility: {
+        score: utilityScore,
+        status: utilityStatus,
+        decision_events_total: utilityFunnel.decision_events_total,
+        no_action_unlock_coverage_pct: utilityFunnel.no_action_unlock_coverage_pct,
+        unique_sessions: utilityFunnel.unique_sessions,
+      },
+    },
+  };
+}
+
 async function fetchLatestMarketProductSnapshotWrite(db: D1Database): Promise<string | null> {
   try {
     const row = await db.prepare(`
@@ -7614,6 +8127,33 @@ export default {
 
         try {
           await env.DB.prepare(`
+            CREATE TABLE IF NOT EXISTS market_opportunity_ledger (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              refresh_run_id INTEGER,
+              as_of TEXT NOT NULL,
+              horizon TEXT NOT NULL CHECK(horizon IN ('7d', '30d')),
+              candidate_count INTEGER NOT NULL DEFAULT 0,
+              published_count INTEGER NOT NULL DEFAULT 0,
+              suppressed_count INTEGER NOT NULL DEFAULT 0,
+              quality_filtered_count INTEGER NOT NULL DEFAULT 0,
+              coherence_suppressed_count INTEGER NOT NULL DEFAULT 0,
+              data_quality_suppressed_count INTEGER NOT NULL DEFAULT 0,
+              degraded_reason TEXT,
+              top_direction_candidate TEXT CHECK(top_direction_candidate IN ('bullish', 'bearish', 'neutral')),
+              top_direction_published TEXT CHECK(top_direction_published IN ('bullish', 'bearish', 'neutral')),
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_created ON market_opportunity_ledger(created_at DESC)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_as_of ON market_opportunity_ledger(as_of DESC, horizon)`).run();
+          await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_run ON market_opportunity_ledger(refresh_run_id, horizon)`).run();
+          migrations.push('market_opportunity_ledger');
+        } catch (e) {
+          console.error('market_opportunity_ledger migration failed:', e);
+        }
+
+        try {
+          await env.DB.prepare(`
             CREATE TABLE IF NOT EXISTS market_calibration_snapshots (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               as_of TEXT NOT NULL,
@@ -8920,6 +9460,35 @@ export default {
         }
       }
 
+      if (url.pathname === '/api/ops/decision-grade' && method === 'GET') {
+        try {
+          await ensureMarketProductSchema(env.DB);
+        } catch (err) {
+          console.error('Decision-grade schema guard failed:', err);
+          return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
+        }
+
+        const windowRaw = Number.parseInt((url.searchParams.get('window') || '30').trim(), 10);
+        if (!UTILITY_WINDOW_DAY_OPTIONS.has(windowRaw)) {
+          return Response.json({
+            error: 'Invalid window. Supported values: 7, 30',
+          }, { status: 400, headers: corsHeaders });
+        }
+
+        try {
+          const scorecard = await computeDecisionGradeScorecard(env.DB, windowRaw);
+          return Response.json(scorecard, {
+            headers: {
+              ...corsHeaders,
+              'Cache-Control': 'public, max-age=300',
+            },
+          });
+        } catch (err) {
+          console.error('Decision-grade computation failed:', err);
+          return Response.json({ error: 'Decision grade unavailable' }, { status: 503, headers: corsHeaders });
+        }
+      }
+
       if (url.pathname === '/api/market/refresh-products' && method === 'POST') {
         const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
         if (adminAuthFailure) {
@@ -9078,6 +9647,7 @@ export default {
           let qualityFilteredCount = 0;
           let coherenceSuppressedCount = 0;
           let suppressedDataQualityCount = 0;
+          const ledgerRows: OpportunityLedgerInsertPayload[] = [];
           const projectionTargets: Array<{
             snapshot: OpportunitySnapshot | null;
             calibration: MarketCalibrationSnapshotPayload | null;
@@ -9095,9 +9665,82 @@ export default {
             });
             qualityFilteredCount += projected.quality_filtered_count;
             coherenceSuppressedCount += projected.coherence_suppressed_count;
-            if (projected.suppressed_data_quality) {
-              suppressedDataQualityCount += projected.suppressed_count;
+            suppressedDataQualityCount += projected.suppression_by_reason.data_quality_suppressed;
+            ledgerRows.push({
+              refresh_run_id: refreshRunId,
+              as_of: target.snapshot.as_of,
+              horizon: target.snapshot.horizon,
+              candidate_count: projected.total_candidates,
+              published_count: projected.items.length,
+              suppressed_count: projected.suppressed_count,
+              quality_filtered_count: projected.quality_filtered_count,
+              coherence_suppressed_count: projected.coherence_suppressed_count,
+              data_quality_suppressed_count: projected.suppression_by_reason.data_quality_suppressed,
+              degraded_reason: projected.degraded_reason,
+              top_direction_candidate: normalized[0]?.direction ?? null,
+              top_direction_published: projected.items[0]?.direction ?? null,
+            });
+          }
+          for (const row of ledgerRows) {
+            try {
+              await insertOpportunityLedgerRow(env.DB, row);
+            } catch (err) {
+              console.error('Opportunity ledger insert failed:', err);
             }
+          }
+          const overSuppressedCount = ledgerRows.filter((row) =>
+            row.candidate_count > 0 &&
+            row.published_count === 0 &&
+            row.data_quality_suppressed_count === 0
+          ).length;
+          const horizon7 = ledgerRows.find((row) => row.horizon === '7d') || null;
+          const horizon30 = ledgerRows.find((row) => row.horizon === '30d') || null;
+          const crossHorizonState: 'ALIGNED' | 'MIXED' | 'CONFLICT' | 'INSUFFICIENT' = (
+            horizon7 &&
+            horizon30 &&
+            horizon7.published_count > 0 &&
+            horizon30.published_count > 0 &&
+            horizon7.top_direction_published &&
+            horizon30.top_direction_published
+          )
+            ? (horizon7.top_direction_published === horizon30.top_direction_published ? 'ALIGNED' : 'CONFLICT')
+            : (
+              horizon7 &&
+              horizon30 &&
+              horizon7.published_count === 0 &&
+              horizon30.published_count === 0
+            )
+              ? 'INSUFFICIENT'
+              : (
+                horizon7 || horizon30
+              )
+                ? 'MIXED'
+                : 'INSUFFICIENT';
+
+          let decisionGradeSnapshot: {
+            score: number;
+            grade: 'GREEN' | 'YELLOW' | 'RED';
+            go_live_ready: boolean;
+            opportunity_hygiene: {
+              over_suppression_rate_pct: number;
+              cross_horizon_conflict_rate_pct: number;
+              conflict_persistence_days: number;
+            };
+          } | null = null;
+          try {
+            const scorecard = await computeDecisionGradeScorecard(env.DB, 30);
+            decisionGradeSnapshot = {
+              score: scorecard.score,
+              grade: scorecard.grade,
+              go_live_ready: scorecard.go_live_ready,
+              opportunity_hygiene: {
+                over_suppression_rate_pct: scorecard.components.opportunity_hygiene.over_suppression_rate_pct,
+                cross_horizon_conflict_rate_pct: scorecard.components.opportunity_hygiene.cross_horizon_conflict_rate_pct,
+                conflict_persistence_days: scorecard.components.opportunity_hygiene.conflict_persistence_days,
+              },
+            };
+          } catch (err) {
+            console.warn('Decision-grade snapshot unavailable during refresh-products:', err);
           }
 
           let diagnosticsSummary: {
@@ -9140,7 +9783,11 @@ export default {
             quality_filtered_count: qualityFilteredCount,
             coherence_suppressed_count: coherenceSuppressedCount,
             suppressed_data_quality_count: suppressedDataQualityCount,
+            over_suppressed_count: overSuppressedCount,
+            cross_horizon_state: crossHorizonState,
+            opportunity_ledger_rows: ledgerRows.length,
             calibration_diagnostics: diagnosticsSummary,
+            decision_grade_snapshot: decisionGradeSnapshot,
             edge_diagnostics: edgeDiagnosticsReport
               ? {
                   as_of: edgeDiagnosticsReport.as_of,
