@@ -1385,6 +1385,7 @@ interface DecisionImpactObserveSnapshot {
   };
   minimum_samples_required: number;
   minimum_actionable_sessions_required: number;
+  configured_minimum_actionable_sessions_required: number;
   enforce_ready: boolean;
   enforce_breaches: string[];
   enforce_breach_count: number;
@@ -6853,6 +6854,14 @@ function evaluateDecisionImpactObserveMode(
 ): DecisionImpactObserveSnapshot {
   const breaches: string[] = [];
   const enforceBreaches: string[] = [];
+  const observedDays = Math.max(
+    1,
+    Math.min(utilityFunnel.window_days, Math.max(0, utilityFunnel.days_observed)),
+  );
+  const effectiveMinActionableSessions = Math.max(
+    1,
+    Math.ceil((governance.min_actionable_sessions * observedDays) / utilityFunnel.window_days),
+  );
 
   if (market7.sample_size <= 0) {
     breaches.push('market_7d_insufficient_samples');
@@ -6898,12 +6907,12 @@ function evaluateDecisionImpactObserveMode(
 
   if (utilityFunnel.actionable_sessions <= 0) {
     breaches.push('cta_action_insufficient_sessions');
-  } else if (utilityFunnel.actionable_sessions < governance.min_actionable_sessions) {
+  } else if (utilityFunnel.actionable_sessions < effectiveMinActionableSessions) {
     breaches.push('cta_action_below_enforce_min_sessions');
   } else if (utilityFunnel.cta_action_rate_pct < DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min) {
     breaches.push('cta_action_rate_breach');
   }
-  if (utilityFunnel.actionable_sessions >= governance.min_actionable_sessions) {
+  if (utilityFunnel.actionable_sessions >= effectiveMinActionableSessions) {
     if (utilityFunnel.cta_action_rate_pct < DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min) {
       enforceBreaches.push('cta_action_rate_breach');
     }
@@ -6912,7 +6921,7 @@ function evaluateDecisionImpactObserveMode(
   const enforceReady =
     market7.sample_size >= governance.min_sample_size &&
     market30.sample_size >= governance.min_sample_size &&
-    utilityFunnel.actionable_sessions >= governance.min_actionable_sessions;
+    utilityFunnel.actionable_sessions >= effectiveMinActionableSessions;
 
   return {
     enabled: true,
@@ -6925,7 +6934,8 @@ function evaluateDecisionImpactObserveMode(
       cta_action_rate_pct_min: DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min,
     },
     minimum_samples_required: governance.min_sample_size,
-    minimum_actionable_sessions_required: governance.min_actionable_sessions,
+    minimum_actionable_sessions_required: effectiveMinActionableSessions,
+    configured_minimum_actionable_sessions_required: governance.min_actionable_sessions,
     enforce_ready: enforceReady,
     enforce_breaches: Array.from(new Set(enforceBreaches)),
     enforce_breach_count: Array.from(new Set(enforceBreaches)).length,
@@ -7291,15 +7301,27 @@ async function computeDecisionGradeScorecard(
           ? 'watch'
           : 'pass';
 
-  const utilityTarget = boundedWindowDays === 30 ? 25 : 8;
-  const utilityScoreRaw = Math.min(70, utilityFunnel.decision_events_total * 2) + (utilityFunnel.no_action_unlock_coverage_pct * 0.3);
+  const utilityTargetFullWindow = boundedWindowDays === 30 ? 25 : 8;
+  const observedUtilityDays = Math.max(
+    1,
+    Math.min(boundedWindowDays, Math.max(0, utilityFunnel.days_observed)),
+  );
+  const utilityTarget = Math.max(
+    1,
+    Math.ceil((utilityTargetFullWindow * observedUtilityDays) / boundedWindowDays),
+  );
+  const utilityProgressPct = Math.min(
+    100,
+    (utilityFunnel.decision_events_total / utilityTarget) * 100,
+  );
+  const utilityScoreRaw = (utilityProgressPct * 0.7) + (utilityFunnel.no_action_unlock_coverage_pct * 0.3);
   const utilityScore = Number(clamp(0, 100, utilityScoreRaw).toFixed(2));
   const utilityStatus: DecisionGradeComponentStatus =
     utilityFunnel.decision_events_total <= 0
       ? 'insufficient'
       : utilityFunnel.decision_events_total >= utilityTarget && utilityFunnel.no_action_unlock_coverage_pct >= 80
         ? 'pass'
-        : utilityFunnel.decision_events_total >= Math.ceil(utilityTarget / 2) && utilityFunnel.no_action_unlock_coverage_pct >= 60
+        : utilityFunnel.decision_events_total >= Math.ceil(utilityTarget * 0.6) && utilityFunnel.no_action_unlock_coverage_pct >= 60
           ? 'watch'
           : 'fail';
 
@@ -7317,7 +7339,11 @@ async function computeDecisionGradeScorecard(
   if (freshnessStatus !== 'pass') goLiveBlockers.add('freshness_not_pass');
   if (consistencyStatus === 'fail') goLiveBlockers.add('consistency_fail');
   if (calibrationStatus === 'fail') goLiveBlockers.add('calibration_fail');
-  if (edgeStatus !== 'pass') goLiveBlockers.add('edge_not_pass');
+  if (!edgeReport) {
+    goLiveBlockers.add('edge_diagnostics_unavailable');
+  } else if (!edgeReport.promotion_gate.pass) {
+    goLiveBlockers.add('edge_promotion_gate_fail');
+  }
   if (opportunityHygieneStatus === 'fail') goLiveBlockers.add('opportunity_hygiene_fail');
   if (utilityStatus === 'fail') goLiveBlockers.add('utility_signal_weak');
   if (utilityStatus === 'insufficient') goLiveBlockers.add('utility_signal_insufficient');

@@ -356,6 +356,12 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
 - `/api/ops/decision-grade` now emits explicit `go_live_blockers[]` plus readiness context (`decision_impact_enforce_ready`, sample counts, minimum thresholds).
 - New endpoint: `GET /api/ops/go-live-readiness?window=30` for a compact operator view of readiness blockers and score context.
 
+14. **Go-live blocker reduction + enforce readiness normalization (Phase 8)**
+- Utility decision target now scales by observed days in-window (instead of fixed full-window counts), improving early-window status stability.
+- Decision-impact actionable-session minimum is normalized by observed days (with configured minimum still reported) to avoid false readiness negatives during partial windows.
+- Go-live blocker logic now keys edge on promotion-gate safety (`edge_promotion_gate_fail`) rather than strict edge component `pass/watch` state.
+- Enforcement should be flipped only when `/api/ops/go-live-readiness` shows `go_live_ready=true` and no blockers.
+
 ## Scheduler Ownership Runbook
 
 Target ownership is GitHub Actions (`Daily PXI Refresh`) only. Keep Cloudflare cron enabled during hardening, then cut over after stability validation.
