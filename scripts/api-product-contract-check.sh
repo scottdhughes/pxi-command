@@ -935,7 +935,7 @@ check_decision_impact_semantics() {
     (.scope == "theme") and
     (.horizon == "7d") and
     (.window_days == 30) and
-    (.outcome_basis == "spy_forward_proxy") and
+    ((.outcome_basis == "theme_proxy_blend") or (.outcome_basis == "spy_forward_proxy")) and
     (.themes | type == "array" and length <= 10) and
     (all(.themes[]?;
       (.theme_id | type == "string") and
