@@ -6149,6 +6149,7 @@ async function computeUtilityFunnelSummary(
         SUM(CASE WHEN event_type = 'decision_no_action_view' THEN 1 ELSE 0 END) as decision_no_action_views,
         SUM(CASE WHEN event_type = 'no_action_unlock_view' THEN 1 ELSE 0 END) as no_action_unlock_views,
         SUM(CASE WHEN event_type = 'cta_action_click' THEN 1 ELSE 0 END) as cta_action_clicks,
+        COUNT(DISTINCT CASE WHEN event_type = 'cta_action_click' THEN session_id END) as cta_action_sessions,
         COUNT(DISTINCT CASE WHEN event_type = 'decision_actionable_view' THEN session_id END) as actionable_view_sessions,
         COUNT(DISTINCT CASE WHEN event_type IN ('decision_actionable_view', 'cta_action_click') THEN session_id END) as actionable_sessions,
         MAX(created_at) as last_event_at
@@ -6164,6 +6165,7 @@ async function computeUtilityFunnelSummary(
       decision_no_action_views: number | null;
       no_action_unlock_views: number | null;
       cta_action_clicks: number | null;
+      cta_action_sessions: number | null;
       actionable_view_sessions: number | null;
       actionable_sessions: number | null;
       last_event_at: string | null;
@@ -6184,6 +6186,7 @@ async function computeUtilityFunnelSummary(
   const decisionNoActionViews = Math.max(0, Math.floor(toNumber(aggregate?.decision_no_action_views, 0)));
   const noActionUnlockViews = Math.max(0, Math.floor(toNumber(aggregate?.no_action_unlock_views, 0)));
   const ctaActionClicks = Math.max(0, Math.floor(toNumber(aggregate?.cta_action_clicks, 0)));
+  const ctaActionSessions = Math.max(0, Math.floor(toNumber(aggregate?.cta_action_sessions, 0)));
   const actionableViewSessions = Math.max(0, Math.floor(toNumber(aggregate?.actionable_view_sessions, 0)));
   const actionableSessions = Math.max(0, Math.floor(toNumber(aggregate?.actionable_sessions, 0)));
   const decisionEventsTotal = decisionActionableViews + decisionWatchViews + decisionNoActionViews;
@@ -6191,7 +6194,7 @@ async function computeUtilityFunnelSummary(
     ? Number((decisionEventsTotal / uniqueSessions).toFixed(4))
     : 0;
   const ctaActionRatePct = actionableSessions > 0
-    ? Number(((ctaActionClicks / actionableSessions) * 100).toFixed(2))
+    ? Number(((ctaActionSessions / actionableSessions) * 100).toFixed(2))
     : 0;
   const noActionUnlockCoverage = decisionNoActionViews > 0
     ? Number(((noActionUnlockViews / decisionNoActionViews) * 100).toFixed(2))
