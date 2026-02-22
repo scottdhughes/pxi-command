@@ -605,7 +605,7 @@ interface DecisionImpactResponse {
   horizon: '7d' | '30d'
   scope: 'market' | 'theme'
   window_days: 30 | 90
-  outcome_basis: 'spy_forward_proxy'
+  outcome_basis: 'spy_forward_proxy' | 'theme_proxy_blend'
   market: DecisionImpactMarketStats
   themes: DecisionImpactThemeStats[]
   coverage: {
@@ -613,6 +613,8 @@ interface DecisionImpactResponse {
     eligible_items: number
     coverage_ratio: number
     insufficient_reasons: string[]
+    theme_proxy_eligible_items?: number
+    spy_fallback_items?: number
   }
 }
 
@@ -629,6 +631,7 @@ interface OpsDecisionImpactResponse {
   }
   utility_attribution: {
     actionable_views: number
+    actionable_sessions: number
     cta_action_clicks: number
     cta_action_rate_pct: number
     no_action_unlock_views: number
@@ -636,6 +639,7 @@ interface OpsDecisionImpactResponse {
   }
   observe_mode: {
     enabled: boolean
+    mode: 'observe' | 'enforce'
     thresholds: {
       market_7d_hit_rate_min: number
       market_30d_hit_rate_min: number
@@ -643,6 +647,11 @@ interface OpsDecisionImpactResponse {
       market_30d_avg_signed_return_min: number
       cta_action_rate_pct_min: number
     }
+    minimum_samples_required: number
+    minimum_actionable_sessions_required: number
+    enforce_ready: boolean
+    enforce_breaches: string[]
+    enforce_breach_count: number
     breaches: string[]
     breach_count: number
   }
@@ -1186,6 +1195,11 @@ function formatProbability(value: number | null, digits = 0): string {
 function formatMaybePercent(value: number | null, digits = 1): string {
   if (value === null || Number.isNaN(value)) return '—'
   return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}%`
+}
+
+function formatDecisionImpactBasis(value: DecisionImpactResponse['outcome_basis'] | null | undefined): string {
+  if (value === 'theme_proxy_blend') return 'theme proxy blend'
+  return 'SPY proxy'
 }
 
 function formatUnavailableReason(reason: string | null | undefined): string {
@@ -3272,7 +3286,9 @@ function BriefPage({
             {decisionImpact && (
               <div className="impact-card p-4 border rounded-lg">
                 <div className="flex items-center justify-between gap-2">
-                  <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">Market impact (SPY proxy)</div>
+                  <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">
+                    Market impact ({formatDecisionImpactBasis(decisionImpact.outcome_basis)})
+                  </div>
                   <span className={`impact-quality-chip rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${calibrationQualityClass(decisionImpact.market.quality_band)}`}>
                     {decisionImpact.market.quality_band.toLowerCase()}
                   </span>
@@ -3493,7 +3509,7 @@ function OpportunitiesPage({
           <div className="impact-card mb-4 p-4 border rounded-lg">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">
-                What happened after similar setups (SPY proxy)
+                What happened after similar setups ({formatDecisionImpactBasis(decisionImpact.outcome_basis)})
               </div>
               <span className={`impact-quality-chip rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${calibrationQualityClass(decisionImpact.market.quality_band)}`}>
                 market {decisionImpact.market.quality_band.toLowerCase()}
@@ -3519,6 +3535,12 @@ function OpportunitiesPage({
                 <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.coverage.coverage_ratio)}</span>
               </div>
             </div>
+            {decisionImpact.scope === 'theme' && (
+              <div className="mt-2 text-[9px] text-[#949ba5]/70">
+                theme-proxy eligible {decisionImpact.coverage.theme_proxy_eligible_items ?? 0} ·
+                {' '}SPY fallback {decisionImpact.coverage.spy_fallback_items ?? 0}
+              </div>
+            )}
             {decisionImpact.themes.length > 0 && (
               <div className="mt-3">
                 <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/55">Top themes</div>
@@ -3538,8 +3560,12 @@ function OpportunitiesPage({
         )}
         {opsDecisionImpact && (
           <div className="mb-4 text-[10px] text-[#949ba5]/80">
-            observe mode: {opsDecisionImpact.observe_mode.breach_count} breaches ·
+            {opsDecisionImpact.observe_mode.mode} mode ·
+            {' '}observe breaches {opsDecisionImpact.observe_mode.breach_count} ·
+            {' '}enforce breaches {opsDecisionImpact.observe_mode.enforce_breach_count} ·
+            {' '}enforce ready {opsDecisionImpact.observe_mode.enforce_ready ? 'yes' : 'no'} ·
             {' '}cta action rate {opsDecisionImpact.utility_attribution.cta_action_rate_pct.toFixed(2)}%
+            {' '}({opsDecisionImpact.utility_attribution.cta_action_clicks}/{opsDecisionImpact.utility_attribution.actionable_sessions} sessions)
           </div>
         )}
 

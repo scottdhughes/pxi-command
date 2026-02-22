@@ -134,7 +134,7 @@ pxi-command/
 | `/api/market/consistency` | GET | Latest decision consistency score/state/violations |
 | `/api/ops/freshness-slo` | GET | Rolling 7d/30d freshness SLO attainment and recent critical stale incidents |
 | `/api/ops/utility-funnel` | GET | Rolling utility funnel metrics (session -> decision views -> no-action unlock coverage + CTA intent rate) |
-| `/api/ops/decision-impact` | GET | Decision-impact ops view (7d/30d market outcome proxy, theme summary, utility attribution, observe-only breaches) |
+| `/api/ops/decision-impact` | GET | Decision-impact ops view (7d/30d market outcome proxy, theme summary, utility attribution, governance mode with observe + enforce readiness) |
 | `/api/ops/decision-grade` | GET | Rolling governance scorecard (freshness, consistency, calibration, edge evidence, opportunity hygiene, utility) |
 
 ### Product Layer (Phase 1)
@@ -142,7 +142,7 @@ pxi-command/
 |----------|--------|-------------|
 | `/api/brief` | GET | Daily market brief coherent with `/api/plan` policy state (includes contract version + consistency) |
 | `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon with calibration + expectancy + unavailable reasons |
-| `/api/decision-impact` | GET | Outcome attribution using matured opportunity ledger rows with SPY forward proxy (market or theme scope, 30/90d windows) |
+| `/api/decision-impact` | GET | Outcome attribution using matured opportunity ledger rows (market uses SPY forward proxy; theme uses proxy blend with SPY fallback, 30/90d windows) |
 | `/api/diagnostics/calibration` | GET | Calibration diagnostics (Brier/ECE/log loss + quality band) for conviction and edge-quality snapshots |
 | `/api/diagnostics/edge` | GET | Forward-chaining edge evidence (model vs lagged baseline uplift, CI, leakage sentinel, promotion gate) |
 | `/api/alerts/feed` | GET | In-app alert timeline (`regime_change`, `threshold_cross`, `opportunity_spike`, `freshness_warning`) |
@@ -339,6 +339,16 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
   - `market_7d.avg_signed_return_pct > 0`
   - `market_30d.avg_signed_return_pct > 0`
   - `cta_action_rate_pct >= 2.0`
+
+12. **Decision-impact enforcement + attribution hardening (Phase 6)**
+- `ops/decision-impact` now reports governance mode (`observe|enforce`), enforce readiness, and enforce breach list/count.
+- Enforce mode is sample-gated and disabled by default:
+  - `FEATURE_ENABLE_DECISION_IMPACT_ENFORCE=false`
+  - `DECISION_IMPACT_ENFORCE_MIN_SAMPLE=30`
+  - `DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS=10`
+- Theme attribution basis upgraded from pure SPY proxy to theme proxy blend (credit/vol/global/crypto mappings) with explicit SPY fallback when proxy coverage is unavailable.
+- Utility funnel CTA denominator now uses actionable sessions including CTA-click sessions (not only explicit actionable-view events) to reduce denominator undercount.
+- `POST /api/market/backfill-products` can now rebuild opportunity ledgers and regenerate decision-impact snapshots from historical opportunity snapshots (`rebuild_ledgers`, default `true`).
 
 ## Scheduler Ownership Runbook
 

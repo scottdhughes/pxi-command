@@ -35,6 +35,7 @@ interface Env {
   FEATURE_ENABLE_EDGE_DIAGNOSTICS?: string;
   FEATURE_ENABLE_SIGNALS_SANITIZER?: string;
   FEATURE_ENABLE_DECISION_IMPACT?: string;
+  FEATURE_ENABLE_DECISION_IMPACT_ENFORCE?: string;
   FEATURE_ENABLE_CTA_INTENT_TRACKING?: string;
   ENABLE_BRIEF?: string;
   ENABLE_OPPORTUNITIES?: string;
@@ -46,7 +47,10 @@ interface Env {
   ENABLE_EDGE_DIAGNOSTICS?: string;
   ENABLE_SIGNALS_SANITIZER?: string;
   ENABLE_DECISION_IMPACT?: string;
+  ENABLE_DECISION_IMPACT_ENFORCE?: string;
   ENABLE_CTA_INTENT_TRACKING?: string;
+  DECISION_IMPACT_ENFORCE_MIN_SAMPLE?: string;
+  DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS?: string;
 }
 
 // ============== Data Fetchers ==============
@@ -1315,6 +1319,7 @@ interface UtilityFunnelSummary {
   decision_no_action_views: number;
   no_action_unlock_views: number;
   cta_action_clicks: number;
+  actionable_view_sessions: number;
   actionable_sessions: number;
   cta_action_rate_pct: number;
   decision_events_total: number;
@@ -1322,6 +1327,8 @@ interface UtilityFunnelSummary {
   no_action_unlock_coverage_pct: number;
   last_event_at: string | null;
 }
+
+type DecisionImpactOutcomeBasis = 'spy_forward_proxy' | 'theme_proxy_blend';
 
 interface DecisionImpactMarketStats {
   sample_size: number;
@@ -1351,6 +1358,8 @@ interface DecisionImpactCoverage {
   eligible_items: number;
   coverage_ratio: number;
   insufficient_reasons: string[];
+  theme_proxy_eligible_items?: number;
+  spy_fallback_items?: number;
 }
 
 interface DecisionImpactResponsePayload {
@@ -1358,7 +1367,7 @@ interface DecisionImpactResponsePayload {
   horizon: '7d' | '30d';
   scope: 'market' | 'theme';
   window_days: 30 | 90;
-  outcome_basis: 'spy_forward_proxy';
+  outcome_basis: DecisionImpactOutcomeBasis;
   market: DecisionImpactMarketStats;
   themes: DecisionImpactThemeStats[];
   coverage: DecisionImpactCoverage;
@@ -1366,6 +1375,7 @@ interface DecisionImpactResponsePayload {
 
 interface DecisionImpactObserveSnapshot {
   enabled: true;
+  mode: 'observe' | 'enforce';
   thresholds: {
     market_7d_hit_rate_min: number;
     market_30d_hit_rate_min: number;
@@ -1373,6 +1383,11 @@ interface DecisionImpactObserveSnapshot {
     market_30d_avg_signed_return_min: number;
     cta_action_rate_pct_min: number;
   };
+  minimum_samples_required: number;
+  minimum_actionable_sessions_required: number;
+  enforce_ready: boolean;
+  enforce_breaches: string[];
+  enforce_breach_count: number;
   breaches: string[];
   breach_count: number;
 }
@@ -1390,6 +1405,7 @@ interface DecisionImpactOpsResponsePayload {
   };
   utility_attribution: {
     actionable_views: number;
+    actionable_sessions: number;
     cta_action_clicks: number;
     cta_action_rate_pct: number;
     no_action_unlock_views: number;
@@ -1740,6 +1756,41 @@ const DECISION_IMPACT_OBSERVE_THRESHOLDS = {
   market_30d_avg_signed_return_min: 0,
   cta_action_rate_pct_min: 2.0,
 } as const;
+const DECISION_IMPACT_ENFORCE_MIN_SAMPLE_DEFAULT = 30;
+const DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS_DEFAULT = 10;
+
+interface ThemeProxyRule {
+  indicator_id: string;
+  weight: number;
+  invert: boolean;
+}
+
+const THEME_PROXY_RULES = new Map<string, ThemeProxyRule[]>([
+  ['credit', [
+    { indicator_id: 'hyg', weight: 0.65, invert: false },
+    { indicator_id: 'lqd', weight: 0.35, invert: false },
+  ]],
+  ['volatility', [
+    { indicator_id: 'vix', weight: 1, invert: true },
+  ]],
+  ['breadth', [
+    { indicator_id: 'spy_close', weight: 1, invert: false },
+  ]],
+  ['positioning', [
+    { indicator_id: 'spy_close', weight: 1, invert: false },
+  ]],
+  ['macro', [
+    { indicator_id: 'spy_close', weight: 0.7, invert: false },
+    { indicator_id: 'wti_crude', weight: 0.3, invert: false },
+  ]],
+  ['global', [
+    { indicator_id: 'copper_gold_ratio', weight: 0.6, invert: false },
+    { indicator_id: 'dxy', weight: 0.4, invert: true },
+  ]],
+  ['crypto', [
+    { indicator_id: 'btc_price', weight: 1, invert: false },
+  ]],
+]);
 
 function checkRateLimitStore(
   ip: string,
@@ -1954,6 +2005,29 @@ function isFeatureEnabled(
   return TRUE_FLAG_VALUES.has(String(raw).toLowerCase());
 }
 
+function resolveDecisionImpactGovernance(env: Env): DecisionImpactGovernanceOptions {
+  return {
+    enforce_enabled: isFeatureEnabled(
+      env,
+      'FEATURE_ENABLE_DECISION_IMPACT_ENFORCE',
+      'ENABLE_DECISION_IMPACT_ENFORCE',
+      false,
+    ),
+    min_sample_size: parseEnvIntInRange(
+      env.DECISION_IMPACT_ENFORCE_MIN_SAMPLE,
+      DECISION_IMPACT_ENFORCE_MIN_SAMPLE_DEFAULT,
+      10,
+      1000,
+    ),
+    min_actionable_sessions: parseEnvIntInRange(
+      env.DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS,
+      DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS_DEFAULT,
+      1,
+      1000,
+    ),
+  };
+}
+
 function clamp(min: number, max: number, value: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -1969,6 +2043,70 @@ function asIsoDateTime(date: Date): string {
 function toNumber(value: unknown, fallback = 0): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toIntInRange(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function parseEnvIntInRange(
+  raw: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (raw === undefined || raw === null || raw === '') {
+    return fallback;
+  }
+  return toIntInRange(raw, fallback, min, max);
+}
+
+function normalizeThemeIdForProxy(themeId: string): string {
+  return String(themeId || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function resolveThemeProxyRules(themeId: string): ThemeProxyRule[] {
+  const normalized = normalizeThemeIdForProxy(themeId);
+  if (!normalized) {
+    return [{ indicator_id: 'spy_close', weight: 1, invert: false }];
+  }
+
+  const direct = THEME_PROXY_RULES.get(normalized);
+  if (direct && direct.length > 0) {
+    return direct;
+  }
+
+  if (normalized.includes('credit')) {
+    return THEME_PROXY_RULES.get('credit') || [{ indicator_id: 'spy_close', weight: 1, invert: false }];
+  }
+  if (normalized.includes('vol')) {
+    return THEME_PROXY_RULES.get('volatility') || [{ indicator_id: 'spy_close', weight: 1, invert: false }];
+  }
+  if (normalized.includes('breadth')) {
+    return THEME_PROXY_RULES.get('breadth') || [{ indicator_id: 'spy_close', weight: 1, invert: false }];
+  }
+  if (normalized.includes('macro') || normalized.includes('growth') || normalized.includes('liquidity')) {
+    return THEME_PROXY_RULES.get('macro') || [{ indicator_id: 'spy_close', weight: 1, invert: false }];
+  }
+  if (normalized.includes('global') || normalized.includes('fx')) {
+    return THEME_PROXY_RULES.get('global') || [{ indicator_id: 'spy_close', weight: 1, invert: false }];
+  }
+  if (normalized.includes('crypto') || normalized.includes('btc') || normalized.includes('eth')) {
+    return THEME_PROXY_RULES.get('crypto') || [{ indicator_id: 'spy_close', weight: 1, invert: false }];
+  }
+
+  return [{ indicator_id: 'spy_close', weight: 1, invert: false }];
 }
 
 function stableHash(value: string): string {
@@ -6011,7 +6149,8 @@ async function computeUtilityFunnelSummary(
         SUM(CASE WHEN event_type = 'decision_no_action_view' THEN 1 ELSE 0 END) as decision_no_action_views,
         SUM(CASE WHEN event_type = 'no_action_unlock_view' THEN 1 ELSE 0 END) as no_action_unlock_views,
         SUM(CASE WHEN event_type = 'cta_action_click' THEN 1 ELSE 0 END) as cta_action_clicks,
-        COUNT(DISTINCT CASE WHEN event_type = 'decision_actionable_view' THEN session_id END) as actionable_sessions,
+        COUNT(DISTINCT CASE WHEN event_type = 'decision_actionable_view' THEN session_id END) as actionable_view_sessions,
+        COUNT(DISTINCT CASE WHEN event_type IN ('decision_actionable_view', 'cta_action_click') THEN session_id END) as actionable_sessions,
         MAX(created_at) as last_event_at
       FROM market_utility_events
       WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
@@ -6025,6 +6164,7 @@ async function computeUtilityFunnelSummary(
       decision_no_action_views: number | null;
       no_action_unlock_views: number | null;
       cta_action_clicks: number | null;
+      actionable_view_sessions: number | null;
       actionable_sessions: number | null;
       last_event_at: string | null;
     }>(),
@@ -6044,6 +6184,7 @@ async function computeUtilityFunnelSummary(
   const decisionNoActionViews = Math.max(0, Math.floor(toNumber(aggregate?.decision_no_action_views, 0)));
   const noActionUnlockViews = Math.max(0, Math.floor(toNumber(aggregate?.no_action_unlock_views, 0)));
   const ctaActionClicks = Math.max(0, Math.floor(toNumber(aggregate?.cta_action_clicks, 0)));
+  const actionableViewSessions = Math.max(0, Math.floor(toNumber(aggregate?.actionable_view_sessions, 0)));
   const actionableSessions = Math.max(0, Math.floor(toNumber(aggregate?.actionable_sessions, 0)));
   const decisionEventsTotal = decisionActionableViews + decisionWatchViews + decisionNoActionViews;
   const decisionEventsPerSession = uniqueSessions > 0
@@ -6068,6 +6209,7 @@ async function computeUtilityFunnelSummary(
     decision_no_action_views: decisionNoActionViews,
     no_action_unlock_views: noActionUnlockViews,
     cta_action_clicks: ctaActionClicks,
+    actionable_view_sessions: actionableViewSessions,
     actionable_sessions: actionableSessions,
     cta_action_rate_pct: ctaActionRatePct,
     decision_events_total: decisionEventsTotal,
@@ -6145,6 +6287,88 @@ async function insertOpportunityItemLedgerRow(
   ).run();
 }
 
+interface OpportunityLedgerBuildResult {
+  ledger_row: OpportunityLedgerInsertPayload;
+  item_rows: OpportunityItemLedgerInsertPayload[];
+  projected: OpportunityFeedProjection;
+  normalized_items: OpportunityItem[];
+}
+
+function buildOpportunityLedgerProjection(args: {
+  refresh_run_id: number | null;
+  snapshot: OpportunitySnapshot;
+  calibration: MarketCalibrationSnapshotPayload | null;
+  coherence_gate_enabled: boolean;
+  freshness: FreshnessStatus;
+  consistency_state: ConsistencyState;
+}): OpportunityLedgerBuildResult {
+  const normalized = normalizeOpportunityItemsForPublishing(args.snapshot.items, args.calibration);
+  const qualityGateResult = removeLowInformationOpportunities(normalized);
+  const coherenceGateResult = applyOpportunityCoherenceGate(
+    qualityGateResult.items,
+    args.coherence_gate_enabled,
+  );
+  const projected = projectOpportunityFeed(normalized, {
+    coherence_gate_enabled: args.coherence_gate_enabled,
+    freshness: args.freshness,
+    consistency_state: args.consistency_state,
+  });
+  const qualityRetainedIds = new Set(qualityGateResult.items.map((item) => item.id));
+  const coherenceEligibleIds = new Set(coherenceGateResult.items.map((item) => item.id));
+  const publishedIds = new Set(projected.items.map((item) => item.id));
+
+  const itemRows: OpportunityItemLedgerInsertPayload[] = normalized.map((item) => {
+    const isPublished = publishedIds.has(item.id);
+    let suppressionReason: OpportunityItemLedgerInsertPayload['suppression_reason'] = null;
+    if (!isPublished) {
+      if (!qualityRetainedIds.has(item.id)) {
+        suppressionReason = 'quality_filtered';
+      } else if (!coherenceEligibleIds.has(item.id)) {
+        suppressionReason = 'coherence_failed';
+      } else if (projected.suppressed_data_quality || projected.degraded_reason === 'suppressed_data_quality') {
+        suppressionReason = 'suppressed_data_quality';
+      } else if (projected.degraded_reason === 'coherence_gate_failed') {
+        suppressionReason = 'coherence_failed';
+      } else if (projected.degraded_reason === 'quality_filtered') {
+        suppressionReason = 'quality_filtered';
+      }
+    }
+
+    return {
+      refresh_run_id: args.refresh_run_id,
+      as_of: args.snapshot.as_of,
+      horizon: args.snapshot.horizon,
+      opportunity_id: item.id,
+      theme_id: item.theme_id,
+      theme_name: item.theme_name,
+      direction: item.direction,
+      conviction_score: Math.max(0, Math.min(100, Math.round(toNumber(item.conviction_score, 0)))),
+      published: isPublished ? 1 : 0,
+      suppression_reason: suppressionReason,
+    };
+  });
+
+  return {
+    ledger_row: {
+      refresh_run_id: args.refresh_run_id,
+      as_of: args.snapshot.as_of,
+      horizon: args.snapshot.horizon,
+      candidate_count: projected.total_candidates,
+      published_count: projected.items.length,
+      suppressed_count: projected.suppressed_count,
+      quality_filtered_count: projected.quality_filtered_count,
+      coherence_suppressed_count: projected.coherence_suppressed_count,
+      data_quality_suppressed_count: projected.suppression_by_reason.data_quality_suppressed,
+      degraded_reason: projected.degraded_reason,
+      top_direction_candidate: normalized[0]?.direction ?? null,
+      top_direction_published: projected.items[0]?.direction ?? null,
+    },
+    item_rows: itemRows,
+    projected,
+    normalized_items: normalized,
+  };
+}
+
 function roundMetric(value: number, digits = 4): number {
   if (!Number.isFinite(value)) return 0;
   return Number(value.toFixed(digits));
@@ -6162,6 +6386,31 @@ interface DecisionImpactObservation {
   as_of: string;
   forward_return_pct: number;
   signed_return_pct: number;
+  basis_kind: 'spy_market' | 'theme_proxy' | 'spy_fallback';
+}
+
+interface IndicatorSeriesPoint {
+  date: string;
+  value: number;
+}
+
+function latestDateInSeries(series: IndicatorSeriesPoint[]): string | null {
+  if (series.length <= 0) return null;
+  return series[series.length - 1].date;
+}
+
+function priceOnOrAfterSeries(
+  seriesMap: Map<string, number> | undefined,
+  date: string,
+  toleranceDays = 3,
+): number | null {
+  if (!seriesMap) return null;
+  for (let offset = 0; offset <= toleranceDays; offset += 1) {
+    const candidate = addCalendarDays(date, offset);
+    const price = seriesMap.get(candidate);
+    if (price !== undefined) return price;
+  }
+  return null;
 }
 
 function buildDecisionImpactMarketStats(
@@ -6355,51 +6604,77 @@ async function computeDecisionImpact(
   const startDate = addCalendarDays(effectiveAsOfDate, -(windowDays - 1));
   const horizonDays = args.horizon === '7d' ? 7 : 30;
 
-  const [ledgerRows, spyRows] = await Promise.all([
-    db.prepare(`
-      SELECT as_of, theme_id, theme_name, direction
-      FROM market_opportunity_item_ledger
-      WHERE horizon = ?
-        AND published = 1
-        AND substr(as_of, 1, 10) >= ?
-        AND substr(as_of, 1, 10) <= ?
-      ORDER BY as_of DESC, id DESC
-    `).bind(args.horizon, startDate, effectiveAsOfDate).all<{
-      as_of: string;
-      theme_id: string;
-      theme_name: string;
-      direction: string;
-    }>(),
-    db.prepare(`
-      SELECT date, value
-      FROM indicator_values
-      WHERE indicator_id = 'spy_close'
-      ORDER BY date ASC
-    `).all<{ date: string; value: number }>(),
-  ]);
+  const ledgerRows = await db.prepare(`
+    SELECT as_of, theme_id, theme_name, direction
+    FROM market_opportunity_item_ledger
+    WHERE horizon = ?
+      AND published = 1
+      AND substr(as_of, 1, 10) >= ?
+      AND substr(as_of, 1, 10) <= ?
+    ORDER BY as_of DESC, id DESC
+  `).bind(args.horizon, startDate, effectiveAsOfDate).all<{
+    as_of: string;
+    theme_id: string;
+    theme_name: string;
+    direction: string;
+  }>();
 
-  const spyMap = new Map<string, number>();
-  const spySeries = spyRows.results || [];
-  for (const row of spySeries) {
-    spyMap.set(row.date, row.value);
-  }
-  const latestSpyDate = (() => {
-    if (spySeries.length <= 0) return null;
-    const rawLatest = spySeries[spySeries.length - 1].date;
-    if (rawLatest <= effectiveAsOfDate) return rawLatest;
-    return effectiveAsOfDate;
-  })();
-  const priceOnOrAfter = (date: string, toleranceDays = 3): number | null => {
-    for (let offset = 0; offset <= toleranceDays; offset += 1) {
-      const candidate = addCalendarDays(date, offset);
-      const price = spyMap.get(candidate);
-      if (price !== undefined) return price;
+  const proxyIndicatorIds = new Set<string>(['spy_close']);
+  if (args.scope === 'theme') {
+    for (const row of ledgerRows.results || []) {
+      for (const rule of resolveThemeProxyRules(row.theme_id)) {
+        proxyIndicatorIds.add(rule.indicator_id);
+      }
     }
-    return null;
-  };
+  }
+
+  const indicatorIdList = [...proxyIndicatorIds];
+  const placeholders = indicatorIdList.map(() => '?').join(',');
+  const indicatorRows = await db.prepare(`
+    SELECT indicator_id, date, value
+    FROM indicator_values
+    WHERE indicator_id IN (${placeholders})
+    ORDER BY indicator_id ASC, date ASC
+  `).bind(...indicatorIdList).all<{
+    indicator_id: string;
+    date: string;
+    value: number;
+  }>();
+
+  const seriesByIndicator = new Map<string, IndicatorSeriesPoint[]>();
+  for (const row of indicatorRows.results || []) {
+    const bucket = seriesByIndicator.get(row.indicator_id) || [];
+    bucket.push({ date: row.date, value: row.value });
+    seriesByIndicator.set(row.indicator_id, bucket);
+  }
+  const seriesMapByIndicator = new Map<string, Map<string, number>>();
+  const latestDateByIndicator = new Map<string, string>();
+  for (const [indicatorId, series] of seriesByIndicator.entries()) {
+    const map = new Map<string, number>();
+    for (const point of series) {
+      map.set(point.date, point.value);
+    }
+    seriesMapByIndicator.set(indicatorId, map);
+    const latestDate = latestDateInSeries(series);
+    if (latestDate) {
+      latestDateByIndicator.set(indicatorId, latestDate <= effectiveAsOfDate ? latestDate : effectiveAsOfDate);
+    }
+  }
+
+  const latestReferenceDate = (() => {
+    const spyLatest = latestDateByIndicator.get('spy_close');
+    if (spyLatest) {
+      return spyLatest;
+    }
+    const dates = [...latestDateByIndicator.values()];
+    if (dates.length <= 0) return null;
+    return dates.sort((a, b) => a.localeCompare(b))[dates.length - 1];
+  })();
 
   let maturedItems = 0;
   let eligibleItems = 0;
+  let themeProxyEligibleItems = 0;
+  let spyFallbackItems = 0;
   const observations: DecisionImpactObservation[] = [];
 
   for (const row of ledgerRows.results || []) {
@@ -6411,12 +6686,12 @@ async function computeDecisionImpact(
     const asOfDate = String(row.as_of || '').slice(0, 10);
     if (!parseIsoDate(asOfDate)) continue;
 
-    if (!latestSpyDate) {
+    if (!latestReferenceDate) {
       continue;
     }
 
     const maturityDate = addCalendarDays(asOfDate, horizonDays);
-    if (maturityDate > latestSpyDate) {
+    if (maturityDate > latestReferenceDate) {
       continue;
     }
     maturedItems += 1;
@@ -6425,13 +6700,56 @@ async function computeDecisionImpact(
       continue;
     }
 
-    const spot = priceOnOrAfter(asOfDate, 3);
-    const forward = priceOnOrAfter(maturityDate, 3);
-    if (spot === null || forward === null || spot === 0) {
+    let forwardReturnPct: number | null = null;
+    let basisKind: DecisionImpactObservation['basis_kind'] = 'spy_market';
+
+    if (args.scope === 'theme') {
+      const proxyRules = resolveThemeProxyRules(row.theme_id);
+      let weightedReturn = 0;
+      let totalWeight = 0;
+      for (const rule of proxyRules) {
+        const series = seriesMapByIndicator.get(rule.indicator_id);
+        const spot = priceOnOrAfterSeries(series, asOfDate, 3);
+        const forward = priceOnOrAfterSeries(series, maturityDate, 3);
+        if (spot === null || forward === null || spot === 0) {
+          continue;
+        }
+        const rawReturn = ((forward - spot) / spot) * 100;
+        const orientedReturn = rule.invert ? -rawReturn : rawReturn;
+        const weight = Number.isFinite(rule.weight) && rule.weight > 0 ? rule.weight : 1;
+        weightedReturn += orientedReturn * weight;
+        totalWeight += weight;
+      }
+      if (totalWeight > 0) {
+        forwardReturnPct = weightedReturn / totalWeight;
+        basisKind = 'theme_proxy';
+        themeProxyEligibleItems += 1;
+      } else {
+        const spySeries = seriesMapByIndicator.get('spy_close');
+        const spot = priceOnOrAfterSeries(spySeries, asOfDate, 3);
+        const forward = priceOnOrAfterSeries(spySeries, maturityDate, 3);
+        if (spot === null || forward === null || spot === 0) {
+          continue;
+        }
+        forwardReturnPct = ((forward - spot) / spot) * 100;
+        basisKind = 'spy_fallback';
+        spyFallbackItems += 1;
+      }
+    } else {
+      const spySeries = seriesMapByIndicator.get('spy_close');
+      const spot = priceOnOrAfterSeries(spySeries, asOfDate, 3);
+      const forward = priceOnOrAfterSeries(spySeries, maturityDate, 3);
+      if (spot === null || forward === null || spot === 0) {
+        continue;
+      }
+      forwardReturnPct = ((forward - spot) / spot) * 100;
+      basisKind = 'spy_market';
+    }
+
+    if (forwardReturnPct === null) {
       continue;
     }
 
-    const forwardReturnPct = ((forward - spot) / spot) * 100;
     const signedReturnPct = direction === 'bullish' ? forwardReturnPct : -forwardReturnPct;
     eligibleItems += 1;
     observations.push({
@@ -6440,20 +6758,34 @@ async function computeDecisionImpact(
       as_of: row.as_of,
       forward_return_pct: forwardReturnPct,
       signed_return_pct: signedReturnPct,
+      basis_kind: basisKind,
     });
   }
 
   const coverageRatio = maturedItems > 0 ? (eligibleItems / maturedItems) : 0;
   const insufficientReasons: string[] = [];
-  if (!latestSpyDate) {
+  if (!latestReferenceDate) {
     insufficientReasons.push('missing_spy_close_series');
   }
   if (maturedItems === 0) {
     insufficientReasons.push('no_matured_items');
   } else if (eligibleItems === 0) {
-    insufficientReasons.push('no_eligible_items_with_spy_proxy');
+    insufficientReasons.push(args.scope === 'theme' ? 'no_eligible_items_with_proxy' : 'no_eligible_items_with_spy_proxy');
   } else if (coverageRatio < 0.6) {
-    insufficientReasons.push('low_spy_proxy_coverage');
+    insufficientReasons.push(args.scope === 'theme' ? 'low_proxy_coverage' : 'low_spy_proxy_coverage');
+  }
+  if (args.scope === 'theme' && eligibleItems > 0) {
+    if (themeProxyEligibleItems === 0) {
+      insufficientReasons.push('theme_proxy_unavailable_using_spy_fallback');
+    } else {
+      const themeProxyCoverage = themeProxyEligibleItems / eligibleItems;
+      if (themeProxyCoverage < 0.6) {
+        insufficientReasons.push('low_theme_proxy_coverage');
+      }
+      if (spyFallbackItems > 0) {
+        insufficientReasons.push('partial_theme_proxy_fallback');
+      }
+    }
   }
 
   const marketStats = buildDecisionImpactMarketStats(observations);
@@ -6463,13 +6795,17 @@ async function computeDecisionImpact(
   const asOfOutput = args.as_of
     ? asIsoDateTime(new Date(`${effectiveAsOfDate}T00:00:00.000Z`))
     : asOfNow;
+  const outcomeBasis: DecisionImpactOutcomeBasis =
+    args.scope === 'theme' && themeProxyEligibleItems > 0
+      ? 'theme_proxy_blend'
+      : 'spy_forward_proxy';
 
   return {
     as_of: asOfOutput,
     horizon: args.horizon,
     scope: args.scope,
     window_days: windowDays,
-    outcome_basis: 'spy_forward_proxy',
+    outcome_basis: outcomeBasis,
     market: marketStats,
     themes: themeStats,
     coverage: {
@@ -6477,16 +6813,26 @@ async function computeDecisionImpact(
       eligible_items: eligibleItems,
       coverage_ratio: roundMetric(coverageRatio),
       insufficient_reasons: insufficientReasons,
+      theme_proxy_eligible_items: args.scope === 'theme' ? themeProxyEligibleItems : undefined,
+      spy_fallback_items: args.scope === 'theme' ? spyFallbackItems : undefined,
     },
   };
+}
+
+interface DecisionImpactGovernanceOptions {
+  enforce_enabled: boolean;
+  min_sample_size: number;
+  min_actionable_sessions: number;
 }
 
 function evaluateDecisionImpactObserveMode(
   market7: DecisionImpactMarketStats,
   market30: DecisionImpactMarketStats,
   utilityFunnel: UtilityFunnelSummary,
+  governance: DecisionImpactGovernanceOptions,
 ): DecisionImpactObserveSnapshot {
   const breaches: string[] = [];
+  const enforceBreaches: string[] = [];
 
   if (market7.sample_size <= 0) {
     breaches.push('market_7d_insufficient_samples');
@@ -6496,6 +6842,14 @@ function evaluateDecisionImpactObserveMode(
     }
     if (market7.avg_signed_return_pct <= DECISION_IMPACT_OBSERVE_THRESHOLDS.market_7d_avg_signed_return_min) {
       breaches.push('market_7d_avg_signed_return_breach');
+    }
+  }
+  if (market7.sample_size >= governance.min_sample_size) {
+    if (market7.hit_rate < DECISION_IMPACT_OBSERVE_THRESHOLDS.market_7d_hit_rate_min) {
+      enforceBreaches.push('market_7d_hit_rate_breach');
+    }
+    if (market7.avg_signed_return_pct <= DECISION_IMPACT_OBSERVE_THRESHOLDS.market_7d_avg_signed_return_min) {
+      enforceBreaches.push('market_7d_avg_signed_return_breach');
     }
   }
 
@@ -6509,15 +6863,34 @@ function evaluateDecisionImpactObserveMode(
       breaches.push('market_30d_avg_signed_return_breach');
     }
   }
+  if (market30.sample_size >= governance.min_sample_size) {
+    if (market30.hit_rate < DECISION_IMPACT_OBSERVE_THRESHOLDS.market_30d_hit_rate_min) {
+      enforceBreaches.push('market_30d_hit_rate_breach');
+    }
+    if (market30.avg_signed_return_pct <= DECISION_IMPACT_OBSERVE_THRESHOLDS.market_30d_avg_signed_return_min) {
+      enforceBreaches.push('market_30d_avg_signed_return_breach');
+    }
+  }
 
   if (utilityFunnel.actionable_sessions <= 0) {
     breaches.push('cta_action_insufficient_sessions');
   } else if (utilityFunnel.cta_action_rate_pct < DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min) {
     breaches.push('cta_action_rate_breach');
   }
+  if (utilityFunnel.actionable_sessions >= governance.min_actionable_sessions) {
+    if (utilityFunnel.cta_action_rate_pct < DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min) {
+      enforceBreaches.push('cta_action_rate_breach');
+    }
+  }
+
+  const enforceReady =
+    market7.sample_size >= governance.min_sample_size &&
+    market30.sample_size >= governance.min_sample_size &&
+    utilityFunnel.actionable_sessions >= governance.min_actionable_sessions;
 
   return {
     enabled: true,
+    mode: governance.enforce_enabled ? 'enforce' : 'observe',
     thresholds: {
       market_7d_hit_rate_min: DECISION_IMPACT_OBSERVE_THRESHOLDS.market_7d_hit_rate_min,
       market_30d_hit_rate_min: DECISION_IMPACT_OBSERVE_THRESHOLDS.market_30d_hit_rate_min,
@@ -6525,6 +6898,11 @@ function evaluateDecisionImpactObserveMode(
       market_30d_avg_signed_return_min: DECISION_IMPACT_OBSERVE_THRESHOLDS.market_30d_avg_signed_return_min,
       cta_action_rate_pct_min: DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min,
     },
+    minimum_samples_required: governance.min_sample_size,
+    minimum_actionable_sessions_required: governance.min_actionable_sessions,
+    enforce_ready: enforceReady,
+    enforce_breaches: Array.from(new Set(enforceBreaches)),
+    enforce_breach_count: Array.from(new Set(enforceBreaches)).length,
     breaches: Array.from(new Set(breaches)),
     breach_count: Array.from(new Set(breaches)).length,
   };
@@ -6533,7 +6911,13 @@ function evaluateDecisionImpactObserveMode(
 async function buildDecisionImpactOpsResponse(
   db: D1Database,
   windowDays: 30 | 90,
+  governance?: DecisionImpactGovernanceOptions,
 ): Promise<DecisionImpactOpsResponsePayload> {
+  const appliedGovernance: DecisionImpactGovernanceOptions = governance || {
+    enforce_enabled: false,
+    min_sample_size: DECISION_IMPACT_ENFORCE_MIN_SAMPLE_DEFAULT,
+    min_actionable_sessions: DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS_DEFAULT,
+  };
   const [market7, market30, themes7, utilityFunnel] = await Promise.all([
     computeDecisionImpact(db, {
       horizon: '7d',
@@ -6567,7 +6951,12 @@ async function buildDecisionImpactOpsResponse(
       return a.theme_id.localeCompare(b.theme_id);
     })
     .slice(0, 5);
-  const observeMode = evaluateDecisionImpactObserveMode(market7.market, market30.market, utilityFunnel);
+  const observeMode = evaluateDecisionImpactObserveMode(
+    market7.market,
+    market30.market,
+    utilityFunnel,
+    appliedGovernance,
+  );
 
   return {
     as_of: asIsoDateTime(new Date()),
@@ -6582,6 +6971,7 @@ async function buildDecisionImpactOpsResponse(
     },
     utility_attribution: {
       actionable_views: utilityFunnel.decision_actionable_views,
+      actionable_sessions: utilityFunnel.actionable_sessions,
       cta_action_clicks: utilityFunnel.cta_action_clicks,
       cta_action_rate_pct: utilityFunnel.cta_action_rate_pct,
       no_action_unlock_views: utilityFunnel.no_action_unlock_views,
@@ -9683,9 +10073,10 @@ export default {
           }, { status: 400, headers: corsHeaders });
         }
         const windowDays = windowRaw as 30 | 90;
+        const decisionImpactGovernance = resolveDecisionImpactGovernance(env);
 
         try {
-          const payload = await buildDecisionImpactOpsResponse(env.DB, windowDays);
+          const payload = await buildDecisionImpactOpsResponse(env.DB, windowDays, decisionImpactGovernance);
           return Response.json(payload, {
             headers: {
               ...corsHeaders,
@@ -10354,6 +10745,7 @@ export default {
           'ENABLE_DECISION_IMPACT',
           true,
         );
+        const decisionImpactGovernance = resolveDecisionImpactGovernance(env);
         const triggerHeader = request.headers.get('X-Refresh-Trigger');
         const refreshTrigger = triggerHeader && triggerHeader.trim().length > 0
           ? triggerHeader.trim().slice(0, 128)
@@ -10483,67 +10875,19 @@ export default {
           ];
           for (const target of projectionTargets) {
             if (!target.snapshot) continue;
-            const normalized = normalizeOpportunityItemsForPublishing(target.snapshot.items, target.calibration);
-            const qualityGateResult = removeLowInformationOpportunities(normalized);
-            const coherenceGateResult = applyOpportunityCoherenceGate(
-              qualityGateResult.items,
-              coherenceGateEnabled,
-            );
-            const projected = projectOpportunityFeed(normalized, {
+            const ledgerBuild = buildOpportunityLedgerProjection({
+              refresh_run_id: refreshRunId,
+              snapshot: target.snapshot,
+              calibration: target.calibration,
               coherence_gate_enabled: coherenceGateEnabled,
               freshness: freshnessForRun,
               consistency_state: consistencyStateForRun,
             });
-            const qualityRetainedIds = new Set(qualityGateResult.items.map((item) => item.id));
-            const coherenceEligibleIds = new Set(coherenceGateResult.items.map((item) => item.id));
-            const publishedIds = new Set(projected.items.map((item) => item.id));
-            qualityFilteredCount += projected.quality_filtered_count;
-            coherenceSuppressedCount += projected.coherence_suppressed_count;
-            suppressedDataQualityCount += projected.suppression_by_reason.data_quality_suppressed;
-            ledgerRows.push({
-              refresh_run_id: refreshRunId,
-              as_of: target.snapshot.as_of,
-              horizon: target.snapshot.horizon,
-              candidate_count: projected.total_candidates,
-              published_count: projected.items.length,
-              suppressed_count: projected.suppressed_count,
-              quality_filtered_count: projected.quality_filtered_count,
-              coherence_suppressed_count: projected.coherence_suppressed_count,
-              data_quality_suppressed_count: projected.suppression_by_reason.data_quality_suppressed,
-              degraded_reason: projected.degraded_reason,
-              top_direction_candidate: normalized[0]?.direction ?? null,
-              top_direction_published: projected.items[0]?.direction ?? null,
-            });
-            for (const item of normalized) {
-              const isPublished = publishedIds.has(item.id);
-              let suppressionReason: OpportunityItemLedgerInsertPayload['suppression_reason'] = null;
-              if (!isPublished) {
-                if (!qualityRetainedIds.has(item.id)) {
-                  suppressionReason = 'quality_filtered';
-                } else if (!coherenceEligibleIds.has(item.id)) {
-                  suppressionReason = 'coherence_failed';
-                } else if (projected.suppressed_data_quality || projected.degraded_reason === 'suppressed_data_quality') {
-                  suppressionReason = 'suppressed_data_quality';
-                } else if (projected.degraded_reason === 'coherence_gate_failed') {
-                  suppressionReason = 'coherence_failed';
-                } else if (projected.degraded_reason === 'quality_filtered') {
-                  suppressionReason = 'quality_filtered';
-                }
-              }
-
-              itemLedgerRows.push({
-                refresh_run_id: refreshRunId,
-                as_of: target.snapshot.as_of,
-                horizon: target.snapshot.horizon,
-                opportunity_id: item.id,
-                theme_id: item.theme_id,
-                theme_name: item.theme_name,
-                direction: item.direction,
-                conviction_score: Math.max(0, Math.min(100, Math.round(toNumber(item.conviction_score, 0)))),
-                published: isPublished ? 1 : 0,
-                suppression_reason: suppressionReason,
-              });
-            }
+            qualityFilteredCount += ledgerBuild.projected.quality_filtered_count;
+            coherenceSuppressedCount += ledgerBuild.projected.coherence_suppressed_count;
+            suppressedDataQualityCount += ledgerBuild.projected.suppression_by_reason.data_quality_suppressed;
+            ledgerRows.push(ledgerBuild.ledger_row);
+            itemLedgerRows.push(...ledgerBuild.item_rows);
           }
           for (const row of ledgerRows) {
             try {
@@ -10594,11 +10938,19 @@ export default {
             market_7d_sample_size: number;
             market_30d_hit_rate: number;
             market_30d_sample_size: number;
+            actionable_sessions: number;
             cta_action_rate_pct: number;
+            governance_mode: 'observe' | 'enforce';
+            enforce_ready: boolean;
+            enforce_breach_count: number;
+            enforce_breaches: string[];
+            minimum_samples_required: number;
+            minimum_actionable_sessions_required: number;
             observe_breach_count: number;
             observe_breaches: string[];
           } | null = null;
           let decisionImpactGenerationError: string | null = null;
+          let decisionImpactEnforcementError: string | null = null;
           if (decisionImpactEnabled) {
             try {
               const asOfFallback = brief?.as_of || opportunities7d?.as_of || opportunities30d?.as_of || asIsoDateTime(new Date());
@@ -10622,20 +10974,37 @@ export default {
                 }
               }
 
-              const opsDecisionImpact = await buildDecisionImpactOpsResponse(env.DB, 30);
+              const opsDecisionImpact = await buildDecisionImpactOpsResponse(env.DB, 30, decisionImpactGovernance);
               decisionImpactSummary = {
                 market_7d_hit_rate: opsDecisionImpact.market_7d.hit_rate,
                 market_7d_sample_size: opsDecisionImpact.market_7d.sample_size,
                 market_30d_hit_rate: opsDecisionImpact.market_30d.hit_rate,
                 market_30d_sample_size: opsDecisionImpact.market_30d.sample_size,
+                actionable_sessions: opsDecisionImpact.utility_attribution.actionable_sessions,
                 cta_action_rate_pct: opsDecisionImpact.utility_attribution.cta_action_rate_pct,
+                governance_mode: opsDecisionImpact.observe_mode.mode,
+                enforce_ready: opsDecisionImpact.observe_mode.enforce_ready,
+                enforce_breach_count: opsDecisionImpact.observe_mode.enforce_breach_count,
+                enforce_breaches: opsDecisionImpact.observe_mode.enforce_breaches,
+                minimum_samples_required: opsDecisionImpact.observe_mode.minimum_samples_required,
+                minimum_actionable_sessions_required: opsDecisionImpact.observe_mode.minimum_actionable_sessions_required,
                 observe_breach_count: opsDecisionImpact.observe_mode.breach_count,
                 observe_breaches: opsDecisionImpact.observe_mode.breaches,
               };
+              if (
+                decisionImpactGovernance.enforce_enabled &&
+                opsDecisionImpact.observe_mode.enforce_ready &&
+                opsDecisionImpact.observe_mode.enforce_breach_count > 0
+              ) {
+                decisionImpactEnforcementError = `decision_impact_enforcement_failed:${opsDecisionImpact.observe_mode.enforce_breaches.join(',')}`;
+              }
             } catch (err) {
               decisionImpactGenerationError = err instanceof Error ? err.message : String(err);
               console.error('Decision impact snapshot generation failed:', err);
             }
+          }
+          if (decisionImpactEnforcementError) {
+            throw new Error(decisionImpactEnforcementError);
           }
 
           let decisionGradeSnapshot: {
@@ -10772,6 +11141,7 @@ export default {
           overwrite?: boolean;
           dry_run?: boolean;
           recalibrate?: boolean;
+          rebuild_ledgers?: boolean;
         } = {};
         try {
           body = await request.json() as {
@@ -10781,6 +11151,7 @@ export default {
             overwrite?: boolean;
             dry_run?: boolean;
             recalibrate?: boolean;
+            rebuild_ledgers?: boolean;
           };
         } catch {
           body = {};
@@ -10802,6 +11173,7 @@ export default {
         const overwrite = body.overwrite === true;
         const dryRun = body.dry_run === true;
         const recalibrate = body.recalibrate !== false;
+        const rebuildLedgers = body.rebuild_ledgers !== false;
 
         const dateRows = await env.DB.prepare(`
           SELECT p.date as date, COUNT(c.category) as category_count
@@ -10882,6 +11254,23 @@ export default {
         let convictionCalibration7d: MarketCalibrationSnapshotPayload | null = null;
         let convictionCalibration30d: MarketCalibrationSnapshotPayload | null = null;
         let edgeCalibration: MarketCalibrationSnapshotPayload | null = null;
+        let ledgerRowsGenerated = 0;
+        let itemLedgerRowsGenerated = 0;
+        let decisionImpactSnapshotsGenerated = 0;
+        let decisionImpactSummary: {
+          market_7d_hit_rate: number;
+          market_7d_sample_size: number;
+          market_30d_hit_rate: number;
+          market_30d_sample_size: number;
+          actionable_sessions: number;
+          cta_action_rate_pct: number;
+          governance_mode: 'observe' | 'enforce';
+          enforce_ready: boolean;
+          enforce_breach_count: number;
+          enforce_breaches: string[];
+          observe_breach_count: number;
+          observe_breaches: string[];
+        } | null = null;
         if (!dryRun && recalibrate) {
           try {
             convictionCalibration7d = await buildConvictionCalibrationSnapshot(env.DB, '7d');
@@ -10921,6 +11310,106 @@ export default {
           }
         }
 
+        if (!dryRun && rebuildLedgers) {
+          const snapshotLimit = Math.max(
+            1,
+            Math.min(MAX_BACKFILL_LIMIT * 2, candidateDates.length * 2 + 10),
+          );
+          const snapshotRows = await env.DB.prepare(`
+            SELECT as_of, horizon, payload_json
+            FROM opportunity_snapshots
+            WHERE substr(as_of, 1, 10) >= ?
+              AND substr(as_of, 1, 10) <= ?
+              AND horizon IN ('7d', '30d')
+            ORDER BY as_of ASC, horizon ASC
+            LIMIT ?
+          `).bind(startDate, endDate, snapshotLimit).all<{
+            as_of: string;
+            horizon: '7d' | '30d';
+            payload_json: string;
+          }>();
+
+          for (const row of snapshotRows.results || []) {
+            let snapshot: OpportunitySnapshot | null = null;
+            try {
+              snapshot = JSON.parse(row.payload_json) as OpportunitySnapshot;
+            } catch {
+              snapshot = null;
+            }
+            if (!snapshot || !Array.isArray(snapshot.items)) {
+              continue;
+            }
+
+            try {
+              const calibration = row.horizon === '7d' ? convictionCalibration7d : convictionCalibration30d;
+              const ledgerBuild = buildOpportunityLedgerProjection({
+                refresh_run_id: null,
+                snapshot,
+                calibration,
+                coherence_gate_enabled: true,
+                freshness: {
+                  has_stale_data: false,
+                  stale_count: 0,
+                  critical_stale_count: 0,
+                },
+                consistency_state: 'PASS',
+              });
+
+              await insertOpportunityLedgerRow(env.DB, ledgerBuild.ledger_row);
+              ledgerRowsGenerated += 1;
+
+              for (const itemRow of ledgerBuild.item_rows) {
+                await insertOpportunityItemLedgerRow(env.DB, itemRow);
+                itemLedgerRowsGenerated += 1;
+              }
+            } catch (err) {
+              const errorMessage = err instanceof Error ? err.message : String(err);
+              failedDates.push({
+                date: row.as_of.slice(0, 10),
+                error: `ledger:${errorMessage.slice(0, 260)}`,
+              });
+            }
+          }
+
+          const asOfForImpact = `${endDate}T00:00:00.000Z`;
+          try {
+            for (const horizon of ['7d', '30d'] as const) {
+              for (const scope of ['market', 'theme'] as const) {
+                for (const windowDays of [30, 90] as const) {
+                  const snapshot = await computeDecisionImpact(env.DB, {
+                    horizon,
+                    scope,
+                    window_days: windowDays,
+                    limit: scope === 'theme' ? 50 : 10,
+                    as_of: asOfForImpact,
+                  });
+                  await storeDecisionImpactSnapshot(env.DB, snapshot);
+                  decisionImpactSnapshotsGenerated += 1;
+                }
+              }
+            }
+
+            const governance = resolveDecisionImpactGovernance(env);
+            const opsDecisionImpact = await buildDecisionImpactOpsResponse(env.DB, 30, governance);
+            decisionImpactSummary = {
+              market_7d_hit_rate: opsDecisionImpact.market_7d.hit_rate,
+              market_7d_sample_size: opsDecisionImpact.market_7d.sample_size,
+              market_30d_hit_rate: opsDecisionImpact.market_30d.hit_rate,
+              market_30d_sample_size: opsDecisionImpact.market_30d.sample_size,
+              actionable_sessions: opsDecisionImpact.utility_attribution.actionable_sessions,
+              cta_action_rate_pct: opsDecisionImpact.utility_attribution.cta_action_rate_pct,
+              governance_mode: opsDecisionImpact.observe_mode.mode,
+              enforce_ready: opsDecisionImpact.observe_mode.enforce_ready,
+              enforce_breach_count: opsDecisionImpact.observe_mode.enforce_breach_count,
+              enforce_breaches: opsDecisionImpact.observe_mode.enforce_breaches,
+              observe_breach_count: opsDecisionImpact.observe_mode.breach_count,
+              observe_breaches: opsDecisionImpact.observe_mode.breaches,
+            };
+          } catch (err) {
+            console.error('Backfill decision-impact snapshot regeneration failed:', err);
+          }
+        }
+
         return Response.json({
           ok: true,
           dry_run: dryRun,
@@ -10930,12 +11419,17 @@ export default {
             limit,
             overwrite,
             recalibrate,
+            rebuild_ledgers: rebuildLedgers,
           },
           scanned_dates: candidateDates.length,
           processed_dates: processedDates,
           skipped_dates: skippedDates,
           seeded_snapshots: seededSnapshots,
           calibrations_generated: calibrationsGenerated,
+          opportunity_ledger_rows_generated: ledgerRowsGenerated,
+          opportunity_item_ledger_rows_generated: itemLedgerRowsGenerated,
+          decision_impact_snapshots_generated: decisionImpactSnapshotsGenerated,
+          decision_impact: decisionImpactSummary,
           calibration_samples: {
             edge_total_samples: edgeCalibration?.total_samples ?? null,
             conviction_7d_total_samples: convictionCalibration7d?.total_samples ?? null,
