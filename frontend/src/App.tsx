@@ -10,6 +10,7 @@ type UtilityEventType =
   | 'decision_watch_view'
   | 'decision_no_action_view'
   | 'no_action_unlock_view'
+  | 'cta_action_click'
 
 interface RouteMeta {
   title: string
@@ -574,6 +575,77 @@ interface OpportunitiesResponse {
   ttl_state?: 'fresh' | 'stale' | 'overdue' | 'unknown'
   next_expected_refresh_at?: string | null
   overdue_seconds?: number | null
+}
+
+interface DecisionImpactMarketStats {
+  sample_size: number
+  hit_rate: number
+  avg_forward_return_pct: number
+  avg_signed_return_pct: number
+  win_rate: number
+  downside_p10_pct: number
+  max_loss_pct: number
+  quality_band: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+}
+
+interface DecisionImpactThemeStats {
+  theme_id: string
+  theme_name: string
+  sample_size: number
+  hit_rate: number
+  avg_signed_return_pct: number
+  avg_forward_return_pct: number
+  win_rate: number
+  quality_band: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'
+  last_as_of: string
+}
+
+interface DecisionImpactResponse {
+  as_of: string
+  horizon: '7d' | '30d'
+  scope: 'market' | 'theme'
+  window_days: 30 | 90
+  outcome_basis: 'spy_forward_proxy'
+  market: DecisionImpactMarketStats
+  themes: DecisionImpactThemeStats[]
+  coverage: {
+    matured_items: number
+    eligible_items: number
+    coverage_ratio: number
+    insufficient_reasons: string[]
+  }
+}
+
+interface OpsDecisionImpactResponse {
+  as_of: string
+  window_days: 30 | 90
+  market_7d: DecisionImpactMarketStats
+  market_30d: DecisionImpactMarketStats
+  theme_summary: {
+    themes_with_samples: number
+    themes_robust: number
+    top_positive: DecisionImpactThemeStats[]
+    top_negative: DecisionImpactThemeStats[]
+  }
+  utility_attribution: {
+    actionable_views: number
+    cta_action_clicks: number
+    cta_action_rate_pct: number
+    no_action_unlock_views: number
+    decision_events_total: number
+  }
+  observe_mode: {
+    enabled: boolean
+    thresholds: {
+      market_7d_hit_rate_min: number
+      market_30d_hit_rate_min: number
+      market_7d_avg_signed_return_min: number
+      market_30d_avg_signed_return_min: number
+      cta_action_rate_pct_min: number
+    }
+    breaches: string[]
+    breach_count: number
+  }
 }
 
 interface CalibrationDiagnosticsResponse {
@@ -3132,7 +3204,15 @@ function OpportunityPreview({ data, onOpen }: { data: OpportunitiesResponse | nu
   )
 }
 
-function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => void }) {
+function BriefPage({
+  brief,
+  decisionImpact,
+  onBack,
+}: {
+  brief: BriefData | null
+  decisionImpact: DecisionImpactResponse | null
+  onBack: () => void
+}) {
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
       <div className="max-w-4xl mx-auto">
@@ -3189,6 +3269,37 @@ function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => v
               )}
             </div>
 
+            {decisionImpact && (
+              <div className="impact-card p-4 border rounded-lg">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">Market impact (SPY proxy)</div>
+                  <span className={`impact-quality-chip rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${calibrationQualityClass(decisionImpact.market.quality_band)}`}>
+                    {decisionImpact.market.quality_band.toLowerCase()}
+                  </span>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
+                  <div className="impact-row">
+                    <span className="text-[#949ba5]">hit rate</span>
+                    <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.market.hit_rate)}</span>
+                  </div>
+                  <div className="impact-row">
+                    <span className="text-[#949ba5]">avg signed</span>
+                    <span className={`font-mono ${decisionImpact.market.avg_signed_return_pct >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
+                      {formatMaybePercent(decisionImpact.market.avg_signed_return_pct)}
+                    </span>
+                  </div>
+                  <div className="impact-row">
+                    <span className="text-[#949ba5]">sample size</span>
+                    <span className="font-mono text-[#d7dbe1]">{decisionImpact.market.sample_size}</span>
+                  </div>
+                  <div className="impact-row">
+                    <span className="text-[#949ba5]">coverage</span>
+                    <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.coverage.coverage_ratio)}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg">
                 <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-3">Category Movers</div>
@@ -3235,17 +3346,27 @@ function BriefPage({ brief, onBack }: { brief: BriefData | null; onBack: () => v
 
 function OpportunitiesPage({
   data,
+  decisionImpact,
+  opsDecisionImpact,
   diagnostics,
   edgeDiagnostics,
   horizon,
   onHorizonChange,
+  onLogActionIntent,
   onBack,
 }: {
   data: OpportunitiesResponse | null
+  decisionImpact: DecisionImpactResponse | null
+  opsDecisionImpact: OpsDecisionImpactResponse | null
   diagnostics: CalibrationDiagnosticsResponse | null
   edgeDiagnostics: EdgeDiagnosticsResponse | null
   horizon: '7d' | '30d'
   onHorizonChange: (h: '7d' | '30d') => void
+  onLogActionIntent: (args: {
+    asOf: string
+    horizon: '7d' | '30d'
+    actionabilityState: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION'
+  }) => void
   onBack: () => void
 }) {
   const suppressedCount = Math.max(0, data?.suppressed_count || 0)
@@ -3279,6 +3400,9 @@ function OpportunitiesPage({
   const hasQualityFilter = degradedReason === 'quality_filtered'
   const hasRefreshTtlSuppression = degradedReason === 'refresh_ttl_overdue' || degradedReason === 'refresh_ttl_unknown'
   const edgeWindow = edgeDiagnostics?.windows.find((window) => window.horizon === horizon) || edgeDiagnostics?.windows[0] || null
+  const [ctaLoggedKey, setCtaLoggedKey] = useState<string | null>(null)
+  const currentCtaKey = data ? `${data.as_of}:${horizon}` : null
+  const ctaLogged = currentCtaKey !== null && ctaLoggedKey === currentCtaKey
 
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-10">
@@ -3365,6 +3489,60 @@ function OpportunitiesPage({
           </div>
         )}
 
+        {decisionImpact && (
+          <div className="impact-card mb-4 p-4 border rounded-lg">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">
+                What happened after similar setups (SPY proxy)
+              </div>
+              <span className={`impact-quality-chip rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${calibrationQualityClass(decisionImpact.market.quality_band)}`}>
+                market {decisionImpact.market.quality_band.toLowerCase()}
+              </span>
+            </div>
+            <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px]">
+              <div className="impact-row">
+                <span className="text-[#949ba5]">hit rate</span>
+                <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.market.hit_rate)}</span>
+              </div>
+              <div className="impact-row">
+                <span className="text-[#949ba5]">avg signed</span>
+                <span className={`font-mono ${decisionImpact.market.avg_signed_return_pct >= 0 ? 'text-[#00c896]' : 'text-[#ff6b6b]'}`}>
+                  {formatMaybePercent(decisionImpact.market.avg_signed_return_pct)}
+                </span>
+              </div>
+              <div className="impact-row">
+                <span className="text-[#949ba5]">sample</span>
+                <span className="font-mono text-[#d7dbe1]">{decisionImpact.market.sample_size}</span>
+              </div>
+              <div className="impact-row">
+                <span className="text-[#949ba5]">coverage</span>
+                <span className="font-mono text-[#d7dbe1]">{formatProbability(decisionImpact.coverage.coverage_ratio)}</span>
+              </div>
+            </div>
+            {decisionImpact.themes.length > 0 && (
+              <div className="mt-3">
+                <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/55">Top themes</div>
+                <div className="mt-2 space-y-1.5">
+                  {decisionImpact.themes.slice(0, 5).map((theme) => (
+                    <div key={theme.theme_id} className="impact-row text-[10px]">
+                      <span className="text-[#cfd5de]">{theme.theme_name}</span>
+                      <span className="font-mono text-[#949ba5]">
+                        hit {formatProbability(theme.hit_rate)} · signed {formatMaybePercent(theme.avg_signed_return_pct)} · n={theme.sample_size}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {opsDecisionImpact && (
+          <div className="mb-4 text-[10px] text-[#949ba5]/80">
+            observe mode: {opsDecisionImpact.observe_mode.breach_count} breaches ·
+            {' '}cta action rate {opsDecisionImpact.utility_attribution.cta_action_rate_pct.toFixed(2)}%
+          </div>
+        )}
+
         {degradedReason && (
           <div className={`mb-4 text-[10px] ${hasDataQualitySuppression || hasContractGateSuppression ? 'text-[#f59e0b]' : 'text-[#949ba5]'}`}>
             {formatOpportunityDegradedReason(degradedReason)}
@@ -3417,6 +3595,26 @@ function OpportunitiesPage({
                 <p key={line} className="text-[10px] text-[#f3e3c2]">- {line}</p>
               ))}
             </div>
+          </div>
+        )}
+        {ctaEnabled && actionabilityState !== 'NO_ACTION' && data && (
+          <div className="mb-4 flex flex-wrap items-center gap-3 rounded border border-[#1f3e56] bg-[#081521]/70 px-3 py-2">
+            <button
+              onClick={() => {
+                onLogActionIntent({
+                  asOf: data.as_of,
+                  horizon,
+                  actionabilityState,
+                })
+                setCtaLoggedKey(currentCtaKey)
+              }}
+              className="px-3 py-1.5 border border-[#00a3ff] text-[#00a3ff] rounded text-[10px] uppercase tracking-[0.18em] hover:text-[#7ccfff] hover:border-[#7ccfff]"
+            >
+              Log Action Intent
+            </button>
+            <span className="text-[10px] text-[#9ec5e2]">
+              {ctaLogged ? 'Action intent logged for this session/horizon.' : 'Use this when you act on the current opportunity setup.'}
+            </span>
           </div>
         )}
 
@@ -4454,7 +4652,10 @@ function App() {
   const [backtestData, setBacktestData] = useState<BacktestData | null>(null)  // v1.6: Backtest performance
   const [planData, setPlanData] = useState<PlanData | null>(null)
   const [briefData, setBriefData] = useState<BriefData | null>(null)
+  const [briefDecisionImpact, setBriefDecisionImpact] = useState<DecisionImpactResponse | null>(null)
   const [opportunitiesData, setOpportunitiesData] = useState<OpportunitiesResponse | null>(null)
+  const [opportunitiesDecisionImpact, setOpportunitiesDecisionImpact] = useState<DecisionImpactResponse | null>(null)
+  const [opsDecisionImpact, setOpsDecisionImpact] = useState<OpsDecisionImpactResponse | null>(null)
   const [opportunityDiagnostics, setOpportunityDiagnostics] = useState<CalibrationDiagnosticsResponse | null>(null)
   const [edgeDiagnostics, setEdgeDiagnostics] = useState<EdgeDiagnosticsResponse | null>(null)
   const [opportunityHorizon, setOpportunityHorizon] = useState<'7d' | '30d'>('7d')
@@ -4501,6 +4702,27 @@ function App() {
       }
     })
   }, [route])
+
+  const handleOpportunityCtaIntent = useCallback((args: {
+    asOf: string
+    horizon: '7d' | '30d'
+    actionabilityState: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION'
+  }) => {
+    const dedupeKey = `cta_action_click:${utilitySessionIdRef.current}:${args.asOf}:${args.horizon}`
+    trackUtilityEvent('cta_action_click', {
+      route: '/opportunities',
+      actionabilityState: args.actionabilityState,
+      metadata: {
+        as_of: args.asOf,
+        horizon: args.horizon,
+        route: '/opportunities',
+        actionability_state: args.actionabilityState,
+        scope: 'market_theme',
+        source: 'opportunities',
+      },
+      dedupeKey,
+    })
+  }, [trackUtilityEvent])
 
   const navigateTo = (nextRoute: AppRoute) => {
     const path = normalizeRoute(nextRoute)
@@ -4714,7 +4936,7 @@ function App() {
           setLoading(true)
         }
 
-        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, oppRes, oppDiagRes, edgeDiagRes, inboxRes] = await Promise.all([
+        const [pxiRes, signalRes, planRes, predRes, ensembleRes, accuracyRes, historyRes, alertsRes, briefRes, briefImpactRes, oppRes, oppImpactRes, oppOpsImpactRes, oppDiagRes, edgeDiagRes, inboxRes] = await Promise.all([
           fetchPlan.pxi ? fetchApi('/api/pxi') : Promise.resolve(null),
           fetchPlan.signal ? fetchApi('/api/signal').catch(() => null) : Promise.resolve(null),
           fetchPlan.plan ? fetchApi('/api/plan').catch(() => null) : Promise.resolve(null),
@@ -4724,7 +4946,10 @@ function App() {
           fetchPlan.history ? fetchApi('/api/history?days=90').catch(() => null) : Promise.resolve(null),
           fetchPlan.alertsHistory ? fetchApi('/api/alerts?limit=50').catch(() => null) : Promise.resolve(null),
           fetchPlan.brief ? fetchApi('/api/brief?scope=market').catch(() => null) : Promise.resolve(null),
+          fetchPlan.brief ? fetchApi('/api/decision-impact?horizon=7d&scope=market&window=30').catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/opportunities?horizon=${opportunityHorizon}&limit=20`).catch(() => null) : Promise.resolve(null),
+          fetchPlan.opportunities ? fetchApi(`/api/decision-impact?horizon=${opportunityHorizon}&scope=theme&window=30&limit=10`).catch(() => null) : Promise.resolve(null),
+          fetchPlan.opportunities ? fetchApi('/api/ops/decision-impact?window=30').catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/diagnostics/calibration?metric=conviction&horizon=${opportunityHorizon}`).catch(() => null) : Promise.resolve(null),
           fetchPlan.opportunities ? fetchApi(`/api/diagnostics/edge?horizon=${opportunityHorizon}`).catch(() => null) : Promise.resolve(null),
           fetchPlan.inbox ? fetchApi('/api/alerts/feed?limit=50').catch(() => null) : Promise.resolve(null),
@@ -4874,6 +5099,14 @@ function App() {
             })
           }
         }
+        if (briefImpactRes?.ok) {
+          const impactJson = await briefImpactRes.json() as DecisionImpactResponse
+          if (impactJson?.market && impactJson.scope === 'market') {
+            setBriefDecisionImpact(impactJson)
+          }
+        } else if (fetchPlan.brief) {
+          setBriefDecisionImpact(null)
+        }
 
         if (oppRes?.ok) {
           const oppJson = await oppRes.json() as OpportunitiesResponse
@@ -4905,6 +5138,22 @@ function App() {
               overdue_seconds: overdueSeconds,
             })
           }
+        }
+        if (oppImpactRes?.ok) {
+          const impactJson = await oppImpactRes.json() as DecisionImpactResponse
+          if (impactJson?.market && impactJson.scope === 'theme') {
+            setOpportunitiesDecisionImpact(impactJson)
+          }
+        } else if (fetchPlan.opportunities) {
+          setOpportunitiesDecisionImpact(null)
+        }
+        if (oppOpsImpactRes?.ok) {
+          const opsImpactJson = await oppOpsImpactRes.json() as OpsDecisionImpactResponse
+          if (opsImpactJson?.observe_mode && opsImpactJson?.utility_attribution) {
+            setOpsDecisionImpact(opsImpactJson)
+          }
+        } else if (fetchPlan.opportunities) {
+          setOpsDecisionImpact(null)
         }
 
         if (oppDiagRes?.ok) {
@@ -5033,17 +5282,20 @@ function App() {
   }
 
   if (route === '/brief') {
-    return <BriefPage brief={briefData} onBack={() => navigateTo('/')} />
+    return <BriefPage brief={briefData} decisionImpact={briefDecisionImpact} onBack={() => navigateTo('/')} />
   }
 
   if (route === '/opportunities') {
     return (
       <OpportunitiesPage
         data={opportunitiesData}
+        decisionImpact={opportunitiesDecisionImpact}
+        opsDecisionImpact={opsDecisionImpact}
         diagnostics={opportunityDiagnostics}
         edgeDiagnostics={edgeDiagnostics}
         horizon={opportunityHorizon}
         onHorizonChange={setOpportunityHorizon}
+        onLogActionIntent={handleOpportunityCtaIntent}
         onBack={() => navigateTo('/')}
       />
     )

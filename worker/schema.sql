@@ -314,6 +314,39 @@ CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_created ON market_oppor
 CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_as_of ON market_opportunity_ledger(as_of DESC, horizon);
 CREATE INDEX IF NOT EXISTS idx_market_opportunity_ledger_run ON market_opportunity_ledger(refresh_run_id, horizon);
 
+CREATE TABLE IF NOT EXISTS market_opportunity_item_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    refresh_run_id INTEGER,
+    as_of TEXT NOT NULL,
+    horizon TEXT NOT NULL CHECK(horizon IN ('7d', '30d')),
+    opportunity_id TEXT NOT NULL,
+    theme_id TEXT NOT NULL,
+    theme_name TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK(direction IN ('bullish', 'bearish', 'neutral')),
+    conviction_score INTEGER NOT NULL,
+    published INTEGER NOT NULL,
+    suppression_reason TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(as_of, horizon, opportunity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_opp_item_ledger_asof_horizon ON market_opportunity_item_ledger(as_of DESC, horizon);
+CREATE INDEX IF NOT EXISTS idx_market_opp_item_ledger_theme_horizon_asof ON market_opportunity_item_ledger(theme_id, horizon, as_of DESC);
+CREATE INDEX IF NOT EXISTS idx_market_opp_item_ledger_published_created ON market_opportunity_item_ledger(published, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS market_decision_impact_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of TEXT NOT NULL,
+    horizon TEXT NOT NULL CHECK(horizon IN ('7d', '30d')),
+    scope TEXT NOT NULL CHECK(scope IN ('market', 'theme')),
+    window_days INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(as_of, horizon, scope, window_days)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_decision_impact_lookup ON market_decision_impact_snapshots(scope, horizon, window_days, as_of DESC);
+
 CREATE TABLE IF NOT EXISTS market_calibration_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     as_of TEXT NOT NULL,

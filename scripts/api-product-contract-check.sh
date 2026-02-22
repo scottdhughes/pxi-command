@@ -6,8 +6,10 @@ EDGE_DIAGNOSTICS_REQUIRED="${EDGE_DIAGNOSTICS_REQUIRED:-0}"
 OPPORTUNITY_TTL_GRACE_SECONDS="${OPPORTUNITY_TTL_GRACE_SECONDS:-5400}"
 UTILITY_FUNNEL_REQUIRED="${UTILITY_FUNNEL_REQUIRED:-0}"
 DECISION_GRADE_REQUIRED="${DECISION_GRADE_REQUIRED:-0}"
+DECISION_IMPACT_REQUIRED="${DECISION_IMPACT_REQUIRED:-0}"
 UTILITY_FUNNEL_LIVE=0
 DECISION_GRADE_LIVE=0
+DECISION_IMPACT_LIVE=0
 
 TMP_HEADERS="$(mktemp)"
 TMP_BODY="$(mktemp)"
@@ -97,6 +99,27 @@ decision_grade_available() {
   fi
 
   echo "Unexpected status for /api/ops/decision-grade: $code"
+  cat "$TMP_BODY" || true
+  exit 1
+}
+
+decision_impact_available() {
+  local code
+  code=$(curl -sS -o "$TMP_BODY" -w "%{http_code}" --max-time 20 "$API_URL/api/decision-impact?horizon=7d&scope=market&window=30")
+  if [[ "$code" == "200" ]]; then
+    return 0
+  fi
+
+  if [[ "$code" == "404" ]]; then
+    if [[ "$DECISION_IMPACT_REQUIRED" == "1" ]]; then
+      echo "Decision-impact endpoint is required but returned 404"
+      exit 1
+    fi
+    echo "Skipping decision-impact checks: /api/decision-impact is not live yet."
+    return 1
+  fi
+
+  echo "Unexpected status for /api/decision-impact: $code"
   cat "$TMP_BODY" || true
   exit 1
 }
@@ -718,6 +741,9 @@ check_utility_funnel_semantics() {
   local no_action_views
   local unlock_views
   local unlock_coverage
+  local cta_clicks
+  local actionable_sessions
+  local cta_action_rate
 
   utility_json=$(curl -sS --max-time 20 "$API_URL/api/ops/utility-funnel?window=7")
 
@@ -726,8 +752,11 @@ check_utility_funnel_semantics() {
   no_action_views=$(echo "$utility_json" | jq -r '.funnel.decision_no_action_views // -1')
   unlock_views=$(echo "$utility_json" | jq -r '.funnel.no_action_unlock_views // -1')
   unlock_coverage=$(echo "$utility_json" | jq -r '.funnel.no_action_unlock_coverage_pct // -1')
+  cta_clicks=$(echo "$utility_json" | jq -r '.funnel.cta_action_clicks // -1')
+  actionable_sessions=$(echo "$utility_json" | jq -r '.funnel.actionable_sessions // -1')
+  cta_action_rate=$(echo "$utility_json" | jq -r '.funnel.cta_action_rate_pct // -1')
 
-  if ! awk "BEGIN { exit !($sessions >= 0 && $decision_total >= 0 && $no_action_views >= 0 && $unlock_views >= 0) }"; then
+  if ! awk "BEGIN { exit !($sessions >= 0 && $decision_total >= 0 && $no_action_views >= 0 && $unlock_views >= 0 && $cta_clicks >= 0 && $actionable_sessions >= 0) }"; then
     echo "Utility funnel counts must be non-negative"
     echo "$utility_json"
     exit 1
@@ -736,6 +765,38 @@ check_utility_funnel_semantics() {
   if ! awk "BEGIN { exit !($unlock_coverage >= 0 && $unlock_coverage <= 100) }"; then
     echo "Utility funnel coverage must be within [0,100]"
     echo "$utility_json"
+    exit 1
+  fi
+
+  if ! awk "BEGIN { exit !($cta_action_rate >= 0 && $cta_action_rate <= 100) }"; then
+    echo "Utility funnel CTA action rate must be within [0,100]"
+    echo "$utility_json"
+    exit 1
+  fi
+}
+
+check_cta_action_event_contract() {
+  local code
+  local accepted_type
+  local ignored_reason
+  local payload
+
+  payload='{"session_id":"ux_contract_cta","event_type":"cta_action_click","route":"/opportunities","actionability_state":"ACTIONABLE","metadata":{"source":"contract_check","as_of":"2026-02-22T00:00:00.000Z","horizon":"7d","scope":"market_theme"}}'
+  code=$(curl -sS -o "$TMP_BODY" -w "%{http_code}" --max-time 20 -X POST "$API_URL/api/metrics/utility-event" \
+    -H "Content-Type: application/json" \
+    -d "$payload")
+
+  if [[ "$code" != "200" ]]; then
+    echo "Expected 200 for cta_action_click utility event but got $code"
+    cat "$TMP_BODY"
+    exit 1
+  fi
+
+  accepted_type=$(jq -r '.accepted.event_type // ""' "$TMP_BODY")
+  ignored_reason=$(jq -r '.ignored_reason // ""' "$TMP_BODY")
+  if [[ "$accepted_type" != "cta_action_click" && "$ignored_reason" != "cta_intent_tracking_disabled" ]]; then
+    echo "cta_action_click was neither accepted nor explicitly ignored due to feature flag"
+    cat "$TMP_BODY"
     exit 1
   fi
 }
@@ -840,6 +901,77 @@ check_decision_grade_semantics() {
   fi
 }
 
+check_decision_impact_semantics() {
+  local market_json
+  local theme_json
+  local ops_json
+  local market_valid
+  local theme_valid
+  local ops_valid
+
+  market_json=$(curl -sS --max-time 20 "$API_URL/api/decision-impact?horizon=7d&scope=market&window=30")
+  theme_json=$(curl -sS --max-time 20 "$API_URL/api/decision-impact?horizon=7d&scope=theme&window=30&limit=10")
+  ops_json=$(curl -sS --max-time 20 "$API_URL/api/ops/decision-impact?window=30")
+
+  market_valid=$(echo "$market_json" | jq -r '
+    (.scope == "market") and
+    (.horizon == "7d") and
+    (.window_days == 30) and
+    (.outcome_basis == "spy_forward_proxy") and
+    (.themes | type == "array" and length == 0) and
+    (.market.sample_size | type == "number" and . >= 0) and
+    (.market.hit_rate | type == "number" and . >= 0 and . <= 1) and
+    (.market.win_rate | type == "number" and . >= 0 and . <= 1) and
+    (.coverage.coverage_ratio | type == "number" and . >= 0 and . <= 1) and
+    ((.market.quality_band == "ROBUST") or (.market.quality_band == "LIMITED") or (.market.quality_band == "INSUFFICIENT"))
+  ')
+  if [[ "$market_valid" != "true" ]]; then
+    echo "Decision-impact market semantics failure"
+    echo "$market_json"
+    exit 1
+  fi
+
+  theme_valid=$(echo "$theme_json" | jq -r '
+    (.scope == "theme") and
+    (.horizon == "7d") and
+    (.window_days == 30) and
+    (.outcome_basis == "spy_forward_proxy") and
+    (.themes | type == "array" and length <= 10) and
+    (all(.themes[]?;
+      (.theme_id | type == "string") and
+      (.theme_name | type == "string") and
+      (.sample_size | type == "number" and . >= 0) and
+      (.hit_rate | type == "number" and . >= 0 and . <= 1) and
+      (.win_rate | type == "number" and . >= 0 and . <= 1) and
+      ((.quality_band == "ROBUST") or (.quality_band == "LIMITED") or (.quality_band == "INSUFFICIENT"))
+    ))
+  ')
+  if [[ "$theme_valid" != "true" ]]; then
+    echo "Decision-impact theme semantics failure"
+    echo "$theme_json"
+    exit 1
+  fi
+
+  ops_valid=$(echo "$ops_json" | jq -r '
+    (.window_days == 30) and
+    (.market_7d.hit_rate | type == "number" and . >= 0 and . <= 1) and
+    (.market_30d.hit_rate | type == "number" and . >= 0 and . <= 1) and
+    (.utility_attribution.cta_action_rate_pct | type == "number" and . >= 0 and . <= 100) and
+    (.observe_mode.enabled == true) and
+    (.observe_mode.breach_count | type == "number" and . >= 0) and
+    (.observe_mode.thresholds.market_7d_hit_rate_min | type == "number") and
+    (.observe_mode.thresholds.market_30d_hit_rate_min | type == "number") and
+    (.observe_mode.thresholds.market_7d_avg_signed_return_min | type == "number") and
+    (.observe_mode.thresholds.market_30d_avg_signed_return_min | type == "number") and
+    (.observe_mode.thresholds.cta_action_rate_pct_min | type == "number")
+  ')
+  if [[ "$ops_valid" != "true" ]]; then
+    echo "Ops decision-impact semantics failure"
+    echo "$ops_json"
+    exit 1
+  fi
+}
+
 check_api_json_contract "/api/plan" \
   'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number"))) and ((has("cross_horizon")|not) or ((.cross_horizon.as_of|type=="string") and (.cross_horizon.state|type=="string") and (.cross_horizon.eligible_7d|type=="number") and (.cross_horizon.eligible_30d|type=="number") and ((.cross_horizon.top_direction_7d==null) or (.cross_horizon.top_direction_7d|type=="string")) and ((.cross_horizon.top_direction_30d==null) or (.cross_horizon.top_direction_30d|type=="string")) and (.cross_horizon.rationale_codes|type=="array") and (all(.cross_horizon.rationale_codes[]?; type=="string")) and ((.cross_horizon.invalidation_note==null) or (.cross_horizon.invalidation_note|type=="string")))) and ((has("decision_stack")|not) or ((.decision_stack.what_changed|type=="string") and (.decision_stack.what_to_do|type=="string") and (.decision_stack.why_now|type=="string") and (.decision_stack.confidence|type=="string") and (.decision_stack.cta_state|type=="string")))' \
   "plan"
@@ -884,7 +1016,7 @@ fi
 
 if utility_funnel_available; then
   check_api_json_contract "/api/ops/utility-funnel?window=7" \
-    'type=="object" and (.as_of|type=="string") and (.funnel.window_days|type=="number") and (.funnel.days_observed|type=="number") and (.funnel.total_events|type=="number") and (.funnel.unique_sessions|type=="number") and (.funnel.plan_views|type=="number") and (.funnel.opportunities_views|type=="number") and (.funnel.decision_actionable_views|type=="number") and (.funnel.decision_watch_views|type=="number") and (.funnel.decision_no_action_views|type=="number") and (.funnel.no_action_unlock_views|type=="number") and (.funnel.decision_events_total|type=="number") and (.funnel.decision_events_per_session|type=="number") and (.funnel.no_action_unlock_coverage_pct|type=="number") and ((.funnel.last_event_at==null) or (.funnel.last_event_at|type=="string"))' \
+    'type=="object" and (.as_of|type=="string") and (.funnel.window_days|type=="number") and (.funnel.days_observed|type=="number") and (.funnel.total_events|type=="number") and (.funnel.unique_sessions|type=="number") and (.funnel.plan_views|type=="number") and (.funnel.opportunities_views|type=="number") and (.funnel.decision_actionable_views|type=="number") and (.funnel.decision_watch_views|type=="number") and (.funnel.decision_no_action_views|type=="number") and (.funnel.no_action_unlock_views|type=="number") and (.funnel.cta_action_clicks|type=="number") and (.funnel.actionable_sessions|type=="number") and (.funnel.cta_action_rate_pct|type=="number") and (.funnel.decision_events_total|type=="number") and (.funnel.decision_events_per_session|type=="number") and (.funnel.no_action_unlock_coverage_pct|type=="number") and ((.funnel.last_event_at==null) or (.funnel.last_event_at|type=="string"))' \
     "utility-funnel"
   UTILITY_FUNNEL_LIVE=1
 fi
@@ -898,6 +1030,21 @@ if decision_grade_available; then
     'type=="object" and (.as_of|type=="string") and (.window_days|type=="number") and (.score|type=="number") and (.grade|type=="string") and (.go_live_ready|type=="boolean") and (.components.freshness.score|type=="number") and (.components.freshness.status|type=="string") and (.components.freshness.slo_attainment_pct|type=="number") and (.components.freshness.days_with_critical_stale|type=="number") and (.components.freshness.days_observed|type=="number") and (.components.consistency.score|type=="number") and (.components.consistency.status|type=="string") and (.components.consistency.pass_count|type=="number") and (.components.consistency.warn_count|type=="number") and (.components.consistency.fail_count|type=="number") and (.components.consistency.total|type=="number") and (.components.calibration.score|type=="number") and (.components.calibration.status|type=="string") and (.components.calibration.conviction_7d|type=="string") and (.components.calibration.conviction_30d|type=="string") and (.components.calibration.edge_quality|type=="string") and (.components.edge.score|type=="number") and (.components.edge.status|type=="string") and (.components.edge.promotion_gate_pass|type=="boolean") and (.components.edge.lower_bound_positive_horizons|type=="number") and (.components.edge.horizons_observed|type=="number") and (.components.edge.reasons|type=="array") and (all(.components.edge.reasons[]?; type=="string")) and (.components.opportunity_hygiene.score|type=="number") and (.components.opportunity_hygiene.status|type=="string") and (.components.opportunity_hygiene.publish_rate_pct|type=="number") and (.components.opportunity_hygiene.over_suppression_rate_pct|type=="number") and (.components.opportunity_hygiene.cross_horizon_conflict_rate_pct|type=="number") and (.components.opportunity_hygiene.conflict_persistence_days|type=="number") and (.components.opportunity_hygiene.rows_observed|type=="number") and (.components.utility.score|type=="number") and (.components.utility.status|type=="string") and (.components.utility.decision_events_total|type=="number") and (.components.utility.no_action_unlock_coverage_pct|type=="number") and (.components.utility.unique_sessions|type=="number")' \
     "decision-grade"
   DECISION_GRADE_LIVE=1
+fi
+
+if decision_impact_available; then
+  check_api_json_contract "/api/decision-impact?horizon=7d&scope=market&window=30" \
+    'type=="object" and (.as_of|type=="string") and (.horizon=="7d") and (.scope=="market") and (.window_days==30) and (.outcome_basis=="spy_forward_proxy") and (.market.sample_size|type=="number") and (.market.hit_rate|type=="number") and (.market.avg_forward_return_pct|type=="number") and (.market.avg_signed_return_pct|type=="number") and (.market.win_rate|type=="number") and (.market.downside_p10_pct|type=="number") and (.market.max_loss_pct|type=="number") and (.market.quality_band|type=="string") and (.themes|type=="array") and (.coverage.matured_items|type=="number") and (.coverage.eligible_items|type=="number") and (.coverage.coverage_ratio|type=="number") and (.coverage.insufficient_reasons|type=="array")' \
+    "decision-impact-market"
+
+  check_api_json_contract "/api/decision-impact?horizon=7d&scope=theme&window=30&limit=10" \
+    'type=="object" and (.as_of|type=="string") and (.horizon=="7d") and (.scope=="theme") and (.window_days==30) and (.outcome_basis=="spy_forward_proxy") and (.market.sample_size|type=="number") and (.themes|type=="array") and (all(.themes[]?; (.theme_id|type=="string") and (.theme_name|type=="string") and (.sample_size|type=="number") and (.hit_rate|type=="number") and (.avg_signed_return_pct|type=="number") and (.avg_forward_return_pct|type=="number") and (.win_rate|type=="number") and (.quality_band|type=="string") and (.last_as_of|type=="string"))) and (.coverage.matured_items|type=="number") and (.coverage.eligible_items|type=="number") and (.coverage.coverage_ratio|type=="number") and (.coverage.insufficient_reasons|type=="array")' \
+    "decision-impact-theme"
+
+  check_api_json_contract "/api/ops/decision-impact?window=30" \
+    'type=="object" and (.as_of|type=="string") and (.window_days==30) and (.market_7d.sample_size|type=="number") and (.market_7d.hit_rate|type=="number") and (.market_30d.sample_size|type=="number") and (.market_30d.hit_rate|type=="number") and (.theme_summary.themes_with_samples|type=="number") and (.theme_summary.themes_robust|type=="number") and (.theme_summary.top_positive|type=="array") and (.theme_summary.top_negative|type=="array") and (.utility_attribution.actionable_views|type=="number") and (.utility_attribution.cta_action_clicks|type=="number") and (.utility_attribution.cta_action_rate_pct|type=="number") and (.utility_attribution.no_action_unlock_views|type=="number") and (.utility_attribution.decision_events_total|type=="number") and (.observe_mode.enabled==true) and (.observe_mode.thresholds.market_7d_hit_rate_min|type=="number") and (.observe_mode.thresholds.market_30d_hit_rate_min|type=="number") and (.observe_mode.thresholds.market_7d_avg_signed_return_min|type=="number") and (.observe_mode.thresholds.market_30d_avg_signed_return_min|type=="number") and (.observe_mode.thresholds.cta_action_rate_pct_min|type=="number") and (.observe_mode.breaches|type=="array") and (.observe_mode.breach_count|type=="number")' \
+    "ops-decision-impact"
+  DECISION_IMPACT_LIVE=1
 fi
 
 check_policy_state_consistency
@@ -916,9 +1063,13 @@ if edge_diagnostics_available; then
 fi
 if [[ "$UTILITY_FUNNEL_LIVE" == "1" ]]; then
   check_utility_funnel_semantics
+  check_cta_action_event_contract
 fi
 if [[ "$DECISION_GRADE_LIVE" == "1" ]]; then
   check_decision_grade_semantics
+fi
+if [[ "$DECISION_IMPACT_LIVE" == "1" ]]; then
+  check_decision_impact_semantics
 fi
 
 echo "Product API contract checks passed against $API_URL"

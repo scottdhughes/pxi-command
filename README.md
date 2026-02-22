@@ -133,7 +133,8 @@ pxi-command/
 | `/api/plan` | GET | Canonical decision object for homepage (policy state, uncertainty, consistency, trader playbook) |
 | `/api/market/consistency` | GET | Latest decision consistency score/state/violations |
 | `/api/ops/freshness-slo` | GET | Rolling 7d/30d freshness SLO attainment and recent critical stale incidents |
-| `/api/ops/utility-funnel` | GET | Rolling utility funnel metrics (session -> decision views -> no-action unlock coverage) |
+| `/api/ops/utility-funnel` | GET | Rolling utility funnel metrics (session -> decision views -> no-action unlock coverage + CTA intent rate) |
+| `/api/ops/decision-impact` | GET | Decision-impact ops view (7d/30d market outcome proxy, theme summary, utility attribution, observe-only breaches) |
 | `/api/ops/decision-grade` | GET | Rolling governance scorecard (freshness, consistency, calibration, edge evidence, opportunity hygiene, utility) |
 
 ### Product Layer (Phase 1)
@@ -141,13 +142,14 @@ pxi-command/
 |----------|--------|-------------|
 | `/api/brief` | GET | Daily market brief coherent with `/api/plan` policy state (includes contract version + consistency) |
 | `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon with calibration + expectancy + unavailable reasons |
+| `/api/decision-impact` | GET | Outcome attribution using matured opportunity ledger rows with SPY forward proxy (market or theme scope, 30/90d windows) |
 | `/api/diagnostics/calibration` | GET | Calibration diagnostics (Brier/ECE/log loss + quality band) for conviction and edge-quality snapshots |
 | `/api/diagnostics/edge` | GET | Forward-chaining edge evidence (model vs lagged baseline uplift, CI, leakage sentinel, promotion gate) |
 | `/api/alerts/feed` | GET | In-app alert timeline (`regime_change`, `threshold_cross`, `opportunity_spike`, `freshness_warning`) |
 | `/api/alerts/subscribe/start` | POST | Start email digest subscription with verification token |
 | `/api/alerts/subscribe/verify` | POST | Verify subscription token and activate email digest |
 | `/api/alerts/unsubscribe` | POST | Unsubscribe via token |
-| `/api/metrics/utility-event` | POST | Record lightweight product utility telemetry events (session, decision view, no-action unlock) |
+| `/api/metrics/utility-event` | POST | Record lightweight product utility telemetry events (session, decision view, no-action unlock, `cta_action_click`) |
 
 ### ML & Predictions
 | Endpoint | Method | Description |
@@ -310,6 +312,7 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
   - `opportunities_view`
   - decision-state exposures (`decision_actionable_view|decision_watch_view|decision_no_action_view`)
   - `no_action_unlock_view` (tracks no-action days as positive threshold-communication workflow events)
+  - `cta_action_click` (anonymous action intent from `/opportunities`)
 
 10. **Decision-grade governance (Phase 4)**
 - Immutable opportunity ledger tracks candidate-vs-published counts per horizon on every product refresh.
@@ -321,6 +324,21 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
   - edge-promotion evidence
   - opportunity hygiene (over-suppression + cross-horizon conflict persistence)
   - utility funnel adoption
+
+11. **Outcome attribution + utility lift (Phase 5)**
+- New endpoint: `GET /api/decision-impact?horizon=7d|30d&scope=market|theme&window=30|90`
+- New endpoint: `GET /api/ops/decision-impact?window=30|90`
+- Refresh pipeline persists:
+  - item-level publish/suppression ledger (`market_opportunity_item_ledger`)
+  - decision-impact snapshots (`market_decision_impact_snapshots`)
+- Attribution basis is `spy_forward_proxy` (market and theme scope in this phase).
+- Governance is **observe-only** in this phase. Breaches are surfaced in ops/workflow summaries but do not fail refresh runs.
+- Observe thresholds:
+  - `market_7d.hit_rate >= 0.52`
+  - `market_30d.hit_rate >= 0.50`
+  - `market_7d.avg_signed_return_pct > 0`
+  - `market_30d.avg_signed_return_pct > 0`
+  - `cta_action_rate_pct >= 2.0`
 
 ## Scheduler Ownership Runbook
 
