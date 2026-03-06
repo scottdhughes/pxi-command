@@ -92,6 +92,17 @@ interface MarketRefreshSummary {
   };
 }
 
+interface RecalculateResponsePayload {
+  score?: number;
+  label?: string;
+  categories?: number;
+  embedded?: boolean;
+  pxi?: {
+    score?: number;
+    label?: string;
+  };
+}
+
 interface EdgeDiagnosticsWindow {
   horizon: '7d' | '30d';
   sample_size: number;
@@ -279,6 +290,28 @@ export function evaluateEdgePromotionGate(report: EdgeDiagnosticsReport | null |
   return {
     pass: reasons.length === 0,
     reasons: Array.from(new Set(reasons)),
+  };
+}
+
+export function normalizeRecalculateResponse(
+  payload: RecalculateResponsePayload,
+): { score: number; label: string; categories: number; embedded: boolean } {
+  const rawScore = payload.pxi?.score ?? payload.score;
+  const label = payload.pxi?.label ?? payload.label;
+  const categories = Number(payload.categories ?? 0);
+  const embedded = payload.embedded === true;
+
+  if (!Number.isFinite(rawScore) || typeof label !== 'string' || label.trim().length === 0) {
+    throw new Error(`Unexpected recalculate response payload: ${JSON.stringify(payload)}`);
+  }
+
+  const score = Number(rawScore);
+
+  return {
+    score,
+    label,
+    categories,
+    embedded,
   };
 }
 
@@ -1493,12 +1526,7 @@ async function triggerRecalculation(): Promise<void> {
     throw new Error(`Recalculate error ${response.status}: ${errorText}`);
   }
 
-  const result = (await response.json()) as {
-    score: number;
-    label: string;
-    categories: number;
-    embedded?: boolean;
-  };
+  const result = normalizeRecalculateResponse((await response.json()) as RecalculateResponsePayload);
 
   console.log(`  ✓ PXI: ${result.score.toFixed(1)} (${result.label})`);
   console.log(`  ✓ Categories: ${result.categories}`);
