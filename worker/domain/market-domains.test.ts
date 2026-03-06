@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildCanonicalMarketDecision } from './market-core.js';
+import { buildCanonicalMarketDecision, tryHandleMarketCoreRoute } from './market-core.js';
 import { generateMarketEvents, tryHandleMarketProductsRoute } from './market-products.js';
 import { computeDecisionGradeScorecard } from './market-ops.js';
+import type { WorkerRouteContext } from '../types.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -56,6 +57,25 @@ function createFakeDb(handler: (sql: string, args: unknown[]) => QueryResult): D
       return buildStatement(sql);
     },
   } as D1Database;
+}
+
+function createRouteContext(
+  url: string,
+  init?: RequestInit,
+  envOverrides: Record<string, unknown> = {},
+): WorkerRouteContext {
+  const request = new Request(url, init);
+  return {
+    request,
+    env: {
+      DB: createFakeDb(() => null),
+      ...envOverrides,
+    } as WorkerRouteContext['env'],
+    url: new URL(request.url),
+    method: request.method,
+    corsHeaders: {},
+    clientIP: '127.0.0.1',
+  };
 }
 
 function createDecisionImpactHelpers(overrides: Record<string, unknown> = {}) {
@@ -257,6 +277,51 @@ test('buildCanonicalMarketDecision assembles the extracted decision payload', as
     'low_edge_quality',
     'limited_calibration_sample',
   ]);
+});
+
+test('tryHandleMarketCoreRoute reports a generic plan build failure for unexpected decision errors', async () => {
+  const route = createRouteContext('https://pxi.test/api/plan', undefined, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('FROM pxi_scores ORDER BY date DESC LIMIT 10')) {
+        return [{
+          date: '2026-03-05',
+          score: 71,
+          label: 'risk-on',
+          status: 'bullish',
+          delta_1d: 1.1,
+          delta_7d: 4.2,
+          delta_30d: 7.3,
+        }];
+      }
+      if (sql.includes('FROM category_scores WHERE date = ?')) {
+        return [
+          { category: 'credit', score: 68, weight: 0.25 },
+          { category: 'macro', score: 72, weight: 0.25 },
+          { category: 'liquidity', score: 74, weight: 0.25 },
+        ];
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandleMarketCoreRoute(route, {
+    isFeatureEnabled: () => true,
+    detectRegime: async () => ({ regime: 'RISK_ON', confidence: 78, description: 'Risk appetite is improving.' }),
+    computeFreshnessStatus: async () => {
+      throw new Error('missing_build_helper');
+    },
+    fetchPredictionEvaluationSampleSize: async () => 42,
+    buildCurrentBucketRiskBands: async () => ({
+      d7: { sample_size: 15 },
+      d30: { sample_size: 24 },
+    }),
+    fetchLatestCalibrationSnapshot: async () => ({ total_samples: 18 }),
+    buildPlanFallbackPayload: (reason: string) => ({ degraded_reason: reason }),
+  });
+
+  assert.equal(response?.status, 200);
+  const payload = await response!.json() as Record<string, unknown>;
+  assert.equal(payload.degraded_reason, 'decision_build_failed');
 });
 
 test('generateMarketEvents emits regime, threshold, opportunity, and freshness events', async () => {

@@ -6,7 +6,6 @@ on:
       - main
     paths:
       - frontend/**
-      - .github/workflows/verify-frontend-production.yml
       - scripts/site-route-smoke.sh
   workflow_dispatch:
 
@@ -67,18 +66,33 @@ jobs:
           set -euo pipefail
           success=false
           for attempt in $(seq 1 30); do
-            http_code="$(curl -sS -o /tmp/pxi-build.json -w '%{http_code}' --max-time 20 "${SITE_URL}/build.json")"
+            http_code="$(curl -sS -D /tmp/pxi-build.headers -o /tmp/pxi-build.json -w '%{http_code}' --max-time 20 "${SITE_URL}/build.json")"
             if [[ "${http_code}" == "200" ]]; then
-              deployed_sha="$(node -e "const fs = require('node:fs'); const payload = JSON.parse(fs.readFileSync('/tmp/pxi-build.json', 'utf8')); process.stdout.write(String(payload.commit_sha || ''));" )"
-              if [[ "${deployed_sha,,}" == "${EXPECTED_SHA,,}" ]]; then
-                success=true
-                break
+              if grep -qi "^content-type: application/json" /tmp/pxi-build.headers; then
+                deployed_sha="$(node <<'NODE'
+                const fs = require('node:fs');
+
+                try {
+                  const payload = JSON.parse(fs.readFileSync('/tmp/pxi-build.json', 'utf8'));
+                  if (typeof payload.commit_sha === 'string') {
+                    process.stdout.write(payload.commit_sha);
+                  }
+                } catch {
+                  // Wait for the production deployment to publish a valid JSON build manifest.
+                }
+                NODE
+                )"
+                if [[ "${deployed_sha}" != "" && "${deployed_sha,,}" == "${EXPECTED_SHA,,}" ]]; then
+                  success=true
+                  break
+                fi
               fi
             fi
             sleep 20
           done
           if [[ "${success}" != "true" ]]; then
             echo "::error::Timed out waiting for ${SITE_URL}/build.json to report commit ${EXPECTED_SHA}"
+            cat /tmp/pxi-build.headers || true
             cat /tmp/pxi-build.json || true
             exit 1
           fi

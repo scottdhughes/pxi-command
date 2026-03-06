@@ -11,6 +11,13 @@ import type {
 
 type MarketCoreDeps = Record<string, any>;
 
+function resolvePlanFallbackReason(error: unknown): string {
+  if (error instanceof Error && error.message === 'no_pxi_data') {
+    return 'no_pxi_data';
+  }
+  return 'decision_build_failed';
+}
+
 export async function selectLatestPxiWithCategories(db: D1Database): Promise<{
   pxi: PXIRow | null;
   categories: CategoryRow[];
@@ -367,7 +374,7 @@ export async function tryHandleMarketCoreRoute(
       canonical = await buildCanonicalMarketDecision(env.DB, deps);
     } catch (err) {
       console.error('Failed to build canonical market decision:', err);
-      return Response.json(deps.buildPlanFallbackPayload('no_pxi_data'), {
+      return Response.json(deps.buildPlanFallbackPayload(resolvePlanFallbackReason(err)), {
         headers: {
           ...corsHeaders,
           'Cache-Control': 'no-store',
