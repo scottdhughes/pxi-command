@@ -1,6 +1,3 @@
--- PXI Database Schema for D1 (SQLite)
-
--- Raw indicator values from data sources
 CREATE TABLE IF NOT EXISTS indicator_values (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     indicator_id TEXT NOT NULL,
@@ -15,7 +12,6 @@ CREATE INDEX IF NOT EXISTS idx_indicator_values_date ON indicator_values(date DE
 CREATE INDEX IF NOT EXISTS idx_indicator_values_indicator ON indicator_values(indicator_id);
 CREATE INDEX IF NOT EXISTS idx_indicator_values_lookup ON indicator_values(indicator_id, date DESC);
 
--- Normalized indicator scores (0-100)
 CREATE TABLE IF NOT EXISTS indicator_scores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     indicator_id TEXT NOT NULL,
@@ -31,7 +27,6 @@ CREATE TABLE IF NOT EXISTS indicator_scores (
 CREATE INDEX IF NOT EXISTS idx_indicator_scores_date ON indicator_scores(date DESC);
 CREATE INDEX IF NOT EXISTS idx_indicator_scores_lookup ON indicator_scores(indicator_id, date DESC);
 
--- Category scores
 CREATE TABLE IF NOT EXISTS category_scores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     category TEXT NOT NULL,
@@ -45,7 +40,6 @@ CREATE TABLE IF NOT EXISTS category_scores (
 
 CREATE INDEX IF NOT EXISTS idx_category_scores_date ON category_scores(date DESC);
 
--- Final PXI composite scores
 CREATE TABLE IF NOT EXISTS pxi_scores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL UNIQUE,
@@ -60,7 +54,6 @@ CREATE TABLE IF NOT EXISTS pxi_scores (
 
 CREATE INDEX IF NOT EXISTS idx_pxi_scores_date ON pxi_scores(date DESC);
 
--- Fetch logs for monitoring
 CREATE TABLE IF NOT EXISTS fetch_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,
@@ -74,7 +67,6 @@ CREATE TABLE IF NOT EXISTS fetch_logs (
 
 CREATE INDEX IF NOT EXISTS idx_fetch_logs_source ON fetch_logs(source, started_at DESC);
 
--- Market regime embeddings for AI/ML
 CREATE TABLE IF NOT EXISTS market_embeddings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL UNIQUE,
@@ -88,11 +80,6 @@ CREATE TABLE IF NOT EXISTS market_embeddings (
 
 CREATE INDEX IF NOT EXISTS idx_market_embeddings_date ON market_embeddings(date DESC);
 
--- ============================================
--- PXI v1.1 Schema Extensions
--- ============================================
-
--- PXI Signal layer (trading/risk allocation)
 CREATE TABLE IF NOT EXISTS pxi_signal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL UNIQUE,
@@ -111,7 +98,6 @@ CREATE INDEX IF NOT EXISTS idx_pxi_signal_date ON pxi_signal(date DESC);
 CREATE INDEX IF NOT EXISTS idx_pxi_signal_regime ON pxi_signal(regime);
 CREATE INDEX IF NOT EXISTS idx_pxi_signal_type ON pxi_signal(signal_type);
 
--- Alert history with performance metrics
 CREATE TABLE IF NOT EXISTS alert_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     alert_date TEXT NOT NULL,
@@ -131,7 +117,6 @@ CREATE TABLE IF NOT EXISTS alert_history (
 CREATE INDEX IF NOT EXISTS idx_alert_history_date ON alert_history(alert_date DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_history_type ON alert_history(alert_type);
 
--- Backtest results for validation
 CREATE TABLE IF NOT EXISTS backtest_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_date TEXT NOT NULL,
@@ -152,11 +137,6 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 CREATE INDEX IF NOT EXISTS idx_backtest_results_date ON backtest_results(run_date DESC);
 CREATE INDEX IF NOT EXISTS idx_backtest_results_strategy ON backtest_results(strategy);
 
--- ============================================
--- ML/Prediction Tracking Tables
--- ============================================
-
--- Prediction log for tracking predictions vs actual outcomes
 CREATE TABLE IF NOT EXISTS prediction_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prediction_date TEXT NOT NULL UNIQUE,
@@ -169,7 +149,7 @@ CREATE TABLE IF NOT EXISTS prediction_log (
     actual_change_30d REAL,
     confidence_7d REAL,
     confidence_30d REAL,
-    similar_periods TEXT,  -- JSON array of period dates used
+    similar_periods TEXT,
     evaluated_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -177,7 +157,6 @@ CREATE TABLE IF NOT EXISTS prediction_log (
 CREATE INDEX IF NOT EXISTS idx_prediction_log_date ON prediction_log(prediction_date DESC);
 CREATE INDEX IF NOT EXISTS idx_prediction_log_evaluated ON prediction_log(evaluated_at);
 
--- Model parameters for tuning
 CREATE TABLE IF NOT EXISTS model_params (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     param_key TEXT NOT NULL UNIQUE,
@@ -186,7 +165,6 @@ CREATE TABLE IF NOT EXISTS model_params (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
--- Period accuracy tracking (which historical periods are good predictors)
 CREATE TABLE IF NOT EXISTS period_accuracy (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     period_date TEXT NOT NULL UNIQUE,
@@ -194,37 +172,30 @@ CREATE TABLE IF NOT EXISTS period_accuracy (
     correct_predictions INTEGER DEFAULT 0,
     total_predictions INTEGER DEFAULT 0,
     mean_absolute_error REAL,
-    accuracy_score REAL,  -- 0-1 score based on prediction quality
+    accuracy_score REAL,
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_period_accuracy_date ON period_accuracy(period_date DESC);
 CREATE INDEX IF NOT EXISTS idx_period_accuracy_score ON period_accuracy(accuracy_score DESC);
 
--- ML Ensemble prediction tracking (XGBoost + LSTM)
 CREATE TABLE IF NOT EXISTS ensemble_predictions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prediction_date TEXT NOT NULL UNIQUE,
     target_date_7d TEXT NOT NULL,
     target_date_30d TEXT NOT NULL,
     current_score REAL NOT NULL,
-    -- XGBoost predictions
     xgboost_7d REAL,
     xgboost_30d REAL,
-    -- LSTM predictions
     lstm_7d REAL,
     lstm_30d REAL,
-    -- Ensemble (weighted average)
     ensemble_7d REAL,
     ensemble_30d REAL,
-    -- Confidence based on model agreement
-    confidence_7d TEXT,  -- HIGH, MEDIUM, LOW
+    confidence_7d TEXT,
     confidence_30d TEXT,
-    -- Actual outcomes (filled in when target date arrives)
     actual_change_7d REAL,
     actual_change_30d REAL,
-    -- Evaluation metadata
-    direction_correct_7d INTEGER,  -- 1 = correct, 0 = wrong, NULL = not evaluated
+    direction_correct_7d INTEGER,
     direction_correct_30d INTEGER,
     evaluated_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
@@ -233,10 +204,6 @@ CREATE TABLE IF NOT EXISTS ensemble_predictions (
 CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_date ON ensemble_predictions(prediction_date DESC);
 CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_target7d ON ensemble_predictions(target_date_7d);
 CREATE INDEX IF NOT EXISTS idx_ensemble_predictions_target30d ON ensemble_predictions(target_date_30d);
-
--- ============================================
--- PXI Product Layer Tables (Brief/Opportunities/Alerts)
--- ============================================
 
 CREATE TABLE IF NOT EXISTS email_subscribers (
     id TEXT PRIMARY KEY,
@@ -420,6 +387,27 @@ CREATE TABLE IF NOT EXISTS market_alert_deliveries (
 
 CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_event ON market_alert_deliveries(event_id, attempted_at DESC);
 CREATE INDEX IF NOT EXISTS idx_market_alert_deliveries_subscriber ON market_alert_deliveries(subscriber_id, attempted_at DESC);
+
+DELETE FROM market_alert_deliveries
+WHERE id IN (
+    SELECT id
+    FROM (
+        SELECT
+            id,
+            ROW_NUMBER() OVER (
+                PARTITION BY event_id, channel, subscriber_id
+                ORDER BY
+                    CASE WHEN status = 'sent' THEN 0 ELSE 1 END,
+                    datetime(replace(replace(attempted_at, 'T', ' '), 'Z', '')) DESC,
+                    id DESC
+            ) AS row_rank
+        FROM market_alert_deliveries
+        WHERE subscriber_id IS NOT NULL
+          AND channel = 'email'
+    )
+    WHERE row_rank > 1
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_market_alert_deliveries_email_unique
 ON market_alert_deliveries(event_id, channel, subscriber_id)
 WHERE subscriber_id IS NOT NULL;
