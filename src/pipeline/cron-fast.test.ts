@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   evaluateEdgePromotionGate,
   isRetryableYahooError,
+  normalizeRecalculateResponse,
   parseYahooChartResponse,
   retryWithBackoff,
 } from './cron-fast.js';
@@ -148,4 +149,34 @@ test('evaluateEdgePromotionGate fails on leakage sentinel violations', () => {
   assert.equal(evaluation.pass, false);
   assert.equal(evaluation.reasons.includes('7d:evaluated_before_target_2'), true);
   assert.equal(evaluation.reasons.includes('gate:7d:evaluated_before_target_2'), true);
+});
+
+test('normalizeRecalculateResponse supports the current nested worker payload shape', () => {
+  const result = normalizeRecalculateResponse({
+    pxi: {
+      score: 61.2,
+      label: 'neutral',
+    },
+    categories: 4,
+    embedded: true,
+  });
+
+  assert.equal(result.score, 61.2);
+  assert.equal(result.label, 'neutral');
+  assert.equal(result.categories, 4);
+  assert.equal(result.embedded, true);
+});
+
+test('normalizeRecalculateResponse preserves compatibility with legacy top-level fields', () => {
+  const result = normalizeRecalculateResponse({
+    score: 58.4,
+    label: 'risk-off',
+    categories: 3,
+    embedded: false,
+  });
+
+  assert.equal(result.score, 58.4);
+  assert.equal(result.label, 'risk-off');
+  assert.equal(result.categories, 3);
+  assert.equal(result.embedded, false);
 });
