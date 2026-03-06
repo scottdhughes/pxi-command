@@ -1,0 +1,190 @@
+name: Deploy PXI Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target worker environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      run_refresh_smoke:
+        description: 'Run refresh smoke after deploy'
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: deploy-worker-${{ inputs.environment }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: github.repository == 'scottdhughes/pxi-command'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    environment:
+      name: ${{ inputs.environment }}
+    env:
+      TARGET_ENV: ${{ inputs.environment }}
+      DEFAULT_PRODUCTION_BASE_URL: https://api.pxicommand.com
+      WORKER_BASE_URL: ${{ vars.WORKER_BASE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate deploy credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+            echo "::error::Missing environment secret CLOUDFLARE_API_TOKEN"
+            exit 1
+          fi
+          if [[ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+            echo "::error::Missing environment variable CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+          if [[ -z "${WRITE_API_KEY:-}" ]]; then
+            echo "::error::Missing environment secret WRITE_API_KEY"
+            exit 1
+          fi
+
+      - name: Resolve target base URL
+        run: |
+          set -euo pipefail
+          if [[ "${TARGET_ENV}" == "production" ]]; then
+            target_base_url="${WORKER_BASE_URL:-${DEFAULT_PRODUCTION_BASE_URL}}"
+          else
+            target_base_url="${WORKER_BASE_URL:-}"
+          fi
+          if [[ -z "${target_base_url}" ]]; then
+            echo "::error::Missing environment variable WORKER_BASE_URL for ${TARGET_ENV}"
+            exit 1
+          fi
+          echo "TARGET_BASE_URL=${target_base_url%/}" >> "$GITHUB_ENV"
+
+      - name: Typecheck worker
+        run: npm run typecheck:worker
+
+      - name: Run worker tests
+        run: npm run test:worker
+
+      - name: Run contract tests
+        run: npm run test:contracts
+
+      - name: Build root TypeScript
+        run: npm run build
+
+      - name: Run root node tests
+        run: node --test dist/config/indicator-sla.test.js dist/pipeline/cron-fast.test.js
+
+      - name: Compute deploy metadata
+        run: |
+          set -euo pipefail
+          BUILD_SHA="$(git rev-parse --short=12 HEAD)"
+          BUILD_TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          WORKER_VERSION="pxi-${BUILD_SHA}-${BUILD_TIMESTAMP}"
+          {
+            echo "BUILD_SHA=${BUILD_SHA}"
+            echo "BUILD_TIMESTAMP=${BUILD_TIMESTAMP}"
+            echo "WORKER_VERSION=${WORKER_VERSION}"
+          } >> "$GITHUB_ENV"
+
+      - name: Deploy worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler deploy \
+            --config worker/wrangler.toml \
+            --env "${TARGET_ENV}" \
+            --var "BUILD_SHA:${BUILD_SHA}" \
+            --var "BUILD_TIMESTAMP:${BUILD_TIMESTAMP}" \
+            --var "WORKER_VERSION:${WORKER_VERSION}"
+
+      - name: Apply remote D1 migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler d1 migrations apply DB --config worker/wrangler.toml --remote --env "${TARGET_ENV}"
+
+      - name: Poll deployed health until build SHA matches
+        run: |
+          set -euo pipefail
+          success=false
+          for attempt in $(seq 1 30); do
+            http_code="$(curl -sS -o /tmp/pxi-worker-health.json -w '%{http_code}' --max-time 20 "${TARGET_BASE_URL}/health")"
+            if [[ "${http_code}" == "200" ]]; then
+              deployed_sha="$(node -e "const fs = require('node:fs'); const payload = JSON.parse(fs.readFileSync('/tmp/pxi-worker-health.json', 'utf8')); process.stdout.write(String(payload.build_sha || ''));" )"
+              if [[ "${deployed_sha,,}" == "${BUILD_SHA,,}" ]]; then
+                success=true
+                break
+              fi
+            fi
+            sleep 10
+          done
+          if [[ "${success}" != "true" ]]; then
+            echo "::error::Timed out waiting for deployed /health build_sha to match ${BUILD_SHA}"
+            cat /tmp/pxi-worker-health.json || true
+            exit 1
+          fi
+
+      - name: Run product contract gate
+        run: bash scripts/api-product-contract-check.sh "${TARGET_BASE_URL}"
+
+      - name: Run refresh smoke
+        if: ${{ inputs.run_refresh_smoke }}
+        env:
+          WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+        run: |
+          set -euo pipefail
+          trigger="github_actions_deploy_smoke_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          http_code="$(curl -sS -o /tmp/pxi-worker-refresh-smoke.json -w '%{http_code}' --max-time 240 -X POST "${TARGET_BASE_URL}/api/market/refresh-products" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "X-Refresh-Trigger: ${trigger}")"
+          if [[ "${http_code}" != "200" ]]; then
+            echo "::error::Refresh smoke failed with HTTP ${http_code}"
+            cat /tmp/pxi-worker-refresh-smoke.json || true
+            exit 1
+          fi
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const payload = JSON.parse(fs.readFileSync('/tmp/pxi-worker-refresh-smoke.json', 'utf8'));
+          const passed =
+            payload?.ok === true &&
+            (
+              payload?.skipped !== true ||
+              payload?.reason === 'refresh_in_progress'
+            );
+
+          if (!passed) {
+            console.error('Refresh smoke returned an unexpected payload.');
+            console.error(JSON.stringify(payload, null, 2));
+            process.exit(1);
+          }
+          NODE

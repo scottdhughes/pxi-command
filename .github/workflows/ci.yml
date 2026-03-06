@@ -22,12 +22,33 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
       - name: Install dependencies
         run: npm ci
       - name: Lint
         run: npm run lint
       - name: Build
         run: npm run build
+      - name: Verify build metadata artifact
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const filePath = path.resolve(process.cwd(), 'dist/build.json');
+          const payload = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+
+          if (typeof payload.generated_at !== 'string' || Number.isNaN(Date.parse(payload.generated_at))) {
+            throw new Error('frontend build.json is missing a valid generated_at field');
+          }
+          if (typeof payload.commit_sha !== 'string' || payload.commit_sha.trim().length === 0) {
+            throw new Error('frontend build.json is missing commit_sha');
+          }
+          if (typeof payload.branch !== 'string' || payload.branch.trim().length === 0) {
+            throw new Error('frontend build.json is missing branch');
+          }
+          NODE
 
   worker:
     name: Worker Typecheck
@@ -44,6 +65,12 @@ jobs:
         run: npm ci
       - name: Typecheck
         run: npm run build
+      - name: Worker typecheck
+        run: npm run typecheck:worker
+      - name: Worker tests
+        run: npm run test:worker
+      - name: Contract tests
+        run: npm run test:contracts
       - name: Unit tests
         run: node --test dist/config/indicator-sla.test.js dist/pipeline/cron-fast.test.js
 
@@ -84,17 +111,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          check_html_status() {
-            local path="$1"
-            local expected="$2"
-            local code
-            code=$(curl -sS -o /tmp/page.out -w "%{http_code}" --max-time 20 "$SITE_URL$path")
-            if [[ "$code" != "$expected" ]]; then
-              echo "Expected $expected for $path but got $code"
-              exit 1
-            fi
-          }
-
           check_api_status() {
             local path="$1"
             local expected="$2"
@@ -122,50 +138,16 @@ jobs:
             fi
           }
 
-          check_site_content_type() {
-            local path="$1"
-            local expected="$2"
-            local expected_prefix="$3"
-            local code
-            code=$(curl -sS -D /tmp/site-content.headers -o /tmp/site-content.out -w "%{http_code}" --max-time 20 "$SITE_URL$path")
-            if [[ "$code" != "$expected" ]]; then
-              echo "Expected $expected for $path but got $code"
-              exit 1
-            fi
-            if ! grep -qi "^content-type: ${expected_prefix}" /tmp/site-content.headers; then
-              echo "Expected content-type starting with '${expected_prefix}' for $path"
-              cat /tmp/site-content.headers
-              exit 1
-            fi
-          }
-
-          check_html_status "/" 200
-          check_html_status "/spec" 200
-          check_html_status "/alerts" 200
-          check_html_status "/guide" 200
-
-          signals_code=$(curl -sS -o /tmp/signals.out -w "%{http_code}" --max-time 20 "$SITE_URL/signals")
-          signals_followed_code=$(curl -Ls -o /tmp/signals_followed.out -w "%{http_code}" --max-time 20 "$SITE_URL/signals")
-          if [[ "$signals_code" != "200" && "$signals_code" != "301" && "$signals_code" != "302" ]]; then
-            echo "Expected 200/301/302 for /signals but got $signals_code"
-            exit 1
-          fi
-          if [[ "$signals_followed_code" != "200" ]]; then
-            echo "Expected /signals to eventually resolve to 200, got $signals_followed_code"
-            exit 1
-          fi
-
-          check_html_status "/signals/latest" 200
-          check_site_content_type "/llms.txt" 200 "text/plain"
-          check_site_content_type "/agent.md" 200 "text/markdown"
-          check_site_content_type "/signals/agent.md" 200 "text/markdown"
+          bash scripts/site-route-smoke.sh "$SITE_URL"
           check_site_json_status "/signals/api/runs" 200
           check_site_json_status "/signals/api/accuracy" 200
           check_site_json_status "/signals/api/predictions" 200
           check_site_json_status "/signals/api/runs?status=foo" 400
           check_api_status "/health" 200
           check_api_status "/api/pxi" 200
+          check_api_status "/api/history" 200
           check_api_status "/api/alerts?limit=5" 200
+          check_api_status "/api/category/macro" 200
           check_api_status "/api/signal" 200
           check_api_status "/api/diagnostics/calibration?metric=conviction&horizon=7d" 200
           check_api_status "/api/ops/freshness-slo" 200

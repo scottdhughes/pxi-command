@@ -1,0 +1,87 @@
+name: Verify Frontend Production
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - frontend/**
+      - .github/workflows/verify-frontend-production.yml
+      - scripts/site-route-smoke.sh
+  workflow_dispatch:
+
+jobs:
+  verify:
+    if: github.repository == 'scottdhughes/pxi-command'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    environment:
+      name: production
+    env:
+      SITE_URL: https://pxicommand.com
+      EXPECTED_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend locally
+        working-directory: frontend
+        run: npm run build
+
+      - name: Verify local build metadata
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const payload = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'frontend/dist/build.json'), 'utf8'));
+          if (typeof payload.generated_at !== 'string' || Number.isNaN(Date.parse(payload.generated_at))) {
+            throw new Error('frontend/dist/build.json is missing a valid generated_at field');
+          }
+          if (typeof payload.commit_sha !== 'string' || payload.commit_sha.toLowerCase() !== process.env.EXPECTED_SHA.toLowerCase()) {
+            throw new Error(`frontend/dist/build.json commit_sha mismatch: expected ${process.env.EXPECTED_SHA}, got ${payload.commit_sha}`);
+          }
+          if (typeof payload.branch !== 'string' || payload.branch.trim().length === 0) {
+            throw new Error('frontend/dist/build.json is missing branch');
+          }
+          NODE
+
+      - name: Poll production build metadata until deploy matches
+        run: |
+          set -euo pipefail
+          success=false
+          for attempt in $(seq 1 30); do
+            http_code="$(curl -sS -o /tmp/pxi-build.json -w '%{http_code}' --max-time 20 "${SITE_URL}/build.json")"
+            if [[ "${http_code}" == "200" ]]; then
+              deployed_sha="$(node -e "const fs = require('node:fs'); const payload = JSON.parse(fs.readFileSync('/tmp/pxi-build.json', 'utf8')); process.stdout.write(String(payload.commit_sha || ''));" )"
+              if [[ "${deployed_sha,,}" == "${EXPECTED_SHA,,}" ]]; then
+                success=true
+                break
+              fi
+            fi
+            sleep 20
+          done
+          if [[ "${success}" != "true" ]]; then
+            echo "::error::Timed out waiting for ${SITE_URL}/build.json to report commit ${EXPECTED_SHA}"
+            cat /tmp/pxi-build.json || true
+            exit 1
+          fi
+
+      - name: Run frontend route smoke
+        run: bash scripts/site-route-smoke.sh "${SITE_URL}"

@@ -3,39 +3,41 @@ main = "api.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# D1 Database
 [env.staging]
+name = "pxi-api-staging"
+workers_dev = true
+
+# Provision isolated staging resources before deploying this environment.
 [[env.staging.d1_databases]]
 binding = "DB"
-database_name = "pxi-db"
-database_id = "2254a52c-11b6-40a6-8881-ef6880f70d21"
+database_name = "pxi-db-staging"
+database_id = "00000000-0000-0000-0000-000000000001"
+migrations_dir = "migrations"
 
-# Vectorize for market embeddings
 [[env.staging.vectorize]]
 binding = "VECTORIZE"
-index_name = "pxi-embeddings"
+index_name = "pxi-embeddings-staging"
 
-# Workers AI
 [env.staging.ai]
 binding = "AI"
 
-# KV for ML models
 [[env.staging.kv_namespaces]]
 binding = "ML_MODELS"
-id = "88901ff0216a484eb81b8004be0f5aea"
+id = "00000000000000000000000000000001"
 
 [[env.staging.kv_namespaces]]
 binding = "RATE_LIMIT_KV"
-id = "e9d69a554ea44727b185127ea67e6932"
-
-[[env.staging.send_email]]
-name = "EMAIL_OUTBOUND"
+id = "00000000000000000000000000000002"
 
 [env.staging.vars]
+DEPLOY_ENV = "staging"
+BUILD_SHA = "local-dev"
+BUILD_TIMESTAMP = "1970-01-01T00:00:00.000Z"
+WORKER_VERSION = "pxi-dev"
 FEATURE_ENABLE_BRIEF = "true"
 FEATURE_ENABLE_OPPORTUNITIES = "true"
 FEATURE_ENABLE_ALERTS_IN_APP = "true"
-FEATURE_ENABLE_ALERTS_EMAIL = "true"
+FEATURE_ENABLE_ALERTS_EMAIL = "false"
 FEATURE_ENABLE_PLAN = "true"
 FEATURE_ENABLE_OPPORTUNITY_COHERENCE_GATE = "true"
 FEATURE_ENABLE_CALIBRATION_DIAGNOSTICS = "true"
@@ -49,6 +51,7 @@ DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS = "10"
 ALERTS_FROM_EMAIL = "alerts@pxicommand.com"
 
 [env.production]
+name = "pxi-api"
 routes = [
   { pattern = "api.pxicommand.com", custom_domain = true },
   { pattern = "www.pxicommand.com/*", zone_name = "pxicommand.com" }
@@ -58,6 +61,7 @@ routes = [
 binding = "DB"
 database_name = "pxi-db"
 database_id = "2254a52c-11b6-40a6-8881-ef6880f70d21"
+migrations_dir = "migrations"
 
 [[env.production.vectorize]]
 binding = "VECTORIZE"
@@ -78,6 +82,10 @@ id = "e9d69a554ea44727b185127ea67e6932"
 name = "EMAIL_OUTBOUND"
 
 [env.production.vars]
+DEPLOY_ENV = "production"
+BUILD_SHA = "local-dev"
+BUILD_TIMESTAMP = "1970-01-01T00:00:00.000Z"
+WORKER_VERSION = "pxi-dev"
 FEATURE_ENABLE_BRIEF = "true"
 FEATURE_ENABLE_OPPORTUNITIES = "true"
 FEATURE_ENABLE_ALERTS_IN_APP = "true"
@@ -101,6 +109,7 @@ name = "pxi-api"
 binding = "DB"
 database_name = "pxi-db"
 database_id = "2254a52c-11b6-40a6-8881-ef6880f70d21"
+migrations_dir = "migrations"
 
 [[env.fallback.vectorize]]
 binding = "VECTORIZE"
@@ -121,6 +130,10 @@ id = "e9d69a554ea44727b185127ea67e6932"
 name = "EMAIL_OUTBOUND"
 
 [env.fallback.vars]
+DEPLOY_ENV = "fallback"
+BUILD_SHA = "local-dev"
+BUILD_TIMESTAMP = "1970-01-01T00:00:00.000Z"
+WORKER_VERSION = "pxi-dev"
 FEATURE_ENABLE_BRIEF = "true"
 FEATURE_ENABLE_OPPORTUNITIES = "true"
 FEATURE_ENABLE_ALERTS_IN_APP = "true"
