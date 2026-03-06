@@ -51,7 +51,7 @@ DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS = "10"
 ALERTS_FROM_EMAIL = "alerts@pxicommand.com"
 
 [env.production]
-name = "pxi-api"
+name = "pxi-api-production"
 routes = [
   { pattern = "api.pxicommand.com", custom_domain = true },
   { pattern = "www.pxicommand.com/*", zone_name = "pxicommand.com" }

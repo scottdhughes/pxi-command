@@ -47,8 +47,28 @@ test('worker staging bindings are isolated from production', () => {
   assert.notDeepEqual(stagingKvIds, productionKvIds);
 
   assert.match(staging, /name = "pxi-api-staging"/);
+  assert.match(production, /name = "pxi-api-production"/);
   assert.doesNotMatch(staging, /\[\[env\.staging\.send_email\]\]/);
   assert.match(staging, /FEATURE_ENABLE_ALERTS_EMAIL = "false"/);
   assert.match(staging, /DEPLOY_ENV = "staging"/);
   assert.match(production, /DEPLOY_ENV = "production"/);
+});
+
+test('worker deploy workflow targets the configured production and staging script names', () => {
+  const workflowPath = path.resolve(process.cwd(), '.github/workflows/deploy-worker.yml');
+  const workflow = readFileSync(workflowPath, 'utf8');
+
+  assert.match(workflow, /worker_script_name="pxi-api-production"/);
+  assert.match(workflow, /worker_script_name="pxi-api-staging"/);
+  assert.match(workflow, /--name "\$\{WORKER_SCRIPT_NAME\}"/);
+});
+
+test('frontend production verify workflow tolerates non-JSON build responses while polling', () => {
+  const workflowPath = path.resolve(process.cwd(), '.github/workflows/verify-frontend-production.yml');
+  const workflow = readFileSync(workflowPath, 'utf8');
+
+  assert.match(workflow, /curl -sS -D \/tmp\/pxi-build\.headers -o \/tmp\/pxi-build\.json/);
+  assert.match(workflow, /grep -qi "\^content-type: application\/json"/);
+  assert.match(workflow, /try \{/);
+  assert.match(workflow, /catch \{/);
 });

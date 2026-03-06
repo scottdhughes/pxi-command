@@ -69,18 +69,21 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve target base URL
+      - name: Resolve target deployment settings
         run: |
           set -euo pipefail
           if [[ "${TARGET_ENV}" == "production" ]]; then
             target_base_url="${WORKER_BASE_URL:-${DEFAULT_PRODUCTION_BASE_URL}}"
+            worker_script_name="pxi-api-production"
           else
             target_base_url="${WORKER_BASE_URL:-}"
+            worker_script_name="pxi-api-staging"
           fi
           if [[ -z "${target_base_url}" ]]; then
             echo "::error::Missing environment variable WORKER_BASE_URL for ${TARGET_ENV}"
             exit 1
           fi
+          echo "WORKER_SCRIPT_NAME=${worker_script_name}" >> "$GITHUB_ENV"
           echo "TARGET_BASE_URL=${target_base_url%/}" >> "$GITHUB_ENV"
 
       - name: Typecheck worker
@@ -119,6 +122,7 @@ jobs:
           npx wrangler deploy \
             --config worker/wrangler.toml \
             --env "${TARGET_ENV}" \
+            --name "${WORKER_SCRIPT_NAME}" \
             --var "BUILD_SHA:${BUILD_SHA}" \
             --var "BUILD_TIMESTAMP:${BUILD_TIMESTAMP}" \
             --var "WORKER_VERSION:${WORKER_VERSION}"
