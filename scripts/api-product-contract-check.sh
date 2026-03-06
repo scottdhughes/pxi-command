@@ -391,8 +391,7 @@ check_freshness_alert_parity() {
   local plan_stale
   local brief_stale
   local pxi_stale
-  local alert_body
-  local alert_stale
+  local matching_alert_count
 
   plan_json=$(curl -sS --max-time 20 "$API_URL/api/plan")
   brief_json=$(curl -sS --max-time 20 "$API_URL/api/brief?scope=market")
@@ -417,16 +416,19 @@ check_freshness_alert_parity() {
     exit 1
   fi
 
-  if [[ -n "$alert_body" ]]; then
-    if [[ "$alert_body" =~ ([0-9]+) ]]; then
-      alert_stale="${BASH_REMATCH[1]}"
-      if [[ "$alert_stale" != "$plan_stale" ]]; then
-        echo "Freshness alert parity mismatch: alert=$alert_stale plan=$plan_stale"
-        echo "$alerts_json"
-        exit 1
-      fi
-    else
-      echo "Unable to parse stale count from freshness alert body: $alert_body"
+  if [[ "$plan_stale" != "0" ]]; then
+    matching_alert_count=$(echo "$alerts_json" | jq -r --arg plan_stale "$plan_stale" '
+      [
+        .alerts[]?
+        | select(.event_type=="freshness_warning")
+        | .body
+        | (try capture("(?<count>[0-9]+)").count catch empty)
+        | select(. == $plan_stale)
+      ] | length
+    ')
+
+    if [[ "$matching_alert_count" == "0" ]]; then
+      echo "Freshness alert parity mismatch: expected a freshness alert with stale_count=$plan_stale"
       echo "$alerts_json"
       exit 1
     fi
