@@ -219,7 +219,9 @@ export async function tryHandleMarketCoreRoute(
       .slice(0, 3)
       .map(({ priorityScore: _priorityScore, ...offender }: any) => offender);
 
-    const latestRefresh = await deps.resolveLatestRefreshTimestamp(env.DB);
+    const latestRefreshResolver =
+      deps.resolveLatestObservedRefreshTimestamp || deps.resolveLatestRefreshTimestamp;
+    const latestRefresh = await latestRefreshResolver(env.DB);
     const nextRefresh = deps.computeNextExpectedRefresh(new Date());
 
     const payload: PXIResponsePayload = {

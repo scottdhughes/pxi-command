@@ -140,7 +140,11 @@ export function buildOpportunityLedgerProjection(args: {
   coherence_gate_enabled: boolean;
   freshness: FreshnessStatus;
   consistency_state: ConsistencyState;
+  publication_allowed?: boolean;
+  publication_blocked_reason?: string | null;
 }): OpportunityLedgerBuildResult {
+  const publicationAllowed = args.publication_allowed !== false;
+  const publicationBlockedReason = args.publication_blocked_reason || 'governance_blocked';
   const normalized = normalizeOpportunityItemsForPublishing(args.snapshot.items, args.calibration);
   const qualityGateResult = removeLowInformationOpportunities(normalized);
   const coherenceGateResult = applyOpportunityCoherenceGate(
@@ -154,7 +158,9 @@ export function buildOpportunityLedgerProjection(args: {
   });
   const qualityRetainedIds = new Set(qualityGateResult.items.map((item) => item.id));
   const coherenceEligibleIds = new Set(coherenceGateResult.items.map((item) => item.id));
-  const publishedIds = new Set(projected.items.map((item) => item.id));
+  const projectedPublishedIds = new Set(projected.items.map((item) => item.id));
+  const blockedPublishedIds = publicationAllowed ? new Set<string>() : new Set(projected.items.map((item) => item.id));
+  const publishedIds = publicationAllowed ? projectedPublishedIds : new Set<string>();
 
   const itemRows: OpportunityItemLedgerInsertPayload[] = normalized.map((item) => {
     const isPublished = publishedIds.has(item.id);
@@ -165,6 +171,8 @@ export function buildOpportunityLedgerProjection(args: {
         suppressionReason = 'quality_filtered';
       } else if (!coherenceEligibleIds.has(item.id)) {
         suppressionReason = 'coherence_failed';
+      } else if (blockedPublishedIds.has(item.id)) {
+        suppressionReason = 'governance_blocked';
       } else if (projected.suppressed_data_quality || projected.degraded_reason === 'suppressed_data_quality') {
         suppressionReason = 'suppressed_data_quality';
       } else if (projected.degraded_reason === 'coherence_gate_failed') {
@@ -194,14 +202,14 @@ export function buildOpportunityLedgerProjection(args: {
       as_of: args.snapshot.as_of,
       horizon: args.snapshot.horizon,
       candidate_count: projected.total_candidates,
-      published_count: projected.items.length,
-      suppressed_count: projected.suppressed_count,
+      published_count: publicationAllowed ? projected.items.length : 0,
+      suppressed_count: publicationAllowed ? projected.suppressed_count : (projected.suppressed_count + blockedPublishedIds.size),
       quality_filtered_count: projected.quality_filtered_count,
       coherence_suppressed_count: projected.coherence_suppressed_count,
       data_quality_suppressed_count: projected.suppression_by_reason.data_quality_suppressed,
-      degraded_reason: projected.degraded_reason,
+      degraded_reason: publicationAllowed ? projected.degraded_reason : publicationBlockedReason,
       top_direction_candidate: normalized[0]?.direction ?? null,
-      top_direction_published: projected.items[0]?.direction ?? null,
+      top_direction_published: publicationAllowed ? (projected.items[0]?.direction ?? null) : null,
     },
     item_rows: itemRows,
     projected,

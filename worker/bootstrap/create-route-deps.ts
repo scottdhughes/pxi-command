@@ -16,6 +16,7 @@ import {
   computeFreshnessSloWindow as computeFreshnessSloWindowData,
   recordMarketRefreshRunFinish as recordMarketRefreshRunFinishData,
   recordMarketRefreshRunStart as recordMarketRefreshRunStartData,
+  resolveLatestObservedRefreshTimestamp as resolveLatestObservedRefreshTimestampData,
   resolveLatestRefreshTimestamp as resolveLatestRefreshTimestampData,
 } from '../data/market-refresh';
 import {
@@ -136,6 +137,7 @@ export function createRouteDeps() {
     resolveConflictState: legacy.resolveConflictState,
     resolveDecisionImpactGovernance: legacy.resolveDecisionImpactGovernance,
     resolveHorizonBias: legacy.resolveHorizonBias,
+    resolveLatestObservedRefreshTimestamp: resolveLatestObservedRefreshTimestampData,
     resolveLatestRefreshTimestamp: resolveLatestRefreshTimestampData,
     resolvePlanActionability: legacy.resolvePlanActionability,
     resolveStalePolicy: legacy.resolveStalePolicy,

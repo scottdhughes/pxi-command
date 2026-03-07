@@ -162,7 +162,7 @@ export async function recordMarketRefreshRunFinish(
   db: D1Database,
   runId: number | null,
   payload: {
-    status: 'success' | 'failed';
+    status: 'success' | 'failed' | 'blocked';
     brief_generated?: number;
     opportunities_generated?: number;
     calibrations_generated?: number;
@@ -236,6 +236,35 @@ export async function fetchLatestSuccessfulMarketRefreshRun(db: D1Database): Pro
   }
 }
 
+export async function fetchLatestObservedMarketRefreshRun(db: D1Database): Promise<{
+  completed_at: string | null;
+  trigger: string | null;
+  stale_count: number | null;
+  critical_stale_count: number | null;
+  as_of: string | null;
+} | null> {
+  try {
+    const row = await db.prepare(`
+      SELECT completed_at, "trigger" as trigger, stale_count, critical_stale_count, as_of
+      FROM market_refresh_runs
+      WHERE status IN ('success', 'blocked')
+        AND completed_at IS NOT NULL
+      ORDER BY completed_at DESC, id DESC
+      LIMIT 1
+    `).first<{
+      completed_at: string | null;
+      trigger: string | null;
+      stale_count: number | null;
+      critical_stale_count: number | null;
+      as_of: string | null;
+    }>();
+
+    return row || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function computeFreshnessSloWindow(
   db: D1Database,
   windowDays: number,
@@ -252,7 +281,7 @@ export async function computeFreshnessSloWindow(
         MAX(COALESCE(stale_count, 0)) as stale_count,
         MAX(COALESCE(critical_stale_count, 0)) as critical_stale_count
       FROM market_refresh_runs
-      WHERE status = 'success'
+      WHERE status IN ('success', 'blocked')
         AND completed_at IS NOT NULL
         AND completed_at >= datetime('now', ?)
       GROUP BY run_date
@@ -372,6 +401,47 @@ export async function resolveLatestRefreshTimestamp(db: D1Database): Promise<{
 }> {
   const [latestRefreshRun, latestProductSnapshotWrite, lastFetchLogRow] = await Promise.all([
     fetchLatestSuccessfulMarketRefreshRun(db),
+    fetchLatestMarketProductSnapshotWrite(db),
+    db.prepare(`
+      SELECT MAX(completed_at) as last_refresh_at
+      FROM fetch_logs
+      WHERE completed_at IS NOT NULL
+    `).first<{ last_refresh_at: string | null }>(),
+  ]);
+
+  if (latestRefreshRun?.completed_at) {
+    return {
+      last_refresh_at_utc: latestRefreshRun.completed_at,
+      source: 'market_refresh_runs',
+    };
+  }
+
+  if (latestProductSnapshotWrite) {
+    return {
+      last_refresh_at_utc: latestProductSnapshotWrite,
+      source: 'market_product_snapshots',
+    };
+  }
+
+  if (lastFetchLogRow?.last_refresh_at) {
+    return {
+      last_refresh_at_utc: lastFetchLogRow.last_refresh_at,
+      source: 'fetch_logs',
+    };
+  }
+
+  return {
+    last_refresh_at_utc: null,
+    source: 'unknown',
+  };
+}
+
+export async function resolveLatestObservedRefreshTimestamp(db: D1Database): Promise<{
+  last_refresh_at_utc: string | null;
+  source: 'market_refresh_runs' | 'market_product_snapshots' | 'fetch_logs' | 'unknown';
+}> {
+  const [latestRefreshRun, latestProductSnapshotWrite, lastFetchLogRow] = await Promise.all([
+    fetchLatestObservedMarketRefreshRun(db),
     fetchLatestMarketProductSnapshotWrite(db),
     db.prepare(`
       SELECT MAX(completed_at) as last_refresh_at

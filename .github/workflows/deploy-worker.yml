@@ -182,8 +182,18 @@ jobs:
           const passed =
             payload?.ok === true &&
             (
-              payload?.skipped !== true ||
-              payload?.reason === 'refresh_in_progress'
+              (
+                payload?.skipped === true &&
+                payload?.reason === 'refresh_in_progress'
+              ) ||
+              (
+                payload?.blocked === true &&
+                payload?.reason === 'decision_impact_enforcement_failed'
+              ) ||
+              (
+                payload?.blocked !== true &&
+                payload?.skipped !== true
+              )
             );
 
           if (!passed) {

@@ -83,6 +83,11 @@ interface MarketRefreshSummary {
   generated_at_utc: string;
   result: {
     ok?: boolean;
+    blocked?: boolean;
+    skipped?: boolean;
+    publication_status?: 'published' | 'blocked' | 'skipped';
+    reason?: string;
+    governance_breaches?: string[];
     brief_generated?: number;
     opportunities_generated?: number;
     calibrations_generated?: number;
@@ -1586,10 +1591,21 @@ async function triggerMarketProductsRefresh(): Promise<void> {
   };
 
   await writeFile(MARKET_SUMMARY_PATH, `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
-  console.log(`  ✓ Brief generated: ${result.brief_generated ?? 0}`);
-  console.log(`  ✓ Opportunities generated: ${result.opportunities_generated ?? 0}`);
+  if (result.blocked === true) {
+    console.warn('  ! Market publication blocked by governance');
+    console.warn(`  ! Reason: ${result.reason ?? 'decision_impact_enforcement_failed'}`);
+    if (Array.isArray(result.governance_breaches) && result.governance_breaches.length > 0) {
+      console.warn(`  ! Governance breaches: ${result.governance_breaches.join(', ')}`);
+    }
+  } else if (result.skipped === true) {
+    console.log(`  ! Market publication skipped: ${result.reason ?? 'refresh_in_progress'}`);
+  } else {
+    console.log(`  ✓ Brief generated: ${result.brief_generated ?? 0}`);
+    console.log(`  ✓ Opportunities generated: ${result.opportunities_generated ?? 0}`);
+    console.log(`  ✓ Alerts generated: ${result.alerts_generated ?? 0}`);
+  }
+  console.log(`  ✓ Publication status: ${result.publication_status ?? 'published'}`);
   console.log(`  ✓ Calibrations generated: ${result.calibrations_generated ?? 0}`);
-  console.log(`  ✓ Alerts generated: ${result.alerts_generated ?? 0}`);
   console.log(`  ✓ Summary written: ${MARKET_SUMMARY_PATH}`);
 }
 
