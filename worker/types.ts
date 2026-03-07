@@ -493,6 +493,7 @@ export interface MarketEdgeDiagnosticsSummary {
 
 export interface RefreshProductsCompletedResponsePayload {
   ok: true;
+  publication_status: 'published';
   brief_generated: number;
   opportunities_generated: number;
   calibrations_generated: number;
@@ -520,8 +521,42 @@ export interface RefreshProductsCompletedResponsePayload {
   refresh_run_id: number | null;
 }
 
+export interface RefreshProductsBlockedResponsePayload {
+  ok: true;
+  blocked: true;
+  reason: 'decision_impact_enforcement_failed';
+  publication_status: 'blocked';
+  governance_breaches: string[];
+  brief_generated: 0;
+  opportunities_generated: 0;
+  calibrations_generated: number;
+  alerts_generated: 0;
+  consistency_stored: number;
+  consistency_state: ConsistencyState | 'INSUFFICIENT';
+  consistency_score: number | null;
+  as_of: string | null;
+  stale_count: number;
+  critical_stale_count: number;
+  quality_filtered_count: number;
+  coherence_suppressed_count: number;
+  suppressed_data_quality_count: number;
+  over_suppressed_count: number;
+  cross_horizon_state: 'ALIGNED' | 'MIXED' | 'CONFLICT' | 'INSUFFICIENT';
+  opportunity_ledger_rows: number;
+  opportunity_item_ledger_rows: number;
+  decision_impact_snapshots_generated: number;
+  decision_impact: MarketDecisionImpactSummary | null;
+  decision_impact_error: string | null;
+  calibration_diagnostics: MarketCalibrationDiagnosticsSummary | null;
+  decision_grade_snapshot: MarketDecisionGradeSnapshot | null;
+  edge_diagnostics: MarketEdgeDiagnosticsSummary | null;
+  refresh_trigger: string;
+  refresh_run_id: number | null;
+}
+
 export interface RefreshProductsSkippedResponsePayload {
   ok: true;
+  publication_status: 'skipped';
   skipped: true;
   reason: 'refresh_in_progress';
   refresh_run_id: number | null;
@@ -530,6 +565,7 @@ export interface RefreshProductsSkippedResponsePayload {
 
 export type RefreshProductsResponsePayload =
   | RefreshProductsCompletedResponsePayload
+  | RefreshProductsBlockedResponsePayload
   | RefreshProductsSkippedResponsePayload;
 
 export interface BackfillProductsResponsePayload {
@@ -599,7 +635,7 @@ export interface OpportunityItemLedgerInsertPayload {
   direction: OpportunityDirection;
   conviction_score: number;
   published: 0 | 1;
-  suppression_reason: 'coherence_failed' | 'quality_filtered' | 'suppressed_data_quality' | null;
+  suppression_reason: 'coherence_failed' | 'quality_filtered' | 'suppressed_data_quality' | 'governance_blocked' | null;
 }
 
 export interface OpportunityLedgerInsertPayload {

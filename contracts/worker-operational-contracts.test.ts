@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   backfillFixture,
   backfillProductsFixture,
+  refreshProductsBlockedFixture,
   refreshProductsFixture,
   utilityFunnelFixture,
   workerOperationalFixtures,
@@ -19,6 +20,7 @@ test('worker operational fixtures cover the admin and publication payload surfac
     'recalculateAllSignals',
     'refreshIngestion',
     'refreshProducts',
+    'refreshProductsBlocked',
     'refreshProductsSkipped',
     'sendDigest',
     'skippedDigest',
@@ -31,6 +33,8 @@ test('worker operational fixtures cover the admin and publication payload surfac
 test('worker operational fixtures preserve core runtime invariants', () => {
   assert.equal(backfillFixture.results.some((result) => result.error), true);
   assert.equal(refreshProductsFixture.opportunity_item_ledger_rows >= refreshProductsFixture.opportunity_ledger_rows, true);
+  assert.equal(refreshProductsBlockedFixture.publication_status, 'blocked');
+  assert.equal(refreshProductsBlockedFixture.brief_generated, 0);
   assert.equal(refreshProductsFixture.decision_impact?.market_7d_sample_size !== null, true);
   assert.equal(backfillProductsFixture.calibration_samples.edge_total_samples !== null, true);
   assert.equal(utilityFunnelFixture.funnel.total_events >= utilityFunnelFixture.funnel.decision_events_total, true);

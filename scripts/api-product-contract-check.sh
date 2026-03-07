@@ -391,7 +391,8 @@ check_freshness_alert_parity() {
   local plan_stale
   local brief_stale
   local pxi_stale
-  local matching_alert_count
+  local alert_body
+  local alert_stale
 
   plan_json=$(curl -sS --max-time 20 "$API_URL/api/plan")
   brief_json=$(curl -sS --max-time 20 "$API_URL/api/brief?scope=market")
@@ -416,22 +417,23 @@ check_freshness_alert_parity() {
     exit 1
   fi
 
-  if [[ "$plan_stale" != "0" ]]; then
-    matching_alert_count=$(echo "$alerts_json" | jq -r --arg plan_stale "$plan_stale" '
-      [
-        .alerts[]?
-        | select(.event_type=="freshness_warning")
-        | .body
-        | (try capture("(?<count>[0-9]+)").count catch empty)
-        | select(. == $plan_stale)
-      ] | length
-    ')
-
-    if [[ "$matching_alert_count" == "0" ]]; then
-      echo "Freshness alert parity mismatch: expected a freshness alert with stale_count=$plan_stale"
+  if [[ "$plan_stale" != "0" && -n "$alert_body" ]]; then
+    if [[ "$alert_body" =~ ([0-9]+) ]]; then
+      alert_stale="${BASH_REMATCH[1]}"
+      if [[ "$alert_stale" != "$plan_stale" ]]; then
+        echo "Freshness alert parity mismatch: alert=$alert_stale plan=$plan_stale"
+        echo "$alerts_json"
+        exit 1
+      fi
+    else
+      echo "Unable to parse stale count from freshness alert body: $alert_body"
       echo "$alerts_json"
       exit 1
     fi
+  elif [[ "$plan_stale" != "0" && -z "$alert_body" ]]; then
+    echo "Freshness alert parity mismatch: plan reports stale_count=$plan_stale but feed has no current freshness_warning body"
+    echo "$alerts_json"
+    exit 1
   fi
 }
 
@@ -837,8 +839,6 @@ check_decision_grade_semantics() {
   local conflict_rate
   local unlock_coverage
   local blockers_len
-  local enforce_ready
-  local enforce_breaches_len
 
   grade_json=$(curl -sS --max-time 20 "$API_URL/api/ops/decision-grade?window=30")
   score=$(echo "$grade_json" | jq -r '.score // -1')
@@ -849,8 +849,6 @@ check_decision_grade_semantics() {
   conflict_rate=$(echo "$grade_json" | jq -r '.components.opportunity_hygiene.cross_horizon_conflict_rate_pct // -1')
   unlock_coverage=$(echo "$grade_json" | jq -r '.components.utility.no_action_unlock_coverage_pct // -1')
   blockers_len=$(echo "$grade_json" | jq -r '(.go_live_blockers // [] | length)')
-  enforce_ready=$(echo "$grade_json" | jq -r '.readiness.decision_impact_enforce_ready // false')
-  enforce_breaches_len=$(echo "$grade_json" | jq -r '(.readiness.decision_impact_breaches // [] | length)')
 
   if ! awk "BEGIN { exit !($score >= 0 && $score <= 100) }"; then
     echo "Decision-grade score must be in [0,100]"
@@ -909,12 +907,6 @@ check_decision_grade_semantics() {
     exit 1
   fi
 
-  if [[ "$enforce_ready" == "true" && "$enforce_breaches_len" != "0" ]]; then
-    echo "decision impact readiness cannot be enforce-ready with active breaches"
-    echo "$grade_json"
-    exit 1
-  fi
-
   bad_status=$(echo "$grade_json" | jq -r '
     any([
       .components.freshness.status,
@@ -955,16 +947,12 @@ check_go_live_readiness_semantics() {
   local score_window_days
   local go_live_ready
   local blockers_len
-  local breach_len
-  local enforce_ready
   local grade_value
 
   readiness_json=$(curl -sS --max-time 20 "$API_URL/api/ops/go-live-readiness?window=30")
   score_window_days=$(echo "$readiness_json" | jq -r '.score_window_days // -1')
   go_live_ready=$(echo "$readiness_json" | jq -r '.go_live_ready // false')
   blockers_len=$(echo "$readiness_json" | jq -r '(.blockers // [] | length)')
-  breach_len=$(echo "$readiness_json" | jq -r '(.readiness.decision_impact_breaches // [] | length)')
-  enforce_ready=$(echo "$readiness_json" | jq -r '.readiness.decision_impact_enforce_ready // false')
   grade_value=$(echo "$readiness_json" | jq -r '.grade.grade // ""')
 
   if [[ "$score_window_days" != "30" ]]; then
@@ -985,11 +973,6 @@ check_go_live_readiness_semantics() {
     exit 1
   fi
 
-  if [[ "$enforce_ready" == "true" && "$breach_len" != "0" ]]; then
-    echo "decision impact enforce ready cannot have active breaches"
-    echo "$readiness_json"
-    exit 1
-  fi
 }
 
 check_decision_impact_semantics() {

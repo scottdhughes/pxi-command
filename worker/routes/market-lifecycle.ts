@@ -204,6 +204,7 @@ export async function tryHandleMarketLifecycleRoute(
       const payload: RefreshProductsResponsePayload = {
         ok: true,
         skipped: true,
+        publication_status: 'skipped',
         reason: 'refresh_in_progress',
         refresh_run_id: refreshClaim.run_id,
         refresh_trigger: refreshClaim.refresh_trigger,
@@ -260,7 +261,6 @@ export async function tryHandleMarketLifecycleRoute(
       if (briefEnabled) {
         brief = await deps.buildBriefSnapshot(env.DB);
         if (brief) {
-          await deps.storeBriefSnapshot(env.DB, brief);
           await deps.storeConsistencyCheck(env.DB, brief.source_plan_as_of, brief.consistency);
           consistencyStored = true;
         }
@@ -285,25 +285,6 @@ export async function tryHandleMarketLifecycleRoute(
         opportunities30d = await deps.buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d, {
           sanitize_signals_tickers: signalsSanitizerEnabled,
         });
-        if (opportunities7d) await deps.storeOpportunitySnapshot(env.DB, opportunities7d);
-        if (opportunities30d) await deps.storeOpportunitySnapshot(env.DB, opportunities30d);
-      }
-
-      let alertsGenerated = 0;
-      if (brief && opportunities7d) {
-        const projectedForAlerts = deps.projectOpportunityFeed(
-          deps.normalizeOpportunityItemsForPublishing(opportunities7d.items, convictionCalibration7d),
-          {
-            coherence_gate_enabled: coherenceGateEnabled,
-            freshness: brief.freshness_status,
-            consistency_state: brief.consistency.state,
-          },
-        );
-        const generated = await generateMarketEvents(env.DB, deps, brief, {
-          ...opportunities7d,
-          items: projectedForAlerts.items,
-        });
-        alertsGenerated = await deps.insertMarketEvents(env.DB, generated, inAppAlertsEnabled);
       }
 
       const freshnessForRun = brief?.freshness_status || await deps.computeFreshnessStatus(env.DB);
@@ -320,74 +301,6 @@ export async function tryHandleMarketLifecycleRoute(
           }
         }
       }
-
-      let qualityFilteredCount = 0;
-      let coherenceSuppressedCount = 0;
-      let suppressedDataQualityCount = 0;
-      const ledgerRows: any[] = [];
-      const itemLedgerRows: any[] = [];
-      const projectionTargets = [
-        { snapshot: opportunities7d, calibration: convictionCalibration7d },
-        { snapshot: opportunities30d, calibration: convictionCalibration30d },
-      ];
-      for (const target of projectionTargets) {
-        if (!target.snapshot) continue;
-        const ledgerBuild = deps.buildOpportunityLedgerProjection({
-          refresh_run_id: refreshRunId,
-          snapshot: target.snapshot,
-          calibration: target.calibration,
-          coherence_gate_enabled: coherenceGateEnabled,
-          freshness: freshnessForRun,
-          consistency_state: consistencyStateForRun,
-        });
-        qualityFilteredCount += ledgerBuild.projected.quality_filtered_count;
-        coherenceSuppressedCount += ledgerBuild.projected.coherence_suppressed_count;
-        suppressedDataQualityCount += ledgerBuild.projected.suppression_by_reason.data_quality_suppressed;
-        ledgerRows.push(ledgerBuild.ledger_row);
-        itemLedgerRows.push(...ledgerBuild.item_rows);
-      }
-      for (const row of ledgerRows) {
-        try {
-          await deps.insertOpportunityLedgerRow(env.DB, row);
-        } catch (err) {
-          console.error('Opportunity ledger insert failed:', err);
-        }
-      }
-      for (const row of itemLedgerRows) {
-        try {
-          await deps.insertOpportunityItemLedgerRow(env.DB, row);
-        } catch (err) {
-          console.error('Opportunity item ledger insert failed:', err);
-        }
-      }
-      const overSuppressedCount = ledgerRows.filter((row) =>
-        row.candidate_count > 0 &&
-        row.published_count === 0 &&
-        row.data_quality_suppressed_count === 0,
-      ).length;
-      const horizon7 = ledgerRows.find((row) => row.horizon === '7d') || null;
-      const horizon30 = ledgerRows.find((row) => row.horizon === '30d') || null;
-      const crossHorizonState: RefreshProductsCompletedResponsePayload['cross_horizon_state'] = (
-        horizon7 &&
-        horizon30 &&
-        horizon7.published_count > 0 &&
-        horizon30.published_count > 0 &&
-        horizon7.top_direction_published &&
-        horizon30.top_direction_published
-      )
-        ? (horizon7.top_direction_published === horizon30.top_direction_published ? 'ALIGNED' : 'CONFLICT')
-        : (
-          horizon7 &&
-          horizon30 &&
-          horizon7.published_count === 0 &&
-          horizon30.published_count === 0
-        )
-          ? 'INSUFFICIENT'
-          : (
-            horizon7 || horizon30
-          )
-            ? 'MIXED'
-            : 'INSUFFICIENT';
 
       let decisionImpactSnapshotsGenerated = 0;
       let decisionImpactSummary: RefreshProductsCompletedResponsePayload['decision_impact'] = null;
@@ -445,9 +358,80 @@ export async function tryHandleMarketLifecycleRoute(
           console.error('Decision impact snapshot generation failed:', err);
         }
       }
-      if (decisionImpactEnforcementError) {
-        throw new Error(decisionImpactEnforcementError);
+
+      const governanceBreaches = decisionImpactSummary?.enforce_breaches || [];
+      const publicationBlocked = Boolean(decisionImpactEnforcementError);
+      const publicationBlockedReason = publicationBlocked ? 'governance_blocked' : null;
+
+      let qualityFilteredCount = 0;
+      let coherenceSuppressedCount = 0;
+      let suppressedDataQualityCount = 0;
+      const ledgerRows: any[] = [];
+      const itemLedgerRows: any[] = [];
+      const projectionTargets = [
+        { snapshot: opportunities7d, calibration: convictionCalibration7d },
+        { snapshot: opportunities30d, calibration: convictionCalibration30d },
+      ];
+      for (const target of projectionTargets) {
+        if (!target.snapshot) continue;
+        const ledgerBuild = deps.buildOpportunityLedgerProjection({
+          refresh_run_id: refreshRunId,
+          snapshot: target.snapshot,
+          calibration: target.calibration,
+          coherence_gate_enabled: coherenceGateEnabled,
+          freshness: freshnessForRun,
+          consistency_state: consistencyStateForRun,
+          publication_allowed: !publicationBlocked,
+          publication_blocked_reason: publicationBlockedReason,
+        });
+        qualityFilteredCount += ledgerBuild.projected.quality_filtered_count;
+        coherenceSuppressedCount += ledgerBuild.projected.coherence_suppressed_count;
+        suppressedDataQualityCount += ledgerBuild.projected.suppression_by_reason.data_quality_suppressed;
+        ledgerRows.push(ledgerBuild.ledger_row);
+        itemLedgerRows.push(...ledgerBuild.item_rows);
       }
+      for (const row of ledgerRows) {
+        try {
+          await deps.insertOpportunityLedgerRow(env.DB, row);
+        } catch (err) {
+          console.error('Opportunity ledger insert failed:', err);
+        }
+      }
+      for (const row of itemLedgerRows) {
+        try {
+          await deps.insertOpportunityItemLedgerRow(env.DB, row);
+        } catch (err) {
+          console.error('Opportunity item ledger insert failed:', err);
+        }
+      }
+      const overSuppressedCount = ledgerRows.filter((row) =>
+        row.candidate_count > 0 &&
+        row.published_count === 0 &&
+        row.data_quality_suppressed_count === 0,
+      ).length;
+      const horizon7 = ledgerRows.find((row) => row.horizon === '7d') || null;
+      const horizon30 = ledgerRows.find((row) => row.horizon === '30d') || null;
+      const crossHorizonState: RefreshProductsCompletedResponsePayload['cross_horizon_state'] = (
+        horizon7 &&
+        horizon30 &&
+        horizon7.published_count > 0 &&
+        horizon30.published_count > 0 &&
+        horizon7.top_direction_published &&
+        horizon30.top_direction_published
+      )
+        ? (horizon7.top_direction_published === horizon30.top_direction_published ? 'ALIGNED' : 'CONFLICT')
+        : (
+          horizon7 &&
+          horizon30 &&
+          horizon7.published_count === 0 &&
+          horizon30.published_count === 0
+        )
+          ? 'INSUFFICIENT'
+          : (
+            horizon7 || horizon30
+          )
+            ? 'MIXED'
+            : 'INSUFFICIENT';
 
       let decisionGradeSnapshot: RefreshProductsCompletedResponsePayload['decision_grade_snapshot'] = null;
       try {
@@ -482,28 +466,31 @@ export async function tryHandleMarketLifecycleRoute(
         };
       }
 
-      await deps.recordMarketRefreshRunFinish(env.DB, refreshRunId, {
-        status: 'success',
-        brief_generated: brief ? 1 : 0,
-        opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
-        calibrations_generated: calibrationsGenerated,
-        alerts_generated: alertsGenerated,
-        stale_count: freshnessForRun.stale_count,
-        critical_stale_count: freshnessForRun.critical_stale_count,
-        as_of: brief?.as_of || opportunities7d?.as_of || null,
-        error: null,
-      });
-
-      const payload: RefreshProductsCompletedResponsePayload = {
-        ok: true,
-        brief_generated: brief ? 1 : 0,
-        opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
-        calibrations_generated: calibrationsGenerated,
-        alerts_generated: alertsGenerated,
+      const edgeDiagnosticsSummary = edgeDiagnosticsReport
+        ? {
+            as_of: edgeDiagnosticsReport.as_of,
+            promotion_gate: edgeDiagnosticsReport.promotion_gate,
+            windows: edgeDiagnosticsReport.windows.map((window: any) => ({
+              horizon: window.horizon,
+              sample_size: window.sample_size,
+              model_direction_accuracy: window.model_direction_accuracy,
+              baseline_direction_accuracy: window.baseline_direction_accuracy,
+              uplift_vs_baseline: window.uplift_vs_baseline,
+              uplift_ci95_low: window.uplift_ci95_low,
+              uplift_ci95_high: window.uplift_ci95_high,
+              lower_bound_positive: window.lower_bound_positive,
+              leakage_sentinel: window.leakage_sentinel,
+              quality_band: window.quality_band,
+            })),
+          }
+        : null;
+      const asOfForRun = brief?.as_of || opportunities7d?.as_of || opportunities30d?.as_of || null;
+      const basePayload = {
+        ok: true as const,
         consistency_stored: consistencyStored ? 1 : 0,
         consistency_state: consistencyStateForRun,
         consistency_score: brief?.consistency.score ?? null,
-        as_of: brief?.as_of || opportunities7d?.as_of || null,
+        as_of: asOfForRun,
         stale_count: freshnessForRun.stale_count,
         critical_stale_count: freshnessForRun.critical_stale_count,
         quality_filtered_count: qualityFilteredCount,
@@ -518,26 +505,84 @@ export async function tryHandleMarketLifecycleRoute(
         decision_impact_error: decisionImpactGenerationError,
         calibration_diagnostics: diagnosticsSummary,
         decision_grade_snapshot: decisionGradeSnapshot,
-        edge_diagnostics: edgeDiagnosticsReport
-          ? {
-              as_of: edgeDiagnosticsReport.as_of,
-              promotion_gate: edgeDiagnosticsReport.promotion_gate,
-              windows: edgeDiagnosticsReport.windows.map((window: any) => ({
-                horizon: window.horizon,
-                sample_size: window.sample_size,
-                model_direction_accuracy: window.model_direction_accuracy,
-                baseline_direction_accuracy: window.baseline_direction_accuracy,
-                uplift_vs_baseline: window.uplift_vs_baseline,
-                uplift_ci95_low: window.uplift_ci95_low,
-                uplift_ci95_high: window.uplift_ci95_high,
-                lower_bound_positive: window.lower_bound_positive,
-                leakage_sentinel: window.leakage_sentinel,
-                quality_band: window.quality_band,
-              })),
-            }
-          : null,
+        edge_diagnostics: edgeDiagnosticsSummary,
         refresh_trigger: refreshTrigger,
         refresh_run_id: refreshRunId,
+      };
+
+      if (publicationBlocked) {
+        await deps.recordMarketRefreshRunFinish(env.DB, refreshRunId, {
+          status: 'blocked',
+          brief_generated: 0,
+          opportunities_generated: 0,
+          calibrations_generated: calibrationsGenerated,
+          alerts_generated: 0,
+          stale_count: freshnessForRun.stale_count,
+          critical_stale_count: freshnessForRun.critical_stale_count,
+          as_of: asOfForRun,
+          error: decisionImpactEnforcementError?.slice(0, 1000) || 'decision_impact_enforcement_failed',
+        });
+
+        const payload: RefreshProductsResponsePayload = {
+          ...basePayload,
+          blocked: true,
+          reason: 'decision_impact_enforcement_failed',
+          publication_status: 'blocked',
+          governance_breaches: governanceBreaches,
+          brief_generated: 0,
+          opportunities_generated: 0,
+          calibrations_generated: calibrationsGenerated,
+          alerts_generated: 0,
+        };
+        return Response.json(payload, { headers: corsHeaders });
+      }
+
+      if (brief) {
+        await deps.storeBriefSnapshot(env.DB, brief);
+      }
+      if (opportunities7d) {
+        await deps.storeOpportunitySnapshot(env.DB, opportunities7d);
+      }
+      if (opportunities30d) {
+        await deps.storeOpportunitySnapshot(env.DB, opportunities30d);
+      }
+
+      let alertsGenerated = 0;
+      if (brief && opportunities7d) {
+        const projectedForAlerts = deps.projectOpportunityFeed(
+          deps.normalizeOpportunityItemsForPublishing(opportunities7d.items, convictionCalibration7d),
+          {
+            coherence_gate_enabled: coherenceGateEnabled,
+            freshness: brief.freshness_status,
+            consistency_state: brief.consistency.state,
+          },
+        );
+        const generated = await generateMarketEvents(env.DB, deps, brief, {
+          ...opportunities7d,
+          items: projectedForAlerts.items,
+        });
+        alertsGenerated = await deps.insertMarketEvents(env.DB, generated, inAppAlertsEnabled);
+      }
+
+      await deps.recordMarketRefreshRunFinish(env.DB, refreshRunId, {
+        status: 'success',
+        brief_generated: brief ? 1 : 0,
+        opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
+        calibrations_generated: calibrationsGenerated,
+        alerts_generated: alertsGenerated,
+        stale_count: freshnessForRun.stale_count,
+        critical_stale_count: freshnessForRun.critical_stale_count,
+        as_of: asOfForRun,
+        error: null,
+      });
+
+      const payload: RefreshProductsCompletedResponsePayload = {
+        ...basePayload,
+        publication_status: 'published',
+        brief_generated: brief ? 1 : 0,
+        opportunities_generated: (opportunities7d ? 1 : 0) + (opportunities30d ? 1 : 0),
+        calibrations_generated: calibrationsGenerated,
+        alerts_generated: alertsGenerated,
       };
 
       return Response.json(payload, { headers: corsHeaders });

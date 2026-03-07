@@ -41,6 +41,19 @@ async function main(): Promise<void> {
   };
 
   await writeFile(MARKET_SUMMARY_PATH, `${JSON.stringify(output, null, 2)}\n`, 'utf8');
+  if (result?.blocked === true) {
+    console.warn(`Market publication blocked by governance (${result.reason ?? 'decision_impact_enforcement_failed'}). Summary written to ${MARKET_SUMMARY_PATH}`);
+    if (Array.isArray(result.governance_breaches) && result.governance_breaches.length > 0) {
+      console.warn(`Governance breaches: ${result.governance_breaches.join(', ')}`);
+    }
+    return;
+  }
+
+  if (result?.skipped === true) {
+    console.log(`Market publication skipped (${result.reason ?? 'refresh_in_progress'}). Summary written to ${MARKET_SUMMARY_PATH}`);
+    return;
+  }
+
   console.log(`Market products refreshed. Summary written to ${MARKET_SUMMARY_PATH}`);
 }
 

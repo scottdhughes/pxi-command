@@ -92,6 +92,23 @@ jobs:
             -H "X-Refresh-Trigger: github_actions_market_backfill_post_refresh")"
           echo "${RESPONSE}" | jq . > /tmp/post-refresh-response.json
           cat /tmp/post-refresh-response.json
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const payload = JSON.parse(fs.readFileSync('/tmp/post-refresh-response.json', 'utf8'));
+          if (payload?.ok !== true) {
+            console.error('Post-refresh market generation returned HTTP 200 but payload.ok was not true.');
+            console.error(JSON.stringify(payload, null, 2));
+            process.exit(1);
+          }
+          const publicationStatus =
+            payload?.publication_status ||
+            (payload?.blocked === true ? 'blocked' : (payload?.skipped === true ? 'skipped' : 'published'));
+          console.log(`Post-refresh publication_status=${publicationStatus}`);
+          if (payload?.blocked === true && Array.isArray(payload?.governance_breaches) && payload.governance_breaches.length > 0) {
+            console.warn(`Governance breaches: ${payload.governance_breaches.join(', ')}`);
+          }
+          NODE
 
       - name: Append summary
         if: always()
@@ -111,8 +128,14 @@ jobs:
               echo ""
               echo "### Post Refresh Summary"
               echo ""
-              echo "| Brief generated | Opportunities generated | Calibrations generated | Alerts generated | As of |"
-              echo "|---:|---:|---:|---:|---|"
-              jq -r '"| \(.brief_generated // 0) | \(.opportunities_generated // 0) | \(.calibrations_generated // 0) | \(.alerts_generated // 0) | \(.as_of // "n/a") |"' /tmp/post-refresh-response.json
+              echo "| Publication status | Reason | Brief generated | Opportunities generated | Calibrations generated | Alerts generated | As of |"
+              echo "|---|---|---:|---:|---:|---:|---|"
+              jq -r '"| \(.publication_status // (if .blocked == true then "blocked" elif .skipped == true then "skipped" else "published" end)) | \(.reason // "n/a") | \(.brief_generated // 0) | \(.opportunities_generated // 0) | \(.calibrations_generated // 0) | \(.alerts_generated // 0) | \(.as_of // "n/a") |"' /tmp/post-refresh-response.json
+              if jq -e '.governance_breaches != null and (.governance_breaches | length > 0)' /tmp/post-refresh-response.json >/dev/null 2>&1; then
+                echo ""
+                echo "| Governance breaches |"
+                echo "|---|"
+                jq -r '"| " + ((.governance_breaches // []) | join(", ")) + " |"' /tmp/post-refresh-response.json
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
