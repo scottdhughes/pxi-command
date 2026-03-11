@@ -63,6 +63,27 @@ test('evaluateSla detects stale and missing states', () => {
   assert.equal(missingEval.stale, true);
 });
 
+test('evaluateSla uses business-day aging for weekly series', () => {
+  const now = new Date('2026-03-11T13:15:00Z');
+  const policy = resolveIndicatorSla('jobless_claims', 'weekly');
+  const evaluation = evaluateSla('2026-02-28', now, policy);
+
+  assert.equal(evaluation.days_old, 8);
+  assert.equal(evaluation.stale, false);
+});
+
+test('evaluateSla uses business-day aging for source-lagged series', () => {
+  const now = new Date('2026-03-11T13:15:00Z');
+  const policy = resolveIndicatorSla('wti_crude', 'daily');
+  const freshEvaluation = evaluateSla('2026-03-02', now, policy);
+  const staleEvaluation = evaluateSla('2026-02-27', now, policy);
+
+  assert.equal(freshEvaluation.days_old, 7);
+  assert.equal(freshEvaluation.stale, false);
+  assert.equal(staleEvaluation.days_old, 8);
+  assert.equal(staleEvaluation.stale, true);
+});
+
 test('resolveStalePolicy applies class defaults and indicator overrides', () => {
   const dailyPolicy = resolveStalePolicy('foo_daily', 'daily');
   assert.equal(dailyPolicy.retry_attempts, 2);
