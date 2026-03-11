@@ -69,19 +69,7 @@ jobs:
             http_code="$(curl -sS -D /tmp/pxi-build.headers -o /tmp/pxi-build.json -w '%{http_code}' --max-time 20 "${SITE_URL}/build.json")"
             if [[ "${http_code}" == "200" ]]; then
               if grep -qi "^content-type: application/json" /tmp/pxi-build.headers; then
-                deployed_sha="$(node <<'NODE'
-                const fs = require('node:fs');
-
-                try {
-                  const payload = JSON.parse(fs.readFileSync('/tmp/pxi-build.json', 'utf8'));
-                  if (typeof payload.commit_sha === 'string') {
-                    process.stdout.write(payload.commit_sha);
-                  }
-                } catch {
-                  // Wait for the production deployment to publish a valid JSON build manifest.
-                }
-                NODE
-                )"
+                deployed_sha="$(node -e "const fs = require('node:fs'); try { const payload = JSON.parse(fs.readFileSync('/tmp/pxi-build.json', 'utf8')); if (typeof payload.commit_sha === 'string') { process.stdout.write(payload.commit_sha); } } catch {}")"
                 if [[ "${deployed_sha}" != "" && "${deployed_sha,,}" == "${EXPECTED_SHA,,}" ]]; then
                   success=true
                   break
