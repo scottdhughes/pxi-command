@@ -279,6 +279,113 @@ test('buildCanonicalMarketDecision assembles the extracted decision payload', as
   ]);
 });
 
+test('tryHandleMarketProductsRoute rebuilds brief snapshots when freshness state drifts', async () => {
+  let storedSnapshot: Record<string, unknown> | null = null;
+
+  const route = createRouteContext('https://pxi.test/api/brief?scope=market', undefined, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('FROM market_brief_snapshots')) {
+        return {
+          payload_json: JSON.stringify({
+            as_of: '2026-03-11T00:00:00.000Z',
+            summary: 'stale snapshot',
+            regime_delta: 'UNCHANGED',
+            top_changes: [],
+            risk_posture: 'neutral',
+            policy_state: {
+              stance: 'MIXED',
+              risk_posture: 'neutral',
+              conflict_state: 'MIXED',
+              base_signal: 'DEFENSIVE',
+              regime_context: 'TRANSITION',
+              rationale: 'mixed:stale_inputs',
+              rationale_codes: ['stale_inputs'],
+            },
+            source_plan_as_of: '2026-03-11T00:00:00.000Z',
+            contract_version: '2026-02-17-v2',
+            consistency: {
+              score: 97,
+              state: 'PASS',
+              violations: ['stale_inputs_penalty'],
+              components: {
+                base_score: 100,
+                structural_penalty: 0,
+                reliability_penalty: 3,
+              },
+            },
+            freshness_status: {
+              has_stale_data: true,
+              stale_count: 2,
+              critical_stale_count: 0,
+            },
+          }),
+        };
+      }
+      if (sql.includes('SELECT date') && sql.includes('FROM pxi_scores')) {
+        return { date: '2026-03-11' };
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const rebuiltSnapshot = {
+    as_of: '2026-03-11T00:00:00.000Z',
+    summary: 'fresh snapshot',
+    regime_delta: 'UNCHANGED',
+    top_changes: [],
+    risk_posture: 'risk_off',
+    policy_state: {
+      stance: 'RISK_OFF',
+      risk_posture: 'risk_off',
+      conflict_state: 'MIXED',
+      base_signal: 'DEFENSIVE',
+      regime_context: 'TRANSITION',
+      rationale: 'aligned:defensive',
+      rationale_codes: ['aligned'],
+    },
+    source_plan_as_of: '2026-03-11T00:00:00.000Z',
+    contract_version: '2026-02-17-v2',
+    consistency: {
+      score: 100,
+      state: 'PASS',
+      violations: [],
+      components: {
+        base_score: 100,
+        structural_penalty: 0,
+        reliability_penalty: 0,
+      },
+    },
+    freshness_status: {
+      has_stale_data: false,
+      stale_count: 0,
+      critical_stale_count: 0,
+    },
+  };
+
+  const response = await tryHandleMarketProductsRoute(route as any, {
+    isFeatureEnabled: () => true,
+    ensureMarketProductSchema: async () => undefined,
+    computeFreshnessStatus: async () => ({
+      has_stale_data: false,
+      stale_count: 0,
+      critical_stale_count: 0,
+    }),
+    toNumber: (value: unknown, fallback = 0) => {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : fallback;
+    },
+    buildBriefSnapshot: async () => rebuiltSnapshot,
+    storeBriefSnapshot: async (_db: D1Database, snapshot: Record<string, unknown>) => {
+      storedSnapshot = snapshot;
+    },
+    buildBriefFallbackSnapshot: (reason: string) => ({ degraded_reason: reason }),
+  });
+
+  assert.ok(response);
+  assert.deepEqual(await response!.json(), rebuiltSnapshot);
+  assert.deepEqual(storedSnapshot, rebuiltSnapshot);
+});
+
 test('tryHandleMarketCoreRoute reports a generic plan build failure for unexpected decision errors', async () => {
   const route = createRouteContext('https://pxi.test/api/plan', undefined, {
     DB: createFakeDb((sql) => {
