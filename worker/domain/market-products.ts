@@ -363,6 +363,28 @@ export async function tryHandleMarketProductsRoute(
       }
     }
 
+    if (snapshot) {
+      try {
+        const currentFreshness = await deps.computeFreshnessStatus(env.DB);
+        const snapshotFreshness = snapshot.freshness_status || {
+          has_stale_data: false,
+          stale_count: 0,
+          critical_stale_count: 0,
+        };
+
+        if (
+          Boolean(snapshotFreshness.has_stale_data) !== Boolean(currentFreshness.has_stale_data) ||
+          deps.toNumber(snapshotFreshness.stale_count, 0) !== deps.toNumber(currentFreshness.stale_count, 0) ||
+          deps.toNumber(snapshotFreshness.critical_stale_count, 0) !== deps.toNumber(currentFreshness.critical_stale_count, 0)
+        ) {
+          snapshot = null;
+        }
+      } catch (err) {
+        console.error('Brief freshness parity check failed:', err);
+        snapshot = null;
+      }
+    }
+
     if (!snapshot) {
       try {
         snapshot = await deps.buildBriefSnapshot(env.DB);
