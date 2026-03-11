@@ -1,4 +1,4 @@
-import { ensureEmailAlertDeliveryUniqueness } from '../db/schema';
+import { ensureEmailAlertDeliveryUniqueness, ensureMarketRefreshRunStatusSchema } from '../db/schema';
 import type {
   BackfillResponsePayload,
   MigrationResponsePayload,
@@ -290,7 +290,7 @@ export async function tryHandleAdminIngestionRoute(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           started_at TEXT NOT NULL,
           completed_at TEXT,
-          status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed')),
+          status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed', 'blocked')),
           "trigger" TEXT NOT NULL DEFAULT 'unknown',
           brief_generated INTEGER DEFAULT 0,
           opportunities_generated INTEGER DEFAULT 0,
@@ -303,6 +303,7 @@ export async function tryHandleAdminIngestionRoute(
           created_at TEXT DEFAULT (datetime('now'))
         )
       `).run();
+      await ensureMarketRefreshRunStatusSchema(env.DB);
       await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
       await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
       migrations.push('market_refresh_runs');

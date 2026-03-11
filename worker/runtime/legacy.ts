@@ -3826,7 +3826,7 @@ async function ensureMarketProductSchema(db: D1Database): Promise<void> {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         started_at TEXT NOT NULL,
         completed_at TEXT,
-        status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed')),
+        status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed', 'blocked')),
         "trigger" TEXT NOT NULL DEFAULT 'unknown',
         brief_generated INTEGER DEFAULT 0,
         opportunities_generated INTEGER DEFAULT 0,
@@ -5759,7 +5759,7 @@ async function recordMarketRefreshRunFinish(
   db: D1Database,
   runId: number | null,
   payload: {
-    status: 'success' | 'failed';
+    status: 'success' | 'failed' | 'blocked';
     brief_generated?: number;
     opportunities_generated?: number;
     calibrations_generated?: number;
@@ -9177,7 +9177,7 @@ export default {
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               started_at TEXT NOT NULL,
               completed_at TEXT,
-              status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed')),
+              status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed', 'blocked')),
               "trigger" TEXT NOT NULL DEFAULT 'unknown',
               brief_generated INTEGER DEFAULT 0,
               opportunities_generated INTEGER DEFAULT 0,

@@ -27,6 +27,20 @@ async function indexExists(
   return Boolean(row?.name);
 }
 
+async function tableSql(
+  db: D1Database,
+  tableName: string,
+): Promise<string | null> {
+  const row = await db.prepare(`
+    SELECT sql
+    FROM sqlite_master
+    WHERE type = 'table'
+      AND name = ?
+    LIMIT 1
+  `).bind(tableName).first<{ sql: string | null }>();
+  return row?.sql || null;
+}
+
 async function dedupeMarketAlertDeliveries(db: D1Database): Promise<void> {
   const duplicateGroups = await db.prepare(`
     SELECT event_id, channel, subscriber_id, COUNT(*) as duplicate_count
@@ -90,6 +104,83 @@ export async function ensureEmailAlertDeliveryUniqueness(db: D1Database): Promis
     ON market_alert_deliveries(event_id, channel, subscriber_id)
     WHERE subscriber_id IS NOT NULL
   `).run();
+}
+
+export async function ensureMarketRefreshRunStatusSchema(db: D1Database): Promise<void> {
+  const hasCriticalStaleCount = await tableHasColumn(db, 'market_refresh_runs', 'critical_stale_count');
+  if (!hasCriticalStaleCount) {
+    await db.prepare(
+      `ALTER TABLE market_refresh_runs ADD COLUMN critical_stale_count INTEGER`
+    ).run();
+  }
+
+  const marketRefreshRunsSql = await tableSql(db, 'market_refresh_runs');
+  if (marketRefreshRunsSql?.includes(`'blocked'`)) {
+    return;
+  }
+
+  await db.prepare(`
+    ALTER TABLE market_refresh_runs
+    RENAME TO market_refresh_runs_legacy_status
+  `).run();
+
+  await db.prepare(`
+    CREATE TABLE market_refresh_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed', 'blocked')),
+      "trigger" TEXT NOT NULL DEFAULT 'unknown',
+      brief_generated INTEGER DEFAULT 0,
+      opportunities_generated INTEGER DEFAULT 0,
+      calibrations_generated INTEGER DEFAULT 0,
+      alerts_generated INTEGER DEFAULT 0,
+      stale_count INTEGER,
+      critical_stale_count INTEGER,
+      as_of TEXT,
+      error TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  await db.prepare(`
+    INSERT INTO market_refresh_runs (
+      id,
+      started_at,
+      completed_at,
+      status,
+      "trigger",
+      brief_generated,
+      opportunities_generated,
+      calibrations_generated,
+      alerts_generated,
+      stale_count,
+      critical_stale_count,
+      as_of,
+      error,
+      created_at
+    )
+    SELECT
+      id,
+      started_at,
+      completed_at,
+      status,
+      "trigger",
+      brief_generated,
+      opportunities_generated,
+      calibrations_generated,
+      alerts_generated,
+      stale_count,
+      critical_stale_count,
+      as_of,
+      error,
+      created_at
+    FROM market_refresh_runs_legacy_status
+  `).run();
+
+  await db.prepare(`DROP TABLE market_refresh_runs_legacy_status`).run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
 }
 
 export async function ensureMarketProductSchema(db: D1Database): Promise<void> {
@@ -260,7 +351,7 @@ export async function ensureMarketProductSchema(db: D1Database): Promise<void> {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         started_at TEXT NOT NULL,
         completed_at TEXT,
-        status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed')),
+        status TEXT NOT NULL CHECK(status IN ('running', 'success', 'failed', 'blocked')),
         "trigger" TEXT NOT NULL DEFAULT 'unknown',
         brief_generated INTEGER DEFAULT 0,
         opportunities_generated INTEGER DEFAULT 0,
@@ -273,12 +364,7 @@ export async function ensureMarketProductSchema(db: D1Database): Promise<void> {
         created_at TEXT DEFAULT (datetime('now'))
       )
     `).run();
-    const hasCriticalStaleCount = await tableHasColumn(db, 'market_refresh_runs', 'critical_stale_count');
-    if (!hasCriticalStaleCount) {
-      await db.prepare(
-        `ALTER TABLE market_refresh_runs ADD COLUMN critical_stale_count INTEGER`
-      ).run();
-    }
+    await ensureMarketRefreshRunStatusSchema(db);
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_completed ON market_refresh_runs(status, completed_at DESC)`).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_market_refresh_runs_created ON market_refresh_runs(created_at DESC)`).run();
 
