@@ -33,7 +33,7 @@ export function formatUnavailableReason(reason: string | null | undefined): stri
 export function formatOpportunityDegradedReason(reason: string | null | undefined): string {
   if (!reason) return ''
   if (reason === 'suppressed_data_quality') return 'Opportunity feed is suppressed due to critical stale inputs or consistency failure.'
-  if (reason === 'coherence_gate_failed') return 'No eligible opportunities (contract gate).'
+  if (reason === 'coherence_gate_failed') return 'Some setups were suppressed by the contract gate.'
   if (reason === 'quality_filtered') return 'Low-information opportunities were filtered from this feed.'
   if (reason === 'refresh_ttl_overdue') return 'Opportunity feed is in watch mode because refresh data is overdue.'
   if (reason === 'refresh_ttl_unknown') return 'Opportunity feed cannot verify refresh recency yet.'

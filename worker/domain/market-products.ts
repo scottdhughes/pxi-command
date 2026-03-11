@@ -65,6 +65,11 @@ function parseIsoTimestamp(value: string | null | undefined): Date | null {
   return parsed;
 }
 
+function snapshotAsOfDate(snapshot: OpportunitySnapshot | null): string | null {
+  if (!snapshot?.as_of) return null;
+  return snapshot.as_of.slice(0, 10);
+}
+
 export function computeOpportunityTtlMetadata(
   lastRefreshAtUtc: string | null,
   now = new Date(),
@@ -483,9 +488,29 @@ export async function tryHandleMarketProductsRoute(
       }
     }
 
-    if (!snapshot) {
-      try {
-        snapshot = await deps.buildOpportunitySnapshot(env.DB, horizon, undefined, {
+    let latestPxiDate: string | null = null;
+    try {
+      const latestPxiRow = await env.DB.prepare(`
+        SELECT date
+        FROM pxi_scores
+        ORDER BY date DESC
+        LIMIT 1
+      `).first<{ date: string | null }>();
+      latestPxiDate = latestPxiRow?.date || null;
+    } catch (err) {
+      console.error('Latest PXI date lookup failed for opportunities:', err);
+    }
+
+    const hadStoredSnapshot = Boolean(snapshot);
+    const shouldRebuildSnapshot = !snapshot || (
+      Boolean(latestPxiDate) &&
+      Boolean(snapshotAsOfDate(snapshot)) &&
+      String(snapshotAsOfDate(snapshot)) < String(latestPxiDate)
+    );
+
+	    if (shouldRebuildSnapshot) {
+	      try {
+	        snapshot = await deps.buildOpportunitySnapshot(env.DB, horizon, undefined, {
           sanitize_signals_tickers: signalsSanitizerEnabled,
         });
       } catch (err) {
@@ -501,18 +526,31 @@ export async function tryHandleMarketProductsRoute(
           },
         });
       }
-      try {
-        await deps.storeOpportunitySnapshot(env.DB, snapshot);
-      } catch (err) {
-        console.error('Opportunity snapshot store failed:', err);
-      }
-    }
+	      if (!hadStoredSnapshot) {
+	        try {
+	          await deps.storeOpportunitySnapshot(env.DB, snapshot);
+	        } catch (err) {
+	          console.error('Opportunity snapshot store failed:', err);
+	        }
+	      }
+	    }
+	    if (!snapshot) {
+	      const fallback = deps.buildOpportunityFallbackSnapshot(horizon, 'snapshot_unavailable');
+	      return Response.json(buildOpportunityRouteFallbackResponse(fallback, unknownTtlMetadata), {
+	        headers: {
+	          ...corsHeaders,
+	          'Cache-Control': 'no-store',
+	        },
+	      });
+	    }
+	    const effectiveSnapshot = snapshot;
 
+	    const resolveRefreshTimestamp = deps.resolveLatestObservedRefreshTimestamp || deps.resolveLatestRefreshTimestamp;
     const [convictionCalibration, freshness, latestConsistencyCheck, latestRefresh] = await Promise.all([
       deps.fetchLatestCalibrationSnapshot(env.DB, 'conviction', horizon),
       deps.computeFreshnessStatus(env.DB),
       deps.fetchLatestConsistencyCheck(env.DB),
-      deps.resolveLatestRefreshTimestamp(env.DB),
+      resolveRefreshTimestamp(env.DB),
     ]);
 
     let consistencyState = latestConsistencyCheck?.state ?? 'PASS';
@@ -524,7 +562,7 @@ export async function tryHandleMarketProductsRoute(
       }
     }
 
-    const normalizedItems = deps.normalizeOpportunityItemsForPublishing(snapshot.items, convictionCalibration);
+	    const normalizedItems = deps.normalizeOpportunityItemsForPublishing(effectiveSnapshot.items, convictionCalibration);
     const projectedFeed = deps.projectOpportunityFeed(normalizedItems, {
       coherence_gate_enabled: coherenceGateEnabled,
       freshness,
@@ -551,9 +589,9 @@ export async function tryHandleMarketProductsRoute(
       ? 'no-store'
       : 'public, max-age=60';
 
-    const responsePayload: OpportunityFeedResponsePayload = {
-      as_of: snapshot.as_of,
-      horizon: snapshot.horizon,
+	    const responsePayload: OpportunityFeedResponsePayload = {
+	      as_of: effectiveSnapshot.as_of,
+	      horizon: effectiveSnapshot.horizon,
       items: responseItems,
       suppressed_count: projectedFeed.suppressed_count,
       quality_filtered_count: projectedFeed.quality_filtered_count,
