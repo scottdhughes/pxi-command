@@ -167,6 +167,32 @@ function parseLatestDate(value: string | Date): Date | null {
   return parsed;
 }
 
+function startOfUtcDay(value: Date): Date {
+  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()));
+}
+
+function countBusinessDaysSince(latestDate: Date, now: Date): number {
+  const latestDay = startOfUtcDay(latestDate);
+  const nowDay = startOfUtcDay(now);
+
+  if (nowDay.getTime() <= latestDay.getTime()) {
+    return 0;
+  }
+
+  let businessDays = 0;
+  const cursor = new Date(latestDay.getTime());
+
+  while (cursor.getTime() < nowDay.getTime()) {
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    const day = cursor.getUTCDay();
+    if (day !== 0 && day !== 6) {
+      businessDays += 1;
+    }
+  }
+
+  return businessDays;
+}
+
 export function resolveIndicatorSla(
   indicatorId: string,
   frequency?: string | null
@@ -247,7 +273,9 @@ export function evaluateSla(
     };
   }
 
-  const daysOld = (now.getTime() - parsedDate.getTime()) / (24 * 60 * 60 * 1000);
+  const daysOld = policy.class === 'weekly' || policy.class === 'source_lagged'
+    ? countBusinessDaysSince(parsedDate, now)
+    : (now.getTime() - parsedDate.getTime()) / (24 * 60 * 60 * 1000);
   return {
     latest_date: normalizeIsoDateString(parsedDate.toISOString()),
     days_old: daysOld,
