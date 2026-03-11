@@ -1,6 +1,7 @@
 import type { RefObject } from 'react'
 
 import { EmailSubscribeModal } from '../components/EmailSubscribeModal'
+import { SiteDisclaimer } from '../components/SiteDisclaimer'
 import {
   ExportButton,
   MLPredictionsCard,
@@ -662,8 +663,11 @@ export function HomePage({
       </main>
 
       <footer className="fixed bottom-0 left-0 right-0 p-4 sm:p-6">
-        <div className="text-[9px] sm:text-[10px] text-[#949ba5]/30 font-mono tracking-wider text-center uppercase">
-          Macro Market Strength Index
+        <div className="space-y-1">
+          <div className="text-[9px] sm:text-[10px] text-[#949ba5]/30 font-mono tracking-wider text-center uppercase">
+            Macro Market Strength Index
+          </div>
+          <SiteDisclaimer />
         </div>
       </footer>
     </div>

@@ -1,3 +1,4 @@
+import { SiteDisclaimer } from '../components/SiteDisclaimer'
 import {
   calibrationQualityClass,
   formatDecisionImpactBasis,
@@ -144,6 +145,7 @@ export function BriefPage({
           </div>
         )}
       </div>
+      <SiteDisclaimer className="mt-8 pb-2" />
     </div>
   )
 }

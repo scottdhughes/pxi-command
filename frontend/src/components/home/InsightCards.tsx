@@ -391,6 +391,7 @@ export function OpportunityPreview({ data, onOpen }: { data: OpportunitiesRespon
   const dataAgeText = formatDataAgeSeconds(data.data_age_seconds)
   const nextExpectedRefresh = data.next_expected_refresh_at ? new Date(data.next_expected_refresh_at).toLocaleString() : 'unknown'
   const hasFeedState = top.length > 0 || suppressedCount > 0 || Boolean(data.degraded_reason)
+  const noEligibleContractGate = data.degraded_reason === 'coherence_gate_failed' && top.length === 0
 
   if (!hasFeedState) return null
 
@@ -408,7 +409,9 @@ export function OpportunityPreview({ data, onOpen }: { data: OpportunitiesRespon
 
       {data.degraded_reason && (
         <p className="mb-3 text-[10px] text-[#f59e0b]">
-          {formatOpportunityDegradedReason(data.degraded_reason)}
+          {noEligibleContractGate
+            ? 'Opportunity feed currently suppressed: No eligible opportunities (contract gate).'
+            : formatOpportunityDegradedReason(data.degraded_reason)}
         </p>
       )}
       <div className="mb-3 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wider">
@@ -419,7 +422,7 @@ export function OpportunityPreview({ data, onOpen }: { data: OpportunitiesRespon
           data age {dataAgeText}
         </span>
         <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
-          next refresh {nextExpectedRefresh}
+          next scheduled refresh {nextExpectedRefresh}
         </span>
       </div>
       {suppressedCount > 0 && (
@@ -441,7 +444,11 @@ export function OpportunityPreview({ data, onOpen }: { data: OpportunitiesRespon
       )}
 
       {top.length === 0 ? (
-        <div className="text-[10px] text-[#949ba5]">No eligible opportunities currently published.</div>
+        <div className="text-[10px] text-[#949ba5]">
+          {noEligibleContractGate
+            ? 'No eligible opportunities are currently published.'
+            : 'No eligible opportunities currently published.'}
+        </div>
       ) : (
         <div className="space-y-2">
           {top.map((item) => {

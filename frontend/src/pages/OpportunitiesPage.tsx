@@ -1,5 +1,6 @@
 import { useState } from 'react'
 
+import { SiteDisclaimer } from '../components/SiteDisclaimer'
 import {
   calibrationQualityClass,
   deriveNoActionUnlockConditions,
@@ -64,6 +65,7 @@ export function OpportunitiesPage({
   const ctaEnabled = typeof data?.cta_enabled === 'boolean'
     ? Boolean(data.cta_enabled)
     : (Boolean(data?.items?.length) && ctaDisabledReasons.length === 0)
+  const itemCount = data?.items?.length ?? 0
   const ttlState = data?.ttl_state || 'unknown'
   const dataAgeText = formatDataAgeSeconds(data?.data_age_seconds)
   const nextExpectedRefresh = data?.next_expected_refresh_at ? new Date(data.next_expected_refresh_at).toLocaleString() : 'unknown'
@@ -76,6 +78,7 @@ export function OpportunitiesPage({
       })
     : []
   const hasContractGateSuppression = degradedReason === 'coherence_gate_failed'
+  const noEligibleContractGate = degradedReason === 'coherence_gate_failed' && itemCount === 0
   const hasDataQualitySuppression = degradedReason === 'suppressed_data_quality'
   const hasQualityFilter = degradedReason === 'quality_filtered'
   const hasRefreshTtlSuppression = degradedReason === 'refresh_ttl_overdue' || degradedReason === 'refresh_ttl_unknown'
@@ -236,7 +239,9 @@ export function OpportunitiesPage({
 
         {degradedReason && (
           <div className={`mb-4 text-[10px] ${hasDataQualitySuppression || hasContractGateSuppression ? 'text-[#f59e0b]' : 'text-[#949ba5]'}`}>
-            {formatOpportunityDegradedReason(degradedReason)}
+            {noEligibleContractGate
+              ? 'Opportunity feed currently suppressed: No eligible opportunities (contract gate).'
+              : formatOpportunityDegradedReason(degradedReason)}
           </div>
         )}
 
@@ -248,7 +253,7 @@ export function OpportunitiesPage({
             data age {dataAgeText}
           </span>
           <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
-            next refresh {nextExpectedRefresh}
+            next scheduled refresh {nextExpectedRefresh}
           </span>
           {ttlState === 'overdue' && overdueSeconds !== null && (
             <span className="px-2 py-1 border border-[#ff6b6b]/40 rounded text-[#ff6b6b]">
@@ -313,10 +318,10 @@ export function OpportunitiesPage({
           </div>
         )}
 
-        {!data || data.items.length === 0 ? (
+        {!data || itemCount === 0 ? (
           <div className="text-[#949ba5]">
             {hasContractGateSuppression
-              ? 'No eligible opportunities (contract gate).'
+              ? 'No eligible opportunities are currently published.'
               : hasDataQualitySuppression
                 ? 'Opportunities are suppressed until critical data quality recovers.'
                 : hasQualityFilter
@@ -385,6 +390,7 @@ export function OpportunitiesPage({
           </div>
         )}
       </div>
+      <SiteDisclaimer className="mt-8 pb-2" />
     </div>
   )
 }

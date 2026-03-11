@@ -561,6 +561,86 @@ test('tryHandleMarketProductsRoute preserves opportunity coherence and CTA field
   );
 });
 
+test('tryHandleMarketProductsRoute rebuilds stale opportunity snapshots and uses observed refresh timestamps', async () => {
+  const nowIso = new Date().toISOString();
+  let rebuilt = 0;
+  let storedAfterRebuild = 0;
+
+  const request = new Request('https://pxi.test/api/opportunities?horizon=7d&limit=5');
+  const route = {
+    request,
+    env: {
+      DB: createFakeDb((sql) => {
+        if (sql.includes('FROM opportunity_snapshots')) {
+          return {
+            payload_json: JSON.stringify({
+              as_of: '2026-03-08T00:00:00.000Z',
+              horizon: '7d',
+              items: [{ id: 'old-op', theme_id: 'credit', theme_name: 'credit', conviction_score: 55 }],
+            }),
+          };
+        }
+        if (sql.includes('FROM pxi_scores')) {
+          return { date: '2026-03-11' };
+        }
+        throw new Error(`Unhandled query: ${sql}`);
+      }),
+    },
+    url: new URL(request.url),
+    method: 'GET',
+    corsHeaders: {},
+  };
+
+  const response = await tryHandleMarketProductsRoute(route as any, {
+    isFeatureEnabled: () => true,
+    ensureMarketProductSchema: async () => {},
+    buildOpportunityFallbackSnapshot: () => {
+      throw new Error('fallback should not be used');
+    },
+    buildOpportunitySnapshot: async () => {
+      rebuilt += 1;
+      return {
+        as_of: '2026-03-11T00:00:00.000Z',
+        horizon: '7d',
+        items: [{ id: 'new-op', theme_id: 'macro', theme_name: 'macro', conviction_score: 68 }],
+      };
+    },
+    storeOpportunitySnapshot: async () => {
+      storedAfterRebuild += 1;
+    },
+    fetchLatestCalibrationSnapshot: async () => ({ quality_band: 'ROBUST' }),
+    computeFreshnessStatus: async () => ({ stale_count: 0, critical_stale_count: 0 }),
+    fetchLatestConsistencyCheck: async () => ({ state: 'PASS' }),
+    resolveLatestObservedRefreshTimestamp: async () => ({ last_refresh_at_utc: nowIso }),
+    resolveLatestRefreshTimestamp: async () => ({ last_refresh_at_utc: '2026-03-08T14:00:00.000Z' }),
+    normalizeOpportunityItemsForPublishing: (items: unknown[]) => items,
+    projectOpportunityFeed: () => ({
+      items: [{ id: 'new-op', theme_id: 'macro', theme_name: 'macro', conviction_score: 68 }],
+      suppressed_count: 0,
+      quality_filtered_count: 0,
+      coherence_suppressed_count: 0,
+      suppression_by_reason: { coherence_failed: 0, quality_filtered: 0, data_quality_suppressed: 0 },
+      quality_filter_rate: 0,
+      coherence_fail_rate: 0,
+      degraded_reason: null,
+    }),
+    computeCalibrationDiagnostics: () => ({ quality_band: 'ROBUST', ece: 0.04 }),
+    evaluateOpportunityCtaState: () => ({
+      actionability_state: 'ACTIONABLE',
+      cta_enabled: true,
+      cta_disabled_reasons: [],
+    }),
+  });
+
+  assert.ok(response);
+  const payload = await response!.json() as Record<string, unknown>;
+  assert.equal(rebuilt, 1);
+  assert.equal(storedAfterRebuild, 0);
+  assert.equal(payload.as_of, '2026-03-11T00:00:00.000Z');
+  assert.equal(payload.ttl_state, 'fresh');
+  assert.equal((payload.items as Array<Record<string, unknown>>)[0]?.id, 'new-op');
+});
+
 test('computeDecisionGradeScorecard composes go-live blockers from extracted diagnostics', async () => {
   const fixture = buildOpsFixture({
     positiveReturns: false,

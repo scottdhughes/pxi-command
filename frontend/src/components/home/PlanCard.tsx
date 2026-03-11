@@ -70,6 +70,9 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
     plan.opportunity_ref?.degraded_reason === 'suppressed_data_quality' ||
     plan.opportunity_ref?.degraded_reason === 'coherence_gate_failed'
   )
+  const noEligibleContractGate =
+    plan.opportunity_ref?.degraded_reason === 'coherence_gate_failed' &&
+    plan.opportunity_ref?.eligible_count === 0
   const crossHorizonState = plan.cross_horizon?.state || null
   const crossHorizonClass =
     crossHorizonState === 'ALIGNED' ? 'border-[#00c896]/40 text-[#00c896]' :
@@ -147,7 +150,9 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
           <p className="mt-2 text-[12px] leading-relaxed text-[#e4e8ee]">{plan.setup_summary}</p>
           {opportunitySuppressed && (
             <p className="mt-2 text-[10px] text-[#f59e0b]">
-              Opportunity feed currently suppressed: {formatOpportunityDegradedReason(plan.opportunity_ref?.degraded_reason)}
+              {noEligibleContractGate
+                ? 'Opportunity feed currently suppressed: No eligible opportunities (contract gate).'
+                : formatOpportunityDegradedReason(plan.opportunity_ref?.degraded_reason)}
             </p>
           )}
           {actionabilityState === 'NO_ACTION' && (
