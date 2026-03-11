@@ -1,5 +1,6 @@
 import { useState } from 'react'
 
+import { SiteDisclaimer } from '../components/SiteDisclaimer'
 import {
   calibrationQualityClass,
   deriveNoActionUnlockConditions,
@@ -389,6 +390,7 @@ export function OpportunitiesPage({
           </div>
         )}
       </div>
+      <SiteDisclaimer className="mt-8 pb-2" />
     </div>
   )
 }

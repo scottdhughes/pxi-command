@@ -1,5 +1,6 @@
 import { useState } from 'react'
 
+import { SiteDisclaimer } from './SiteDisclaimer'
 import type { AlertData } from '../lib/types'
 
 export function AlertHistoryPanel({
@@ -189,6 +190,7 @@ export function AlertHistoryPanel({
             Coming Soon
           </button>
         </div>
+        <SiteDisclaimer className="mt-8 pb-2" />
       </div>
     </div>
   )

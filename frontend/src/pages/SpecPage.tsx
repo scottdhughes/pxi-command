@@ -1,3 +1,5 @@
+import { SiteDisclaimer } from '../components/SiteDisclaimer'
+
 export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inPage?: boolean }) {
   const wrapperClass = inPage
     ? 'min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-16 overflow-auto'
@@ -394,8 +396,11 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
           </div>
         </section>
 
-        <div className="text-[9px] text-[#949ba5]/30 font-mono tracking-wider text-center uppercase pt-8 border-t border-[#26272b]">
-          PXI/COMMAND Protocol v1.3
+        <div className="space-y-2 pt-8 border-t border-[#26272b]">
+          <div className="text-[9px] text-[#949ba5]/30 font-mono tracking-wider text-center uppercase">
+            PXI/COMMAND Protocol v1.3
+          </div>
+          <SiteDisclaimer />
         </div>
       </div>
     </div>

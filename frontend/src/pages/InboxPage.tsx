@@ -1,3 +1,4 @@
+import { SiteDisclaimer } from '../components/SiteDisclaimer'
 import type { MarketFeedAlert } from '../lib/types'
 
 function severityClass(severity: MarketFeedAlert['severity']) {
@@ -71,6 +72,7 @@ export function InboxPage({
             ))}
           </div>
         )}
+        <SiteDisclaimer className="mt-8 pb-2" />
       </div>
     </div>
   )
