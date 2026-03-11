@@ -572,8 +572,6 @@ export function HomePage({
           <StatusBadge status={data.status} label={data.label} />
         </div>
 
-        <TodayPlanCard plan={planData} />
-
         <div className="text-center mb-4 sm:mb-6">
           <div className="text-[120px] sm:text-[180px] md:text-[220px] font-extralight leading-none tracking-[-0.04em] tabular-nums">
             {Math.round(data.score)}
@@ -611,6 +609,8 @@ export function HomePage({
               />
             ))}
         </div>
+
+        <TodayPlanCard plan={planData} />
 
         {chartData.length > 0 && (
           <HistoricalChart
