@@ -59,6 +59,13 @@ def assert_expected_schema(connection: sqlite3.Connection) -> None:
     if missing_indexes:
         raise SystemExit(f"Missing expected indexes after migration apply: {', '.join(missing_indexes)}")
 
+    refresh_runs_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'market_refresh_runs'"
+    ).fetchone()
+    refresh_runs_sql = refresh_runs_sql_row[0] if refresh_runs_sql_row else ""
+    if "'blocked'" not in refresh_runs_sql:
+        raise SystemExit("market_refresh_runs schema does not allow status='blocked' after migration apply")
+
 
 def apply_migrations_to_empty_db() -> None:
     with tempfile.NamedTemporaryFile(suffix=".sqlite3") as handle:
