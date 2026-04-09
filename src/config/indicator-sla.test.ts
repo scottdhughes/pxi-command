@@ -20,6 +20,7 @@ test('resolveIndicatorSla infers frequency from indicator config when omitted', 
   assert.equal(resolveIndicatorSla('jobless_claims').max_age_days, 10);
   assert.equal(resolveIndicatorSla('cfnai').max_age_days, 120);
   assert.equal(resolveIndicatorSla('net_liquidity').class, 'weekly');
+  assert.equal(resolveIndicatorSla('vix').age_basis, 'business');
 });
 
 test('resolveIndicatorSla honors source-lagged overrides', () => {
@@ -82,6 +83,15 @@ test('evaluateSla uses business-day aging for source-lagged series', () => {
   assert.equal(freshEvaluation.stale, false);
   assert.equal(staleEvaluation.days_old, 8);
   assert.equal(staleEvaluation.stale, true);
+});
+
+test('evaluateSla uses business-day aging for critical daily market series', () => {
+  const now = new Date('2026-04-06T07:20:00Z');
+  const policy = resolveIndicatorSla('lqd', 'daily');
+  const evaluation = evaluateSla('2026-04-02', now, policy);
+
+  assert.equal(evaluation.days_old, 2);
+  assert.equal(evaluation.stale, false);
 });
 
 test('resolveStalePolicy applies class defaults and indicator overrides', () => {
