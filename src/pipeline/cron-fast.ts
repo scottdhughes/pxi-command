@@ -144,6 +144,22 @@ interface YahooChartPayload {
   };
 }
 
+interface YahooQuoteSnapshot {
+  regularMarketPrice?: number | null;
+  postMarketPrice?: number | null;
+  preMarketPrice?: number | null;
+  regularMarketPreviousClose?: number | null;
+  regularMarketTime?: number | Date | string | null;
+  postMarketTime?: number | Date | string | null;
+  preMarketTime?: number | Date | string | null;
+}
+
+interface YahooQuotePayload {
+  quoteResponse?: {
+    result?: YahooQuoteSnapshot[];
+  };
+}
+
 const indicatorFrequencyMap = new Map<string, string>(
   INDICATORS.map((indicator) => [indicator.id, indicator.frequency])
 );
@@ -151,6 +167,7 @@ const monitoredIndicators = new Set<string>([
   ...INDICATORS.map((indicator) => indicator.id),
   ...MONITORED_SLA_INDICATORS,
 ]);
+const YAHOO_QUOTE_FALLBACK_INDICATORS = new Set<string>(['vix', 'hyg', 'lqd', 'spy_close']);
 
 // Collected indicator values for this run.
 const allIndicators: IndicatorValue[] = [];
@@ -252,6 +269,72 @@ export function parseYahooChartResponse(
   }
 
   return values;
+}
+
+function normalizeQuoteTimestamp(
+  value: number | Date | string | null | undefined,
+): Date | null {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value : null;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const millis = value > 1_000_000_000_000 ? value : value * 1000;
+    const parsed = new Date(millis);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = new Date(value);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+
+  return null;
+}
+
+function buildYahooQuoteIndicatorValue(
+  quote: YahooQuoteSnapshot | null | undefined,
+  indicatorId: string,
+  source: string,
+  fallbackDate: Date = new Date(),
+): IndicatorValue[] {
+  if (!quote) {
+    return [];
+  }
+
+  const valueCandidates = [
+    quote.regularMarketPrice,
+    quote.postMarketPrice,
+    quote.preMarketPrice,
+    quote.regularMarketPreviousClose,
+  ];
+  const value = valueCandidates.find((candidate) => Number.isFinite(candidate as number));
+  if (!Number.isFinite(value as number)) {
+    return [];
+  }
+
+  const timestamp =
+    normalizeQuoteTimestamp(quote.regularMarketTime) ??
+    normalizeQuoteTimestamp(quote.postMarketTime) ??
+    normalizeQuoteTimestamp(quote.preMarketTime) ??
+    fallbackDate;
+
+  return [{
+    indicator_id: indicatorId,
+    date: format(timestamp, 'yyyy-MM-dd'),
+    value: value as number,
+    source,
+  }];
+}
+
+export function parseYahooQuoteResponse(
+  payload: unknown,
+  indicatorId: string,
+  source: string = 'yahoo_quote_direct',
+  fallbackDate: Date = new Date(),
+): IndicatorValue[] {
+  const parsed = payload as YahooQuotePayload;
+  return buildYahooQuoteIndicatorValue(parsed?.quoteResponse?.result?.[0], indicatorId, source, fallbackDate);
 }
 
 export function evaluateEdgePromotionGate(report: EdgeDiagnosticsReport | null | undefined): {
@@ -615,7 +698,45 @@ async function fetchYahooSeriesViaDirectApi(symbol: string, indicatorId: string)
   return values;
 }
 
+async function fetchYahooQuoteViaLibrary(symbol: string, indicatorId: string): Promise<IndicatorValue[]> {
+  const quote = await yahooFinance.quote(symbol);
+  const values = buildYahooQuoteIndicatorValue(quote as YahooQuoteSnapshot, indicatorId, 'yahoo_quote');
+  if (values.length === 0) {
+    throw new Error(`No quote data for ${symbol}`);
+  }
+  return values;
+}
+
+async function fetchYahooQuoteViaDirectApi(symbol: string, indicatorId: string): Promise<IndicatorValue[]> {
+  const response = await axios.get(`https://query1.finance.yahoo.com/v7/finance/quote`, {
+    params: {
+      symbols: symbol,
+    },
+    timeout: 20000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Accept': 'application/json',
+    },
+    validateStatus: () => true,
+  });
+
+  if (response.status === 429) {
+    throw new Error('Yahoo direct quote API rate limited (429)');
+  }
+  if (response.status >= 400) {
+    throw new Error(`Yahoo direct quote API error ${response.status}`);
+  }
+
+  const values = parseYahooQuoteResponse(response.data, indicatorId, 'yahoo_quote_direct');
+  if (values.length === 0) {
+    throw new Error(`No quote data for ${symbol}`);
+  }
+
+  return values;
+}
+
 async function fetchYahooSeriesWithFallback(symbol: string, indicatorId: string): Promise<IndicatorValue[]> {
+  let lastError: unknown = null;
   try {
     const values = await retryWithBackoff(
       () => fetchYahooSeriesViaLibrary(symbol, indicatorId),
@@ -631,12 +752,49 @@ async function fetchYahooSeriesWithFallback(symbol: string, indicatorId: string)
       return values;
     }
   } catch (error) {
+    lastError = error;
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`  ⚠ ${indicatorId}: yahoo-finance2 failed (${message}), trying direct API`);
   }
 
+  try {
+    return await retryWithBackoff(
+      () => fetchYahooSeriesViaDirectApi(symbol, indicatorId),
+      {
+        maxAttempts: 4,
+        baseDelayMs: 300,
+        maxDelayMs: 3000,
+        shouldRetry: isRetryableYahooError,
+      }
+    );
+  } catch (error) {
+    lastError = error;
+  }
+
+  if (!YAHOO_QUOTE_FALLBACK_INDICATORS.has(indicatorId)) {
+    throw (lastError instanceof Error ? lastError : new Error(String(lastError)));
+  }
+
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  console.warn(`  ⚠ ${indicatorId}: chart endpoints unavailable (${message}), trying quote fallback`);
+
+  try {
+    return await retryWithBackoff(
+      () => fetchYahooQuoteViaLibrary(symbol, indicatorId),
+      {
+        maxAttempts: 3,
+        baseDelayMs: 250,
+        maxDelayMs: 2000,
+        shouldRetry: isRetryableYahooError,
+      }
+    );
+  } catch (error) {
+    const fallbackMessage = error instanceof Error ? error.message : String(error);
+    console.warn(`  ⚠ ${indicatorId}: yahoo-finance2 quote failed (${fallbackMessage}), trying direct quote API`);
+  }
+
   return retryWithBackoff(
-    () => fetchYahooSeriesViaDirectApi(symbol, indicatorId),
+    () => fetchYahooQuoteViaDirectApi(symbol, indicatorId),
     {
       maxAttempts: 4,
       baseDelayMs: 300,
@@ -1468,7 +1626,7 @@ async function postToWorkerAPI(): Promise<void> {
   console.log('\n━━━ Posting to Worker API ━━━');
   console.log(`  Total indicator values: ${allIndicators.length}`);
 
-  const requestedBatchSize = Number.parseInt(process.env.CRON_WRITE_BATCH_SIZE ?? '1000', 10);
+  const requestedBatchSize = Number.parseInt(process.env.CRON_WRITE_BATCH_SIZE ?? '2500', 10);
   const batchSize = Number.isFinite(requestedBatchSize)
     ? Math.min(5000, Math.max(100, requestedBatchSize))
     : 1000;

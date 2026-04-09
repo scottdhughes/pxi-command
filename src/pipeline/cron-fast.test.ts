@@ -6,6 +6,7 @@ import {
   isRetryableYahooError,
   normalizeRecalculateResponse,
   parseYahooChartResponse,
+  parseYahooQuoteResponse,
   retryWithBackoff,
 } from './cron-fast.js';
 
@@ -51,6 +52,36 @@ test('parseYahooChartResponse falls back to quote close values', () => {
   assert.equal(rows.length, 1);
   assert.equal(rows[0].value, 99.2);
   assert.equal(rows[0].source, 'yahoo_direct');
+});
+
+test('parseYahooQuoteResponse parses quote payloads for fallback market indicators', () => {
+  const rows = parseYahooQuoteResponse({
+    quoteResponse: {
+      result: [{
+        regularMarketPrice: 512.34,
+        regularMarketTime: 1744053000,
+      }],
+    },
+  }, 'spy_close');
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].indicator_id, 'spy_close');
+  assert.equal(rows[0].value, 512.34);
+  assert.equal(rows[0].source, 'yahoo_quote_direct');
+});
+
+test('parseYahooQuoteResponse falls back to previous close when live quote fields are unavailable', () => {
+  const rows = parseYahooQuoteResponse({
+    quoteResponse: {
+      result: [{
+        regularMarketPreviousClose: 88.1,
+      }],
+    },
+  }, 'hyg', 'yahoo_quote_direct', new Date('2026-04-06T07:20:00Z'));
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].value, 88.1);
+  assert.equal(rows[0].date, '2026-04-06');
 });
 
 test('retryWithBackoff retries 429 errors then succeeds', async () => {

@@ -1,11 +1,13 @@
 import { INDICATORS } from './indicators.js';
 
 export type IndicatorSlaClass = 'daily' | 'weekly' | 'monthly' | 'source_lagged';
+export type IndicatorSlaAgeBasis = 'calendar' | 'business';
 
 export interface IndicatorSlaPolicy {
   class: IndicatorSlaClass;
   max_age_days: number;
   critical: boolean;
+  age_basis: IndicatorSlaAgeBasis;
 }
 
 export interface IndicatorSlaEvaluation {
@@ -113,6 +115,13 @@ const KNOWN_FREQUENCY_HINTS: Record<string, string> = {
   net_liquidity: 'weekly',
 };
 
+const BUSINESS_DAY_DAILY_INDICATORS = new Set<string>([
+  'vix',
+  'spy_close',
+  'hyg',
+  'lqd',
+]);
+
 export const CRITICAL_INDICATORS = new Set<string>([
   'aaii_sentiment',
   'copper_gold_ratio',
@@ -202,6 +211,7 @@ export function resolveIndicatorSla(
       class: 'source_lagged',
       max_age_days: SOURCE_LAGGED_MAX_AGE_BY_INDICATOR[indicatorId],
       critical: CRITICAL_INDICATORS.has(indicatorId),
+      age_basis: 'business',
     };
   }
 
@@ -213,6 +223,10 @@ export function resolveIndicatorSla(
     class: frequencyToSlaClass(inferredFrequency),
     max_age_days: maxAgeDays,
     critical: CRITICAL_INDICATORS.has(indicatorId),
+    age_basis:
+      inferredFrequency === 'weekly'
+        ? 'business'
+        : (BUSINESS_DAY_DAILY_INDICATORS.has(indicatorId) ? 'business' : 'calendar'),
   };
 }
 
@@ -273,7 +287,7 @@ export function evaluateSla(
     };
   }
 
-  const daysOld = policy.class === 'weekly' || policy.class === 'source_lagged'
+  const daysOld = policy.age_basis === 'business'
     ? countBusinessDaysSince(parsedDate, now)
     : (now.getTime() - parsedDate.getTime()) / (24 * 60 * 60 * 1000);
   return {
