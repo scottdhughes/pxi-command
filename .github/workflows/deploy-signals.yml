@@ -101,11 +101,23 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          npm run smoke:deploy -- \
-            https://pxicommand.com/signals \
-            --strict-version \
-            --expect-worker-version "${WORKER_VERSION}" \
-            --expect-build-sha "${BUILD_SHA}" \
-            --check-migrations \
-            --migration-env production \
-            --migration-db SIGNALS_DB
+          for attempt in {1..6}; do
+            if npm run smoke:deploy -- \
+              https://pxicommand.com/signals \
+              --strict-version \
+              --expect-worker-version "${WORKER_VERSION}" \
+              --expect-build-sha "${BUILD_SHA}" \
+              --check-migrations \
+              --migration-env production \
+              --migration-db SIGNALS_DB; then
+              exit 0
+            fi
+
+            if [[ "${attempt}" -eq 6 ]]; then
+              echo "::error::Deploy parity did not converge after ${attempt} attempts"
+              exit 1
+            fi
+
+            echo "Deploy parity has not converged (attempt ${attempt}/6); retrying in 10 seconds"
+            sleep 10
+          done
