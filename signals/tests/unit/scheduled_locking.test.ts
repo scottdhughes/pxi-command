@@ -184,6 +184,21 @@ describe("runPipeline lock guard", () => {
     expect(insertRunMock).toHaveBeenCalledTimes(1)
   })
 
+  it("publishes fewer than the requested top N when included themes have sufficient evidence", async () => {
+    const env = createEnv()
+    env.DEFAULT_TOP_N = 10
+
+    await runPipeline(env, { dataset: createDataset() })
+
+    expect(renderJsonMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({ top_n: 1 }),
+      1,
+      expect.arrayContaining([expect.objectContaining({ theme_id: "ai_infra" })])
+    )
+  })
+
   it("releases lock even when pipeline body throws", async () => {
     const env = createEnv()
     computeMetricsMock.mockImplementationOnce(() => {

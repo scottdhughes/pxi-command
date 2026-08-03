@@ -87,14 +87,22 @@ export async function runPipeline(env: Env, opts: { dataset?: RedditDataset } = 
       return m ? m.evidence_links.length >= 3 : false
     })
 
-    if (eligible.length < cfg.topN) {
+    if (eligible.length === 0) {
       throw new Error("insufficient_evidence")
     }
 
-    const ranked: ThemeReportItem[] = eligible.slice(0, cfg.topN).map((s, idx) => {
+    const effectiveTopN = Math.min(cfg.topN, eligible.length)
+    if (effectiveTopN < cfg.topN) {
+      logWarn("Publishing a partial ranked report because fewer themes met the evidence threshold", {
+        requestedTopN: cfg.topN,
+        effectiveTopN,
+      })
+    }
+
+    const ranked: ThemeReportItem[] = eligible.slice(0, effectiveTopN).map((s, idx) => {
         const m = metricResult.metrics.find((mm) => mm.theme_id === s.theme_id)
         if (!m) throw new Error("Missing metrics for theme")
-        const classification = classifyTheme(m, s, idx + 1, cfg.topN)
+        const classification = classifyTheme(m, s, idx + 1, effectiveTopN)
         return {
           rank: idx + 1,
           theme_id: s.theme_id,
@@ -124,7 +132,7 @@ export async function runPipeline(env: Env, opts: { dataset?: RedditDataset } = 
       {
         lookback_days: cfg.lookbackDays,
         baseline_days: cfg.baselineDays,
-        top_n: cfg.topN,
+        top_n: effectiveTopN,
         price_provider: cfg.priceProvider,
         enable_comments: cfg.enableComments,
         enable_rss: cfg.enableRss,
