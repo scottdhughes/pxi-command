@@ -68,15 +68,15 @@ See [docs/API.md](docs/API.md) for detailed API documentation.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ADMIN_RUN_TOKEN` | Yes | - | Token for manual run endpoint |
-| `REDDIT_CLIENT_ID` | No | - | Reddit API client ID (falls back to public endpoints) |
-| `REDDIT_CLIENT_SECRET` | No | - | Reddit API client secret |
+| `REDDIT_CLIENT_ID` | Yes | - | Reddit Data API OAuth client ID |
+| `REDDIT_CLIENT_SECRET` | Yes | - | Reddit Data API OAuth client secret |
 | `REDDIT_USER_AGENT` | No | - | User agent for Reddit requests |
 | `DEFAULT_LOOKBACK_DAYS` | No | 7 | Days for recent activity window |
 | `DEFAULT_BASELINE_DAYS` | No | 30 | Days for baseline comparison |
 | `DEFAULT_TOP_N` | No | 10 | Number of themes in report |
 | `PUBLIC_BASE_PATH` | No | /signals | Base path for all routes |
 
-> **Note:** Reddit API credentials are optional. Without them, the system falls back to public Reddit endpoints (`old.reddit.com/.json`) which don't require authentication.
+> **Note:** Reddit requires OAuth for Data API access, including traffic from hosted-service IP ranges. Configure an approved Reddit Data API app and use a descriptive user agent; the worker intentionally does not fall back to unauthenticated scraping.
 
 ### Cloudflare Bindings
 
