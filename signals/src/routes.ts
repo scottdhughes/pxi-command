@@ -231,12 +231,13 @@ async function buildStubReport(env: Env) {
     const m = metricResult.metrics.find((mm) => mm.theme_id === s.theme_id)
     return m ? m.evidence_links.length >= 3 : false
   })
-  if (eligible.length < cfg.topN) {
+  if (eligible.length === 0) {
     throw new Error("insufficient_evidence")
   }
-  const ranked = eligible.slice(0, cfg.topN).map((s, idx) => {
+  const effectiveTopN = Math.min(cfg.topN, eligible.length)
+  const ranked = eligible.slice(0, effectiveTopN).map((s, idx) => {
     const m = metricResult.metrics.find((mm) => mm.theme_id === s.theme_id)!
-    const classification = classifyTheme(m, s, idx + 1, cfg.topN)
+    const classification = classifyTheme(m, s, idx + 1, effectiveTopN)
     return {
       rank: idx + 1,
       theme_id: s.theme_id,
@@ -256,7 +257,7 @@ async function buildStubReport(env: Env) {
     {
       lookback_days: cfg.lookbackDays,
       baseline_days: cfg.baselineDays,
-      top_n: cfg.topN,
+      top_n: effectiveTopN,
       price_provider: cfg.priceProvider,
       enable_comments: cfg.enableComments,
       enable_rss: cfg.enableRss,

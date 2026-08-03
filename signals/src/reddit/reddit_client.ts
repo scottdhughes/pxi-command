@@ -7,11 +7,16 @@ import { logWarn } from "../utils/logger"
 import { RedditAPIError } from "../errors"
 
 const REDDIT_BASE = "https://oauth.reddit.com"
+const REDDIT_PUBLIC = "https://www.reddit.com"
 
 // Reddit-compliant User-Agent format: <platform>:<app_id>:<version> (by /u/<username>)
 const DEFAULT_USER_AGENT = "web:pxi-signals:1.0.0 (by /u/pxi_command)"
 const RETRYABLE_HTTP_STATUSES = new Set([429, 500, 502, 503, 504, 522, 523, 524])
 const MAX_RETRY_DELAY_MS = 15_000
+const MAX_RSS_RESPONSE_BYTES = 1_500_000
+const MAX_RSS_POSTS_PER_SUBREDDIT = 100
+const RSS_REQUEST_SPACING_MS = 6_500
+const REDDIT_HOSTNAMES = new Set(["reddit.com", "www.reddit.com"])
 
 function getApiHeaders(userAgent: string, token?: string): Record<string, string> {
   return {
@@ -45,9 +50,12 @@ function parseRetryAfterMs(headers: Headers): number | null {
   return Math.min(MAX_RETRY_DELAY_MS, Math.max(0, retryAt - Date.now()))
 }
 
-function getRetryDelayMs(attempt: number, headers?: Headers): number {
+function getRetryDelayMs(attempt: number, headers?: Headers, status?: number): number {
   const retryAfter = headers ? parseRetryAfterMs(headers) : null
   if (retryAfter !== null) return retryAfter
+  if (status === 429) {
+    return Math.min(MAX_RETRY_DELAY_MS, 6_000 * Math.pow(2, attempt))
+  }
   const base = Math.min(MAX_RETRY_DELAY_MS, 500 * Math.pow(2, attempt))
   return Math.round(base + Math.random() * 250)
 }
@@ -64,7 +72,7 @@ async function fetchWithBackoff(input: RequestInfo, init: RequestInit, maxRetrie
         return res
       }
 
-      const waitMs = getRetryDelayMs(attempt, res.headers)
+      const waitMs = getRetryDelayMs(attempt, res.headers, res.status)
       logWarn("Retrying Reddit request after retryable status", {
         status: res.status,
         attempt: attempt + 1,
@@ -155,6 +163,169 @@ function resolveListingUrl(sub: string, limit: number, after: string | null): st
 function resolveCommentUrl(permalink: string, maxComments: number): string {
   const path = getRedditPathFromPermalink(permalink)
   return `${REDDIT_BASE}${path}.json?limit=${maxComments}`
+}
+
+function decodeXmlEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    quot: '"',
+  }
+
+  return value.replace(/&(#x[0-9a-f]+|#\d+|amp|apos|gt|lt|quot);/gi, (match, entity: string) => {
+    if (entity.startsWith("#x")) {
+      const codePoint = Number.parseInt(entity.slice(2), 16)
+      return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match
+    }
+    if (entity.startsWith("#")) {
+      const codePoint = Number.parseInt(entity.slice(1), 10)
+      return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : match
+    }
+    return named[entity.toLowerCase()] ?? match
+  })
+}
+
+function readAtomElement(entry: string, name: string): string | null {
+  const match = entry.match(new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${name}>`, "i"))
+  return match ? match[1] : null
+}
+
+function stripHtml(value: string): string {
+  const decoded = decodeXmlEntities(value)
+  const withoutAttribution = decoded.split(/\s+submitted by\s+/i, 1)[0]
+  return decodeXmlEntities(
+    withoutAttribution
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s+/g, "\n")
+    .trim()
+}
+
+function parseRssPosts(xml: string, subreddit: string): RedditPost[] {
+  const posts: RedditPost[] = []
+  const entries = xml.match(/<entry>[\s\S]*?<\/entry>/gi) ?? []
+
+  for (const entry of entries) {
+    const rawId = readAtomElement(entry, "id")?.trim()
+    const rawTitle = readAtomElement(entry, "title")
+    const rawPublished = readAtomElement(entry, "published") ?? readAtomElement(entry, "updated")
+    const rawContent = readAtomElement(entry, "content") ?? ""
+    const linkMatch = entry.match(/<link\s+[^>]*href=["']([^"']+)["'][^>]*\/?\s*>/i)
+    if (!rawId || rawTitle === null || !rawPublished || !linkMatch) continue
+
+    const createdMs = Date.parse(rawPublished.trim())
+    if (!Number.isFinite(createdMs)) continue
+
+    let link: URL
+    try {
+      link = new URL(decodeXmlEntities(linkMatch[1]))
+    } catch {
+      continue
+    }
+
+    const expectedPrefix = `/r/${subreddit}/comments/`
+    if (!REDDIT_HOSTNAMES.has(link.hostname) || !link.pathname.startsWith(expectedPrefix)) {
+      continue
+    }
+
+    posts.push({
+      id: rawId.replace(/^t3_/, ""),
+      subreddit,
+      created_utc: Math.floor(createdMs / 1000),
+      title: decodeXmlEntities(rawTitle).trim(),
+      selftext: stripHtml(rawContent),
+      permalink: `https://reddit.com${link.pathname}`,
+      score: 0,
+      num_comments: 0,
+    })
+  }
+
+  return posts
+}
+
+async function fetchRssPosts(subreddit: string, userAgent: string, limit: number): Promise<RedditPost[]> {
+  const boundedLimit = Math.min(Math.max(1, limit), MAX_RSS_POSTS_PER_SUBREDDIT)
+  const url = `${REDDIT_PUBLIC}/r/${subreddit}/new.rss?limit=${boundedLimit}`
+  const res = await fetchWithBackoff(url, {
+    headers: {
+      "User-Agent": userAgent,
+      Accept: "application/atom+xml, application/xml;q=0.9",
+    },
+  })
+  if (!res.ok) {
+    throw new RedditAPIError(`Reddit RSS request failed: ${res.status}`, {
+      status: res.status,
+      subreddit,
+    })
+  }
+
+  const contentLength = Number(res.headers.get("Content-Length"))
+  if (Number.isFinite(contentLength) && contentLength > MAX_RSS_RESPONSE_BYTES) {
+    throw new RedditAPIError("Reddit RSS response exceeded size limit", { subreddit, contentLength })
+  }
+
+  const xml = await res.text()
+  if (new TextEncoder().encode(xml).byteLength > MAX_RSS_RESPONSE_BYTES) {
+    throw new RedditAPIError("Reddit RSS response exceeded size limit", { subreddit })
+  }
+
+  return parseRssPosts(xml, subreddit)
+}
+
+async function fetchRedditRssDataset(
+  env: Env,
+  subreddits: string[],
+  userAgent: string
+): Promise<RedditDataset> {
+  const cfg = getConfig(env)
+  const posts: RedditPost[] = []
+  const failedSubreddits: Array<{ subreddit: string; reason: string }> = []
+
+  for (const [index, sub] of subreddits.entries()) {
+    try {
+      posts.push(...(await fetchRssPosts(sub, userAgent, cfg.maxPostsPerSubreddit)))
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err)
+      failedSubreddits.push({ subreddit: sub, reason })
+      logWarn("Skipping subreddit after RSS failure", { sub, reason })
+    }
+    if (index < subreddits.length - 1) {
+      await sleepWithJitter(RSS_REQUEST_SPACING_MS)
+    }
+  }
+
+  if (posts.length === 0) {
+    const failureSummary = failedSubreddits.map((entry) => `${entry.subreddit}:${entry.reason}`).join(", ")
+    throw new Error(
+      failureSummary.length > 0
+        ? `Reddit RSS dataset fetch produced no posts (${failureSummary})`
+        : "Reddit RSS dataset fetch produced no posts"
+    )
+  }
+
+  if (failedSubreddits.length > 0) {
+    logWarn("Reddit RSS dataset completed with partial subreddit coverage", {
+      failedSubreddits: failedSubreddits.map((entry) => entry.subreddit),
+      requestedSubreddits: subreddits.length,
+      collectedPosts: posts.length,
+    })
+  }
+
+  if (cfg.enableComments) {
+    logWarn("Reddit comments are unavailable in RSS ingestion mode")
+  }
+
+  return {
+    generated_at_utc: nowUtcIso(),
+    subreddits,
+    posts,
+  }
 }
 
 async function fetchListing(
@@ -254,6 +425,9 @@ function mapPost(child: any, subreddit: string): RedditPost | null {
 export async function fetchRedditDataset(env: Env, subreddits: string[]): Promise<RedditDataset> {
   const cfg = getConfig(env)
   const ua = env.REDDIT_USER_AGENT || DEFAULT_USER_AGENT
+  if (!env.REDDIT_CLIENT_ID && !env.REDDIT_CLIENT_SECRET && cfg.enableRss) {
+    return fetchRedditRssDataset(env, subreddits, ua)
+  }
   const token = await getOAuthToken(env)
 
   const posts: RedditPost[] = []

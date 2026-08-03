@@ -52,6 +52,22 @@ function oauthResponse(): Response {
   )
 }
 
+function rssResponse(subreddit: string, id: string): Response {
+  return new Response(
+    `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <content type="html">&lt;div class=&quot;md&quot;&gt;&lt;p&gt;Nuclear &amp;amp; grid discussion&lt;/p&gt;&lt;/div&gt; submitted by /u/test</content>
+    <id>t3_${id}</id>
+    <link href="https://www.reddit.com/r/${subreddit}/comments/${id}/test_post/" />
+    <published>2026-08-03T15:47:13+00:00</published>
+    <title>Test &amp; verify</title>
+  </entry>
+</feed>`,
+    { status: 200, headers: { "Content-Type": "application/atom+xml" } }
+  )
+}
+
 function createRedditEnv() {
   return createMockEnv({
     REDDIT_CLIENT_ID: "test-client-id",
@@ -151,6 +167,45 @@ describe("reddit client resilience", () => {
       context: {
         missingBindings: ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"],
       },
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("uses bounded RSS ingestion when explicitly enabled and OAuth credentials are absent", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = resolveUrl(input)
+      expect(url).toBe("https://www.reddit.com/r/stocks/new.rss?limit=100")
+      expect(new Headers(init?.headers).get("Accept")).toContain("application/atom+xml")
+      expect(new Headers(init?.headers).get("Authorization")).toBeNull()
+      return rssResponse("stocks", "rss123")
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const dataset = await fetchRedditDataset(createMockEnv({ ENABLE_RSS: 1 }), ["stocks"])
+
+    expect(dataset.posts).toEqual([
+      expect.objectContaining({
+        id: "rss123",
+        subreddit: "stocks",
+        title: "Test & verify",
+        selftext: "Nuclear & grid discussion",
+        permalink: "https://reddit.com/r/stocks/comments/rss123/test_post/",
+        score: 0,
+        num_comments: 0,
+      }),
+    ])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not hide a partial OAuth configuration behind RSS fallback", async () => {
+    const fetchMock = vi.fn()
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    await expect(
+      fetchRedditDataset(createMockEnv({ ENABLE_RSS: 1, REDDIT_CLIENT_ID: "only-an-id" }), ["stocks"])
+    ).rejects.toMatchObject({
+      code: "REDDIT_API_ERROR",
+      context: { missingBindings: ["REDDIT_CLIENT_SECRET"] },
     })
     expect(fetchMock).not.toHaveBeenCalled()
   })
