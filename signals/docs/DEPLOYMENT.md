@@ -54,11 +54,15 @@ wrangler kv:namespace create SIGNALS_KV_STAGING
 
 ## Set Secrets
 
+Reddit Data API access requires a Reddit-approved OAuth application. Set the
+production secrets with `--env production` (and repeat with `--env staging` only
+if staging should run live ingestion):
+
 ```
-wrangler secret put REDDIT_CLIENT_ID
-wrangler secret put REDDIT_CLIENT_SECRET
-wrangler secret put REDDIT_USER_AGENT
-wrangler secret put ADMIN_RUN_TOKEN
+wrangler secret put REDDIT_CLIENT_ID --env production
+wrangler secret put REDDIT_CLIENT_SECRET --env production
+wrangler secret put REDDIT_USER_AGENT --env production
+wrangler secret put ADMIN_RUN_TOKEN --env production
 ```
 
 ## Deploy Worker

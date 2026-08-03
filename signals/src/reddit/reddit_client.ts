@@ -4,32 +4,20 @@ import type { RedditComment, RedditDataset, RedditPost } from "./types"
 import { nowUtcIso } from "../utils/time"
 import { parseRedditListing, parseOAuthResponse } from "./schemas"
 import { logWarn } from "../utils/logger"
+import { RedditAPIError } from "../errors"
 
 const REDDIT_BASE = "https://oauth.reddit.com"
-const REDDIT_PUBLIC_BASES = ["https://api.reddit.com", "https://www.reddit.com", "https://old.reddit.com"]
 
 // Reddit-compliant User-Agent format: <platform>:<app_id>:<version> (by /u/<username>)
 const DEFAULT_USER_AGENT = "web:pxi-signals:1.0.0 (by /u/pxi_command)"
 const RETRYABLE_HTTP_STATUSES = new Set([429, 500, 502, 503, 504, 522, 523, 524])
 const MAX_RETRY_DELAY_MS = 15_000
 
-// Browser-like headers to avoid bot detection (Reddit 2026 requirements)
-function getBrowserHeaders(userAgent: string): Record<string, string> {
+function getApiHeaders(userAgent: string, token?: string): Record<string, string> {
   return {
     "User-Agent": userAgent,
-    "Accept": "application/json, text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Sec-CH-UA": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    "Sec-CH-UA-Mobile": "?0",
-    "Sec-CH-UA-Platform": '"macOS"',
-    "Upgrade-Insecure-Requests": "1",
+    Accept: "application/json",
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   }
 }
 
@@ -103,13 +91,17 @@ async function fetchWithBackoff(input: RequestInfo, init: RequestInit, maxRetrie
   throw new Error("unreachable_backoff_state")
 }
 
-async function getOAuthToken(env: Env): Promise<string | null> {
+async function getOAuthToken(env: Env): Promise<string> {
   const id = env.REDDIT_CLIENT_ID
   const secret = env.REDDIT_CLIENT_SECRET
   const ua = env.REDDIT_USER_AGENT || DEFAULT_USER_AGENT
   if (!id || !secret) {
-    logWarn("Reddit OAuth credentials not configured, will use public API with browser headers")
-    return null
+    throw new RedditAPIError("Reddit OAuth credentials are not configured", {
+      missingBindings: [
+        ...(!id ? ["REDDIT_CLIENT_ID"] : []),
+        ...(!secret ? ["REDDIT_CLIENT_SECRET"] : []),
+      ],
+    })
   }
 
   const body = new URLSearchParams({
@@ -117,11 +109,10 @@ async function getOAuthToken(env: Env): Promise<string | null> {
   })
 
   const basic = btoa(`${id}:${secret}`)
-  const browserHeaders = getBrowserHeaders(ua)
-  const res = await fetch("https://www.reddit.com/api/v1/access_token", {
+  const res = await fetchWithBackoff("https://www.reddit.com/api/v1/access_token", {
     method: "POST",
     headers: {
-      ...browserHeaders,
+      ...getApiHeaders(ua),
       Authorization: `Basic ${basic}`,
       "Content-Type": "application/x-www-form-urlencoded",
     },
@@ -129,8 +120,10 @@ async function getOAuthToken(env: Env): Promise<string | null> {
   })
 
   if (!res.ok) {
-    logWarn("OAuth token request failed", { status: res.status, statusText: res.statusText })
-    return null
+    throw new RedditAPIError(`Reddit OAuth token request failed: ${res.status}`, {
+      status: res.status,
+      statusText: res.statusText,
+    })
   }
 
   const json = await res.json()
@@ -141,7 +134,7 @@ async function getOAuthToken(env: Env): Promise<string | null> {
       hasAccessToken: typeof json === "object" && json !== null && "access_token" in json,
       responseKeys: typeof json === "object" && json !== null ? Object.keys(json) : [],
     })
-    return null
+    throw new RedditAPIError("Reddit OAuth response validation failed")
   }
 
   return parsed.access_token
@@ -155,134 +148,92 @@ function getRedditPathFromPermalink(permalink: string): string {
   }
 }
 
-function getAuthHeaders(base: string, ua: string, token?: string | null): Record<string, string> {
-  const headers = getBrowserHeaders(ua)
-  if (token && base === REDDIT_BASE) {
-    headers.Authorization = `Bearer ${token}`
-  }
-  return headers
+function resolveListingUrl(sub: string, limit: number, after: string | null): string {
+  return `${REDDIT_BASE}/r/${sub}/new.json?limit=${limit}${after ? `&after=${after}` : ""}`
 }
 
-function resolveListingUrl(base: string, sub: string, limit: number, after: string | null): string {
-  return `${base}/r/${sub}/new.json?limit=${limit}${after ? `&after=${after}` : ""}`
-}
-
-function resolveCommentUrl(base: string, permalink: string, maxComments: number): string {
+function resolveCommentUrl(permalink: string, maxComments: number): string {
   const path = getRedditPathFromPermalink(permalink)
-  return `${base}${path}.json?limit=${maxComments}`
+  return `${REDDIT_BASE}${path}.json?limit=${maxComments}`
 }
 
-async function fetchListingWithFallback(
+async function fetchListing(
   sub: string,
   limit: number,
   after: string | null,
   ua: string,
-  token: string | null,
-  publicBases: string[]
+  token: string
 ) {
-  let lastStatus: string | number = "unknown"
-  const baseCandidates = token ? [REDDIT_BASE, ...publicBases] : [...publicBases]
-  for (const base of baseCandidates) {
-    const headers = getAuthHeaders(base, ua, token)
-    const url = resolveListingUrl(base, sub, limit, after)
-    let res: Response
-    try {
-      res = await fetchWithBackoff(url, { headers })
-    } catch (err) {
-      lastStatus = "network-error"
-      logWarn("Reddit listing request failed with network error", { base, sub, error: String(err) })
-      continue
-    }
-
-    if (!res.ok) {
-      lastStatus = res.status
-      logWarn(`Reddit listing request failed`, { base, status: res.status, sub })
-      continue
-    }
-
-    let json: unknown
-    try {
-      json = await res.json()
-    } catch {
-      lastStatus = "invalid-json"
-      logWarn("Reddit listing response body parse failed", { base, sub })
-      continue
-    }
-
-    const parsed = parseRedditListing(json)
-    if (!parsed) {
-      lastStatus = "invalid-schema"
-      logWarn("Reddit listing validation failed, trying next source", { base, sub })
-      continue
-    }
-
-    return parsed
+  const url = resolveListingUrl(sub, limit, after)
+  const res = await fetchWithBackoff(url, { headers: getApiHeaders(ua, token) })
+  if (!res.ok) {
+    throw new RedditAPIError(`Reddit listing request failed: ${res.status}`, {
+      status: res.status,
+      subreddit: sub,
+    })
   }
 
-  throw new Error(`Reddit fetch failed: ${lastStatus}`)
+  let json: unknown
+  try {
+    json = await res.json()
+  } catch {
+    throw new RedditAPIError("Reddit listing response was not valid JSON", { subreddit: sub })
+  }
+
+  const parsed = parseRedditListing(json)
+  if (!parsed) {
+    throw new RedditAPIError("Reddit listing response validation failed", { subreddit: sub })
+  }
+  return parsed
 }
 
-async function fetchCommentsWithFallback(
+async function fetchComments(
   permalink: string,
   maxComments: number,
   ua: string,
-  token: string | null,
-  publicBases: string[]
+  token: string
 ) {
-  const errors: string[] = []
-  const baseCandidates = token ? [REDDIT_BASE, ...publicBases] : [...publicBases]
-  for (const base of baseCandidates) {
-    const headers = getAuthHeaders(base, ua, token)
-    const url = resolveCommentUrl(base, permalink, maxComments)
-    let res: Response
-    try {
-      res = await fetchWithBackoff(url, { headers })
-    } catch (err) {
-      errors.push(`${base}:network-error`)
-      logWarn("Comment request failed with network error", { base, permalink, error: String(err) })
-      continue
-    }
-
-    if (!res.ok) {
-      const error = `${base}:${res.status}`
-      errors.push(error)
-      continue
-    }
-
-    let json: unknown
-    try {
-      json = await res.json()
-    } catch {
-      errors.push(`${base}:invalid-json`)
-      continue
-    }
-
-    if (!Array.isArray(json) || json.length < 2) {
-      errors.push(`${base}:unexpected-comment-format`)
-      logWarn("Unexpected comment response format", { base, permalink })
-      continue
-    }
-
-    const comments: RedditComment[] = []
-    const listing = (json[1] as { data?: { children?: unknown[] } })?.data?.children || []
-    for (const child of listing) {
-      const c = (child as { data?: { id?: string; created_utc?: number; body?: string; permalink?: string } })?.data
-      if (!c || !c.body || !c.id || !c.created_utc || !c.permalink) continue
-      comments.push({
-        id: c.id,
-        created_utc: c.created_utc,
-        body: c.body,
-        permalink: `https://reddit.com${c.permalink}`,
-      })
-      if (comments.length >= maxComments) break
-    }
-    return comments
+  const url = resolveCommentUrl(permalink, maxComments)
+  let res: Response
+  try {
+    res = await fetchWithBackoff(url, { headers: getApiHeaders(ua, token) })
+  } catch (err) {
+    logWarn("Comment request failed with network error", { permalink, error: String(err) })
+    return []
   }
 
-  if (errors.length > 0) {
-    logWarn("Failed to fetch comments", { permalink, errors })
+  if (!res.ok) {
+    logWarn("Comment request failed", { permalink, status: res.status })
+    return []
   }
-  return []
+
+  let json: unknown
+  try {
+    json = await res.json()
+  } catch {
+    logWarn("Comment response body parse failed", { permalink })
+    return []
+  }
+
+  if (!Array.isArray(json) || json.length < 2) {
+    logWarn("Unexpected comment response format", { permalink })
+    return []
+  }
+
+  const comments: RedditComment[] = []
+  const listing = (json[1] as { data?: { children?: unknown[] } })?.data?.children || []
+  for (const child of listing) {
+    const c = (child as { data?: { id?: string; created_utc?: number; body?: string; permalink?: string } })?.data
+    if (!c || !c.body || !c.id || !c.created_utc || !c.permalink) continue
+    comments.push({
+      id: c.id,
+      created_utc: c.created_utc,
+      body: c.body,
+      permalink: `https://reddit.com${c.permalink}`,
+    })
+    if (comments.length >= maxComments) break
+  }
+  return comments
 }
 
 function mapPost(child: any, subreddit: string): RedditPost | null {
@@ -305,8 +256,6 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
   const ua = env.REDDIT_USER_AGENT || DEFAULT_USER_AGENT
   const token = await getOAuthToken(env)
 
-  const publicBases = REDDIT_PUBLIC_BASES
-
   const posts: RedditPost[] = []
   const failedSubreddits: Array<{ subreddit: string; reason: string }> = []
   for (const sub of subreddits) {
@@ -314,9 +263,9 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
     let fetched = 0
     while (fetched < cfg.maxPostsPerSubreddit) {
       const limit = Math.min(100, cfg.maxPostsPerSubreddit - fetched)
-      let json: Awaited<ReturnType<typeof fetchListingWithFallback>>
+      let json: Awaited<ReturnType<typeof fetchListing>>
       try {
-        json = await fetchListingWithFallback(sub, limit, after, ua, token, publicBases)
+        json = await fetchListing(sub, limit, after, ua, token)
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err)
         failedSubreddits.push({ subreddit: sub, reason })
@@ -332,7 +281,7 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
       fetched += children.length
       after = json?.data?.after || null
       if (!after || children.length === 0) break
-      await sleepWithJitter(500) // Increased delay with jitter to avoid detection
+      await sleepWithJitter(500) // Pace paginated API requests.
     }
   }
 
@@ -355,8 +304,8 @@ export async function fetchRedditDataset(env: Env, subreddits: string[]): Promis
 
   if (cfg.enableComments) {
     for (const post of posts) {
-      post.comments = await fetchCommentsWithFallback(post.permalink, cfg.maxCommentsPerPost, ua, token, publicBases)
-      await sleepWithJitter(400) // Increased delay with jitter
+      post.comments = await fetchComments(post.permalink, cfg.maxCommentsPerPost, ua, token)
+      await sleepWithJitter(400) // Pace comment API requests.
     }
   }
 

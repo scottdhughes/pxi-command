@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs"
+import { resolve } from "node:path"
 import { describe, expect, it } from "vitest"
 import { getNyseHolidaySet, isNyseHoliday, shouldRunScheduledPipeline } from "../../src/worker"
 import { isNyseHolidayDate } from "../../src/utils/calendar"
@@ -48,6 +50,13 @@ describe("NYSE holiday calendar", () => {
 })
 
 describe("scheduled pipeline decisioning", () => {
+  it("configures catch-up cron triggers on the deployed production environment", () => {
+    const config = readFileSync(resolve(process.cwd(), "wrangler.toml"), "utf8")
+
+    expect(config).toContain("[env.production.triggers]")
+    expect(config).toContain('crons = ["0 15 * * 1", "0 15 * * 2", "0 15 * * 3"]')
+  })
+
   it("skips Monday on NYSE holidays", () => {
     const result = decide("2026-02-16T15:00:00.000Z", "2026-02-12T22:41:09.394Z")
     expect(result.shouldRun).toBe(false)

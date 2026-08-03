@@ -2,11 +2,6 @@ name = "pxi-signals"
 main = "src/worker.ts"
 compatibility_date = "2024-10-01"
 
-[triggers]
-# Weekly schedule: Monday, Tuesday, Wednesday at 15:00 UTC.
-# Tuesday/Wednesday include stale-data catch-up logic in src/worker.ts.
-crons = ["0 15 * * 1", "0 15 * * 2", "0 15 * * 3"]
-
 [env.staging]
 name = "pxi-signals-staging"
 routes = [
@@ -44,6 +39,12 @@ routes = [
   { pattern = "pxicommand.com/signals", zone_name = "pxicommand.com" },
   { pattern = "pxicommand.com/signals/*", zone_name = "pxicommand.com" }
 ]
+
+# Weekly schedule: Monday, Tuesday, Wednesday at 15:00 UTC.
+# Tuesday/Wednesday include stale-data catch-up logic in src/worker.ts.
+[env.production.triggers]
+crons = ["0 15 * * 1", "0 15 * * 2", "0 15 * * 3"]
+
 [[env.production.d1_databases]]
 binding = "SIGNALS_DB"
 database_name = "pxi_signals"

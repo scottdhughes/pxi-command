@@ -360,8 +360,6 @@ export function usePxiAppShell() {
     const isHomeRoute = route === '/'
 
     if (!hasWork) {
-      setLoading(false)
-      setError(null)
       return
     }
 
