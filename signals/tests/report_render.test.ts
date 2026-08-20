@@ -9,6 +9,7 @@ import { buildTakeaways } from "../src/analysis/takeaways"
 import { renderJson } from "../src/report/render_json"
 import { renderHtml } from "../src/report/render_html"
 import { nowUtcIso } from "../src/utils/time"
+import { upgradeStoredReportNavigation } from "../src/routes"
 
 describe("report rendering", () => {
   it("includes required sections", () => {
@@ -53,5 +54,14 @@ describe("report rendering", () => {
     for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
       expect(html).toContain(`href="${href}"`)
     }
+  })
+
+  it("upgrades navigation in stored report snapshots", () => {
+    const legacy = `<html><head></head><body><div class="nav-dropdown-menu"><a href="/">/</a><a href="/spec">/SPEC</a><a href="/signals">/SIGNALS</a></div></body></html>`
+    const upgraded = upgradeStoredReportNavigation(legacy)
+    for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
+      expect(upgraded).toContain(`href="${href}"`)
+    }
+    expect(upgraded).toContain(".nav-dropdown-menu{width:224px")
   })
 })

@@ -15,6 +15,33 @@ import { renderHtml } from "./report/render_html"
 import { nowUtcIso } from "./utils/time"
 import { ulid } from "ulidx"
 
+const COMPLETE_SITE_NAV = `<div class="nav-dropdown-menu">
+        <a href="/" class="nav-dropdown-item">/HOME</a>
+        <a href="/brief" class="nav-dropdown-item">/DAILY BRIEF</a>
+        <a href="/opportunities" class="nav-dropdown-item">/OPPORTUNITIES</a>
+        <a href="/signals" class="nav-dropdown-item">/SIGNALS</a>
+        <a href="/alerts" class="nav-dropdown-item">/ALERT HISTORY</a>
+        <a href="/inbox" class="nav-dropdown-item">/ALERT INBOX</a>
+        <a href="/guide" class="nav-dropdown-item">/GUIDE</a>
+        <a href="/spec" class="nav-dropdown-item">/METHODOLOGY</a>
+      </div>`
+
+const STORED_REPORT_NAV_STYLE = `<style>
+  .nav-dropdown-menu{width:224px;max-height:calc(100vh - 72px);overflow-y:auto;background:rgba(10,10,10,.98);border-radius:4px;padding:4px;box-shadow:0 16px 40px rgba(0,0,0,.55)}
+  .nav-dropdown-item{padding:10px 12px;color:var(--text-muted);border-radius:4px}
+  .nav-dropdown-item:hover{color:var(--text)}
+</style>`
+
+export function upgradeStoredReportNavigation(html: string): string {
+  const upgraded = html.replace(
+    /<div class="nav-dropdown-menu">[\s\S]*?<\/div>/,
+    COMPLETE_SITE_NAV,
+  )
+  return upgraded.includes(STORED_REPORT_NAV_STYLE)
+    ? upgraded
+    : upgraded.replace("</head>", `${STORED_REPORT_NAV_STYLE}</head>`)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Security Constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,7 +328,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (!run) return htmlResponse(await buildStubReport(env))
       const html = await getObjectText(env, run.report_html_key)
       if (!html) return htmlResponse(await buildStubReport(env))
-      return htmlResponse(html)
+      return htmlResponse(upgradeStoredReportNavigation(html))
     } catch {
       return htmlResponse(fallbackHtml())
     }
@@ -316,7 +343,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!run) return new Response("Not found", { status: 404 })
     const html = await getObjectText(env, run.report_html_key)
     if (!html) return new Response("Not found", { status: 404 })
-    return htmlResponse(html)
+    return htmlResponse(upgradeStoredReportNavigation(html))
   }
 
   if (method === "GET" && path === "/api/runs") {
