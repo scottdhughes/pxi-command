@@ -454,6 +454,21 @@ export function HomePage({
     ? `${delta7d >= 0 ? '+' : ''}${delta7d.toFixed(1)}`
     : null
 
+  const navigationItems: Array<{
+    href: '/' | '/brief' | '/opportunities' | '/signals' | '/alerts' | '/inbox' | '/guide' | '/spec'
+    label: string
+    badge?: number
+  }> = [
+    { href: '/', label: 'Home' },
+    { href: '/brief', label: 'Daily Brief' },
+    { href: '/opportunities', label: 'Opportunities' },
+    { href: '/signals', label: 'Signals' },
+    { href: '/alerts', label: 'Alert History', badge: alertsData?.count },
+    { href: '/inbox', label: 'Alert Inbox', badge: alertsFeed?.alerts?.length },
+    { href: '/guide', label: 'Guide' },
+    { href: '/spec', label: 'Methodology' },
+  ]
+
   return (
     <div className="min-h-screen bg-black text-[#f3f3f3] flex flex-col items-center justify-center px-4 sm:px-8 py-12 sm:py-16">
       {showOnboarding && <OnboardingModal onClose={handleCloseOnboarding} exampleScore={data.score} />}
@@ -483,80 +498,42 @@ export function HomePage({
 
           <button
             onClick={() => setMenuOpen(!menuOpen)}
-            className="text-[10px] sm:text-[11px] font-mono tracking-[0.2em] text-[#949ba5] uppercase hover:text-[#f3f3f3] transition-colors"
+            className="rounded border border-[#26272b] px-2 py-1 text-[9px] sm:text-[10px] font-mono tracking-[0.16em] text-[#949ba5] uppercase hover:border-[#4a4d54] hover:text-[#f3f3f3] transition-colors"
             aria-label="Open navigation menu"
+            aria-expanded={menuOpen}
           >
-            {menuOpen ? '▲' : '▼'}
+            {menuOpen ? 'close' : 'menu'}
           </button>
           {menuOpen && (
-            <div className="absolute top-full left-0 mt-2 bg-[#0a0a0a] border border-[#26272b] rounded shadow-lg min-w-[130px]">
-              <button
-                onClick={() => {
-                  navigateTo('/spec')
-                  setMenuOpen(false)
-                }}
-                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
-              >
-                /spec
-              </button>
-              <a
-                href="/signals"
-                className="block w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
-              >
-                /signals
-              </a>
-              <button
-                onClick={() => {
-                  navigateTo('/alerts')
-                  setMenuOpen(false)
-                }}
-                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
-              >
-                /alerts
-                {alertsData && alertsData.count > 0 && (
-                  <span className="ml-2 text-[8px] text-[#00a3ff]">({alertsData.count})</span>
-                )}
-              </button>
-              <button
-                onClick={() => {
-                  navigateTo('/brief')
-                  setMenuOpen(false)
-                }}
-                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
-              >
-                /brief
-              </button>
-              <button
-                onClick={() => {
-                  navigateTo('/opportunities')
-                  setMenuOpen(false)
-                }}
-                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
-              >
-                /opportunities
-              </button>
-              <button
-                onClick={() => {
-                  navigateTo('/inbox')
-                  setMenuOpen(false)
-                }}
-                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors"
-              >
-                /inbox
-                {alertsFeed?.alerts?.length ? (
-                  <span className="ml-2 text-[8px] text-[#00a3ff]">({alertsFeed.alerts.length})</span>
-                ) : null}
-              </button>
-              <button
-                onClick={() => {
-                  navigateTo('/guide')
-                  setMenuOpen(false)
-                }}
-                className="w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-wider text-[#949ba5] hover:text-[#f3f3f3] hover:bg-[#26272b]/50 transition-colors border-t border-[#26272b]"
-              >
-                /guide
-              </button>
-            </div>
+            <nav
+              aria-label="Primary navigation"
+              className="absolute top-full left-0 z-[70] mt-2 w-56 max-h-[calc(100vh-5rem)] overflow-y-auto rounded-md border border-[#26272b] bg-[#0a0a0a]/98 p-1 shadow-2xl backdrop-blur"
+            >
+              {navigationItems.map((item, index) => {
+                const className = `flex w-full items-center justify-between rounded px-3 py-2.5 text-left text-[10px] font-mono uppercase tracking-[0.12em] text-[#949ba5] transition-colors hover:bg-[#26272b]/60 hover:text-[#f3f3f3] ${index === 6 ? 'mt-1 border-t border-[#26272b] pt-3' : ''}`
+                const content = (
+                  <>
+                    <span><span className="mr-2 text-[#00a3ff]/70">/</span>{item.label}</span>
+                    {item.badge ? <span className="text-[8px] text-[#00a3ff]">{item.badge}</span> : null}
+                  </>
+                )
+
+                return item.href === '/signals' ? (
+                  <a key={item.href} href={item.href} className={className}>{content}</a>
+                ) : (
+                  <button
+                    key={item.href}
+                    onClick={() => {
+                      navigateTo(item.href as AppRoute)
+                      setMenuOpen(false)
+                    }}
+                    className={className}
+                  >
+                    {content}
+                  </button>
+                )
+              })}
+            </nav>
           )}
         </div>
         <div className="text-[10px] sm:text-[11px] font-mono text-[#949ba5]/50">

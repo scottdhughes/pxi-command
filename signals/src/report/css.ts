@@ -174,10 +174,14 @@ body::before {
   position: absolute;
   top: 100%;
   left: 0;
-  min-width: 160px;
-  background: var(--bg);
+  width: 224px;
+  max-height: calc(100vh - 72px);
+  overflow-y: auto;
+  background: rgba(10, 10, 10, 0.98);
   border: 1px solid var(--border);
-  padding: var(--space-sm) 0;
+  border-radius: var(--radius-sm);
+  padding: var(--space-xs);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
   opacity: 0;
   visibility: hidden;
   transform: translateY(-4px);
@@ -193,18 +197,20 @@ body::before {
 
 .nav-dropdown-item {
   display: block;
-  padding: var(--space-sm) var(--space-md);
+  padding: 10px 12px;
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 500;
   letter-spacing: 0.05em;
-  color: var(--accent);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
   text-decoration: none;
   transition: background 0.15s;
 }
 
 .nav-dropdown-item:hover {
   background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
 }
 
 .site-nav-date {

@@ -639,9 +639,14 @@ export function renderHtml(
         PXI<span class="brand-slash">/</span>COMMAND<span class="brand-caret"></span>
       </button>
       <div class="nav-dropdown-menu">
-        <a href="/" class="nav-dropdown-item">/</a>
-        <a href="/spec" class="nav-dropdown-item">/SPEC</a>
+        <a href="/" class="nav-dropdown-item">/HOME</a>
+        <a href="/brief" class="nav-dropdown-item">/DAILY BRIEF</a>
+        <a href="/opportunities" class="nav-dropdown-item">/OPPORTUNITIES</a>
         <a href="/signals" class="nav-dropdown-item">/SIGNALS</a>
+        <a href="/alerts" class="nav-dropdown-item">/ALERT HISTORY</a>
+        <a href="/inbox" class="nav-dropdown-item">/ALERT INBOX</a>
+        <a href="/guide" class="nav-dropdown-item">/GUIDE</a>
+        <a href="/spec" class="nav-dropdown-item">/METHODOLOGY</a>
       </div>
     </div>
     <div class="site-nav-links">

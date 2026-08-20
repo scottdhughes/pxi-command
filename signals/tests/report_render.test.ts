@@ -50,5 +50,8 @@ describe("report rendering", () => {
     expect(html).toContain("Key Takeaways")
     expect(html).toContain("Not investment advice.")
     expect(html).toContain("Top Signal")
+    for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
+      expect(html).toContain(`href="${href}"`)
+    }
   })
 })
