@@ -1,7 +1,18 @@
 name = "pxi-api"
 main = "api.ts"
-compatibility_date = "2024-01-01"
+compatibility_date = "2026-08-20"
 compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.01
 
 [env.staging]
 name = "pxi-api-staging"
