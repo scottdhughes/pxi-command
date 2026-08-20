@@ -945,7 +945,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
   }
 
   try {
-    const igSpread = await fetchFredSeries('BAMLC0A4CBBBEY', 'ig_oas_spread', fredApiKey);
+    const igSpread = await fetchFredSeries('BAMLC0A0CM', 'ig_oas_spread', fredApiKey);
     all.push(...igSpread);
     console.log(`IG OAS Spread: ${igSpread.length} values`);
   } catch (e) {
@@ -987,13 +987,14 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     console.error('EM Spread failed:', e);
   }
 
-  // ISM Manufacturing PMI
+  // Manufacturing payrolls (FRED MANEMP). The legacy ID is retained so existing
+  // history and model weights remain stable; this is not an ISM PMI series.
   try {
     const ism = await fetchFredSeries('MANEMP', 'ism_manufacturing', fredApiKey);
     all.push(...ism);
-    console.log(`ISM Manufacturing: ${ism.length} values`);
+    console.log(`Manufacturing payrolls: ${ism.length} values`);
   } catch (e) {
-    console.error('ISM Manufacturing failed:', e);
+    console.error('Manufacturing payrolls failed:', e);
   }
 
   // Initial Jobless Claims

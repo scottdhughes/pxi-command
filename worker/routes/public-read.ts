@@ -3,6 +3,7 @@ import type {
   CategoryDetailResponsePayload,
   WorkerRouteContext,
 } from '../types';
+import { INDICATORS } from '../../src/config/indicators.js';
 
 type PublicReadDeps = Record<string, any>;
 
@@ -188,23 +189,8 @@ export async function tryHandlePublicReadRoute(
       'SELECT score, weight FROM category_scores WHERE category = ? AND date = ?'
     ).bind(category, latestPxi.date).first<{ score: number; weight: number }>();
 
-    const indicatorCategories: Record<string, string> = {
-      fed_balance_sheet: 'positioning', treasury_general_account: 'positioning',
-      reverse_repo: 'positioning', m2_yoy: 'positioning',
-      hy_oas_spread: 'credit', ig_oas_spread: 'credit', yield_curve_2s10s: 'credit',
-      vix: 'volatility', vix_term_structure: 'volatility', skew: 'volatility',
-      put_call_ratio: 'volatility', move_index: 'volatility',
-      sp500_adline: 'breadth', sp500_pct_above_200: 'breadth', sp500_pct_above_50: 'breadth',
-      nyse_new_highs_lows: 'breadth',
-      ism_manufacturing: 'macro', ism_services: 'macro', unemployment_claims: 'macro',
-      consumer_sentiment: 'macro', aaii_sentiment: 'macro',
-      dxy: 'global', copper_gold_ratio: 'global', btc_flows: 'global',
-      stablecoin_mcap: 'crypto', btc_funding_rate: 'crypto',
-    };
-
-    const categoryIndicatorIds = Object.entries(indicatorCategories)
-      .filter(([, mappedCategory]) => mappedCategory === category)
-      .map(([indicatorId]) => indicatorId);
+    const categoryIndicators = INDICATORS.filter((indicator) => indicator.category === category);
+    const categoryIndicatorIds = categoryIndicators.map((indicator) => indicator.id);
 
     const indicatorScoresResult = await env.DB.prepare(`
       SELECT indicator_id, raw_value, normalized_value
@@ -230,21 +216,7 @@ export async function tryHandlePublicReadRoute(
       ? (scores.filter((score) => score < currentScore).length / scores.length) * 100
       : 50;
 
-    const indicatorNames: Record<string, string> = {
-      fed_balance_sheet: 'Fed Balance Sheet', treasury_general_account: 'Treasury General Account',
-      reverse_repo: 'Reverse Repo Facility', m2_yoy: 'M2 Money Supply YoY',
-      hy_oas_spread: 'High Yield Spread', ig_oas_spread: 'Investment Grade Spread',
-      yield_curve_2s10s: '2s10s Yield Curve',
-      vix: 'VIX', vix_term_structure: 'VIX Term Structure', skew: 'SKEW Index',
-      put_call_ratio: 'Put/Call Ratio', move_index: 'MOVE Index',
-      sp500_adline: 'S&P 500 A/D Line', sp500_pct_above_200: '% Above 200 DMA',
-      sp500_pct_above_50: '% Above 50 DMA', nyse_new_highs_lows: 'NYSE New Highs-Lows',
-      ism_manufacturing: 'ISM Manufacturing', ism_services: 'ISM Services',
-      unemployment_claims: 'Initial Claims', consumer_sentiment: 'Consumer Sentiment',
-      aaii_sentiment: 'AAII Bull/Bear',
-      dxy: 'Dollar Index', copper_gold_ratio: 'Copper/Gold Ratio', btc_flows: 'BTC ETF Flows',
-      stablecoin_mcap: 'Stablecoin Mcap RoC', btc_funding_rate: 'BTC Funding Rate',
-    };
+    const indicatorNames = new Map(categoryIndicators.map((indicator) => [indicator.id, indicator.name]));
 
     const payload: CategoryDetailResponsePayload = {
       category,
@@ -254,7 +226,7 @@ export async function tryHandlePublicReadRoute(
       percentile_rank: Math.round(percentileRank),
       indicators: (indicatorScoresResult.results || []).map((indicator) => ({
         id: indicator.indicator_id,
-        name: indicatorNames[indicator.indicator_id] || indicator.indicator_id,
+        name: indicatorNames.get(indicator.indicator_id) || indicator.indicator_id,
         raw_value: indicator.raw_value,
         normalized_value: indicator.normalized_value,
       })),

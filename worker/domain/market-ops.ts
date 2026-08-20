@@ -313,23 +313,11 @@ function evaluateDecisionImpactObserveMode(
     }
   }
 
-  if (utilityFunnel.actionable_sessions <= 0) {
-    breaches.push('cta_action_insufficient_sessions');
-  } else if (utilityFunnel.actionable_sessions < effectiveMinActionableSessions) {
-    breaches.push('cta_action_below_enforce_min_sessions');
-  } else if (utilityFunnel.cta_action_rate_pct < DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min) {
-    breaches.push('cta_action_rate_breach');
-  }
-  if (utilityFunnel.actionable_sessions >= effectiveMinActionableSessions) {
-    if (utilityFunnel.cta_action_rate_pct < DECISION_IMPACT_OBSERVE_THRESHOLDS.cta_action_rate_pct_min) {
-      enforceBreaches.push('cta_action_rate_breach');
-    }
-  }
-
+  // Client utility events are useful product analytics but are not authenticated.
+  // They must not influence an enforcement or publication-readiness decision.
   const enforceReady =
     market7.sample_size >= governance.min_sample_size &&
-    market30.sample_size >= governance.min_sample_size &&
-    utilityFunnel.actionable_sessions >= effectiveMinActionableSessions;
+    market30.sample_size >= governance.min_sample_size;
 
   return {
     enabled: true,
@@ -723,13 +711,14 @@ export async function computeDecisionGradeScorecard(
           ? 'watch'
           : 'fail';
 
+  // Utility telemetry is intentionally informational: anonymous clients can
+  // submit it, so including it in a go-live grade would make the gate gameable.
   const weightedScore = Number((
-    freshnessScore * 0.25 +
+    freshnessScore * 0.30 +
     consistencyScore * 0.20 +
     calibrationScore * 0.20 +
     edgeScore * 0.15 +
-    boundedOpportunityHygieneScore * 0.15 +
-    utilityScore * 0.05
+    boundedOpportunityHygieneScore * 0.15
   ).toFixed(2));
   const grade = decisionGradeFromScore(weightedScore);
   const goLiveBlockers = new Set<string>();
@@ -743,8 +732,6 @@ export async function computeDecisionGradeScorecard(
     goLiveBlockers.add('edge_promotion_gate_fail');
   }
   if (opportunityHygieneStatus === 'fail') goLiveBlockers.add('opportunity_hygiene_fail');
-  if (utilityStatus === 'fail') goLiveBlockers.add('utility_signal_weak');
-  if (utilityStatus === 'insufficient') goLiveBlockers.add('utility_signal_insufficient');
   if (!decisionImpactOps.observe_mode.enforce_ready) {
     goLiveBlockers.add('decision_impact_not_enforce_ready');
   }

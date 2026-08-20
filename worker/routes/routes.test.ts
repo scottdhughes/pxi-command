@@ -263,11 +263,20 @@ test('tryHandleSimilarityRoute embeds historical dates on /api/embed', async () 
   });
 
   const response = await tryHandleSimilarityRoute(route as any, {
+    enforceAdminAuth: async () => null,
     getEmbeddingVector: (embedding: any) => embedding.data[0],
   });
   const payload = await response!.json() as Record<string, unknown>;
   assert.equal(payload.embedded_dates, 1);
   assert.equal(upserted, 1);
+});
+
+test('tryHandleSimilarityRoute rejects unauthenticated embedding rebuilds', async () => {
+  const route = createRouteContext('https://pxi.test/api/embed', { method: 'POST' });
+  const response = await tryHandleSimilarityRoute(route as any, {
+    enforceAdminAuth: async () => Response.json({ error: 'Unauthorized' }, { status: 401 }),
+  });
+  assert.equal(response?.status, 401);
 });
 
 test('tryHandleAdminIngestionRoute enforces auth on /api/migrate', async () => {

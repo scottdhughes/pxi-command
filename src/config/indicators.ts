@@ -36,18 +36,18 @@ export const INDICATORS: IndicatorDefinition[] = [
     description: 'RRP usage - liquidity parked at Fed',
   },
   {
-    id: 'm2_yoy',
-    name: 'M2 Money Supply YoY%',
+    id: 'net_liquidity',
+    name: 'Net Liquidity',
     category: 'positioning',
     source: 'fred',
-    ticker: 'M2SL',
-    frequency: 'monthly',
-    normalization: 'zscore',
+    ticker: 'WALCL-WTREGEN-RRPONTSYD',
+    frequency: 'weekly',
+    normalization: 'percentile',
     inverted: false,
-    description: 'Year-over-year M2 growth rate',
+    description: 'Fed assets less Treasury General Account and reverse-repo balances',
   },
 
-  // ============== CREDIT SPREADS (18%) ==============
+  // ============== CREDIT SPREADS (20%) ==============
   {
     id: 'hy_oas_spread',
     name: 'High Yield OAS Spread',
@@ -93,7 +93,7 @@ export const INDICATORS: IndicatorDefinition[] = [
     description: 'Credit quality spread within IG',
   },
 
-  // ============== VOLATILITY & SENTIMENT (18%) ==============
+  // ============== VOLATILITY & SENTIMENT (20%) ==============
   {
     id: 'vix',
     name: 'VIX',
@@ -117,40 +117,29 @@ export const INDICATORS: IndicatorDefinition[] = [
     description: 'VIX - VIX3M spread (contango = bullish)',
   },
   {
-    id: 'put_call_ratio',
-    name: 'Equity Put/Call Ratio',
-    category: 'volatility',
-    source: 'cboe',
-    ticker: 'EQUITY_PC',
-    frequency: 'daily',
-    normalization: 'percentile_inverted',
-    inverted: true,
-    description: 'CBOE equity put/call ratio',
-  },
-  {
     id: 'aaii_sentiment',
-    name: 'AAII Bull-Bear Spread',
+    name: 'Risk Sentiment Proxy',
     category: 'volatility',
-    source: 'aaii',
-    ticker: 'BULL_BEAR',
-    frequency: 'weekly',
+    source: 'calculated',
+    ticker: 'CNN_FEAR_GREED_MINUS_50',
+    frequency: 'daily',
     normalization: 'percentile',
     inverted: false,
-    description: 'AAII investor sentiment survey spread',
+    description: 'CNN Fear & Greed score centered at zero; not AAII survey data',
   },
   {
     id: 'gex',
-    name: 'SPX Gamma Exposure',
+    name: 'Volatility-Surface Proxy',
     category: 'volatility',
-    source: 'cboe',
-    ticker: 'SPX',
+    source: 'calculated',
+    ticker: 'VIX_TERM_PROXY',
     frequency: 'daily',
     normalization: 'percentile',
     inverted: false,
-    description: 'Market maker gamma exposure. Positive = low vol regime, negative = high vol regime.',
+    description: 'Derived volatility-surface regime proxy; not dealer gamma exposure',
   },
 
-  // ============== MARKET BREADTH (12%) ==============
+  // ============== MARKET BREADTH (15%) ==============
   {
     id: 'rsp_spy_ratio',
     name: 'RSP/SPY Ratio',
@@ -199,25 +188,14 @@ export const INDICATORS: IndicatorDefinition[] = [
   // ============== MACRO ECONOMIC (10%) ==============
   {
     id: 'ism_manufacturing',
-    name: 'ISM Manufacturing PMI',
+    name: 'Manufacturing Payrolls',
     category: 'macro',
     source: 'fred',
     ticker: 'MANEMP',
     frequency: 'monthly',
-    normalization: 'direct',
+    normalization: 'percentile',
     inverted: false,
-    description: 'ISM Manufacturing Index',
-  },
-  {
-    id: 'ism_services',
-    name: 'ISM Services PMI',
-    category: 'macro',
-    source: 'fred',
-    ticker: 'NMFCI',
-    frequency: 'monthly',
-    normalization: 'direct',
-    inverted: false,
-    description: 'ISM Non-Manufacturing Index',
+    description: 'Manufacturing employees, thousands (FRED MANEMP); legacy internal ID retained for history compatibility',
   },
   {
     id: 'jobless_claims',
@@ -301,15 +279,15 @@ export const INDICATORS: IndicatorDefinition[] = [
     description: 'Bitcoin price relative to 200-day MA',
   },
   {
-    id: 'btc_etf_flows',
-    name: 'BTC ETF Net Flows (7d)',
+    id: 'btc_price',
+    name: 'Bitcoin Price',
     category: 'crypto',
-    source: 'farside',
-    ticker: 'BTC_ETF_FLOWS',
+    source: 'yahoo',
+    ticker: 'BTC-USD',
     frequency: 'daily',
     normalization: 'percentile',
     inverted: false,
-    description: 'Net flows into spot BTC ETFs',
+    description: 'Bitcoin spot price in US dollars',
   },
   {
     id: 'stablecoin_mcap',
@@ -321,17 +299,6 @@ export const INDICATORS: IndicatorDefinition[] = [
     normalization: 'percentile',
     inverted: false,
     description: 'Total stablecoin market cap growth',
-  },
-  {
-    id: 'btc_funding_rate',
-    name: 'BTC Perpetual Funding Rate',
-    category: 'crypto',
-    source: 'coinglass',
-    ticker: 'BTC_FUNDING',
-    frequency: 'realtime',
-    normalization: 'bellcurve',
-    inverted: false,
-    description: 'Average BTC perpetual funding rate',
   },
 ];
 

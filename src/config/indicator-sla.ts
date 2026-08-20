@@ -31,7 +31,10 @@ export interface IndicatorStalePolicy {
 
 const DAILY_MAX_AGE_DAYS = 4;
 const WEEKLY_MAX_AGE_DAYS = 10;
-const MONTHLY_MAX_AGE_DAYS = 45;
+// Monthly observations are conventionally dated to the first day of their
+// reference month and may be released weeks later. 65 days avoids declaring a
+// current monthly release stale merely because its observation date is old.
+const MONTHLY_MAX_AGE_DAYS = 65;
 
 const SOURCE_LAGGED_MAX_AGE_BY_INDICATOR: Record<string, number> = {
   wti_crude: 7,

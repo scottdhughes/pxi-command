@@ -722,5 +722,5 @@ test('computeDecisionGradeScorecard composes go-live blockers from extracted dia
   assert.ok(scorecard.go_live_blockers.includes('opportunity_hygiene_fail'));
   assert.ok(scorecard.go_live_blockers.includes('decision_impact_not_enforce_ready'));
   assert.ok(scorecard.go_live_blockers.includes('decision_impact_market_7d_below_enforce_min_sample'));
-  assert.ok(scorecard.go_live_blockers.includes('decision_impact_cta_action_below_enforce_min_sessions'));
+  assert.ok(!scorecard.go_live_blockers.includes('decision_impact_cta_action_below_enforce_min_sessions'));
 });

@@ -738,6 +738,20 @@ export async function tryHandleMarketProductsRoute(
       return Response.json({ error: 'Signing secret unavailable' }, { status: 503, headers: corsHeaders });
     }
 
+    const recentVerification = await env.DB.prepare(`
+      SELECT 1 AS recent
+      FROM email_verification_tokens
+      WHERE email = ?
+        AND datetime(created_at) >= datetime('now', '-10 minutes')
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).bind(email).first<{ recent: number }>();
+    if (recentVerification) {
+      // Keep the response generic so callers cannot use this endpoint to test
+      // whether an address is already pending or subscribed.
+      return Response.json({ ok: true }, { headers: corsHeaders });
+    }
+
     const subscriberId = `sub_${deps.stableHash(`${email}:${Date.now()}:${deps.generateToken(4)}`)}`;
     const cadence = deps.normalizeCadence(body?.cadence);
     const types = deps.normalizeAlertTypes(body?.types);

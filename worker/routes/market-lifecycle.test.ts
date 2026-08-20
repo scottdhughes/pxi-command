@@ -445,7 +445,6 @@ test('tryHandleMarketLifecycleRoute returns a blocked payload when governance bl
     'market_7d_avg_signed_return_breach',
     'market_30d_hit_rate_breach',
     'market_30d_avg_signed_return_breach',
-    'cta_action_rate_breach',
   ]);
   assert.equal(payload.brief_generated, 0);
   assert.equal(payload.opportunities_generated, 0);

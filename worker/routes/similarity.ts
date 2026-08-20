@@ -219,6 +219,14 @@ export async function tryHandleSimilarityRoute(
   }
 
   if (url.pathname === '/api/embed' && method === 'POST') {
+    const adminAuthFailure = await deps.enforceAdminAuth(
+      route.request,
+      env,
+      corsHeaders,
+      route.clientIP,
+    );
+    if (adminAuthFailure) return adminAuthFailure;
+
     const dates = await env.DB.prepare(
       'SELECT DISTINCT date FROM indicator_values ORDER BY date'
     ).all<{ date: string }>();

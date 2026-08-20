@@ -483,27 +483,6 @@ async function fetchFredSeries(seriesId: string, indicatorId: string): Promise<I
   return values;
 }
 
-async function fetchFredSeriesWithFallback(
-  seriesIds: string[],
-  indicatorId: string
-): Promise<{ values: IndicatorValue[]; seriesId: string }> {
-  let lastError: unknown = null;
-  for (const seriesId of seriesIds) {
-    try {
-      const values = await fetchFredSeries(seriesId, indicatorId);
-      if (values.length > 0) {
-        return { values, seriesId };
-      }
-      lastError = new Error(`FRED series ${seriesId} returned no rows`);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  const message = lastError instanceof Error ? lastError.message : String(lastError);
-  throw new Error(message || `Failed to fetch ${indicatorId} from FRED fallback series`);
-}
-
 async function fetchAllFred(): Promise<void> {
   console.log('\n━━━ FRED Data ━━━');
 
@@ -512,7 +491,7 @@ async function fetchAllFred(): Promise<void> {
     { ticker: 'RRPONTSYD', id: 'reverse_repo' },
     { ticker: 'WTREGEN', id: 'treasury_general_account' },
     { ticker: 'BAMLH0A0HYM2', id: 'hy_oas_spread' },
-    { ticker: 'BAMLC0A4CBBBEY', id: 'ig_oas_spread' },
+    { ticker: 'BAMLC0A0CM', id: 'ig_oas_spread' },
     { ticker: 'T10Y2Y', id: 'yield_curve_2s10s' },
     { ticker: 'DCOILWTICO', id: 'wti_crude' },
     { ticker: 'DTWEXBGS', id: 'dollar_index' },
@@ -532,34 +511,6 @@ async function fetchAllFred(): Promise<void> {
       console.error(`  ✗ ${id}: ${message}`);
     }
     await sleep(200);
-  }
-
-  // ISM services can drift between FRED aliases; try known fallbacks.
-  try {
-    const { values, seriesId } = await fetchFredSeriesWithFallback(
-      ['NAPMNOI', 'NMFCI'],
-      'ism_services'
-    );
-    const written = recordIndicatorValues(values);
-    console.log(`  ✓ ism_services: ${written} values (${seriesId})`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.log(`  ⚠ ism_services primary failed: ${message}`);
-    const latestIsmManufacturing = [...allIndicators]
-      .filter((value) => value.indicator_id === 'ism_manufacturing')
-      .sort((a, b) => b.date.localeCompare(a.date))[0];
-
-    if (latestIsmManufacturing && Number.isFinite(latestIsmManufacturing.value)) {
-      const written = recordIndicatorValues([{
-        indicator_id: 'ism_services',
-        date: format(new Date(), 'yyyy-MM-dd'),
-        value: latestIsmManufacturing.value,
-        source: 'ism_manufacturing_proxy',
-      }]);
-      console.log(`  ✓ ism_services: ${written} value (ism_manufacturing_proxy)`);
-    } else {
-      console.error('  ✗ ism_services: unavailable from both primary and proxy');
-    }
   }
 
   // Derive BBB-AAA spread from BAA/AAA effective yields.
