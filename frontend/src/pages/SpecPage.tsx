@@ -44,8 +44,8 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
               </ul>
             </div>
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#00c896]">
-              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">PXI-Signal</div>
-              <p className="text-[10px] text-[#949ba5]/70 mb-2">Actionable layer for risk allocation</p>
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">PXI-Signal (Research)</div>
+              <p className="text-[10px] text-[#949ba5]/70 mb-2">Experimental policy layer; not a validated allocation recommendation</p>
               <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
                 <li>• Risk allocation (0-100%)</li>
                 <li>• Signal type classification</li>
@@ -75,13 +75,13 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Category Composition</h2>
           <div className="space-y-4">
             {[
-              { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, AAII sentiment, GEX (gamma exposure)', formula: '100 - percentile(VIX, 5yr)' },
+              { name: 'Volatility', weight: 20, indicators: 'VIX, VIX term structure, risk-sentiment proxy, volatility-surface proxy', formula: '100 - percentile(VIX, 5yr)' },
               { name: 'Credit', weight: 20, indicators: 'HY OAS, IG OAS, 2s10s curve, BBB-AAA spread', formula: '100 - percentile(HY_spread, 5yr)' },
               { name: 'Breadth', weight: 15, indicators: 'RSP/SPY ratio, sector breadth, small/mid cap strength', formula: 'percentile(breadth_composite, 5yr)' },
               { name: 'Positioning', weight: 15, indicators: 'Fed balance sheet, TGA, reverse repo, net liquidity', formula: 'percentile(net_liq, 5yr)' },
-              { name: 'Macro', weight: 10, indicators: 'ISM manufacturing, jobless claims, CFNAI', formula: 'percentile(macro_composite, 5yr)' },
+              { name: 'Macro', weight: 10, indicators: 'Manufacturing payrolls, jobless claims, CFNAI', formula: 'percentile(macro_composite, 5yr)' },
               { name: 'Global', weight: 10, indicators: 'DXY, copper/gold ratio, EM spreads, AUD/JPY', formula: 'percentile(global_composite, 5yr)' },
-              { name: 'Crypto', weight: 10, indicators: 'BTC vs 200DMA, stablecoin mcap, BTC ETF flows, funding rates', formula: 'percentile(crypto_composite, 5yr)' },
+              { name: 'Crypto', weight: 10, indicators: 'BTC vs 200DMA, stablecoin market-cap growth, BTC spot price', formula: 'percentile(crypto_composite, 5yr)' },
             ].map((cat) => (
               <div key={cat.name} className="bg-[#0a0a0a]/60 rounded px-4 py-3">
                 <div className="flex justify-between items-center mb-2">
@@ -96,9 +96,9 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
         </section>
 
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">PXI-Signal Trading Policy</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Research Allocation Heuristic</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
-            The signal layer applies a canonical trading policy to convert PXI state into risk allocation.
+            The experimental signal layer applies a deterministic heuristic to convert PXI state into a research allocation.
             Base allocation scales linearly from 30% (PXI=0) to 100% (PXI=100).
           </p>
           <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[11px] text-[#f3f3f3]/70 space-y-1 mb-4">
@@ -128,6 +128,17 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
           </div>
         </section>
 
+        <section className="mb-12 rounded border border-[#f59e0b]/30 bg-[#f59e0b]/5 px-4 py-4">
+          <h2 className="text-[10px] text-[#f59e0b] uppercase tracking-widest mb-2">Validation Status</h2>
+          <p className="text-[12px] text-[#949ba5] leading-relaxed">
+            PXI is currently a descriptive regime heuristic. Legacy backtests, forward-return tables,
+            ML performance claims, and historical allocation statistics are hidden until they are
+            reproduced with versioned point-in-time inputs, walk-forward evaluation, costs, and
+            adequate out-of-sample calibration. Do not treat the score as investment advice.
+          </p>
+        </section>
+
+        {false && <>
         <section className="mb-12">
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Regime Detection</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
@@ -374,12 +385,14 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
           </div>
         </section>
 
+        </>}
+
         <section className="mb-12">
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Interpretation Guide</h2>
           <div className="grid grid-cols-2 gap-4 text-[11px]">
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
               <div className="text-[#00a3ff] font-medium mb-1">0–40: Weak</div>
-              <p className="text-[10px] text-[#949ba5]/70">Risk-off conditions. Historically favorable for forward returns (mean reversion).</p>
+              <p className="text-[10px] text-[#949ba5]/70">Weak conditions across the weighted inputs; not a return forecast.</p>
             </div>
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
               <div className="text-[#949ba5] font-medium mb-1">40–60: Neutral</div>
@@ -391,7 +404,7 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
             </div>
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
               <div className="text-[#ff6b6b] font-medium mb-1">80–100: Extended</div>
-              <p className="text-[10px] text-[#949ba5]/70">Historically poor forward returns. Elevated reversal risk.</p>
+              <p className="text-[10px] text-[#949ba5]/70">Broadly strong or extended inputs; not a reversal forecast.</p>
             </div>
           </div>
         </section>
