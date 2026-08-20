@@ -1,6 +1,18 @@
 name = "pxi-signals"
 main = "src/worker.ts"
-compatibility_date = "2024-10-01"
+compatibility_date = "2026-08-20"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.01
 
 [env.staging]
 name = "pxi-signals-staging"
