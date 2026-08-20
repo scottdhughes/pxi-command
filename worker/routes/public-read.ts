@@ -193,11 +193,39 @@ export async function tryHandlePublicReadRoute(
     const categoryIndicatorIds = categoryIndicators.map((indicator) => indicator.id);
 
     const indicatorScoresResult = await env.DB.prepare(`
-      SELECT indicator_id, raw_value, normalized_value
-      FROM indicator_scores
-      WHERE indicator_id IN (${categoryIndicatorIds.map(() => '?').join(',')})
-        AND date = ?
-    `).bind(...categoryIndicatorIds, latestPxi.date).all<{
+      WITH latest AS (
+        SELECT iv.indicator_id, iv.value AS raw_value
+        FROM indicator_values iv
+        INNER JOIN (
+          SELECT indicator_id, MAX(date) AS max_date
+          FROM indicator_values
+          WHERE indicator_id IN (${categoryIndicatorIds.map(() => '?').join(',')})
+            AND date <= ?
+          GROUP BY indicator_id
+        ) current
+          ON current.indicator_id = iv.indicator_id
+         AND current.max_date = iv.date
+      )
+      SELECT
+        latest.indicator_id,
+        latest.raw_value,
+        100.0 * (
+          SUM(CASE WHEN history.value < latest.raw_value THEN 1 ELSE 0 END) +
+          (0.5 * SUM(CASE WHEN history.value = latest.raw_value THEN 1 ELSE 0 END))
+        ) / COUNT(history.value) AS normalized_value
+      FROM latest
+      INNER JOIN indicator_values history
+        ON history.indicator_id = latest.indicator_id
+       AND history.date >= date(?, '-5 years')
+       AND history.date <= ?
+      GROUP BY latest.indicator_id, latest.raw_value
+      HAVING COUNT(history.value) >= 10
+    `).bind(
+      ...categoryIndicatorIds,
+      latestPxi.date,
+      latestPxi.date,
+      latestPxi.date,
+    ).all<{
       indicator_id: string;
       raw_value: number;
       normalized_value: number;
@@ -228,7 +256,9 @@ export async function tryHandlePublicReadRoute(
         id: indicator.indicator_id,
         name: indicatorNames.get(indicator.indicator_id) || indicator.indicator_id,
         raw_value: indicator.raw_value,
-        normalized_value: indicator.normalized_value,
+        normalized_value: categoryIndicators.find((definition) => definition.id === indicator.indicator_id)?.inverted
+          ? 100 - indicator.normalized_value
+          : indicator.normalized_value,
       })),
       history: (historyResult.results || []).reverse(),
     };
