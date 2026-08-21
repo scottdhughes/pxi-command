@@ -13,7 +13,7 @@ test('resolveIndicatorSla uses frequency defaults', () => {
   assert.equal(resolveIndicatorSla('foo_daily', 'daily').max_age_days, 4);
   assert.equal(resolveIndicatorSla('foo_realtime', 'realtime').max_age_days, 4);
   assert.equal(resolveIndicatorSla('foo_weekly', 'weekly').max_age_days, 10);
-  assert.equal(resolveIndicatorSla('foo_monthly', 'monthly').max_age_days, 45);
+  assert.equal(resolveIndicatorSla('foo_monthly', 'monthly').max_age_days, 65);
 });
 
 test('resolveIndicatorSla infers frequency from indicator config when omitted', () => {

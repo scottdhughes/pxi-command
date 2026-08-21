@@ -1,5 +1,7 @@
 import { SiteDisclaimer } from '../components/SiteDisclaimer'
 
+const shouldRenderUnvalidatedLegacyEvidence = (): boolean => false
+
 export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inPage?: boolean }) {
   const wrapperClass = inPage
     ? 'min-h-screen bg-black text-[#f3f3f3] px-4 sm:px-8 py-16 overflow-auto'
@@ -138,7 +140,7 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
           </p>
         </section>
 
-        {false && <>
+        {shouldRenderUnvalidatedLegacyEvidence() && <>
         <section className="mb-12">
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Regime Detection</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
