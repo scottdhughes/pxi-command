@@ -43,6 +43,44 @@ jobs:
           MARKET_SUMMARY_PATH: /tmp/pxi-market-summary.json
         run: npm run cron:daily
 
+      - name: Verify immutable research snapshot capture
+        env:
+          WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 research/export_d1_snapshot.py --out /tmp/pxi-d1-research-snapshot.json
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const payload = JSON.parse(fs.readFileSync('/tmp/pxi-d1-research-snapshot.json', 'utf8'));
+          if (payload.point_in_time_guarantee !== true) {
+            throw new Error('Research export did not assert point-in-time safety');
+          }
+          if (!Array.isArray(payload.rows) || payload.rows.length < 1) {
+            throw new Error('Research export contains no immutable decision snapshots');
+          }
+          const latest = payload.rows[payload.rows.length - 1];
+          const featureNames = Object.keys(latest.features || {});
+          const observationNames = Object.keys(latest.feature_observation_dates || {});
+          const sourceNames = Object.keys(latest.feature_sources || {});
+          if (latest.immutable_snapshot !== true || !latest.snapshot_id) {
+            throw new Error('Latest research row is not marked immutable');
+          }
+          if (featureNames.length < 1 || featureNames.length !== observationNames.length || featureNames.length !== sourceNames.length) {
+            throw new Error('Latest research row has incomplete feature provenance');
+          }
+          if (!featureNames.every((name) =>
+            Object.hasOwn(latest.feature_observation_dates, name) &&
+            Object.hasOwn(latest.feature_sources, name)
+          )) {
+            throw new Error('Latest research row provenance keys do not match its feature keys');
+          }
+          fs.appendFileSync(
+            process.env.GITHUB_STEP_SUMMARY,
+            `\n### Immutable research capture\n\n- rows: ${payload.rows.length}\n- latest decision: ${latest.decision_date}\n- latest features: ${featureNames.length}\n- storage: ${payload.storage_contract}\n`,
+          );
+          NODE
+
       - name: Append SLA summary
         if: always()
         run: |
