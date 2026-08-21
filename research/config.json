@@ -1,0 +1,12 @@
+{
+  "horizons_calendar_days": [7, 30],
+  "min_train_rows": 126,
+  "test_rows": 21,
+  "step_rows": 21,
+  "ridge_alpha": 10.0,
+  "round_trip_cost_bps": 10.0,
+  "minimum_oos_rows": 60,
+  "minimum_walk_forward_slices": 3,
+  "minimum_feature_coverage": 0.9,
+  "maximum_pairwise_correlation": 0.9
+}

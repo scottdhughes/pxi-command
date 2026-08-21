@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pxicommand.com/schemas/research-snapshot-v1.json",
+  "title": "PXI point-in-time research snapshot",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "dataset_id",
+    "generated_at",
+    "point_in_time_guarantee",
+    "feature_version",
+    "benchmark",
+    "rows"
+  ],
+  "properties": {
+    "schema_version": { "const": "pxi-research-snapshot/v1" },
+    "dataset_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "point_in_time_guarantee": { "type": "boolean" },
+    "feature_version": { "type": "string", "minLength": 1 },
+    "benchmark": {
+      "type": "object",
+      "required": ["symbol", "price_source"],
+      "properties": {
+        "symbol": { "type": "string", "minLength": 1 },
+        "price_source": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["decision_date", "available_at", "features", "benchmark_close"],
+        "properties": {
+          "decision_date": { "type": "string", "format": "date" },
+          "available_at": { "type": "string", "format": "date-time" },
+          "features": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": { "type": ["number", "null"] }
+          },
+          "benchmark_close": { "type": "number", "exclusiveMinimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": true
+}

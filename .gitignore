@@ -5,6 +5,8 @@ frontend/dist/
 .env.local
 .env*.local
 *.log
+__pycache__/
+*.pyc
 .DS_Store
 .wrangler/
 worker/worker-configuration.d.ts
@@ -14,3 +16,7 @@ scripts/d1-data.sql
 
 # ML generated files
 ml/*.json
+
+# Offline research artifacts (source code and fixtures remain tracked)
+research/out/
+research/snapshots/
