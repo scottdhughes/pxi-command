@@ -347,3 +347,44 @@ test('tryHandleModelingRoute enforces auth on /api/export/training-data', async 
   });
   assert.equal(response?.status, 401);
 });
+
+test('tryHandleModelingRoute enforces auth on /api/export/research-snapshot', async () => {
+  const route = createRouteContext('https://pxi.test/api/export/research-snapshot');
+  const response = await tryHandleModelingRoute(route as any, {
+    enforceAdminAuth: async () => Response.json({ error: 'Unauthorized' }, { status: 401 }),
+  });
+  assert.equal(response?.status, 401);
+});
+
+test('tryHandleModelingRoute exports immutable point-in-time research snapshots', async () => {
+  const stored = {
+    snapshot_id: 'snapshot-1',
+    decision_date: '2026-08-21',
+    available_at: '2026-08-21T20:00:00.000Z',
+    feature_version: 'pxi-feature-snapshot/v1',
+    storage_contract: 'append-only-d1-research-snapshots/v1',
+    capture_source: 'test',
+    benchmark_close: 651.4,
+    benchmark_observation_date: '2026-08-21',
+    features: { pxi_score: 61.2, indicator_ism_manufacturing: 48.2 },
+    feature_observation_dates: { pxi_score: '2026-08-21', indicator_ism_manufacturing: '2026-08-03' },
+    feature_sources: { pxi_score: 'pxi-calculation', indicator_ism_manufacturing: 'fred' },
+  };
+  const route = createRouteContext('https://pxi.test/api/export/research-snapshot', undefined, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('FROM research_feature_snapshots')) {
+        return [{ payload_json: JSON.stringify(stored) }];
+      }
+      return null;
+    }),
+  });
+  const response = await tryHandleModelingRoute(route as any, {
+    enforceAdminAuth: async () => null,
+  });
+  assert.equal(response?.status, 200);
+  const payload = await response!.json() as any;
+  assert.equal(payload.point_in_time_guarantee, true);
+  assert.equal(payload.rows.length, 1);
+  assert.equal(payload.rows[0].immutable_snapshot, true);
+  assert.equal(payload.rows[0].feature_sources.indicator_ism_manufacturing, 'fred');
+});

@@ -2,6 +2,12 @@ import type {
   MLAccuracyApiResponsePayload,
   WorkerRouteContext,
 } from '../types';
+import {
+  RESEARCH_FEATURE_VERSION,
+  RESEARCH_STORAGE_CONTRACT,
+  ensureResearchSnapshotSchema,
+  type StoredResearchSnapshot,
+} from '../data/research-vintages';
 
 type ModelingDeps = Record<string, any>;
 
@@ -2387,6 +2393,76 @@ async function handleExportTrainingDataRoute(route: WorkerRouteContext, deps: Mo
   }, { headers: corsHeaders });
 }
 
+async function handleExportResearchSnapshotRoute(route: WorkerRouteContext, deps: ModelingDeps): Promise<Response> {
+  const { request, env, url, corsHeaders, clientIP } = route;
+  const adminAuthFailure = await deps.enforceAdminAuth(request, env, corsHeaders, clientIP);
+  if (adminAuthFailure) return adminAuthFailure;
+
+  await ensureResearchSnapshotSchema(env.DB);
+  const requestedLimit = Number.parseInt(url.searchParams.get('limit') || '1000', 10);
+  const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 2000)) : 1000;
+  const result = await env.DB.prepare(`
+    SELECT payload_json
+    FROM research_feature_snapshots
+    WHERE feature_version = ?
+      AND storage_contract = ?
+    ORDER BY available_at DESC
+    LIMIT ?
+  `).bind(RESEARCH_FEATURE_VERSION, RESEARCH_STORAGE_CONTRACT, limit).all<{ payload_json: string }>();
+
+  const latestByDecisionDate = new Map<string, StoredResearchSnapshot>();
+  for (const row of result.results || []) {
+    let snapshot: StoredResearchSnapshot;
+    try {
+      snapshot = JSON.parse(row.payload_json) as StoredResearchSnapshot;
+    } catch {
+      continue;
+    }
+    if (latestByDecisionDate.has(snapshot.decision_date)) continue;
+    const decisionEnd = `${snapshot.decision_date}T23:59:59.999Z`;
+    if (snapshot.available_at > decisionEnd) continue;
+    const names = Object.keys(snapshot.features || {});
+    const completeProvenance = names.length > 0 && names.every((name) =>
+      Boolean(snapshot.feature_observation_dates?.[name]) &&
+      Boolean(snapshot.feature_sources?.[name]) &&
+      snapshot.feature_observation_dates[name] <= snapshot.decision_date
+    );
+    if (!completeProvenance || !Number.isFinite(snapshot.benchmark_close) || snapshot.benchmark_close <= 0) continue;
+    latestByDecisionDate.set(snapshot.decision_date, snapshot);
+  }
+
+  const snapshots = [...latestByDecisionDate.values()].sort((a, b) =>
+    a.decision_date.localeCompare(b.decision_date)
+  );
+  const firstDate = snapshots[0]?.decision_date || 'empty';
+  const lastDate = snapshots.at(-1)?.decision_date || 'empty';
+
+  return Response.json({
+    schema_version: 'pxi-research-snapshot/v1',
+    dataset_id: `pxi-d1-vintages-${firstDate}-${lastDate}-${snapshots.length}`,
+    generated_at: new Date().toISOString(),
+    point_in_time_guarantee: true,
+    feature_version: RESEARCH_FEATURE_VERSION,
+    storage_contract: RESEARCH_STORAGE_CONTRACT,
+    benchmark: {
+      symbol: 'SPY',
+      price_source: 'captured indicator_spy_close',
+      treatment: 'exact benchmark value preserved in each immutable decision snapshot',
+    },
+    rows: snapshots.map((snapshot) => ({
+      snapshot_id: snapshot.snapshot_id,
+      decision_date: snapshot.decision_date,
+      available_at: snapshot.available_at,
+      immutable_snapshot: true,
+      features: snapshot.features,
+      feature_observation_dates: snapshot.feature_observation_dates,
+      feature_sources: snapshot.feature_sources,
+      benchmark_close: snapshot.benchmark_close,
+      benchmark_observation_date: snapshot.benchmark_observation_date,
+    })),
+  }, { headers: corsHeaders });
+}
+
 export async function tryHandleModelingRoute(
   route: WorkerRouteContext,
   deps: ModelingDeps,
@@ -2455,6 +2531,10 @@ export async function tryHandleModelingRoute(
 
   if (url.pathname === '/api/export/training-data' && method === 'GET') {
     return handleExportTrainingDataRoute(route, deps);
+  }
+
+  if (url.pathname === '/api/export/research-snapshot' && method === 'GET') {
+    return handleExportResearchSnapshotRoute(route, deps);
   }
 
   return null;

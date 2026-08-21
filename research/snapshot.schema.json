@@ -17,6 +17,7 @@
     "dataset_id": { "type": "string", "minLength": 1 },
     "generated_at": { "type": "string", "format": "date-time" },
     "point_in_time_guarantee": { "type": "boolean" },
+    "storage_contract": { "type": "string", "minLength": 1 },
     "feature_version": { "type": "string", "minLength": 1 },
     "benchmark": {
       "type": "object",
@@ -33,14 +34,25 @@
         "type": "object",
         "required": ["decision_date", "available_at", "features", "benchmark_close"],
         "properties": {
+          "snapshot_id": { "type": "string", "minLength": 1 },
           "decision_date": { "type": "string", "format": "date" },
           "available_at": { "type": "string", "format": "date-time" },
+          "immutable_snapshot": { "type": "boolean" },
           "features": {
             "type": "object",
             "minProperties": 1,
             "additionalProperties": { "type": ["number", "null"] }
           },
-          "benchmark_close": { "type": "number", "exclusiveMinimum": 0 }
+          "feature_observation_dates": {
+            "type": "object",
+            "additionalProperties": { "type": "string", "format": "date" }
+          },
+          "feature_sources": {
+            "type": "object",
+            "additionalProperties": { "type": "string", "minLength": 1 }
+          },
+          "benchmark_close": { "type": "number", "exclusiveMinimum": 0 },
+          "benchmark_observation_date": { "type": "string", "format": "date" }
         },
         "additionalProperties": false
       }

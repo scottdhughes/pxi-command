@@ -21,12 +21,19 @@ EXPECTED_TABLES = {
     "market_decision_impact_snapshots",
     "market_calibration_snapshots",
     "market_utility_events",
+    "research_feature_snapshots",
 }
 
 EXPECTED_INDEXES = {
     "idx_market_alert_deliveries_email_unique",
     "idx_market_refresh_runs_completed",
     "idx_market_decision_impact_lookup",
+    "idx_research_feature_snapshots_decision",
+}
+
+EXPECTED_TRIGGERS = {
+    "research_feature_snapshots_no_update",
+    "research_feature_snapshots_no_delete",
 }
 
 
@@ -46,7 +53,7 @@ def apply_sql_file(connection: sqlite3.Connection, path: Path) -> None:
 
 def assert_expected_schema(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
-        "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index')"
+        "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index', 'trigger')"
     ).fetchall()
     names_by_type: dict[str, set[str]] = {"table": set(), "index": set()}
     for name, obj_type in rows:
@@ -54,10 +61,35 @@ def assert_expected_schema(connection: sqlite3.Connection) -> None:
 
     missing_tables = sorted(EXPECTED_TABLES - names_by_type["table"])
     missing_indexes = sorted(EXPECTED_INDEXES - names_by_type["index"])
+    missing_triggers = sorted(EXPECTED_TRIGGERS - names_by_type.get("trigger", set()))
     if missing_tables:
         raise SystemExit(f"Missing expected tables after migration apply: {', '.join(missing_tables)}")
     if missing_indexes:
         raise SystemExit(f"Missing expected indexes after migration apply: {', '.join(missing_indexes)}")
+    if missing_triggers:
+        raise SystemExit(f"Missing expected triggers after migration apply: {', '.join(missing_triggers)}")
+
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO research_feature_snapshots (
+          snapshot_id, decision_date, available_at, feature_version,
+          storage_contract, capture_source, benchmark_close,
+          benchmark_observation_date, payload_json
+        ) VALUES (
+          'immutability-test', '2026-03-05', '2026-03-05T20:00:00.000Z',
+          'test-v1', 'append-only-d1-research-snapshots/v1', 'migration-test',
+          100.0, '2026-03-05', '{}'
+        )
+        """
+    )
+    try:
+        connection.execute(
+            "UPDATE research_feature_snapshots SET benchmark_close = 101 WHERE snapshot_id = 'immutability-test'"
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise SystemExit("research_feature_snapshots allowed an update despite immutability trigger")
 
     refresh_runs_sql_row = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'market_refresh_runs'"

@@ -69,6 +69,10 @@ def validate_snapshot(snapshot: dict[str, Any]) -> list[str]:
         errors.append("rows must be a non-empty list")
         return errors
 
+    point_in_time = snapshot.get("point_in_time_guarantee", False) is True
+    if point_in_time and snapshot.get("storage_contract") != "append-only-d1-research-snapshots/v1":
+        errors.append("point-in-time snapshots require the append-only D1 storage contract")
+
     seen_dates: set[str] = set()
     feature_names: set[str] = set()
     for index, row in enumerate(rows):
@@ -89,6 +93,24 @@ def validate_snapshot(snapshot: dict[str, Any]) -> list[str]:
             errors.append(f"row {index}: features must be a non-empty object")
             continue
         feature_names.update(features)
+        if point_in_time:
+            if not isinstance(row.get("snapshot_id"), str) or not row["snapshot_id"].strip():
+                errors.append(f"row {index}: point-in-time row requires snapshot_id")
+            if row.get("immutable_snapshot") is not True:
+                errors.append(f"row {index}: point-in-time row must be marked immutable_snapshot")
+            observation_dates = row.get("feature_observation_dates")
+            sources = row.get("feature_sources")
+            if not isinstance(observation_dates, dict) or set(observation_dates) != set(features):
+                errors.append(f"row {index}: feature observation-date provenance is incomplete")
+            if not isinstance(sources, dict) or set(sources) != set(features):
+                errors.append(f"row {index}: feature source provenance is incomplete")
+            if isinstance(observation_dates, dict):
+                for name, observed_on in observation_dates.items():
+                    try:
+                        if parse_date(observed_on) > decision_date:
+                            errors.append(f"row {index}: feature {name} was observed after decision_date")
+                    except (TypeError, ValueError):
+                        errors.append(f"row {index}: feature {name} has invalid observation date")
         close = row.get("benchmark_close")
         if not isinstance(close, (int, float)) or not math.isfinite(close) or close <= 0:
             errors.append(f"row {index}: benchmark_close must be positive and finite")

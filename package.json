@@ -27,6 +27,7 @@
     "postrefresh:market": "tsx src/pipeline/postrefresh-market.ts",
     "digest:send": "tsx src/pipeline/send-digest.ts",
     "research:snapshot": "python3 research/export_public_snapshot.py --out research/out/public_snapshot.json",
+    "research:snapshot:d1": "python3 research/export_d1_snapshot.py --out research/out/d1_snapshot.json",
     "research:run": "python3 research/pxi_research_lab.py --input research/out/public_snapshot.json --out research/out/latest",
     "research:test": "python3 -m unittest discover -s research/tests -p 'test_*.py'"
   },

@@ -22,6 +22,7 @@ export const migrationFixture = {
 export const writeFixture = {
   success: true,
   written: 42,
+  research_snapshot_id: 'snapshot-example',
 } satisfies WriteResponsePayload;
 
 export const refreshIngestionFixture = {

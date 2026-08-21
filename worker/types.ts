@@ -355,6 +355,7 @@ export interface MigrationResponsePayload {
 export interface WriteResponsePayload {
   success: true;
   written: number;
+  research_snapshot_id: string | null;
 }
 
 export interface RefreshIngestionResponsePayload {

@@ -27,12 +27,24 @@ def synthetic_snapshot(point_in_time: bool = True, rows: int = 260) -> dict:
         decision = start + timedelta(days=index)
         output.append(
             {
+                "snapshot_id": f"synthetic-{index}",
                 "decision_date": decision.isoformat(),
                 "available_at": f"{decision.isoformat()}T23:00:00Z",
+                "immutable_snapshot": True,
                 "features": {
                     "pxi_score": 50 + rng.normal(0, 4),
                     "stable_signal": latent,
                     "redundant_signal": latent * 0.99,
+                },
+                "feature_observation_dates": {
+                    "pxi_score": decision.isoformat(),
+                    "stable_signal": decision.isoformat(),
+                    "redundant_signal": decision.isoformat(),
+                },
+                "feature_sources": {
+                    "pxi_score": "synthetic",
+                    "stable_signal": "synthetic",
+                    "redundant_signal": "synthetic",
                 },
                 "benchmark_close": benchmark,
             }
@@ -42,6 +54,7 @@ def synthetic_snapshot(point_in_time: bool = True, rows: int = 260) -> dict:
         "dataset_id": "synthetic",
         "generated_at": "2026-08-21T00:00:00Z",
         "point_in_time_guarantee": point_in_time,
+        "storage_contract": "append-only-d1-research-snapshots/v1",
         "feature_version": "test-v1",
         "benchmark": {"symbol": "TEST", "price_source": "synthetic"},
         "rows": output,

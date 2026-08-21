@@ -1,4 +1,5 @@
 import { ensureEmailAlertDeliveryUniqueness, ensureMarketRefreshRunStatusSchema } from '../db/schema';
+import { captureResearchFeatureSnapshot } from '../data/research-vintages';
 import type {
   BackfillResponsePayload,
   MigrationResponsePayload,
@@ -511,6 +512,11 @@ export async function tryHandleAdminIngestionRoute(
       totalWritten += batch.length;
     }
 
+    const pxiForSnapshot = body.pxi || (body.type === 'pxi' ? body.data : null);
+    const researchSnapshot = pxiForSnapshot
+      ? await captureResearchFeatureSnapshot(env.DB, pxiForSnapshot, 'write_api')
+      : null;
+
     if (body.pxi) {
       const indicators = await env.DB.prepare(`
         SELECT indicator_id, value FROM indicator_values
@@ -539,7 +545,11 @@ export async function tryHandleAdminIngestionRoute(
       }
     }
 
-    const payload: WriteResponsePayload = { success: true, written: totalWritten };
+    const payload: WriteResponsePayload = {
+      success: true,
+      written: totalWritten,
+      research_snapshot_id: researchSnapshot?.snapshot_id || null,
+    };
     return Response.json(payload, { headers: corsHeaders });
   }
 
@@ -590,6 +600,8 @@ export async function tryHandleAdminIngestionRoute(
       if (catStmts.length > 0) {
         await env.DB.batch(catStmts);
       }
+
+      await captureResearchFeatureSnapshot(env.DB, result.pxi, 'worker_refresh');
     }
 
     const payload: RefreshIngestionResponsePayload = {
