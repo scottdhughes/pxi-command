@@ -650,6 +650,8 @@ export async function tryHandleAdminIngestionRoute(
       await env.DB.batch(catStmts);
     }
 
+    await captureResearchFeatureSnapshot(env.DB, result.pxi, 'worker_recalculate');
+
     let embedded = false;
     try {
       const indicators = await env.DB.prepare(`
