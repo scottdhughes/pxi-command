@@ -20,7 +20,14 @@ def main() -> None:
     if not api_key:
         raise SystemExit("WRITE_API_KEY is required")
 
-    request = urllib.request.Request(args.url, headers={"Authorization": f"Bearer {api_key}"})
+    request = urllib.request.Request(
+        args.url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            # Cloudflare rejects urllib's default Python-urllib user agent (1010).
+            "User-Agent": "pxi-research-export/1.0",
+        },
+    )
     with urllib.request.urlopen(request, timeout=60) as response:
         payload = json.load(response)
 
