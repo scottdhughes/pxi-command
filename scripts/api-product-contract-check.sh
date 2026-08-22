@@ -315,7 +315,7 @@ check_plan_actionability_contract() {
   eligible_count=$(echo "$plan_json" | jq -r '.opportunity_ref.eligible_count // -1')
   has_override=$(echo "$plan_json" | jq -r '((.actionability_reason_codes // []) | index("high_edge_override_no_eligible")) != null')
   cross_horizon_state=$(echo "$plan_json" | jq -r '.cross_horizon.state // ""')
-  edge_evidence_pass=$(echo "$plan_json" | jq -r '.edge_evidence_gate.pass // ""')
+  edge_evidence_pass=$(echo "$plan_json" | jq -r '.edge_evidence_gate.pass | if . == true then "true" elif . == false then "false" else "" end')
 
   case "$actionability_state" in
     ACTIONABLE|WATCH|NO_ACTION) ;;
