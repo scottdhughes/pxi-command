@@ -13,6 +13,7 @@ import type {
   MarketCalibrationSnapshotPayload,
   OpportunitySnapshot,
 } from '../types';
+import { HISTORICAL_BACKFILL_SEED_MARKER } from '../lib/opportunity-snapshot-history';
 
 const BRIEF_CONTRACT_VERSION = '2026-02-17-v2';
 
@@ -367,11 +368,13 @@ export async function fetchLatestMarketProductSnapshotWrite(db: D1Database): Pro
       FROM (
         SELECT created_at FROM market_brief_snapshots
         UNION ALL
-        SELECT created_at FROM opportunity_snapshots
+        SELECT created_at
+        FROM opportunity_snapshots
+        WHERE instr(payload_json, ?) = 0
         UNION ALL
         SELECT created_at FROM market_calibration_snapshots
       )
-    `).first<{ latest_created_at: string | null }>();
+    `).bind(HISTORICAL_BACKFILL_SEED_MARKER).first<{ latest_created_at: string | null }>();
     return row?.latest_created_at || null;
   } catch {
     return null;

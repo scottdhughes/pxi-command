@@ -38,8 +38,13 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
   const noActionUnlockConditions = actionabilityState === 'NO_ACTION'
     ? deriveNoActionUnlockConditions({ actionabilityReasonCodes: actionabilityReasons })
     : []
-  const targetPct = Math.round(plan.action_now.risk_allocation_target * 100)
-  const rawTargetPct = Math.round((plan.action_now.raw_signal_allocation_target ?? plan.action_now.risk_allocation_target) * 100)
+  const actionAuthorized = plan.action_now.action_authorized === true
+  const targetPct = actionAuthorized && typeof plan.action_now.risk_allocation_target === 'number'
+    ? Math.round(plan.action_now.risk_allocation_target * 100)
+    : null
+  const rawTargetPct = actionAuthorized
+    ? Math.round((plan.action_now.raw_signal_allocation_target ?? plan.action_now.risk_allocation_target ?? 0.5) * 100)
+    : null
   const qualityColor =
     plan.edge_quality.label === 'HIGH' ? 'text-[#00c896]' :
     plan.edge_quality.label === 'MEDIUM' ? 'text-[#f59e0b]' :
@@ -126,10 +131,10 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
               {formatActionabilityState(actionabilityState)}
             </span>
             <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
-              tactical {plan.action_now.primary_signal.replace('_', ' ')}
+              {actionAuthorized ? 'tactical' : 'research posture'} {plan.action_now.primary_signal.replace('_', ' ')}
             </span>
-            <span className="rounded border border-[#26272b] px-2 py-1 text-[#d7dbe1]">
-              target {targetPct}%
+            <span className={`rounded border px-2 py-1 ${actionAuthorized ? 'border-[#26272b] text-[#d7dbe1]' : 'border-[#f59e0b]/40 text-[#f59e0b]'}`}>
+              {targetPct === null ? 'allocation withheld' : `target ${targetPct}%`}
             </span>
             {crossHorizonState && (
               <span className={`rounded border px-2 py-1 ${crossHorizonClass}`}>
@@ -137,9 +142,9 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
               </span>
             )}
           </div>
-          {rawTargetPct !== targetPct && (
+          {actionAuthorized && rawTargetPct !== null && rawTargetPct !== targetPct && (
             <p className="mt-1 text-[9px] text-[#949ba5]/75">
-              raw {rawTargetPct}% · {plan.action_now.risk_allocation_basis.replace(/_/g, ' ')}
+              research signal {rawTargetPct}% · {plan.action_now.risk_allocation_basis.replace(/_/g, ' ')}
             </p>
           )}
           {plan.cross_horizon?.invalidation_note && (
@@ -266,10 +271,16 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
         </div>
         <div className="mt-2 rounded border border-[#26272b] px-2 py-2">
           <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Sizing Playbook</p>
-          <p className="mt-1 text-[10px] text-[#d7dbe1]">
-            size range {plan.trader_playbook.recommended_size_pct.min}%-{plan.trader_playbook.recommended_size_pct.max}%
-            {' '}· target {plan.trader_playbook.recommended_size_pct.target}%
-          </p>
+          {actionAuthorized ? (
+            <p className="mt-1 text-[10px] text-[#d7dbe1]">
+              size range {plan.trader_playbook.recommended_size_pct.min}%-{plan.trader_playbook.recommended_size_pct.max}%
+              {' '}· target {plan.trader_playbook.recommended_size_pct.target}%
+            </p>
+          ) : (
+            <p className="mt-1 text-[10px] text-[#f59e0b]">
+              Sizing and scenarios are withheld until the actionability and prospective evidence gates pass.
+            </p>
+          )}
           <p className="mt-1 text-[9px] text-[#949ba5]/70">
             7d follow-through {formatProbability(plan.trader_playbook.benchmark_follow_through_7d.hit_rate)}
             {' '}· n={plan.trader_playbook.benchmark_follow_through_7d.sample_size}
@@ -277,13 +288,13 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
               ? ` · ${formatUnavailableReason(plan.trader_playbook.benchmark_follow_through_7d.unavailable_reason)}`
               : ''}
           </p>
-          <div className="mt-2 space-y-1">
+          {actionAuthorized && <div className="mt-2 space-y-1">
             {plan.trader_playbook.scenarios.slice(0, 3).map((scenario) => (
               <div key={`${scenario.condition}-${scenario.action}`} className="text-[9px] text-[#cfd5de]">
                 <span className="text-[#949ba5]">if</span> {scenario.condition} <span className="text-[#949ba5]">then</span> {scenario.action}
               </div>
             ))}
-          </div>
+          </div>}
         </div>
         {plan.invalidation_rules.length > 0 && (
           <div className="mt-2">

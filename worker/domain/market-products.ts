@@ -1,4 +1,12 @@
-import { buildCanonicalMarketDecision } from './market-core';
+import {
+  buildCanonicalMarketDecision,
+  resolveEdgeEvidenceGate,
+  suppressProjectionForEdgeEvidence,
+} from './market-core';
+import {
+  HISTORICAL_BACKFILL_SEED_MARKER,
+  parseProspectiveOpportunitySnapshot,
+} from '../lib/opportunity-snapshot-history';
 import type {
   AlertsFeedResponsePayload,
   BriefSnapshot,
@@ -193,17 +201,16 @@ export async function generateMarketEvents(
       SELECT payload_json
       FROM opportunity_snapshots
       WHERE horizon = ?
+        AND instr(payload_json, ?) = 0
       ORDER BY as_of DESC
       LIMIT 1 OFFSET 1
-    `).bind(opportunities.horizon).first<{ payload_json: string }>();
+    `).bind(opportunities.horizon, HISTORICAL_BACKFILL_SEED_MARKER).first<{ payload_json: string }>();
 
     let previousTopConviction: number | null = null;
     if (previousSnapshot?.payload_json) {
-      try {
-        const previousPayload = JSON.parse(previousSnapshot.payload_json) as OpportunitySnapshot;
+      const previousPayload = parseProspectiveOpportunitySnapshot<OpportunitySnapshot>(previousSnapshot.payload_json);
+      if (previousPayload) {
         previousTopConviction = previousPayload.items?.[0]?.conviction_score ?? null;
-      } catch {
-        previousTopConviction = null;
       }
     }
 
@@ -281,6 +288,7 @@ function buildOpportunityRouteFallbackResponse(
       coherence_failed: 0,
       quality_filtered: 0,
       data_quality_suppressed: 0,
+      edge_evidence_suppressed: 0,
     },
     quality_filter_rate: 0,
     coherence_fail_rate: 0,
@@ -465,6 +473,21 @@ export async function tryHandleMarketProductsRoute(
       });
     }
 
+    let edgeDiagnosticsReport: unknown = null;
+    if (deps.isFeatureEnabled(
+      env,
+      'FEATURE_ENABLE_EDGE_DIAGNOSTICS',
+      'ENABLE_EDGE_DIAGNOSTICS',
+      true,
+    )) {
+      try {
+        edgeDiagnosticsReport = await deps.buildEdgeDiagnosticsReport(env.DB, [horizon]);
+      } catch (err) {
+        console.warn('Opportunity edge diagnostics unavailable; actionability is disabled:', err);
+      }
+    }
+    const edgeEvidenceGate = resolveEdgeEvidenceGate(edgeDiagnosticsReport, horizon);
+
     let snapshot: OpportunitySnapshot | null = null;
     let stored: { payload_json: string } | null = null;
     try {
@@ -472,20 +495,17 @@ export async function tryHandleMarketProductsRoute(
         SELECT payload_json
         FROM opportunity_snapshots
         WHERE horizon = ?
+          AND instr(payload_json, ?) = 0
         ORDER BY as_of DESC
         LIMIT 1
-      `).bind(horizon).first<{ payload_json: string }>();
+      `).bind(horizon, HISTORICAL_BACKFILL_SEED_MARKER).first<{ payload_json: string }>();
     } catch (err) {
       console.error('Opportunity snapshot lookup failed:', err);
       stored = null;
     }
 
     if (stored?.payload_json) {
-      try {
-        snapshot = JSON.parse(stored.payload_json) as OpportunitySnapshot;
-      } catch {
-        snapshot = null;
-      }
+      snapshot = parseProspectiveOpportunitySnapshot<OpportunitySnapshot>(stored.payload_json);
     }
 
     let latestPxiDate: string | null = null;
@@ -553,21 +573,22 @@ export async function tryHandleMarketProductsRoute(
       resolveRefreshTimestamp(env.DB),
     ]);
 
-    let consistencyState = latestConsistencyCheck?.state ?? 'PASS';
+    let consistencyState = latestConsistencyCheck?.state ?? 'FAIL';
     if (!latestConsistencyCheck) {
       try {
         consistencyState = (await buildCanonicalMarketDecision(env.DB, deps)).consistency.state;
       } catch {
-        consistencyState = 'PASS';
+        consistencyState = 'FAIL';
       }
     }
 
 	    const normalizedItems = deps.normalizeOpportunityItemsForPublishing(effectiveSnapshot.items, convictionCalibration);
-    const projectedFeed = deps.projectOpportunityFeed(normalizedItems, {
+    const candidateProjection = deps.projectOpportunityFeed(normalizedItems, {
       coherence_gate_enabled: coherenceGateEnabled,
       freshness,
       consistency_state: consistencyState,
     });
+    const projectedFeed = suppressProjectionForEdgeEvidence(candidateProjection, edgeEvidenceGate);
     const ttlMetadata = computeOpportunityTtlMetadata(latestRefresh.last_refresh_at_utc, new Date());
     let effectiveDegradedReason = projectedFeed.degraded_reason;
     if (!effectiveDegradedReason && ttlMetadata.ttl_state === 'overdue') {
@@ -578,6 +599,7 @@ export async function tryHandleMarketProductsRoute(
     const diagnostics = deps.computeCalibrationDiagnostics(convictionCalibration);
     const ctaState = deps.evaluateOpportunityCtaState(projectedFeed, diagnostics, ttlMetadata, effectiveDegradedReason);
     const actionabilityReasonCodes = Array.from(new Set([
+      ...(!edgeEvidenceGate.pass ? ['edge_evidence_gate_block'] : []),
       ...(projectedFeed.items.length === 0 ? ['no_eligible_opportunities'] : []),
       ...(effectiveDegradedReason ? [`opportunity_${effectiveDegradedReason}`] : []),
       ...(ctaState.actionability_state === 'WATCH' ? ['watch_state'] : []),
@@ -585,13 +607,16 @@ export async function tryHandleMarketProductsRoute(
       ...ctaState.cta_disabled_reasons.map((reason: string) => `cta_${reason}`),
     ]));
     const responseItems = projectedFeed.items.slice(0, limit);
-    const cacheControl = ttlMetadata.ttl_state === 'overdue' || ttlMetadata.ttl_state === 'unknown'
+    const cacheControl = !edgeEvidenceGate.pass || ttlMetadata.ttl_state === 'overdue' || ttlMetadata.ttl_state === 'unknown'
       ? 'no-store'
       : 'public, max-age=60';
 
-	    const responsePayload: OpportunityFeedResponsePayload = {
+	    const responsePayload: OpportunityFeedResponsePayload & {
+      edge_evidence_gate: { pass: boolean; reasons: string[] };
+    } = {
 	      as_of: effectiveSnapshot.as_of,
 	      horizon: effectiveSnapshot.horizon,
+      edge_evidence_gate: edgeEvidenceGate,
       items: responseItems,
       suppressed_count: projectedFeed.suppressed_count,
       quality_filtered_count: projectedFeed.quality_filtered_count,

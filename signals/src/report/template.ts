@@ -156,9 +156,9 @@ function renderSummaryDashboard(themes: ThemeReportItem[], totalDocs: number): s
         <div class="stat-sub">${avgConfLabel}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">"Now" Signals</div>
+        <div class="stat-label">"Now" Activity Flags</div>
         <div class="stat-value accent">${nowCount}</div>
-        <div class="stat-sub">Ready to act</div>
+        <div class="stat-sub">Research only</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Data Points</div>
@@ -423,7 +423,7 @@ function renderTakeaways(takeaways: {
           </ul>
         </div>
         <div class="takeaway-card actionable">
-          <div class="takeaway-title">Actionable Signals</div>
+          <div class="takeaway-title">Research Timing Flags — Not Actionable</div>
           <ul class="takeaway-list">
             ${renderList(takeaways.actionable_signals)}
           </ul>
@@ -560,8 +560,8 @@ export function renderHtml(
   // Dynamic SEO content
   const topTheme = report.themes[0]
   const topThemeName = topTheme?.theme_name || "Market Themes"
-  const pageTitle = `Early Sector Rotation Signals | PXI Command`
-  const pageDescription = `Weekly analysis of ${report.summary.total_docs} Reddit discussions. Top signal: ${topThemeName}. Updated ${analysisDate}.`
+  const pageTitle = `Sector Rotation Research Signals | PXI Command`
+  const pageDescription = `Research-only analysis of ${report.summary.total_docs} Reddit discussions. Top observed theme: ${topThemeName}. Updated ${analysisDate}.`
   const pageUrl = "https://pxicommand.com/signals"
   const ogImage = "https://pxicommand.com/signals/og-image.png"
 
@@ -580,8 +580,8 @@ export function renderHtml(
     },
     "mainEntity": {
       "@type": "Dataset",
-      "name": "Early Sector Rotation Signals",
-      "description": "Investment theme analysis derived from Reddit discussion patterns",
+      "name": "Sector Rotation Research Signals",
+      "description": "Research-only theme analysis derived from Reddit discussion patterns",
       "dateModified": report.generated_at_utc,
       "creator": {
         "@type": "Organization",
@@ -657,7 +657,7 @@ export function renderHtml(
   <div class="container">
     <!-- Hero Header -->
     <header class="hero">
-      <h1 class="hero-title">Early Sector <span class="accent">Rotation</span> Signals</h1>
+      <h1 class="hero-title">Sector <span class="accent">Rotation</span> Research Signals</h1>
       <div class="hero-meta">
         <div class="hero-meta-item">
           <span class="hero-meta-label">Analysis Date</span>
@@ -674,6 +674,10 @@ export function renderHtml(
       </div>
     </header>
 
+    <div class="research-posture">
+      Research-only observation layer. Timing labels, rankings, confidence, and historical accuracy do not authorize a trade or allocation. PXI action authority remains withheld until the prospective evidence and exact-policy gates pass.
+    </div>
+
     <!-- Summary Dashboard -->
     ${renderSummaryDashboard(report.themes, report.summary.total_docs)}
 
@@ -686,10 +690,10 @@ export function renderHtml(
     <!-- Key Takeaways -->
     ${renderTakeaways(takeaways)}
 
-    <!-- Top Opportunities -->
+    <!-- Top Observed Themes -->
     <div class="section">
       <div class="section-header">
-        <span class="section-title">Top ${report.themes.length} Opportunities</span>
+        <span class="section-title">Top ${report.themes.length} Observed Themes</span>
         <div class="section-line"></div>
       </div>
       ${themeCards}
@@ -699,7 +703,7 @@ export function renderHtml(
     <footer class="footer">
       <div class="footer-text">PXI Command Signals</div>
       <div class="footer-disclaimer">
-        Analysis derived from public Reddit discussions. Not investment advice.
+        Research-only analysis derived from public Reddit discussions. Not investment advice. This is not an action-authority surface.
         Methodology: Mention Velocity, Sentiment Shift, Cross-Platform Confirmation.
       </div>
     </footer>

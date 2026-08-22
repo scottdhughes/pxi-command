@@ -74,7 +74,7 @@ export function TopThemesWidget({ data, regime }: { data: SignalsData | null; re
       {isAligned && (
         <div className="mb-3 px-3 py-1.5 bg-[#00a3ff]/10 border border-[#00a3ff]/20 rounded text-center">
           <span className="text-[9px] text-[#00a3ff]">
-            {regime?.replace('_', ' ')} regime + {topThemes[0].theme_name} trending = Aligned signal
+            {regime?.replace('_', ' ')} regime + {topThemes[0].theme_name} trending = aligned research flag
           </span>
         </div>
       )}
@@ -117,7 +117,7 @@ export function TopThemesWidget({ data, regime }: { data: SignalsData | null; re
       </div>
 
       <div className="mt-3 text-[8px] text-[#949ba5]/30 text-center">
-        Updated: {new Date(data.generated_at_utc).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+        Research-only · Updated: {new Date(data.generated_at_utc).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
       </div>
     </div>
   )
@@ -379,6 +379,7 @@ export function OpportunityPreview({ data, onOpen }: { data: OpportunitiesRespon
     coherence_failed: Math.max(0, data.coherence_suppressed_count || 0),
     quality_filtered: Math.max(0, data.quality_filtered_count || 0),
     data_quality_suppressed: data.degraded_reason === 'suppressed_data_quality' ? suppressedCount : 0,
+    edge_evidence_suppressed: data.degraded_reason === 'edge_evidence_gate_failed' ? suppressedCount : 0,
   }
   const qualityFilterRate = Number.isFinite(data.quality_filter_rate as number) ? Number(data.quality_filter_rate) : 0
   const coherenceFailRate = Number.isFinite(data.coherence_fail_rate as number) ? Number(data.coherence_fail_rate) : 0
@@ -434,6 +435,7 @@ export function OpportunityPreview({ data, onOpen }: { data: OpportunitiesRespon
             coherence {suppressionByReason.coherence_failed} ({(coherenceFailRate * 100).toFixed(0)}%) ·
             {' '}quality {suppressionByReason.quality_filtered} ({(qualityFilterRate * 100).toFixed(0)}%) ·
             {' '}data-quality {suppressionByReason.data_quality_suppressed}
+            {' '}· edge-evidence {suppressionByReason.edge_evidence_suppressed}
           </p>
         </div>
       )}
@@ -572,7 +574,11 @@ export function MLPredictionsCard({ ensemble, accuracy }: { ensemble: EnsembleDa
   return (
     <div className="w-full mt-6 sm:mt-8">
       <div className="text-[10px] sm:text-[11px] text-[#949ba5]/50 uppercase tracking-widest mb-4 text-center">
-        ML Ensemble Prediction
+        Legacy ML Research — Not Promoted
+      </div>
+
+      <div className="mb-4 rounded border border-[#f59e0b]/30 bg-[#f59e0b]/5 px-3 py-2 text-center text-[9px] leading-relaxed text-[#f59e0b]">
+        Exploratory output only. This ensemble is excluded from actionable opportunities and allocation guidance.
       </div>
 
       <div className="flex justify-center gap-8 sm:gap-12 mb-4">
@@ -635,7 +641,7 @@ export function MLPredictionsCard({ ensemble, accuracy }: { ensemble: EnsembleDa
       <MLAccuracyBadge accuracy={accuracy ?? null} />
 
       <div className="text-[8px] text-[#949ba5]/20 text-center mt-1">
-        Weighted ensemble • {ensemble.interpretation.d7.note}
+        Weighted ensemble • {ensemble.interpretation.d7.note} • prospective causal evidence is tracked separately
       </div>
     </div>
   )

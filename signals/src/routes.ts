@@ -30,13 +30,23 @@ const STORED_REPORT_NAV_STYLE = `<style>
   .nav-dropdown-menu{width:224px;max-height:calc(100vh - 72px);overflow-y:auto;background:rgba(10,10,10,.98);border-radius:4px;padding:4px;box-shadow:0 16px 40px rgba(0,0,0,.55)}
   .nav-dropdown-item{padding:10px 12px;color:var(--text-muted);border-radius:4px}
   .nav-dropdown-item:hover{color:var(--text)}
+  .research-posture{margin:0 0 24px;padding:12px 14px;color:#f59e0b;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.35);border-radius:4px;font-size:11px;line-height:1.6}
 </style>`
 
+const RESEARCH_POSTURE_BANNER = `<div class="research-posture">
+      Research-only observation layer. Timing labels, rankings, confidence, and historical accuracy do not authorize a trade or allocation. PXI action authority remains withheld until the prospective evidence and exact-policy gates pass.
+    </div>`
+
 export function upgradeStoredReportNavigation(html: string): string {
-  const upgraded = html.replace(
-    /<div class="nav-dropdown-menu">[\s\S]*?<\/div>/,
-    COMPLETE_SITE_NAV,
-  )
+  let upgraded = html
+    .replace(/<div class="nav-dropdown-menu">[\s\S]*?<\/div>/, COMPLETE_SITE_NAV)
+    .replace(/>Actionable Signals</g, ">Research Timing Flags — Not Actionable<")
+    .replace(/>Top (\d+) Opportunities</g, ">Top $1 Observed Themes<")
+    .replace(/>"Now" Signals</g, '>"Now" Activity Flags<')
+    .replace(/>Ready to act</g, ">Research only<")
+  if (!upgraded.includes('class="research-posture"')) {
+    upgraded = upgraded.replace("<!-- Summary Dashboard -->", `${RESEARCH_POSTURE_BANNER}\n\n    <!-- Summary Dashboard -->`)
+  }
   return upgraded.includes(STORED_REPORT_NAV_STYLE)
     ? upgraded
     : upgraded.replace("</head>", `${STORED_REPORT_NAV_STYLE}</head>`)
@@ -593,7 +603,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       })
     } catch {
       // Return a fallback OG image
-      const svg = generateOgImageSvg("Sector Rotation Signals", 0, new Date().toISOString().split("T")[0])
+      const svg = generateOgImageSvg("Sector Rotation Research", 0, new Date().toISOString().split("T")[0])
       return new Response(svg, {
         headers: { "Content-Type": "image/svg+xml" },
       })
@@ -638,16 +648,16 @@ function generateOgImageSvg(topTheme: string, totalDocs: number, analysisDate: s
 
   <!-- Main Title -->
   <text x="80" y="220" font-family="ui-monospace, SF Mono, monospace" font-size="56" font-weight="600" fill="#f3f3f3">
-    Early Sector
+    Sector Rotation
   </text>
   <text x="80" y="290" font-family="ui-monospace, SF Mono, monospace" font-size="56" font-weight="600" fill="#00a3ff">
-    Rotation Signals
+    Research Signals
   </text>
 
   <!-- Top Signal Box -->
   <rect x="80" y="340" width="1040" height="120" rx="8" fill="#0a0a0a" stroke="#26272b" stroke-width="1"/>
   <text x="110" y="385" font-family="ui-monospace, SF Mono, monospace" font-size="14" fill="#949ba5" letter-spacing="0.1em">
-    TOP SIGNAL
+    TOP OBSERVED THEME
   </text>
   <text x="110" y="430" font-family="ui-monospace, SF Mono, monospace" font-size="32" font-weight="600" fill="#f3f3f3">
     ${escapeXml(topTheme)}

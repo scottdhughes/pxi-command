@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { tryHandleMarketLifecycleRoute } from './market-lifecycle.js';
+import {
+  applyOpportunityPublicationGate,
+  tryHandleMarketLifecycleRoute,
+} from './market-lifecycle.js';
 
 type QueryResult =
   | null
@@ -114,6 +117,55 @@ function createOpportunityItem(id: string) {
     updated_at: '2026-03-05T00:00:00.000Z',
   };
 }
+
+test('applyOpportunityPublicationGate suppresses only otherwise published items and preserves prior reasons', () => {
+  const ledgerBuild = {
+    ledger_row: {
+      candidate_count: 3,
+      published_count: 2,
+      suppressed_count: 1,
+      degraded_reason: 'quality_filtered',
+      top_direction_published: 'bullish',
+    },
+    projected: {
+      items: [{ id: 'published-1' }, { id: 'published-2' }],
+      suppressed_count: 1,
+      degraded_reason: 'quality_filtered',
+      suppression_by_reason: { quality_filtered: 1, edge_evidence_suppressed: 0 },
+    },
+    item_rows: [
+      { opportunity_id: 'published-1', published: 1, suppression_reason: null },
+      { opportunity_id: 'published-2', published: 1, suppression_reason: null },
+      { opportunity_id: 'filtered-1', published: 0, suppression_reason: 'quality_filtered' },
+    ],
+  };
+
+  const gated = applyOpportunityPublicationGate(
+    ledgerBuild,
+    false,
+    'edge_evidence_gate_failed',
+  );
+
+  assert.equal(gated.ledger_row.published_count, 0);
+  assert.equal(gated.ledger_row.suppressed_count, 3);
+  assert.equal(gated.ledger_row.degraded_reason, 'edge_evidence_gate_failed');
+  assert.equal(gated.ledger_row.top_direction_published, null);
+  assert.deepEqual(gated.projected.items, []);
+  assert.equal(gated.projected.suppressed_count, 3);
+  assert.equal(gated.projected.suppression_by_reason.edge_evidence_suppressed, 2);
+  assert.deepEqual(
+    gated.item_rows.map((row: { suppression_reason: string | null }) => row.suppression_reason),
+    ['edge_evidence_gate_failed', 'edge_evidence_gate_failed', 'quality_filtered'],
+  );
+
+  const gatedAgain = applyOpportunityPublicationGate(
+    gated,
+    false,
+    'edge_evidence_gate_failed',
+  );
+  assert.equal(gatedAgain.ledger_row.suppressed_count, 3);
+  assert.equal(gatedAgain.projected.suppressed_count, 3);
+});
 
 test('tryHandleMarketLifecycleRoute ignores CTA utility events when tracking is disabled', async () => {
   const route = createRouteContext('https://pxi.test/api/metrics/utility-event', {
@@ -274,9 +326,29 @@ test('tryHandleMarketLifecycleRoute returns a blocked payload when governance bl
     }),
     isFeatureEnabled: (_env: unknown, flagName: string) => ![
       'FEATURE_ENABLE_CALIBRATION_DIAGNOSTICS',
-      'FEATURE_ENABLE_EDGE_DIAGNOSTICS',
       'FEATURE_ENABLE_IN_APP_ALERTS',
     ].includes(flagName),
+    buildEdgeDiagnosticsReport: async () => ({
+      as_of: '2026-03-05T00:00:00.000Z',
+      integrity_gate: { pass: true, reasons: [] },
+      performance_gate: { pass: false, reasons: ['7d:stale_evaluation', '30d:stale_evaluation'] },
+      evidence_gate: { pass: false, reasons: ['performance_gate_failed'] },
+      promotion_gate: { pass: false, reasons: ['performance_gate_failed'] },
+      windows: (['7d', '30d'] as const).map((horizon) => ({
+        horizon,
+        sample_size: 50,
+        model_direction_accuracy: 0.5,
+        baseline_direction_accuracy: 0.6,
+        uplift_vs_baseline: -0.1,
+        uplift_ci95_low: -0.2,
+        uplift_ci95_high: 0,
+        lower_bound_positive: false,
+        quality_band: 'ROBUST',
+        leakage_sentinel: { pass: true, violation_count: 0, reasons: [] },
+        performance_gate: { pass: false, reasons: ['stale_evaluation'] },
+        evidence_gate: { pass: false, reasons: ['performance_gate_failed'] },
+      })),
+    }),
     buildEdgeQualityCalibrationSnapshot: async () => ({
       as_of: '2026-03-05T00:00:00.000Z',
       metric: 'edge_quality',
@@ -449,6 +521,8 @@ test('tryHandleMarketLifecycleRoute returns a blocked payload when governance bl
   assert.equal(payload.brief_generated, 0);
   assert.equal(payload.opportunities_generated, 0);
   assert.equal(payload.alerts_generated, 0);
+  assert.equal((payload.edge_diagnostics as any).integrity_gate.pass, true);
+  assert.equal((payload.edge_diagnostics as any).performance_gate.pass, false);
   assert.equal(storeBriefCalls.length, 0);
   assert.equal(storeOpportunityCalls.length, 0);
   assert.equal(insertEventCalls.length, 0);
@@ -530,7 +604,7 @@ test('tryHandleMarketLifecycleRoute does not send duplicate digests when sent or
       if (sql.includes('FROM market_brief_snapshots')) {
         return [{ payload_json: JSON.stringify({ as_of: '2026-03-05T00:00:00.000Z', summary: 'Brief' }) }];
       }
-      if (sql.includes("FROM opportunity_snapshots WHERE horizon = '7d'")) {
+      if (sql.includes('FROM opportunity_snapshots') && sql.includes("horizon = '7d'")) {
         return [{ payload_json: JSON.stringify({ as_of: '2026-03-05T00:00:00.000Z', horizon: '7d', items: [] }) }];
       }
       if (sql.includes('FROM market_alert_events')) {
@@ -581,7 +655,7 @@ test('tryHandleMarketLifecycleRoute retries failed digest deliveries and only co
       if (sql.includes('FROM market_brief_snapshots')) {
         return [{ payload_json: JSON.stringify({ as_of: '2026-03-05T00:00:00.000Z', summary: 'Brief' }) }];
       }
-      if (sql.includes("FROM opportunity_snapshots WHERE horizon = '7d'")) {
+      if (sql.includes('FROM opportunity_snapshots') && sql.includes("horizon = '7d'")) {
         return [{ payload_json: JSON.stringify({ as_of: '2026-03-05T00:00:00.000Z', horizon: '7d', items: [] }) }];
       }
       if (sql.includes('FROM market_alert_events')) {
@@ -629,4 +703,60 @@ test('tryHandleMarketLifecycleRoute retries failed digest deliveries and only co
   assert.equal(payload.active_subscribers, 1);
   assert.equal(attempts, 3);
   assert.deepEqual(finalized, [{ kind: 'sent', providerId: 'provider-1' }]);
+});
+
+test('tryHandleMarketLifecycleRoute withholds digest opportunities when edge evidence fails', async () => {
+  let deliveredOpportunityCount = -1;
+  const route = createRouteContext('https://pxi.test/api/market/send-digest', { method: 'POST' }, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('FROM market_brief_snapshots')) {
+        return [{ payload_json: JSON.stringify({ as_of: '2026-03-05T00:00:00.000Z', summary: 'Brief' }) }];
+      }
+      if (sql.includes('FROM opportunity_snapshots') && sql.includes("horizon = '7d'")) {
+        return [{ payload_json: JSON.stringify({
+          as_of: '2026-03-05T00:00:00.000Z',
+          horizon: '7d',
+          items: [createOpportunityItem('digest-item')],
+        }) }];
+      }
+      if (sql.includes('FROM market_alert_events')) return [];
+      if (sql.includes('FROM email_subscribers')) {
+        return [{ id: 'sub-1', email: 'one@example.com', types_json: '[]', cadence: 'daily_8am_et', status: 'active' }];
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandleMarketLifecycleRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    ensureMarketProductSchema: async () => undefined,
+    isFeatureEnabled: () => true,
+    buildEdgeDiagnosticsReport: async () => ({
+      integrity_gate: { pass: true, reasons: [] },
+      windows: [{
+        horizon: '7d',
+        performance_gate: { pass: false, reasons: ['direction_uplift_ci_not_positive'] },
+        evidence_gate: { pass: false, reasons: ['direction_uplift_ci_not_positive'] },
+      }],
+    }),
+    asIsoDate: () => '2026-03-05',
+    canSendEmail: () => true,
+    getAlertsSigningSecret: () => 'secret',
+    normalizeAlertTypes: () => ['regime_change'],
+    reserveDigestDeliveryForSubscriber: async () => ({ action: 'send' }),
+    generateToken: () => 'token',
+    hashToken: async () => 'hashed-token',
+    sendDigestToSubscriber: async (_env: unknown, _email: string, _brief: unknown, opportunities: any) => {
+      deliveredOpportunityCount = opportunities?.items.length ?? 0;
+      return { ok: true, providerId: 'provider-1' };
+    },
+    finalizeDigestDeliverySent: async () => undefined,
+    finalizeDigestDeliveryFailure: async () => undefined,
+  });
+
+  assert.equal(response?.status, 200);
+  const payload = await response!.json() as any;
+  assert.equal(deliveredOpportunityCount, 0);
+  assert.equal(payload.opportunities_included, 0);
+  assert.equal(payload.edge_evidence_gate.pass, false);
 });

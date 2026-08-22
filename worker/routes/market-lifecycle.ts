@@ -1,5 +1,13 @@
-import { buildCanonicalMarketDecision } from '../domain/market-core';
+import {
+  buildCanonicalMarketDecision,
+  resolveEdgeEvidenceGate,
+  suppressProjectionForEdgeEvidence,
+} from '../domain/market-core';
 import { generateMarketEvents } from '../domain/market-products';
+import {
+  HISTORICAL_BACKFILL_SEED_MARKER,
+  parseProspectiveOpportunitySnapshot,
+} from '../lib/opportunity-snapshot-history';
 import {
   buildDecisionImpactOpsResponse,
   computeDecisionGradeScorecard,
@@ -24,6 +32,74 @@ type MarketLifecycleDeps = Record<string, any>;
 const MAX_BACKFILL_LIMIT = 365;
 const UTILITY_WINDOW_DAY_OPTIONS = new Set<number>([7, 30]);
 const VALID_ALERT_TYPES: MarketAlertType[] = ['regime_change', 'threshold_cross', 'opportunity_spike', 'freshness_warning'];
+
+export function applyOpportunityPublicationGate<T extends Record<string, any>>(
+  ledgerBuild: T,
+  publicationAllowed: boolean,
+  blockedReason: 'governance_blocked' | 'edge_evidence_gate_failed' | null,
+): T {
+  if (publicationAllowed) return ledgerBuild;
+
+  const reason = blockedReason || 'edge_evidence_gate_failed';
+  const ledgerRow = ledgerBuild.ledger_row || {};
+  const projected = ledgerBuild.projected || {};
+  const projectedItems = Array.isArray(projected.items) ? projected.items : [];
+  const publishedCount = Math.max(
+    projectedItems.length,
+    Number.isFinite(Number(ledgerRow.published_count)) ? Number(ledgerRow.published_count) : 0,
+  );
+  const priorSuppressed = Number.isFinite(Number(ledgerRow.suppressed_count))
+    ? Math.max(0, Number(ledgerRow.suppressed_count))
+    : 0;
+  const projectedPriorSuppressed = Number.isFinite(Number(projected.suppressed_count))
+    ? Math.max(0, Number(projected.suppressed_count))
+    : priorSuppressed;
+  const suppressionByReason = projected.suppression_by_reason && typeof projected.suppression_by_reason === 'object'
+    ? projected.suppression_by_reason
+    : {};
+  const priorEdgeSuppressed = Number.isFinite(Number(suppressionByReason.edge_evidence_suppressed))
+    ? Math.max(0, Number(suppressionByReason.edge_evidence_suppressed))
+    : 0;
+  const ledgerAlreadyBlocked = Number(ledgerRow.published_count) === 0
+    && ledgerRow.degraded_reason === reason;
+  const finalLedgerSuppressed = ledgerAlreadyBlocked
+    ? priorSuppressed
+    : priorSuppressed + publishedCount;
+  const finalProjectedSuppressed = Math.max(
+    finalLedgerSuppressed,
+    projectedPriorSuppressed + publishedCount,
+  );
+
+  return {
+    ...ledgerBuild,
+    ledger_row: {
+      ...ledgerRow,
+      published_count: 0,
+      suppressed_count: finalLedgerSuppressed,
+      degraded_reason: reason,
+      top_direction_published: null,
+    },
+    projected: {
+      ...projected,
+      items: [],
+      suppressed_count: finalProjectedSuppressed,
+      degraded_reason: reason,
+      suppression_by_reason: reason === 'edge_evidence_gate_failed'
+        ? {
+            ...suppressionByReason,
+            edge_evidence_suppressed: priorEdgeSuppressed + publishedCount,
+          }
+        : suppressionByReason,
+    },
+    item_rows: (Array.isArray(ledgerBuild.item_rows) ? ledgerBuild.item_rows : []).map((row: any) => ({
+      ...row,
+      published: 0,
+      suppression_reason: row.published === 1 || !row.suppression_reason
+        ? reason
+        : row.suppression_reason,
+    })),
+  };
+}
 
 export async function tryHandleMarketLifecycleRoute(
   route: WorkerRouteContext,
@@ -216,11 +292,19 @@ export async function tryHandleMarketLifecycleRoute(
     try {
       let edgeDiagnosticsReport: any = null;
       if (edgeDiagnosticsEnabled) {
-        edgeDiagnosticsReport = await deps.buildEdgeDiagnosticsReport(env.DB, ['7d', '30d']);
-        if (!edgeDiagnosticsReport.promotion_gate.pass) {
-          throw new Error(`promotion_gate_failed:${edgeDiagnosticsReport.promotion_gate.reasons.join(',')}`);
+        try {
+          edgeDiagnosticsReport = await deps.buildEdgeDiagnosticsReport(env.DB, ['7d', '30d']);
+        } catch (err) {
+          // Edge evidence is an actionability gate, not a data-refresh gate.
+          // Continue refreshing descriptive products while all horizons fail
+          // closed below.
+          console.error('Refresh-products edge diagnostics unavailable; actionability is disabled:', err);
         }
       }
+      const edgeEvidenceByHorizon = {
+        '7d': resolveEdgeEvidenceGate(edgeDiagnosticsReport, '7d'),
+        '30d': resolveEdgeEvidenceGate(edgeDiagnosticsReport, '30d'),
+      };
 
       let edgeCalibrationSnapshot: any = null;
       let convictionCalibration7d: any = null;
@@ -288,7 +372,7 @@ export async function tryHandleMarketLifecycleRoute(
       }
 
       const freshnessForRun = brief?.freshness_status || await deps.computeFreshnessStatus(env.DB);
-      let consistencyStateForRun: RefreshProductsCompletedResponsePayload['consistency_state'] = brief?.consistency.state || 'PASS';
+      let consistencyStateForRun: RefreshProductsCompletedResponsePayload['consistency_state'] = brief?.consistency.state || 'FAIL';
       if (!brief) {
         const latestConsistency = await deps.fetchLatestConsistencyCheck(env.DB);
         if (latestConsistency) {
@@ -297,7 +381,7 @@ export async function tryHandleMarketLifecycleRoute(
           try {
             consistencyStateForRun = (await buildCanonicalMarketDecision(env.DB, deps)).consistency.state;
           } catch {
-            consistencyStateForRun = 'PASS';
+            consistencyStateForRun = 'FAIL';
           }
         }
       }
@@ -361,7 +445,6 @@ export async function tryHandleMarketLifecycleRoute(
 
       const governanceBreaches = decisionImpactSummary?.enforce_breaches || [];
       const publicationBlocked = Boolean(decisionImpactEnforcementError);
-      const publicationBlockedReason = publicationBlocked ? 'governance_blocked' : null;
 
       let qualityFilteredCount = 0;
       let coherenceSuppressedCount = 0;
@@ -369,21 +452,32 @@ export async function tryHandleMarketLifecycleRoute(
       const ledgerRows: any[] = [];
       const itemLedgerRows: any[] = [];
       const projectionTargets = [
-        { snapshot: opportunities7d, calibration: convictionCalibration7d },
-        { snapshot: opportunities30d, calibration: convictionCalibration30d },
+        { snapshot: opportunities7d, calibration: convictionCalibration7d, edge_gate: edgeEvidenceByHorizon['7d'] },
+        { snapshot: opportunities30d, calibration: convictionCalibration30d, edge_gate: edgeEvidenceByHorizon['30d'] },
       ];
       for (const target of projectionTargets) {
         if (!target.snapshot) continue;
-        const ledgerBuild = deps.buildOpportunityLedgerProjection({
+        const publicationAllowed = !publicationBlocked && target.edge_gate.pass;
+        const publicationBlockedReason: 'governance_blocked' | 'edge_evidence_gate_failed' | null = publicationBlocked
+          ? 'governance_blocked'
+          : target.edge_gate.pass
+            ? null
+            : 'edge_evidence_gate_failed';
+        const ledgerCandidate = deps.buildOpportunityLedgerProjection({
           refresh_run_id: refreshRunId,
           snapshot: target.snapshot,
           calibration: target.calibration,
           coherence_gate_enabled: coherenceGateEnabled,
           freshness: freshnessForRun,
           consistency_state: consistencyStateForRun,
-          publication_allowed: !publicationBlocked,
+          publication_allowed: publicationAllowed,
           publication_blocked_reason: publicationBlockedReason,
         });
+        const ledgerBuild = applyOpportunityPublicationGate(
+          ledgerCandidate,
+          publicationAllowed,
+          publicationBlockedReason,
+        );
         qualityFilteredCount += ledgerBuild.projected.quality_filtered_count;
         coherenceSuppressedCount += ledgerBuild.projected.coherence_suppressed_count;
         suppressedDataQualityCount += ledgerBuild.projected.suppression_by_reason.data_quality_suppressed;
@@ -469,7 +563,11 @@ export async function tryHandleMarketLifecycleRoute(
       const edgeDiagnosticsSummary = edgeDiagnosticsReport
         ? {
             as_of: edgeDiagnosticsReport.as_of,
+            integrity_gate: edgeDiagnosticsReport.integrity_gate,
+            performance_gate: edgeDiagnosticsReport.performance_gate,
+            evidence_gate: edgeDiagnosticsReport.evidence_gate,
             promotion_gate: edgeDiagnosticsReport.promotion_gate,
+            policy_alignment_gate: edgeDiagnosticsReport.policy_alignment_gate,
             windows: edgeDiagnosticsReport.windows.map((window: any) => ({
               horizon: window.horizon,
               sample_size: window.sample_size,
@@ -479,6 +577,9 @@ export async function tryHandleMarketLifecycleRoute(
               uplift_ci95_low: window.uplift_ci95_low,
               uplift_ci95_high: window.uplift_ci95_high,
               lower_bound_positive: window.lower_bound_positive,
+              hac_bandwidth_days: window.hac_bandwidth_days,
+              performance_gate: window.performance_gate,
+              evidence_gate: window.evidence_gate,
               leakage_sentinel: window.leakage_sentinel,
               quality_band: window.quality_band,
             })),
@@ -549,13 +650,17 @@ export async function tryHandleMarketLifecycleRoute(
 
       let alertsGenerated = 0;
       if (brief && opportunities7d) {
-        const projectedForAlerts = deps.projectOpportunityFeed(
+        const alertCandidates = deps.projectOpportunityFeed(
           deps.normalizeOpportunityItemsForPublishing(opportunities7d.items, convictionCalibration7d),
           {
             coherence_gate_enabled: coherenceGateEnabled,
             freshness: brief.freshness_status,
             consistency_state: brief.consistency.state,
           },
+        );
+        const projectedForAlerts = suppressProjectionForEdgeEvidence(
+          alertCandidates,
+          edgeEvidenceByHorizon['7d'],
         );
         const generated = await generateMarketEvents(env.DB, deps, brief, {
           ...opportunities7d,
@@ -648,7 +753,7 @@ export async function tryHandleMarketLifecycleRoute(
     const overwrite = body.overwrite === true;
     const dryRun = body.dry_run === true;
     const recalibrate = body.recalibrate !== false;
-    const rebuildLedgers = body.rebuild_ledgers !== false;
+    const rebuildLedgers = body.rebuild_ledgers === true;
 
     const dateRows = await env.DB.prepare(`
       SELECT p.date as date, COUNT(c.category) as category_count
@@ -815,6 +920,8 @@ export async function tryHandleMarketLifecycleRoute(
               critical_stale_count: 0,
             },
             consistency_state: 'PASS',
+            publication_allowed: false,
+            publication_blocked_reason: 'historical_backfill_nonprospective',
           });
 
           await deps.insertOpportunityLedgerRow(env.DB, ledgerBuild.ledger_row);
@@ -937,7 +1044,14 @@ export async function tryHandleMarketLifecycleRoute(
 
     const [briefRow, opportunityRow, alertRows, subscribers] = await Promise.all([
       env.DB.prepare(`SELECT payload_json FROM market_brief_snapshots ORDER BY as_of DESC LIMIT 1`).first<{ payload_json: string }>(),
-      env.DB.prepare(`SELECT payload_json FROM opportunity_snapshots WHERE horizon = '7d' ORDER BY as_of DESC LIMIT 1`).first<{ payload_json: string }>(),
+      env.DB.prepare(`
+        SELECT payload_json
+        FROM opportunity_snapshots
+        WHERE horizon = '7d'
+          AND instr(payload_json, ?) = 0
+        ORDER BY as_of DESC
+        LIMIT 1
+      `).bind(HISTORICAL_BACKFILL_SEED_MARKER).first<{ payload_json: string }>(),
       env.DB.prepare(`
         SELECT id, event_type, severity, title, body, entity_type, entity_id, dedupe_key, payload_json, created_at
         FROM market_alert_events
@@ -960,10 +1074,23 @@ export async function tryHandleMarketLifecycleRoute(
     } catch {
       brief = null;
     }
-    try {
-      opportunities = opportunityRow?.payload_json ? (JSON.parse(opportunityRow.payload_json) as OpportunitySnapshot) : null;
-    } catch {
-      opportunities = null;
+    opportunities = parseProspectiveOpportunitySnapshot<OpportunitySnapshot>(opportunityRow?.payload_json);
+    let digestEdgeDiagnostics: unknown = null;
+    if (deps.isFeatureEnabled(
+      env,
+      'FEATURE_ENABLE_EDGE_DIAGNOSTICS',
+      'ENABLE_EDGE_DIAGNOSTICS',
+      true,
+    )) {
+      try {
+        digestEdgeDiagnostics = await deps.buildEdgeDiagnosticsReport(env.DB, ['7d']);
+      } catch (err) {
+        console.warn('Digest edge diagnostics unavailable; opportunities are withheld:', err);
+      }
+    }
+    const digestEdgeGate = resolveEdgeEvidenceGate(digestEdgeDiagnostics, '7d');
+    if (opportunities && !digestEdgeGate.pass) {
+      opportunities = { ...opportunities, items: [] };
     }
     const events = alertRows.results || [];
 
@@ -1024,6 +1151,8 @@ export async function tryHandleMarketLifecycleRoute(
       fail_count: failCount,
       bounce_count: bounceCount,
       active_subscribers: subscribers.results?.length || 0,
+      edge_evidence_gate: digestEdgeGate,
+      opportunities_included: opportunities?.items.length || 0,
     };
 
     return Response.json(payload, { headers: corsHeaders });

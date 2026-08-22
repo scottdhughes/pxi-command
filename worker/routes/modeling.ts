@@ -3,11 +3,13 @@ import type {
   WorkerRouteContext,
 } from '../types';
 import {
+  DAILY_CLOSE_CANONICAL_SLOT,
   RESEARCH_FEATURE_VERSION,
   RESEARCH_STORAGE_CONTRACT,
   ensureResearchSnapshotSchema,
   type StoredResearchSnapshot,
 } from '../data/research-vintages';
+import { evaluatePendingMarketPredictionEvidence } from '../data/market-evidence';
 
 type ModelingDeps = Record<string, any>;
 
@@ -478,10 +480,13 @@ async function handleEvaluateRoute(route: WorkerRouteContext, deps: ModelingDeps
     }
   }
 
+  const marketEvidence = await evaluatePendingMarketPredictionEvidence(env.DB, new Date());
+
   return Response.json({
     success: true,
     pending: pendingPredictions.results?.length || 0,
     evaluated,
+    market_evidence: marketEvidence,
   }, { headers: corsHeaders });
 }
 
@@ -808,7 +813,7 @@ async function handlePredictReturnsRoute(route: WorkerRouteContext, deps: Modeli
 }
 
 async function handleMlEnsembleRoute(route: WorkerRouteContext, deps: ModelingDeps): Promise<Response> {
-  const { env, corsHeaders, executionContext } = route;
+  const { env, corsHeaders } = route;
 
   const [xgboostModel, lstmModel] = await Promise.all([
     deps.loadMLModel(env.ML_MODELS),
@@ -973,45 +978,6 @@ async function handleMlEnsembleRoute(route: WorkerRouteContext, deps: ModelingDe
   const ensemble30d = ensemblePredict(xg30d, lstm30d);
   const agreement7d = calcAgreement(xgboost?.dir_7d ?? null, lstm?.dir_7d ?? null);
   const agreement30d = calcAgreement(xgboost?.dir_30d ?? null, lstm?.dir_30d ?? null);
-
-  const logPrediction = async () => {
-    try {
-      const predDate = new Date(currentDate);
-      const target7d = new Date(predDate);
-      target7d.setDate(target7d.getDate() + 7);
-      const target30d = new Date(predDate);
-      target30d.setDate(target30d.getDate() + 30);
-
-      await env.DB.prepare(`
-        INSERT OR REPLACE INTO ensemble_predictions (
-          prediction_date, target_date_7d, target_date_30d, current_score,
-          xgboost_7d, xgboost_30d, lstm_7d, lstm_30d,
-          ensemble_7d, ensemble_30d, confidence_7d, confidence_30d
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        currentDate,
-        asDateKey(target7d),
-        asDateKey(target30d),
-        currentScore,
-        xg7d,
-        xg30d,
-        lstm7d,
-        lstm30d,
-        ensemble7d.value,
-        ensemble30d.value,
-        agreement7d.agreement,
-        agreement30d.agreement,
-      ).run();
-    } catch (error) {
-      console.error('Failed to log ensemble prediction:', error);
-    }
-  };
-
-  if (executionContext) {
-    executionContext.waitUntil(logPrediction());
-  } else {
-    void logPrediction();
-  }
 
   return Response.json({
     date: currentDate,
@@ -2398,9 +2364,15 @@ async function handleExportResearchSnapshotRoute(route: WorkerRouteContext, deps
     FROM research_feature_snapshots
     WHERE feature_version = ?
       AND storage_contract = ?
+      AND canonical_slot = ?
     ORDER BY available_at DESC
     LIMIT ?
-  `).bind(RESEARCH_FEATURE_VERSION, RESEARCH_STORAGE_CONTRACT, limit).all<{ payload_json: string }>();
+  `).bind(
+    RESEARCH_FEATURE_VERSION,
+    RESEARCH_STORAGE_CONTRACT,
+    DAILY_CLOSE_CANONICAL_SLOT,
+    limit,
+  ).all<{ payload_json: string }>();
 
   const latestByDecisionDate = new Map<string, StoredResearchSnapshot>();
   for (const row of result.results || []) {
@@ -2411,8 +2383,7 @@ async function handleExportResearchSnapshotRoute(route: WorkerRouteContext, deps
       continue;
     }
     if (latestByDecisionDate.has(snapshot.decision_date)) continue;
-    const decisionEnd = `${snapshot.decision_date}T23:59:59.999Z`;
-    if (snapshot.available_at > decisionEnd) continue;
+    if (snapshot.canonical_slot !== DAILY_CLOSE_CANONICAL_SLOT) continue;
     const names = Object.keys(snapshot.features || {});
     const completeProvenance = names.length > 0 && names.every((name) =>
       Boolean(snapshot.feature_observation_dates?.[name]) &&
@@ -2436,6 +2407,7 @@ async function handleExportResearchSnapshotRoute(route: WorkerRouteContext, deps
     point_in_time_guarantee: true,
     feature_version: RESEARCH_FEATURE_VERSION,
     storage_contract: RESEARCH_STORAGE_CONTRACT,
+    canonical_slot: DAILY_CLOSE_CANONICAL_SLOT,
     benchmark: {
       symbol: 'SPY',
       price_source: 'captured indicator_spy_close',
@@ -2446,6 +2418,7 @@ async function handleExportResearchSnapshotRoute(route: WorkerRouteContext, deps
       decision_date: snapshot.decision_date,
       available_at: snapshot.available_at,
       immutable_snapshot: true,
+      canonical_slot: snapshot.canonical_slot,
       features: snapshot.features,
       feature_observation_dates: snapshot.feature_observation_dates,
       feature_sources: snapshot.feature_sources,

@@ -157,6 +157,8 @@ jobs:
           fi
 
       - name: Run product contract gate
+        env:
+          EDGE_EVIDENCE_V2_REQUIRED: '1'
         run: bash scripts/api-product-contract-check.sh "${TARGET_BASE_URL}"
 
       - name: Run refresh smoke

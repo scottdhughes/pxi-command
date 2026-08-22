@@ -427,7 +427,7 @@ export function usePxiAppShell() {
               actionability_reason_codes: Array.isArray(planJson.actionability_reason_codes) ? planJson.actionability_reason_codes : [],
               action_now: {
                 ...planJson.action_now,
-                raw_signal_allocation_target: planJson.action_now.raw_signal_allocation_target ?? planJson.action_now.risk_allocation_target,
+                raw_signal_allocation_target: planJson.action_now.raw_signal_allocation_target ?? planJson.action_now.risk_allocation_target ?? 0.5,
                 risk_allocation_basis: planJson.action_now.risk_allocation_basis || 'penalized_playbook_target',
               },
               policy_state: planJson.policy_state ? {
@@ -577,6 +577,7 @@ export function usePxiAppShell() {
                 coherence_failed: coherenceSuppressedCount,
                 quality_filtered: qualityFilteredCount,
                 data_quality_suppressed: oppJson.degraded_reason === 'suppressed_data_quality' ? suppressedCount : 0,
+                edge_evidence_suppressed: oppJson.degraded_reason === 'edge_evidence_gate_failed' ? suppressedCount : 0,
               },
               quality_filter_rate: Number.isFinite(oppJson.quality_filter_rate as number) ? Number(oppJson.quality_filter_rate) : 0,
               coherence_fail_rate: Number.isFinite(oppJson.coherence_fail_rate as number) ? Number(oppJson.coherence_fail_rate) : 0,

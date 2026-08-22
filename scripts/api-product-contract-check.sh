@@ -3,6 +3,7 @@ set -euo pipefail
 
 API_URL="${1:-${API_URL:-https://api.pxicommand.com}}"
 EDGE_DIAGNOSTICS_REQUIRED="${EDGE_DIAGNOSTICS_REQUIRED:-0}"
+EDGE_EVIDENCE_V2_REQUIRED="${EDGE_EVIDENCE_V2_REQUIRED:-0}"
 OPPORTUNITY_TTL_GRACE_SECONDS="${OPPORTUNITY_TTL_GRACE_SECONDS:-5400}"
 UTILITY_FUNNEL_REQUIRED="${UTILITY_FUNNEL_REQUIRED:-0}"
 DECISION_GRADE_REQUIRED="${DECISION_GRADE_REQUIRED:-0}"
@@ -50,7 +51,7 @@ edge_diagnostics_available() {
   fi
 
   if [[ "$code" == "404" ]]; then
-    if [[ "$EDGE_DIAGNOSTICS_REQUIRED" == "1" ]]; then
+    if [[ "$EDGE_DIAGNOSTICS_REQUIRED" == "1" || "$EDGE_EVIDENCE_V2_REQUIRED" == "1" ]]; then
       echo "Edge diagnostics endpoint is required but returned 404"
       exit 1
     fi
@@ -255,14 +256,33 @@ check_consistency_gate() {
 
 check_plan_playbook_target_coherence() {
   local plan_json
+  local has_action_authorized
+  local action_authorized
   local plan_target
   local playbook_target
   local plan_target_pct
   local abs_diff
 
   plan_json=$(curl -sS --max-time 20 "$API_URL/api/plan")
+  has_action_authorized=$(echo "$plan_json" | jq -r '.action_now | has("action_authorized")')
+  action_authorized=$(echo "$plan_json" | jq -r '.action_now.action_authorized // false')
   plan_target=$(echo "$plan_json" | jq -r '.action_now.risk_allocation_target // ""')
   playbook_target=$(echo "$plan_json" | jq -r '.trader_playbook.recommended_size_pct.target // ""')
+
+  if [[ "$has_action_authorized" == "true" && "$action_authorized" != "true" ]]; then
+    if ! echo "$plan_json" | jq -e '
+      (.action_now.action_authorized == false) and
+      (.action_now.risk_allocation_target == null) and
+      (.action_now.raw_signal_allocation_target | type == "number") and
+      ((.action_now.risk_allocation_basis == "withheld_edge_evidence") or
+       (.action_now.risk_allocation_basis == "withheld_actionability"))
+    ' > /dev/null; then
+      echo "Unauthorized plan must withhold the actionable target while preserving a numeric research signal"
+      echo "$plan_json"
+      exit 1
+    fi
+    return 0
+  fi
 
   if [[ -z "$plan_target" || -z "$playbook_target" ]]; then
     echo "Missing plan/playbook target values for coherence check"
@@ -287,6 +307,7 @@ check_plan_actionability_contract() {
   local edge_label
   local has_override
   local cross_horizon_state
+  local edge_evidence_pass
 
   plan_json=$(curl -sS --max-time 20 "$API_URL/api/plan")
   actionability_state=$(echo "$plan_json" | jq -r '.actionability_state // ""')
@@ -294,6 +315,7 @@ check_plan_actionability_contract() {
   eligible_count=$(echo "$plan_json" | jq -r '.opportunity_ref.eligible_count // -1')
   has_override=$(echo "$plan_json" | jq -r '((.actionability_reason_codes // []) | index("high_edge_override_no_eligible")) != null')
   cross_horizon_state=$(echo "$plan_json" | jq -r '.cross_horizon.state // ""')
+  edge_evidence_pass=$(echo "$plan_json" | jq -r '.edge_evidence_gate.pass // ""')
 
   case "$actionability_state" in
     ACTIONABLE|WATCH|NO_ACTION) ;;
@@ -310,7 +332,7 @@ check_plan_actionability_contract() {
     exit 1
   fi
 
-  if [[ "$edge_label" == "HIGH" && "$eligible_count" == "0" && "$has_override" != "true" ]]; then
+  if [[ "$edge_label" == "HIGH" && "$eligible_count" == "0" && "$has_override" != "true" && "$edge_evidence_pass" != "false" ]]; then
     echo "HIGH edge with zero eligible opportunities requires explicit high_edge_override_no_eligible reason code"
     echo "$plan_json"
     exit 1
@@ -575,7 +597,7 @@ check_opportunity_coherence_contract() {
 
   if [[ -n "$degraded_reason" ]]; then
     case "$degraded_reason" in
-      quality_filtered|coherence_gate_failed|suppressed_data_quality|refresh_ttl_overdue|refresh_ttl_unknown|feature_disabled|migration_guard_failed|snapshot_unavailable|snapshot_rebuilt)
+      quality_filtered|coherence_gate_failed|suppressed_data_quality|edge_evidence_gate_failed|refresh_ttl_overdue|refresh_ttl_unknown|feature_disabled|migration_guard_failed|snapshot_unavailable|snapshot_rebuilt)
         ;;
       *)
         echo "Invalid opportunities degraded_reason: $degraded_reason"
@@ -704,19 +726,11 @@ check_opportunity_coherence_contract() {
 
 check_edge_diagnostics_contract() {
   local edge_json
-  local promotion_pass
   local malformed_windows
   local sentinel_invariant_broken
   local lower_bound_invariant_broken
 
   edge_json=$(curl -sS --max-time 20 "$API_URL/api/diagnostics/edge?horizon=all")
-  promotion_pass=$(echo "$edge_json" | jq -r '.promotion_gate.pass // false')
-
-  if [[ "$promotion_pass" != "true" ]]; then
-    echo "Edge diagnostics promotion gate failed"
-    echo "$edge_json"
-    exit 1
-  fi
 
   malformed_windows=$(echo "$edge_json" | jq -r '
     any(.windows[]?;
@@ -1047,16 +1061,58 @@ check_decision_impact_semantics() {
 }
 
 check_api_json_contract "/api/plan" \
-  'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.action_now.risk_allocation_target|type=="number") and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number"))) and ((has("cross_horizon")|not) or ((.cross_horizon.as_of|type=="string") and (.cross_horizon.state|type=="string") and (.cross_horizon.eligible_7d|type=="number") and (.cross_horizon.eligible_30d|type=="number") and ((.cross_horizon.top_direction_7d==null) or (.cross_horizon.top_direction_7d|type=="string")) and ((.cross_horizon.top_direction_30d==null) or (.cross_horizon.top_direction_30d|type=="string")) and (.cross_horizon.rationale_codes|type=="array") and (all(.cross_horizon.rationale_codes[]?; type=="string")) and ((.cross_horizon.invalidation_note==null) or (.cross_horizon.invalidation_note|type=="string")))) and ((has("decision_stack")|not) or ((.decision_stack.what_changed|type=="string") and (.decision_stack.what_to_do|type=="string") and (.decision_stack.why_now|type=="string") and (.decision_stack.confidence|type=="string") and (.decision_stack.cta_state|type=="string")))' \
+  'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and ((.action_now.risk_allocation_target==null) or (.action_now.risk_allocation_target|type=="number")) and ((.action_now|has("action_authorized")|not) or (.action_now.action_authorized|type=="boolean")) and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and ((has("edge_evidence_gate")|not) or ((.edge_evidence_gate.pass|type=="boolean") and (.edge_evidence_gate.reasons|type=="array") and (all(.edge_evidence_gate.reasons[]?; type=="string")))) and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number"))) and ((has("cross_horizon")|not) or ((.cross_horizon.as_of|type=="string") and (.cross_horizon.state|type=="string") and (.cross_horizon.eligible_7d|type=="number") and (.cross_horizon.eligible_30d|type=="number") and ((.cross_horizon.top_direction_7d==null) or (.cross_horizon.top_direction_7d|type=="string")) and ((.cross_horizon.top_direction_30d==null) or (.cross_horizon.top_direction_30d|type=="string")) and (.cross_horizon.rationale_codes|type=="array") and (all(.cross_horizon.rationale_codes[]?; type=="string")) and ((.cross_horizon.invalidation_note==null) or (.cross_horizon.invalidation_note|type=="string")))) and ((has("decision_stack")|not) or ((.decision_stack.what_changed|type=="string") and (.decision_stack.what_to_do|type=="string") and (.decision_stack.why_now|type=="string") and (.decision_stack.confidence|type=="string") and (.decision_stack.cta_state|type=="string")))' \
   "plan"
+
+if [[ "$EDGE_EVIDENCE_V2_REQUIRED" == "1" ]]; then
+  check_api_json_contract "/api/plan" \
+    'def gate: type=="object" and (.pass|type=="boolean") and (.reasons|type=="array") and all(.reasons[]?; type=="string");
+     type=="object" and
+     (.edge_evidence_gate|gate) and
+     (.action_now.action_authorized|type=="boolean") and
+     (.action_now.raw_signal_allocation_target|type=="number") and
+     (.action_now.action_authorized == ((.edge_evidence_gate.pass == true) and (.actionability_state == "ACTIONABLE"))) and
+     (if .action_now.action_authorized then
+        (.action_now.risk_allocation_target|type=="number") and
+        (.action_now.risk_allocation_basis=="penalized_playbook_target")
+      else
+        (.action_now.risk_allocation_target==null) and
+        ((.action_now.risk_allocation_basis=="withheld_edge_evidence") or
+         (.action_now.risk_allocation_basis=="withheld_actionability")) and
+        (if .edge_evidence_gate.pass then
+           (.action_now.risk_allocation_basis=="withheld_actionability")
+         else
+           (.action_now.risk_allocation_basis=="withheld_edge_evidence") and
+           ((.actionability_reason_codes // []) | index("edge_evidence_gate_block") != null)
+         end)
+      end)' \
+    "plan-edge-evidence-v2"
+fi
 
 check_api_json_contract "/api/brief?scope=market" \
   'type=="object" and (.as_of|type=="string") and (.summary|type=="string") and (.regime_delta|type=="string") and (.risk_posture|type=="string") and (.freshness_status.stale_count|type=="number") and (.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.source_plan_as_of|type=="string") and (.contract_version|type=="string") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and ((.degraded_reason==null) or (.degraded_reason|type=="string"))' \
   "brief"
 
 check_api_json_contract "/api/opportunities?horizon=7d&limit=5" \
-  'type=="object" and (.as_of|type=="string") and (.horizon|type=="string") and (.suppressed_count|type=="number") and (.suppression_by_reason.coherence_failed|type=="number") and (.suppression_by_reason.quality_filtered|type=="number") and (.suppression_by_reason.data_quality_suppressed|type=="number") and (.quality_filter_rate|type=="number") and (.coherence_fail_rate|type=="number") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.cta_enabled|type=="boolean") and (.cta_disabled_reasons|type=="array") and (all(.cta_disabled_reasons[]?; type=="string")) and ((.degraded_reason==null) or (.degraded_reason|type=="string")) and ((.data_age_seconds==null) or (.data_age_seconds|type=="number")) and (.ttl_state|type=="string") and ((.next_expected_refresh_at==null) or (.next_expected_refresh_at|type=="string")) and ((.overdue_seconds==null) or (.overdue_seconds|type=="number")) and (.items|type=="array") and (all(.items[]?; (.id|type=="string") and (.theme_id|type=="string") and (.direction|type=="string") and (.conviction_score|type=="number") and (.calibration.quality|type=="string") and (.calibration.basis=="conviction_decile") and ((.calibration.window==null) or (.calibration.window|type=="string")) and ((.calibration.unavailable_reason==null) or (.calibration.unavailable_reason|type=="string")) and (.expectancy.sample_size|type=="number") and (.expectancy.basis|type=="string") and (.expectancy.quality|type=="string") and ((.expectancy.expected_move_pct==null) or (.expectancy.expected_move_pct|type=="number")) and ((.expectancy.max_adverse_move_pct==null) or (.expectancy.max_adverse_move_pct|type=="number")) and ((.expectancy.unavailable_reason==null) or (.expectancy.unavailable_reason|type=="string")) and (.eligibility.passed|type=="boolean") and (.eligibility.failed_checks|type=="array") and (.decision_contract.coherent|type=="boolean") and (.decision_contract.confidence_band|type=="string") and (.decision_contract.rationale_codes|type=="array")))' \
+  'type=="object" and (.as_of|type=="string") and (.horizon|type=="string") and (.suppressed_count|type=="number") and (.suppression_by_reason.coherence_failed|type=="number") and (.suppression_by_reason.quality_filtered|type=="number") and (.suppression_by_reason.data_quality_suppressed|type=="number") and ((.suppression_by_reason|has("edge_evidence_suppressed")|not) or (.suppression_by_reason.edge_evidence_suppressed|type=="number")) and (.quality_filter_rate|type=="number") and (.coherence_fail_rate|type=="number") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and (.cta_enabled|type=="boolean") and (.cta_disabled_reasons|type=="array") and (all(.cta_disabled_reasons[]?; type=="string")) and ((.degraded_reason==null) or (.degraded_reason|type=="string")) and ((.data_age_seconds==null) or (.data_age_seconds|type=="number")) and (.ttl_state|type=="string") and ((.next_expected_refresh_at==null) or (.next_expected_refresh_at|type=="string")) and ((.overdue_seconds==null) or (.overdue_seconds|type=="number")) and (.items|type=="array") and (all(.items[]?; (.id|type=="string") and (.theme_id|type=="string") and (.direction|type=="string") and (.conviction_score|type=="number") and (.calibration.quality|type=="string") and (.calibration.basis=="conviction_decile") and ((.calibration.window==null) or (.calibration.window|type=="string")) and ((.calibration.unavailable_reason==null) or (.calibration.unavailable_reason|type=="string")) and (.expectancy.sample_size|type=="number") and (.expectancy.basis|type=="string") and (.expectancy.quality|type=="string") and ((.expectancy.expected_move_pct==null) or (.expectancy.expected_move_pct|type=="number")) and ((.expectancy.max_adverse_move_pct==null) or (.expectancy.max_adverse_move_pct|type=="number")) and ((.expectancy.unavailable_reason==null) or (.expectancy.unavailable_reason|type=="string")) and (.eligibility.passed|type=="boolean") and (.eligibility.failed_checks|type=="array") and (.decision_contract.coherent|type=="boolean") and (.decision_contract.confidence_band|type=="string") and (.decision_contract.rationale_codes|type=="array")))' \
   "opportunities"
+
+if [[ "$EDGE_EVIDENCE_V2_REQUIRED" == "1" ]]; then
+  check_api_json_contract "/api/opportunities?horizon=7d&limit=5" \
+    'def gate: type=="object" and (.pass|type=="boolean") and (.reasons|type=="array") and all(.reasons[]?; type=="string");
+     type=="object" and
+     (.edge_evidence_gate|gate) and
+     (.suppression_by_reason.edge_evidence_suppressed|type=="number") and
+     (.suppression_by_reason.edge_evidence_suppressed >= 0) and
+     (if .edge_evidence_gate.pass then true else
+        (.items|length==0) and
+        (.actionability_state=="NO_ACTION") and
+        (.cta_enabled==false) and
+        (.degraded_reason=="edge_evidence_gate_failed") and
+        ((.actionability_reason_codes // []) | index("edge_evidence_gate_block") != null)
+      end)' \
+    "opportunities-edge-evidence-v2"
+fi
 
 check_api_json_contract "/api/alerts/feed?limit=10" \
   'type=="object" and (.as_of|type=="string") and (.alerts|type=="array") and ((.degraded_reason==null) or (.degraded_reason|type=="string")) and (all(.alerts[]?; (.id|type=="string") and (.event_type|type=="string") and (.severity|type=="string") and (.title|type=="string") and (.body|type=="string") and (.entity_type|type=="string") and (.created_at|type=="string")))' \
@@ -1084,8 +1140,75 @@ check_api_json_contract "/api/diagnostics/calibration?metric=conviction&horizon=
 
 if edge_diagnostics_available; then
   check_api_json_contract "/api/diagnostics/edge?horizon=all" \
-    'type=="object" and (.as_of|type=="string") and (.basis|type=="string") and (.windows|type=="array") and ((.windows|length) >= 1) and (.promotion_gate.pass|type=="boolean") and (.promotion_gate.reasons|type=="array") and (all(.promotion_gate.reasons[]?; type=="string")) and (all(.windows[]?; (.horizon|type=="string") and ((.as_of==null) or (.as_of|type=="string")) and (.sample_size|type=="number") and ((.model_direction_accuracy==null) or (.model_direction_accuracy|type=="number")) and ((.baseline_direction_accuracy==null) or (.baseline_direction_accuracy|type=="number")) and ((.uplift_vs_baseline==null) or (.uplift_vs_baseline|type=="number")) and ((.uplift_ci95_low==null) or (.uplift_ci95_low|type=="number")) and ((.uplift_ci95_high==null) or (.uplift_ci95_high|type=="number")) and (.lower_bound_positive|type=="boolean") and (.minimum_reliable_sample|type=="number") and (.quality_band|type=="string") and (.baseline_strategy=="lagged_actual_direction") and (.leakage_sentinel.pass|type=="boolean") and (.leakage_sentinel.violation_count|type=="number") and (.leakage_sentinel.reasons|type=="array") and (.calibration_diagnostics.quality_band|type=="string")))' \
+    'type=="object" and (.as_of|type=="string") and (.basis|type=="string") and (.windows|type=="array") and ((.windows|length) >= 1) and (.promotion_gate.pass|type=="boolean") and (.promotion_gate.reasons|type=="array") and (all(.promotion_gate.reasons[]?; type=="string")) and (all(.windows[]?; (.horizon|type=="string") and ((.as_of==null) or (.as_of|type=="string")) and (.sample_size|type=="number") and ((.model_direction_accuracy==null) or (.model_direction_accuracy|type=="number")) and ((.baseline_direction_accuracy==null) or (.baseline_direction_accuracy|type=="number")) and ((.uplift_vs_baseline==null) or (.uplift_vs_baseline|type=="number")) and ((.uplift_ci95_low==null) or (.uplift_ci95_low|type=="number")) and ((.uplift_ci95_high==null) or (.uplift_ci95_high|type=="number")) and (.lower_bound_positive|type=="boolean") and (.minimum_reliable_sample|type=="number") and (.quality_band|type=="string") and ((.baseline_strategy=="lagged_actual_direction") or (.baseline_strategy=="last_observable_actual_direction")) and (.leakage_sentinel.pass|type=="boolean") and (.leakage_sentinel.violation_count|type=="number") and (.leakage_sentinel.reasons|type=="array") and (.calibration_diagnostics.quality_band|type=="string")))' \
     "diagnostics-edge"
+
+  if [[ "$EDGE_EVIDENCE_V2_REQUIRED" == "1" ]]; then
+    check_api_json_contract "/api/diagnostics/edge?horizon=all" \
+      'def gate:
+         type=="object" and
+         (.pass|type=="boolean") and
+         (.reasons|type=="array") and
+         all(.reasons[]?; type=="string");
+       def nullable_number: (.==null) or (type=="number");
+       type=="object" and
+       (.basis=="immutable_spy_return_evidence_vs_last_observable_actual_direction") and
+       (.model_version=="empirical-bucket-spy-return/v1") and
+       (.method=="paired_calendar_bartlett_newey_west") and
+       (.inference_control.strategy=="finite_horizon_bonferroni") and
+       (.inference_control.familywise_confidence_level==0.95) and
+       (.inference_control.maximum_unique_looks==5000) and
+       (.inference_control.simultaneous_comparisons_per_look==4) and
+       (.inference_control.critical_value==5) and
+       (.inference_control.coverage_basis=="asymptotic_hac_normal_approximation") and
+       (.inference_control.finite_sample_guarantee==false) and
+       (.policy_alignment_gate|gate) and
+       (.policy_alignment_gate.pass==false) and
+       ((.policy_alignment_gate.reasons // []) | index("validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy") != null) and
+       (.promotion_gate.pass==false) and
+       (.windows|type=="array") and
+       ([.windows[].horizon] | sort == ["30d", "7d"]) and
+       (.integrity_gate|gate) and
+       (.performance_gate|gate) and
+       (.evidence_gate|gate) and
+       (.promotion_gate|gate) and
+       all(.windows[]?;
+         ((.horizon=="7d") or (.horizon=="30d")) and
+         (.horizon_days == (if .horizon=="7d" then 7 else 30 end)) and
+         (.baseline_strategy=="last_observable_actual_direction") and
+         (.model_version=="empirical-bucket-spy-return/v1") and
+         (.hac_bandwidth_days|type=="number") and
+         (.hac_bandwidth_days >= (2 * .horizon_days)) and
+         (.sample_size|type=="number") and
+         (.discordant_pairs|type=="number") and
+         (.calendar_span_days|type=="number") and
+         (.weekday_coverage_ratio|type=="number") and
+         (.weekday_coverage_ratio >= 0 and .weekday_coverage_ratio <= 1) and
+         (.integrity_gate|gate) and
+         (.eligibility_gate|gate) and
+         (.performance_gate|gate) and
+         (.evidence_gate|gate) and
+         (.leakage_sentinel.pass|type=="boolean") and
+         (.leakage_sentinel.violation_count|type=="number") and
+         (.leakage_sentinel.reasons|type=="array") and
+         all(.leakage_sentinel.reasons[]?; type=="string") and
+         (.signed_return_after_cost_pct.method=="paired_calendar_bartlett_newey_west") and
+         (.signed_return_after_cost_pct.bandwidth_days==.hac_bandwidth_days) and
+         (.signed_return_after_cost_pct.confidence_level==0.95) and
+         (.signed_return_after_cost_pct.sample_size|type=="number") and
+         (.signed_return_after_cost_pct.mean|nullable_number) and
+         (.signed_return_after_cost_pct.standard_error|nullable_number) and
+         (.signed_return_after_cost_pct.ci95_low|nullable_number) and
+         (.signed_return_after_cost_pct.ci95_high|nullable_number) and
+         (.signed_return_after_cost_pct.model_mean|nullable_number) and
+         (.signed_return_after_cost_pct.baseline_mean|nullable_number) and
+         (.signed_return_after_cost_pct.uplift|nullable_number) and
+         (.signed_return_after_cost_pct.lower_bound_positive|type=="boolean") and
+         (.signed_return_after_cost_pct.unavailable_reasons|type=="array") and
+         all(.signed_return_after_cost_pct.unavailable_reasons[]?; type=="string")
+       )' \
+      "diagnostics-edge-v2"
+  fi
 fi
 
 if utility_funnel_available; then

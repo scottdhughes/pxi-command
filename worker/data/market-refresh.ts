@@ -69,19 +69,17 @@ export async function claimMarketRefreshRun(
           status = 'failed',
           error = 'abandoned_run'
       WHERE status = 'running'
-        AND "trigger" = ?
         AND datetime(replace(replace(started_at, 'T', ' '), 'Z', '')) < datetime('now', ?)
-    `).bind(nowIso, normalizedTrigger, lookbackExpr).run();
+    `).bind(nowIso, lookbackExpr).run();
 
     const existing = await db.prepare(`
       SELECT id
       FROM market_refresh_runs
       WHERE status = 'running'
-        AND "trigger" = ?
         AND datetime(replace(replace(started_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
       ORDER BY datetime(replace(replace(started_at, 'T', ' '), 'Z', '')) DESC, id DESC
       LIMIT 1
-    `).bind(normalizedTrigger, lookbackExpr).first<{ id: number | null }>();
+    `).bind(lookbackExpr).first<{ id: number | null }>();
 
     if (existing?.id) {
       return {
@@ -99,10 +97,9 @@ export async function claimMarketRefreshRun(
         SELECT 1
         FROM market_refresh_runs
         WHERE status = 'running'
-          AND "trigger" = ?
           AND datetime(replace(replace(started_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
       )
-    `).bind(nowIso, normalizedTrigger, normalizedTrigger, lookbackExpr).run();
+    `).bind(nowIso, normalizedTrigger, lookbackExpr).run();
 
     if (typeof result.meta?.changes === 'number' && result.meta.changes > 0) {
       return {
@@ -116,11 +113,10 @@ export async function claimMarketRefreshRun(
       SELECT id
       FROM market_refresh_runs
       WHERE status = 'running'
-        AND "trigger" = ?
         AND datetime(replace(replace(started_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
       ORDER BY datetime(replace(replace(started_at, 'T', ' '), 'Z', '')) DESC, id DESC
       LIMIT 1
-    `).bind(normalizedTrigger, lookbackExpr).first<{ id: number | null }>();
+    `).bind(lookbackExpr).first<{ id: number | null }>();
 
     if (active?.id) {
       return {
@@ -132,13 +128,10 @@ export async function claimMarketRefreshRun(
     }
   } catch (err) {
     console.error('Failed to claim market refresh run:', err);
+    throw err;
   }
 
-  return {
-    status: 'claimed',
-    run_id: await recordMarketRefreshRunStart(db, normalizedTrigger),
-    refresh_trigger: normalizedTrigger,
-  };
+  throw new Error('Failed to claim market refresh run');
 }
 
 export async function recordMarketRefreshRunStart(db: D1Database, trigger: string): Promise<number | null> {

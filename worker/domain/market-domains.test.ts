@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildCanonicalMarketDecision, tryHandleMarketCoreRoute } from './market-core.js';
+import {
+  buildCanonicalMarketDecision,
+  resolveEdgeEvidenceGate,
+  suppressProjectionForEdgeEvidence,
+  tryHandleMarketCoreRoute,
+} from './market-core.js';
 import { generateMarketEvents, tryHandleMarketProductsRoute } from './market-products.js';
 import { computeDecisionGradeScorecard } from './market-ops.js';
 import type { WorkerRouteContext } from '../types.js';
@@ -25,6 +30,52 @@ function toIsoDate(date: Date): string {
 
 function toIsoDateTime(date: Date): string {
   return `${toIsoDate(date)}T00:00:00.000Z`;
+}
+
+function buildEdgeEvidenceReport(
+  passByHorizon: Partial<Record<'7d' | '30d', boolean>> = { '7d': true, '30d': true },
+  integrityPass = true,
+) {
+  const horizons = Object.keys(passByHorizon) as Array<'7d' | '30d'>;
+  const windows = horizons.map((horizon) => {
+    const pass = passByHorizon[horizon] === true;
+    return {
+      horizon,
+      performance_gate: {
+        pass,
+        reasons: pass ? [] : ['stale_evaluation'],
+      },
+      evidence_gate: {
+        pass: integrityPass && pass,
+        reasons: integrityPass && pass ? [] : ['evidence_not_promotable'],
+      },
+    };
+  });
+  const performancePass = windows.every((window) => window.performance_gate.pass);
+  const evidencePass = integrityPass && performancePass;
+  return {
+    integrity_gate: {
+      pass: integrityPass,
+      reasons: integrityPass ? [] : ['leakage_sentinel_failed'],
+    },
+    policy_alignment_gate: {
+      pass: true,
+      reasons: [],
+    },
+    performance_gate: {
+      pass: performancePass,
+      reasons: performancePass ? [] : ['performance_gate_failed'],
+    },
+    evidence_gate: {
+      pass: evidencePass,
+      reasons: evidencePass ? [] : ['evidence_gate_failed'],
+    },
+    promotion_gate: {
+      pass: evidencePass,
+      reasons: evidencePass ? [] : ['evidence_gate_failed'],
+    },
+    windows,
+  };
 }
 
 function createFakeDb(handler: (sql: string, args: unknown[]) => QueryResult): D1Database {
@@ -62,6 +113,46 @@ function createFakeDb(handler: (sql: string, args: unknown[]) => QueryResult): D
     },
   } as D1Database;
 }
+
+test('edge evidence consumers fail closed and resolve each horizon independently', () => {
+  const report = buildEdgeEvidenceReport({ '7d': false, '30d': true });
+
+  const gate7d = resolveEdgeEvidenceGate(report, '7d');
+  const gate30d = resolveEdgeEvidenceGate(report, '30d');
+  const missingGate = resolveEdgeEvidenceGate({ windows: [] }, '7d');
+  const contradictoryReport = buildEdgeEvidenceReport({ '7d': true });
+  contradictoryReport.windows[0].performance_gate = {
+    pass: false,
+    reasons: ['performance_gate_failed'],
+  };
+  const contradictoryGate = resolveEdgeEvidenceGate(contradictoryReport, '7d');
+
+  assert.equal(gate7d.pass, false);
+  assert.ok(gate7d.reasons.some((reason) => reason.includes('stale_evaluation')));
+  assert.equal(gate30d.pass, true);
+  assert.equal(missingGate.pass, false);
+  assert.ok(missingGate.reasons.includes('integrity_gate_missing'));
+  assert.ok(missingGate.reasons.includes('7d:diagnostic_window_missing'));
+  assert.equal(contradictoryGate.pass, false);
+  assert.ok(contradictoryGate.reasons.includes('7d:performance:performance_gate_failed'));
+});
+
+test('edge evidence suppression preserves candidates only as suppressed research output', () => {
+  const projected = suppressProjectionForEdgeEvidence({
+    items: [{ id: 'candidate-1' }, { id: 'candidate-2' }],
+    suppressed_count: 1,
+    degraded_reason: null,
+    suppression_by_reason: { quality_filtered: 1, edge_evidence_suppressed: 0 },
+  }, {
+    pass: false,
+    reasons: ['7d:performance:stale_evaluation'],
+  });
+
+  assert.deepEqual(projected.items, []);
+  assert.equal(projected.suppressed_count, 3);
+  assert.equal(projected.degraded_reason, 'edge_evidence_gate_failed');
+  assert.equal(projected.suppression_by_reason.edge_evidence_suppressed, 2);
+});
 
 test('subscription start preserves active subscribers without sending another verification email', async () => {
   let sendCalls = 0;
@@ -494,6 +585,121 @@ test('tryHandleMarketCoreRoute reports a generic plan build failure for unexpect
   assert.equal(payload.degraded_reason, 'decision_build_failed');
 });
 
+test('tryHandleMarketCoreRoute passes the selected horizon evidence gate into plan actionability', async () => {
+  const resolvedGates: Array<{ pass: boolean; reasons?: string[] }> = [];
+  const asOf = '2026-03-05T00:00:00.000Z';
+  const route = createRouteContext('https://pxi.test/api/plan', undefined, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('FROM pxi_scores ORDER BY date DESC LIMIT 10')) {
+        return [{
+          date: '2026-03-05',
+          score: 71,
+          label: 'risk-on',
+          status: 'bullish',
+          delta_1d: 1.1,
+          delta_7d: 4.2,
+          delta_30d: 7.3,
+        }];
+      }
+      if (sql.includes('FROM category_scores WHERE date = ?')) {
+        return [
+          { category: 'credit', score: 68, weight: 0.25 },
+          { category: 'macro', score: 72, weight: 0.25 },
+          { category: 'liquidity', score: 74, weight: 0.25 },
+        ];
+      }
+      if (sql.includes('FROM market_brief_snapshots')) return null;
+      if (sql.includes('FROM market_alert_events')) {
+        return { latest_as_of: null, warning_count: 0, critical_count: 0 };
+      }
+      if (sql.includes('FROM opportunity_snapshots')) {
+        return [{
+          horizon: '7d',
+          as_of: asOf,
+          payload_json: JSON.stringify({
+            as_of: asOf,
+            horizon: '7d',
+            items: [{ id: 'candidate-1', direction: 'LONG', conviction_score: 80 }],
+          }),
+        }];
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandleMarketCoreRoute(route, {
+    isFeatureEnabled: () => true,
+    detectRegime: async () => ({ regime: 'RISK_ON', confidence: 78, description: 'Risk appetite is improving.' }),
+    computeFreshnessStatus: async () => ({ has_stale_data: false, stale_count: 0, critical_stale_count: 0 }),
+    fetchPredictionEvaluationSampleSize: async () => 100,
+    buildCurrentBucketRiskBands: async () => ({ d7: { sample_size: 100 }, d30: { sample_size: 100 } }),
+    fetchLatestCalibrationSnapshot: async () => ({ total_samples: 100 }),
+    calculatePXISignal: async () => ({
+      signal_type: 'FULL_RISK',
+      risk_allocation: 0.8,
+      volatility_percentile: 50,
+      category_dispersion: 5,
+      adjustments: [],
+    }),
+    detectDivergence: async () => ({ has_divergence: false, alerts: [] }),
+    resolveConflictState: () => 'ALIGNED',
+    toNumber: (value: unknown, fallback = 0) => {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : fallback;
+    },
+    freshnessPenaltyCount: () => 0,
+    computeEdgeQualitySnapshot: () => ({ score: 90, label: 'HIGH' }),
+    buildEdgeQualityCalibrationFromSnapshot: () => ({ quality: 'ROBUST' }),
+    buildPolicyStateSnapshot: () => ({
+      stance: 'RISK_ON',
+      risk_posture: 'FULL_RISK',
+      conflict_state: 'ALIGNED',
+      base_signal: 'FULL_RISK',
+      regime_context: 'RISK_ON',
+      rationale: 'aligned',
+      rationale_codes: ['aligned'],
+    }),
+    buildUncertaintySnapshot: () => ({ level: 'LOW', reasons: [] }),
+    computeRiskSizingSnapshot: () => ({ target_pct: 80, raw_signal_allocation_target: 0.8 }),
+    buildTraderPlaybookSnapshot: async () => ({ recommended_size_pct: { target: 80 } }),
+    buildConsistencySnapshot: () => ({ score: 100, state: 'PASS', violations: [], components: {} }),
+    ensureMarketProductSchema: async () => {},
+    buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': false, '30d': true }),
+    normalizeOpportunityItemsForPublishing: (items: unknown[]) => items,
+    projectOpportunityFeed: (items: unknown[]) => ({
+      items,
+      suppressed_count: 0,
+      degraded_reason: null,
+      suppression_by_reason: {},
+    }),
+    summarizeCrossHorizonCoherence: () => null,
+    resolvePlanActionability: (args: { edge_evidence_gate: { pass: boolean; reasons?: string[] } }) => {
+      resolvedGates.push(args.edge_evidence_gate);
+      return args.edge_evidence_gate.pass
+        ? { state: 'ACTIONABLE', reason_codes: ['high_edge_with_eligible_opportunities'] }
+        : { state: 'NO_ACTION', reason_codes: ['edge_evidence_gate_block'] };
+    },
+    applyCrossHorizonActionabilityOverride: (actionability: unknown) => actionability,
+    buildDecisionStack: () => [],
+    buildInvalidationRules: () => [],
+    resolveHorizonBias: () => 'TACTICAL',
+  });
+
+  assert.ok(response);
+  assert.equal(resolvedGates[0]?.pass, false);
+  assert.ok(resolvedGates[0]?.reasons?.some((reason) => reason.includes('stale_evaluation')));
+  const payload = await response!.json() as Record<string, any>;
+  assert.equal(payload.actionability_state, 'NO_ACTION');
+  assert.equal(payload.edge_evidence_gate.pass, false);
+  assert.equal(payload.action_now.action_authorized, false);
+  assert.equal(payload.action_now.risk_allocation_target, null);
+  assert.equal(payload.action_now.raw_signal_allocation_target, 0.8);
+  assert.equal(payload.action_now.risk_allocation_basis, 'withheld_edge_evidence');
+  assert.ok(payload.actionability_reason_codes.includes('edge_evidence_gate_block'));
+  assert.equal(payload.opportunity_ref.eligible_count, 0);
+  assert.equal(payload.opportunity_ref.degraded_reason, 'edge_evidence_gate_failed');
+});
+
 test('generateMarketEvents emits regime, threshold, opportunity, and freshness events', async () => {
   const db = createFakeDb((sql) => {
     if (sql.includes('FROM pxi_scores')) {
@@ -587,6 +793,7 @@ test('tryHandleMarketProductsRoute preserves opportunity coherence and CTA field
       ],
     }),
     storeOpportunitySnapshot: async () => {},
+    buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': true }),
     fetchLatestCalibrationSnapshot: async () => ({ quality_band: 'LIMITED' }),
     computeFreshnessStatus: async () => ({ stale_count: 0 }),
     fetchLatestConsistencyCheck: async () => ({ state: 'WARN' }),
@@ -622,6 +829,76 @@ test('tryHandleMarketProductsRoute preserves opportunity coherence and CTA field
     (payload.actionability_reason_codes as string[]).sort(),
     ['cta_freshness_guard', 'opportunity_refresh_ttl_unknown', 'watch_state'].sort(),
   );
+});
+
+test('tryHandleMarketProductsRoute independently suppresses a failed horizon evidence gate', async () => {
+  const nowIso = new Date().toISOString();
+  const request = new Request('https://pxi.test/api/opportunities?horizon=7d&limit=5');
+  const route = {
+    request,
+    env: {
+      DB: createFakeDb((sql) => {
+        if (sql.includes('FROM opportunity_snapshots')) {
+          return {
+            payload_json: JSON.stringify({
+              as_of: nowIso,
+              horizon: '7d',
+              items: [{ id: 'candidate-1', theme_id: 'macro', theme_name: 'Macro', conviction_score: 70 }],
+            }),
+          };
+        }
+        if (sql.includes('FROM pxi_scores')) {
+          return { date: nowIso.slice(0, 10) };
+        }
+        throw new Error(`Unhandled query: ${sql}`);
+      }),
+    },
+    url: new URL(request.url),
+    method: 'GET',
+    corsHeaders: {},
+  };
+
+  const response = await tryHandleMarketProductsRoute(route as any, {
+    isFeatureEnabled: () => true,
+    ensureMarketProductSchema: async () => {},
+    buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': false }),
+    buildOpportunityFallbackSnapshot: () => {
+      throw new Error('fallback should not be used');
+    },
+    fetchLatestCalibrationSnapshot: async () => ({ quality_band: 'ROBUST' }),
+    computeFreshnessStatus: async () => ({ stale_count: 0, critical_stale_count: 0 }),
+    fetchLatestConsistencyCheck: async () => ({ state: 'PASS' }),
+    resolveLatestObservedRefreshTimestamp: async () => ({ last_refresh_at_utc: nowIso }),
+    normalizeOpportunityItemsForPublishing: (items: unknown[]) => items,
+    projectOpportunityFeed: (items: unknown[]) => ({
+      items,
+      suppressed_count: 0,
+      quality_filtered_count: 0,
+      coherence_suppressed_count: 0,
+      suppression_by_reason: { coherence_failed: 0, quality_filtered: 0, data_quality_suppressed: 0 },
+      quality_filter_rate: 0,
+      coherence_fail_rate: 0,
+      degraded_reason: null,
+    }),
+    computeCalibrationDiagnostics: () => ({ quality_band: 'ROBUST', ece: 0.01 }),
+    evaluateOpportunityCtaState: (projected: { items: unknown[] }) => ({
+      actionability_state: projected.items.length > 0 ? 'ACTIONABLE' : 'NO_ACTION',
+      cta_enabled: projected.items.length > 0,
+      cta_disabled_reasons: projected.items.length > 0 ? [] : ['no_eligible_opportunities'],
+    }),
+  });
+
+  assert.ok(response);
+  assert.equal(response!.headers.get('Cache-Control'), 'no-store');
+  const payload = await response!.json() as Record<string, any>;
+  assert.deepEqual(payload.items, []);
+  assert.equal(payload.degraded_reason, 'edge_evidence_gate_failed');
+  assert.equal(payload.actionability_state, 'NO_ACTION');
+  assert.equal(payload.cta_enabled, false);
+  assert.equal(payload.edge_evidence_gate.pass, false);
+  assert.ok(payload.edge_evidence_gate.reasons.some((reason: string) => reason.includes('stale_evaluation')));
+  assert.ok(payload.actionability_reason_codes.includes('edge_evidence_gate_block'));
+  assert.ok(payload.actionability_reason_codes.includes('opportunity_edge_evidence_gate_failed'));
 });
 
 test('tryHandleMarketProductsRoute rebuilds stale opportunity snapshots and uses observed refresh timestamps', async () => {
@@ -671,6 +948,7 @@ test('tryHandleMarketProductsRoute rebuilds stale opportunity snapshots and uses
     storeOpportunitySnapshot: async () => {
       storedAfterRebuild += 1;
     },
+    buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': true }),
     fetchLatestCalibrationSnapshot: async () => ({ quality_band: 'ROBUST' }),
     computeFreshnessStatus: async () => ({ stale_count: 0, critical_stale_count: 0 }),
     fetchLatestConsistencyCheck: async () => ({ state: 'PASS' }),

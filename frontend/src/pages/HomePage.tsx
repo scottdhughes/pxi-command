@@ -4,11 +4,8 @@ import { EmailSubscribeModal } from '../components/EmailSubscribeModal'
 import { SiteDisclaimer } from '../components/SiteDisclaimer'
 import {
   ExportButton,
-  MLPredictionsCard,
   OpportunityPreview,
   BriefCompactCard,
-  BacktestCard,
-  SimilarPeriodsCard,
   TopThemesWidget,
 } from '../components/home/InsightCards'
 import {
@@ -140,12 +137,14 @@ function SignalIndicator({ signal }: { signal: SignalData['signal'] | null }) {
   }
 
   const color = signalColors[signal.type] || '#949ba5'
-  const allocationPct = Math.round(signal.risk_allocation * 100)
+  const actionAuthorized = signal.action_authorized === true && typeof signal.risk_allocation === 'number'
 
   return (
     <div className="flex items-center gap-2 sm:gap-4 mb-6">
       <div className="w-20 sm:w-28 shrink-0 text-right">
-        <span className="text-[9px] text-[#949ba5]/50 uppercase tracking-widest">Signal</span>
+        <span className="text-[9px] text-[#949ba5]/50 uppercase tracking-widest">
+          {actionAuthorized ? 'Signal' : 'Research posture'}
+        </span>
       </div>
       <div className="flex-1 flex items-center gap-3">
         <div
@@ -159,8 +158,8 @@ function SignalIndicator({ signal }: { signal: SignalData['signal'] | null }) {
             >
               {signalLabels[signal.type]}
             </span>
-            <span className="text-[11px] text-[#f3f3f3]/80 font-mono">
-              {allocationPct}%
+            <span className={`text-[10px] font-mono ${actionAuthorized ? 'text-[#f3f3f3]/80' : 'text-[#f59e0b]'}`}>
+              {actionAuthorized ? `${Math.round((signal.risk_allocation as number) * 100)}%` : 'allocation withheld'}
             </span>
             {signal.conflict_state && (
               <span className={`text-[8px] uppercase tracking-widest ${
@@ -218,20 +217,13 @@ function DivergenceAlerts({ divergence }: { divergence: PXIData['divergence'] })
                 >
                   {alert.title}
                 </span>
-                {alert.actionable && (
-                  <span className="text-[8px] text-[#949ba5]/50 uppercase tracking-widest shrink-0">
-                    Actionable
-                  </span>
-                )}
+                <span className="text-[8px] text-[#949ba5]/50 uppercase tracking-widest shrink-0">
+                  Research flag
+                </span>
               </div>
               <p className="text-[10px] text-[#949ba5]/60 leading-relaxed mt-1">
                 {alert.description}
               </p>
-              {alert.metrics && alert.metrics.historical_frequency > 0 && (
-                <p className="text-[8px] text-[#949ba5]/40 mt-1">
-                  Historically occurred {alert.metrics.historical_frequency.toFixed(1)}% of days
-                </p>
-              )}
             </div>
             <div className="w-6 sm:w-8 shrink-0" />
           </div>
@@ -279,102 +271,6 @@ function CategoryBar({
   )
 }
 
-function PredictionCard({ prediction }: { prediction: PredictionData }) {
-  const { d7, d30 } = prediction.prediction
-  const extreme = prediction.extreme_reading
-  const { bias, confidence, note } = prediction.interpretation
-
-  const formatReturn = (val: number | null) => {
-    if (val === null) return '—'
-    return `${val >= 0 ? '+' : ''}${val.toFixed(2)}%`
-  }
-
-  const formatWinRate = (val: number | null) => {
-    if (val === null) return '—'
-    return `${Math.round(val)}%`
-  }
-
-  const biasColor = bias === 'BULLISH' ? 'text-[#00a3ff]' : bias === 'BEARISH' ? 'text-[#ff6b6b]' : 'text-[#949ba5]'
-  const outlookLabel = bias === 'BULLISH' ? 'Favorable' : bias === 'BEARISH' ? 'Unfavorable' : 'Mixed'
-  const extremeLabel = (signal: string) => signal === 'BULLISH' ? 'Favorable Setup' : 'Caution'
-
-  return (
-    <div className="w-full mt-6 sm:mt-10">
-      {extreme && (
-        <div className={`mb-4 px-4 py-2 rounded text-center ${
-          extreme.signal === 'BULLISH' ? 'bg-[#00a3ff]/10 border border-[#00a3ff]/30' : 'bg-[#ff6b6b]/10 border border-[#ff6b6b]/30'
-        }`}>
-          <div className={`text-[11px] font-medium uppercase tracking-wider ${
-            extreme.signal === 'BULLISH' ? 'text-[#00a3ff]' : 'text-[#ff6b6b]'
-          }`}>
-            {extreme.type} — {extremeLabel(extreme.signal)}
-          </div>
-          <div className="text-[9px] text-[#949ba5]/50 mt-1">
-            {extreme.historical_count} similar readings → {formatWinRate(extreme.win_rate_30d)} win rate
-          </div>
-        </div>
-      )}
-
-      <div className="text-[10px] sm:text-[11px] text-[#949ba5]/50 uppercase tracking-widest mb-4 text-center">
-        Historical Outlook
-      </div>
-
-      <div className="flex justify-center gap-8 sm:gap-12">
-        <div className="text-center">
-          <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mb-2">7 Day</div>
-          <div className={`text-2xl sm:text-3xl font-light ${
-            (d7.avg_return ?? 0) >= 0 ? 'text-[#00a3ff]' : 'text-[#949ba5]'
-          }`}>
-            {formatReturn(d7.avg_return)}
-          </div>
-          <div className="text-[10px] text-[#949ba5]/60 mt-1">
-            avg return
-          </div>
-          <div className="text-[13px] font-mono text-[#f3f3f3]/80 mt-2">
-            {formatWinRate(d7.win_rate)}
-          </div>
-          <div className="text-[9px] text-[#949ba5]/40">
-            win rate
-          </div>
-        </div>
-
-        <div className="text-center">
-          <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-wider mb-2">30 Day</div>
-          <div className={`text-2xl sm:text-3xl font-light ${
-            (d30.avg_return ?? 0) >= 0 ? 'text-[#00a3ff]' : 'text-[#949ba5]'
-          }`}>
-            {formatReturn(d30.avg_return)}
-          </div>
-          <div className="text-[10px] text-[#949ba5]/60 mt-1">
-            avg return
-          </div>
-          <div className="text-[13px] font-mono text-[#f3f3f3]/80 mt-2">
-            {formatWinRate(d30.win_rate)}
-          </div>
-          <div className="text-[9px] text-[#949ba5]/40">
-            win rate
-          </div>
-        </div>
-      </div>
-
-      <div className="mt-6 text-center">
-        <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-widest mb-1">
-          Forward Outlook
-        </div>
-        <div className={`text-[11px] font-medium uppercase tracking-wider ${biasColor}`}>
-          {outlookLabel}
-        </div>
-        <div className="text-[9px] text-[#949ba5]/40 mt-2">
-          {note}
-        </div>
-        <div className="text-[8px] text-[#949ba5]/30 mt-1">
-          {d7.sample_size} observations at similar levels • {confidence.toLowerCase()} confidence
-        </div>
-      </div>
-    </div>
-  )
-}
-
 type HomePageProps = {
   alertsData: AlertsApiResponse | null
   alertsFeed: AlertsFeedResponse | null
@@ -409,18 +305,14 @@ type HomePageProps = {
 export function HomePage({
   alertsData,
   alertsFeed,
-  backtestData,
   briefData,
   data,
-  ensemble,
   historyData,
   historyRange,
   menuOpen,
   menuRef,
-  mlAccuracy,
   opportunitiesData,
   planData,
-  prediction,
   selectedCategory,
   setHistoryRange,
   setMenuOpen,
@@ -432,7 +324,6 @@ export function HomePage({
   showSubscribeModal,
   signal,
   signalsData,
-  similarData,
   subscriptionNotice,
   navigateTo,
 }: HomePageProps) {
@@ -599,10 +490,6 @@ export function HomePage({
 
         {data.divergence && <DivergenceAlerts divergence={data.divergence} />}
 
-        {prediction && <PredictionCard prediction={prediction} />}
-
-        <MLPredictionsCard ensemble={ensemble} accuracy={mlAccuracy} />
-
         <TopThemesWidget data={signalsData} regime={data.regime?.type} />
 
         <OpportunityPreview data={opportunitiesData} onOpen={() => navigateTo('/opportunities')} />
@@ -628,9 +515,9 @@ export function HomePage({
           </div>
         )}
 
-        <SimilarPeriodsCard data={similarData} />
-
-        <BacktestCard data={backtestData} />
+        <div className="w-full mt-6 p-3 border border-[#26272b] rounded text-[10px] leading-relaxed text-[#949ba5]/70">
+          Legacy forward-return, similarity, ML, and backtest panels are withheld until they are reproduced on the prospective evidence stream.
+        </div>
 
         <StaleDataWarning freshness={data.dataFreshness} />
 

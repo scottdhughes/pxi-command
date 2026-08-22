@@ -142,8 +142,7 @@ test('tryHandleModelingRoute returns 503 for missing /api/ml/predict model', asy
   assert.equal(response?.status, 503);
 });
 
-test('tryHandleModelingRoute logs /api/ml/ensemble predictions via waitUntil', async () => {
-  let logged = 0;
+test('tryHandleModelingRoute keeps public /api/ml/ensemble reads side-effect free', async () => {
   const route = createRouteContext('https://pxi.test/api/ml/ensemble', undefined, {
     DB: createFakeDb((sql, args) => {
       if (sql.includes('SELECT date, score, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 1')) {
@@ -176,10 +175,6 @@ test('tryHandleModelingRoute logs /api/ml/ensemble predictions via waitUntil', a
           { date: '2026-03-04', value: 19 },
         ];
       }
-      if (sql.includes('INSERT OR REPLACE INTO ensemble_predictions')) {
-        logged += 1;
-        return null;
-      }
       throw new Error(`Unhandled query: ${sql} :: ${JSON.stringify(args)}`);
     }),
   });
@@ -208,7 +203,7 @@ test('tryHandleModelingRoute logs /api/ml/ensemble predictions via waitUntil', a
   const payload = await response!.json() as any;
   assert.equal(payload.ensemble.predictions.pxi_change_7d.confidence, 'MEDIUM');
   await Promise.all((route as any).waits);
-  assert.equal(logged, 1);
+  assert.equal((route as any).waits.length, 0);
 });
 
 test('tryHandleModelingRoute returns empty coverage payload for /api/accuracy with no predictions', async () => {
@@ -438,6 +433,7 @@ test('tryHandleModelingRoute exports immutable point-in-time research snapshots'
     feature_version: 'pxi-feature-snapshot/v1',
     storage_contract: 'append-only-d1-research-snapshots/v1',
     capture_source: 'test',
+    canonical_slot: 'daily_close_22z',
     benchmark_close: 651.4,
     benchmark_observation_date: '2026-08-21',
     features: { pxi_score: 61.2, indicator_ism_manufacturing: 48.2 },
@@ -460,5 +456,6 @@ test('tryHandleModelingRoute exports immutable point-in-time research snapshots'
   assert.equal(payload.point_in_time_guarantee, true);
   assert.equal(payload.rows.length, 1);
   assert.equal(payload.rows[0].immutable_snapshot, true);
+  assert.equal(payload.rows[0].canonical_slot, 'daily_close_22z');
   assert.equal(payload.rows[0].feature_sources.indicator_ism_manufacturing, 'fred');
 });

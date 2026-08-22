@@ -105,7 +105,13 @@ export const signalFixture = {
   },
   signal: {
     type: 'FULL_RISK',
-    risk_allocation: 0.85,
+    action_authorized: false,
+    risk_allocation: null,
+    raw_risk_allocation: 0.85,
+    evidence_gate: {
+      pass: false,
+      reasons: ['policy_alignment:validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy'],
+    },
     volatility_percentile: 0.44,
     category_dispersion: 0.18,
     adjustments: ['policy_tailwind', 'breadth_confirmation'],
@@ -157,7 +163,9 @@ export const planFixture = {
     rationale: 'Macro and breadth remain aligned.',
     rationale_codes: ['breadth_confirmation', 'credit_support'],
   },
+  edge_evidence_gate: { pass: true, reasons: [] },
   action_now: {
+    action_authorized: true,
     risk_allocation_target: 0.85,
     raw_signal_allocation_target: 0.9,
     risk_allocation_basis: 'penalized_playbook_target',
@@ -324,6 +332,7 @@ export const opportunitiesFixture = {
     coherence_failed: 1,
     quality_filtered: 0,
     data_quality_suppressed: 0,
+    edge_evidence_suppressed: 0,
   },
   quality_filter_rate: 0,
   coherence_fail_rate: 0.5,
@@ -551,8 +560,23 @@ export const calibrationDiagnosticsFixture = {
 } satisfies CalibrationDiagnosticsResponse;
 
 export const edgeDiagnosticsFixture = {
-  as_of: '2026-03-05',
-  basis: 'edge_quality_v2',
+  as_of: '2026-03-05T22:00:00.000Z',
+  basis: 'immutable_spy_return_evidence_vs_last_observable_actual_direction',
+  model_version: 'empirical-bucket-spy-return/v1',
+  method: 'paired_calendar_bartlett_newey_west',
+  inference_control: {
+    strategy: 'finite_horizon_bonferroni',
+    familywise_confidence_level: 0.95,
+    maximum_unique_looks: 5000,
+    simultaneous_comparisons_per_look: 4,
+    critical_value: 5,
+    coverage_basis: 'asymptotic_hac_normal_approximation',
+    finite_sample_guarantee: false,
+  },
+  policy_alignment_gate: {
+    pass: false,
+    reasons: ['validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy'],
+  },
   windows: [
     {
       horizon: '7d',
@@ -564,9 +588,39 @@ export const edgeDiagnosticsFixture = {
       uplift_ci95_low: 0.02,
       uplift_ci95_high: 0.16,
       lower_bound_positive: true,
-      minimum_reliable_sample: 30,
+      minimum_reliable_sample: 60,
       quality_band: 'ROBUST',
-      baseline_strategy: 'lagged_actual_direction',
+      baseline_strategy: 'last_observable_actual_direction',
+      model_version: 'empirical-bucket-spy-return/v1',
+      horizon_days: 7,
+      hac_bandwidth_days: 20,
+      discordant_pairs: 34,
+      calendar_span_days: 126,
+      weekday_coverage_ratio: 0.92,
+      latest_prediction_date: '2026-03-05',
+      latest_prediction_age_days: 0,
+      latest_evaluated_target_date: '2026-03-05',
+      latest_actual_observation_date: '2026-03-05',
+      latest_actual_observation_age_days: 0,
+      signed_return_after_cost_pct: {
+        method: 'paired_calendar_bartlett_newey_west',
+        bandwidth_days: 20,
+        confidence_level: 0.95,
+        sample_size: 83,
+        mean: 0.31,
+        standard_error: 0.09,
+        ci95_low: 0.13,
+        ci95_high: 0.49,
+        lower_bound_positive: true,
+        unavailable_reasons: [],
+        model_mean: 0.42,
+        baseline_mean: 0.11,
+        uplift: 0.31,
+      },
+      integrity_gate: { pass: true, reasons: [] },
+      eligibility_gate: { pass: true, reasons: [] },
+      performance_gate: { pass: true, reasons: [] },
+      evidence_gate: { pass: true, reasons: [] },
       leakage_sentinel: {
         pass: true,
         violation_count: 0,
@@ -575,9 +629,21 @@ export const edgeDiagnosticsFixture = {
       calibration_diagnostics: calibrationDiagnosticsFixture.diagnostics,
     },
   ],
-  promotion_gate: {
+  integrity_gate: {
     pass: true,
     reasons: [],
+  },
+  performance_gate: {
+    pass: true,
+    reasons: [],
+  },
+  evidence_gate: {
+    pass: true,
+    reasons: [],
+  },
+  promotion_gate: {
+    pass: false,
+    reasons: ['validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy'],
   },
 } satisfies EdgeDiagnosticsResponse;
 

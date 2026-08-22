@@ -1,5 +1,9 @@
 import { ensureEmailAlertDeliveryUniqueness, ensureMarketRefreshRunStatusSchema } from '../db/schema';
-import { captureResearchFeatureSnapshot } from '../data/research-vintages';
+import {
+  DAILY_CLOSE_CANONICAL_SLOT,
+  captureResearchFeatureSnapshot,
+} from '../data/research-vintages';
+import { captureCanonicalMarketPredictionEvidence } from '../data/market-evidence';
 import type {
   BackfillResponsePayload,
   MigrationResponsePayload,
@@ -619,8 +623,9 @@ export async function tryHandleAdminIngestionRoute(
       return adminAuthFailure;
     }
 
-    const body = await request.json() as { date?: string };
+    const body = await request.json() as { date?: string; record_evidence?: boolean };
     const targetDate = body.date || deps.formatDate(new Date());
+    const recordEvidence = body.record_evidence === true;
     const result = await deps.calculatePXI(env.DB, targetDate);
 
     if (!result) {
@@ -650,7 +655,16 @@ export async function tryHandleAdminIngestionRoute(
       await env.DB.batch(catStmts);
     }
 
-    await captureResearchFeatureSnapshot(env.DB, result.pxi, 'worker_recalculate');
+    const researchSnapshot = await captureResearchFeatureSnapshot(
+      env.DB,
+      result.pxi,
+      recordEvidence ? 'worker_recalculate_canonical' : 'worker_recalculate',
+      new Date().toISOString(),
+      recordEvidence ? { canonicalSlot: DAILY_CLOSE_CANONICAL_SLOT } : {},
+    );
+    const evidenceCapture = recordEvidence && researchSnapshot
+      ? await captureCanonicalMarketPredictionEvidence(env.DB, researchSnapshot)
+      : null;
 
     let embedded = false;
     try {
@@ -691,6 +705,11 @@ export async function tryHandleAdminIngestionRoute(
       pxi: result.pxi,
       categories: result.categories.length,
       embedded,
+      research_snapshot_id: researchSnapshot?.snapshot_id ?? null,
+      evidence_predictions_recorded: evidenceCapture?.status === 'inserted' ? 1 : 0,
+      evidence_status: recordEvidence
+        ? (evidenceCapture?.status ?? 'skipped_canonical_capture')
+        : 'not_requested',
     };
     return Response.json(payload, { headers: corsHeaders });
   }

@@ -123,6 +123,8 @@ test('contract fixtures preserve cross-route invariants used by the frontend', (
   assert.equal(planFixture.as_of, briefFixture.as_of);
   assert.equal(planFixture.as_of, opportunitiesFixture.as_of);
   assert.equal(signalFixture.date, pxiFixture.date);
+  assert.equal(signalFixture.signal.action_authorized, false);
+  assert.equal(signalFixture.signal.risk_allocation, null);
   assert.equal(briefFixture.policy_state.base_signal, signalFixture.signal.type);
   assert.equal(alertsApiFixture.count, alertsApiFixture.alerts.length);
   assert.equal(mlAccuracyFixture.coverage?.evaluated_count, mlAccuracyFixture.evaluated_count);

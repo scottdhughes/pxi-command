@@ -141,10 +141,15 @@ export function buildOpportunityLedgerProjection(args: {
   freshness: FreshnessStatus;
   consistency_state: ConsistencyState;
   publication_allowed?: boolean;
-  publication_blocked_reason?: string | null;
+  publication_blocked_reason?:
+    | 'governance_blocked'
+    | 'edge_evidence_gate_failed'
+    | 'historical_backfill_nonprospective'
+    | null;
 }): OpportunityLedgerBuildResult {
   const publicationAllowed = args.publication_allowed !== false;
-  const publicationBlockedReason = args.publication_blocked_reason || 'governance_blocked';
+  const publicationBlockedReason: NonNullable<OpportunityItemLedgerInsertPayload['suppression_reason']> =
+    args.publication_blocked_reason || 'governance_blocked';
   const normalized = normalizeOpportunityItemsForPublishing(args.snapshot.items, args.calibration);
   const qualityGateResult = removeLowInformationOpportunities(normalized);
   const coherenceGateResult = applyOpportunityCoherenceGate(
@@ -172,7 +177,7 @@ export function buildOpportunityLedgerProjection(args: {
       } else if (!coherenceEligibleIds.has(item.id)) {
         suppressionReason = 'coherence_failed';
       } else if (blockedPublishedIds.has(item.id)) {
-        suppressionReason = 'governance_blocked';
+        suppressionReason = publicationBlockedReason;
       } else if (projected.suppressed_data_quality || projected.degraded_reason === 'suppressed_data_quality') {
         suppressionReason = 'suppressed_data_quality';
       } else if (projected.degraded_reason === 'coherence_gate_failed') {

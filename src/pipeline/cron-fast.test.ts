@@ -2,12 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  currentNewYorkDate,
   evaluateEdgePromotionGate,
+  isUsEquityTradingDay,
   isRetryableYahooError,
   normalizeRecalculateResponse,
   parseYahooChartResponse,
   parseYahooQuoteResponse,
   retryWithBackoff,
+  shouldRecordResearchEvidence,
 } from './cron-fast.js';
 
 test('parseYahooChartResponse parses adjusted close data', () => {
@@ -113,10 +116,14 @@ test('isRetryableYahooError identifies non-retryable 4xx errors', () => {
   assert.equal(isRetryableYahooError(new Error('Too Many Requests')), true);
 });
 
-test('evaluateEdgePromotionGate passes when no leakage sentinel violations exist', () => {
+test('evaluateEdgePromotionGate passes only when integrity and per-horizon evidence gates pass', () => {
   const evaluation = evaluateEdgePromotionGate({
     as_of: '2026-02-21T00:00:00.000Z',
-    basis: 'prediction_log_forward_chain_vs_lagged_actual_baseline',
+    basis: 'immutable_spy_return_evidence_vs_last_observable_actual_direction',
+    integrity_gate: {
+      pass: true,
+      reasons: [],
+    },
     windows: [
       {
         horizon: '7d',
@@ -129,6 +136,8 @@ test('evaluateEdgePromotionGate passes when no leakage sentinel violations exist
           violation_count: 0,
           reasons: [],
         },
+        performance_gate: { pass: true, reasons: [] },
+        evidence_gate: { pass: true, reasons: [] },
       },
       {
         horizon: '30d',
@@ -141,6 +150,8 @@ test('evaluateEdgePromotionGate passes when no leakage sentinel violations exist
           violation_count: 0,
           reasons: [],
         },
+        performance_gate: { pass: true, reasons: [] },
+        evidence_gate: { pass: true, reasons: [] },
       },
     ],
     promotion_gate: {
@@ -156,7 +167,11 @@ test('evaluateEdgePromotionGate passes when no leakage sentinel violations exist
 test('evaluateEdgePromotionGate fails on leakage sentinel violations', () => {
   const evaluation = evaluateEdgePromotionGate({
     as_of: '2026-02-21T00:00:00.000Z',
-    basis: 'prediction_log_forward_chain_vs_lagged_actual_baseline',
+    basis: 'immutable_spy_return_evidence_vs_last_observable_actual_direction',
+    integrity_gate: {
+      pass: false,
+      reasons: ['evaluated_before_target_2'],
+    },
     windows: [
       {
         horizon: '7d',
@@ -169,6 +184,8 @@ test('evaluateEdgePromotionGate fails on leakage sentinel violations', () => {
           violation_count: 2,
           reasons: ['evaluated_before_target_2'],
         },
+        performance_gate: { pass: false, reasons: ['direction_uplift_ci_not_positive'] },
+        evidence_gate: { pass: false, reasons: ['direction_uplift_ci_not_positive'] },
       },
     ],
     promotion_gate: {
@@ -180,6 +197,51 @@ test('evaluateEdgePromotionGate fails on leakage sentinel violations', () => {
   assert.equal(evaluation.pass, false);
   assert.equal(evaluation.reasons.includes('7d:evaluated_before_target_2'), true);
   assert.equal(evaluation.reasons.includes('gate:7d:evaluated_before_target_2'), true);
+});
+
+test('evaluateEdgePromotionGate fails closed when the new statistical gates are absent', () => {
+  const evaluation = evaluateEdgePromotionGate({
+    as_of: '2026-02-21T00:00:00.000Z',
+    basis: 'legacy',
+    windows: [{
+      horizon: '7d',
+      sample_size: 100,
+      uplift_vs_baseline: 0.1,
+      uplift_ci95_low: 0.01,
+      uplift_ci95_high: 0.2,
+      leakage_sentinel: { pass: true, violation_count: 0, reasons: [] },
+    }],
+    promotion_gate: { pass: true, reasons: [] },
+  });
+
+  assert.equal(evaluation.pass, false);
+  assert.ok(evaluation.reasons.includes('gate:integrity_gate_missing'));
+  assert.ok(evaluation.reasons.includes('7d:performance_gate_missing'));
+  assert.ok(evaluation.reasons.includes('7d:evidence_gate_missing'));
+});
+
+test('shouldRecordResearchEvidence recognizes only an explicit true flag', () => {
+  assert.equal(shouldRecordResearchEvidence('true'), true);
+  assert.equal(shouldRecordResearchEvidence(' TRUE '), true);
+  assert.equal(shouldRecordResearchEvidence('false'), false);
+  assert.equal(shouldRecordResearchEvidence(undefined), false);
+});
+
+test('currentNewYorkDate keeps after-midnight UTC refreshes on the market date', () => {
+  assert.equal(currentNewYorkDate(new Date('2026-08-22T01:00:00.000Z')), '2026-08-21');
+  assert.equal(currentNewYorkDate(new Date('2026-08-22T15:00:00.000Z')), '2026-08-22');
+});
+
+test('isUsEquityTradingDay recognizes sessions, weekends, holidays, and invalid dates', () => {
+  assert.equal(isUsEquityTradingDay('2026-08-21'), true);
+  assert.equal(isUsEquityTradingDay('2026-08-22'), false);
+  assert.equal(isUsEquityTradingDay('2026-01-01'), false);
+  assert.equal(isUsEquityTradingDay('2026-04-03'), false);
+  assert.equal(isUsEquityTradingDay('2026-06-19'), false);
+  assert.equal(isUsEquityTradingDay('2026-07-03'), false);
+  assert.equal(isUsEquityTradingDay('2026-11-26'), false);
+  assert.equal(isUsEquityTradingDay('2026-12-25'), false);
+  assert.equal(isUsEquityTradingDay('2026-02-31'), false);
 });
 
 test('normalizeRecalculateResponse supports the current nested worker payload shape', () => {

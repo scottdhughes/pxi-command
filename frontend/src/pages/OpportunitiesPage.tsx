@@ -56,6 +56,7 @@ export function OpportunitiesPage({
     coherence_failed: Math.max(0, data?.coherence_suppressed_count || 0),
     quality_filtered: Math.max(0, data?.quality_filtered_count || 0),
     data_quality_suppressed: degradedReason === 'suppressed_data_quality' ? suppressedCount : 0,
+    edge_evidence_suppressed: degradedReason === 'edge_evidence_gate_failed' ? suppressedCount : 0,
   }
   const qualityFilterRate = Number.isFinite(data?.quality_filter_rate as number) ? Number(data?.quality_filter_rate) : 0
   const coherenceFailRate = Number.isFinite(data?.coherence_fail_rate as number) ? Number(data?.coherence_fail_rate) : 0
@@ -83,6 +84,17 @@ export function OpportunitiesPage({
   const hasQualityFilter = degradedReason === 'quality_filtered'
   const hasRefreshTtlSuppression = degradedReason === 'refresh_ttl_overdue' || degradedReason === 'refresh_ttl_unknown'
   const edgeWindow = edgeDiagnostics?.windows.find((window) => window.horizon === horizon) || edgeDiagnostics?.windows[0] || null
+  const edgeEvidencePass = edgeWindow?.evidence_gate?.pass === true
+    && edgeDiagnostics?.policy_alignment_gate?.pass === true
+    && edgeDiagnostics?.promotion_gate?.pass === true
+  const edgeEvidenceReasons = Array.from(new Set([
+    ...(edgeWindow?.evidence_gate?.reasons || ['prospective_evidence_gate_unavailable']),
+    ...(edgeDiagnostics?.policy_alignment_gate?.reasons || ['policy_alignment_gate_unavailable']),
+    ...(edgeDiagnostics?.promotion_gate?.reasons || []),
+  ]))
+  const edgeCoverage = Number.isFinite(edgeWindow?.weekday_coverage_ratio)
+    ? `${((edgeWindow?.weekday_coverage_ratio || 0) * 100).toFixed(0)}%`
+    : 'n/a'
   const [ctaLoggedKey, setCtaLoggedKey] = useState<string | null>(null)
   const currentCtaKey = data ? `${data.as_of}:${horizon}` : null
   const ctaLogged = currentCtaKey !== null && ctaLoggedKey === currentCtaKey
@@ -147,11 +159,11 @@ export function OpportunitiesPage({
             <div className="flex items-center justify-between gap-2">
               <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">Edge diagnostics</div>
               <span className={`rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${
-                edgeDiagnostics.promotion_gate.pass
+                edgeEvidencePass
                   ? 'border-[#00c896]/40 text-[#00c896]'
                   : 'border-[#f59e0b]/40 text-[#f59e0b]'
               }`}>
-                {edgeDiagnostics.promotion_gate.pass ? 'gate pass' : 'gate blocked'}
+                {edgeEvidencePass ? 'horizon pass' : 'horizon no-go'}
               </span>
             </div>
             <div className="mt-2 text-[10px] text-[#d7dbe1]">
@@ -164,6 +176,17 @@ export function OpportunitiesPage({
               {' '}{edgeWindow.uplift_ci95_high === null ? 'n/a' : `${(edgeWindow.uplift_ci95_high * 100).toFixed(2)}%`}] ·
               {' '}lower-bound {edgeWindow.lower_bound_positive ? '>0' : '<=0'}
             </div>
+            <div className="mt-1 text-[10px] text-[#949ba5]">
+              {edgeWindow.baseline_strategy === 'last_observable_actual_direction'
+                ? 'causal baseline: last observable outcome'
+                : 'legacy diagnostic: not promotion eligible'} · discordant pairs {edgeWindow.discordant_pairs ?? 0} ·
+              {' '}span {edgeWindow.calendar_span_days ?? 0}d · coverage {edgeCoverage}
+            </div>
+            {!edgeEvidencePass && (
+              <div className="mt-1 text-[10px] text-[#f59e0b]">
+                no-go: {edgeEvidenceReasons.join(', ')}
+              </div>
+            )}
             {!edgeWindow.leakage_sentinel.pass && (
               <div className="mt-1 text-[10px] text-[#f59e0b]">
                 leakage sentinel: {edgeWindow.leakage_sentinel.reasons.join(', ')}
@@ -271,6 +294,7 @@ export function OpportunitiesPage({
               coherence {suppressionByReason.coherence_failed} ({(coherenceFailRate * 100).toFixed(0)}%) ·
               {' '}quality {suppressionByReason.quality_filtered} ({(qualityFilterRate * 100).toFixed(0)}%) ·
               {' '}data-quality {suppressionByReason.data_quality_suppressed}
+              {' '}· edge-evidence {suppressionByReason.edge_evidence_suppressed}
             </div>
             {actionabilityReasonCodes.length > 0 && (
               <div className="text-[#949ba5]/60">

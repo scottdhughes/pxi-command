@@ -1,5 +1,6 @@
 export const RESEARCH_FEATURE_VERSION = 'pxi-feature-snapshot/v1';
 export const RESEARCH_STORAGE_CONTRACT = 'append-only-d1-research-snapshots/v1';
+export const DAILY_CLOSE_CANONICAL_SLOT = 'daily_close_22z';
 
 export interface ResearchSnapshotPxiInput {
   date: string;
@@ -28,11 +29,16 @@ export interface StoredResearchSnapshot {
   feature_version: string;
   storage_contract: string;
   capture_source: string;
+  canonical_slot: string | null;
   benchmark_close: number;
   benchmark_observation_date: string;
   features: Record<string, number>;
   feature_observation_dates: Record<string, string>;
   feature_sources: Record<string, string>;
+}
+
+export interface ResearchSnapshotCaptureOptions {
+  canonicalSlot?: typeof DAILY_CLOSE_CANONICAL_SLOT | null;
 }
 
 function safeFeatureName(prefix: string, rawName: string): string {
@@ -53,6 +59,28 @@ function addFeature(
   payload.feature_sources[name] = source;
 }
 
+function newYorkDateKey(value: string): string | null {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+  return year && month && day ? `${year}-${month}-${day}` : null;
+}
+
+export function isDailyCloseCanonicalWindow(value: string): boolean {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+  const utcHour = date.getUTCHours();
+  return utcHour >= 22 || utcHour <= 4;
+}
+
 export async function ensureResearchSnapshotSchema(db: D1Database): Promise<void> {
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS research_feature_snapshots (
@@ -63,10 +91,12 @@ export async function ensureResearchSnapshotSchema(db: D1Database): Promise<void
       feature_version TEXT NOT NULL,
       storage_contract TEXT NOT NULL,
       capture_source TEXT NOT NULL,
+      canonical_slot TEXT CHECK (canonical_slot IS NULL OR canonical_slot = 'daily_close_22z'),
       benchmark_close REAL NOT NULL,
       benchmark_observation_date TEXT NOT NULL,
       payload_json TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      CHECK (canonical_slot IS NULL OR benchmark_observation_date = decision_date)
     )
   `).run();
   await db.prepare(`
@@ -76,6 +106,16 @@ export async function ensureResearchSnapshotSchema(db: D1Database): Promise<void
   await db.prepare(`
     CREATE INDEX IF NOT EXISTS idx_research_feature_snapshots_available
     ON research_feature_snapshots(available_at DESC)
+  `).run();
+  await db.prepare(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_research_feature_snapshots_canonical_slot
+    ON research_feature_snapshots(
+      decision_date,
+      feature_version,
+      storage_contract,
+      canonical_slot
+    )
+    WHERE canonical_slot IS NOT NULL
   `).run();
   await db.prepare(`
     CREATE TRIGGER IF NOT EXISTS research_feature_snapshots_no_update
@@ -98,7 +138,10 @@ export async function captureResearchFeatureSnapshot(
   pxi: ResearchSnapshotPxiInput,
   captureSource: string,
   availableAt = new Date().toISOString(),
+  options: ResearchSnapshotCaptureOptions = {},
 ): Promise<StoredResearchSnapshot | null> {
+  const canonicalSlot = options.canonicalSlot ?? null;
+  if (canonicalSlot !== null && canonicalSlot !== DAILY_CLOSE_CANONICAL_SLOT) return null;
   await ensureResearchSnapshotSchema(db);
 
   const [indicatorResult, categoryResult] = await Promise.all([
@@ -132,6 +175,15 @@ export async function captureResearchFeatureSnapshot(
   if (!benchmark || !Number.isFinite(benchmark.value) || benchmark.value <= 0) {
     return null;
   }
+  if (canonicalSlot === DAILY_CLOSE_CANONICAL_SLOT && benchmark.observation_date !== pxi.date) {
+    return null;
+  }
+  if (canonicalSlot === DAILY_CLOSE_CANONICAL_SLOT && newYorkDateKey(availableAt) !== pxi.date) {
+    return null;
+  }
+  if (canonicalSlot === DAILY_CLOSE_CANONICAL_SLOT && !isDailyCloseCanonicalWindow(availableAt)) {
+    return null;
+  }
 
   const snapshotId = crypto.randomUUID();
   const payload: StoredResearchSnapshot = {
@@ -141,6 +193,7 @@ export async function captureResearchFeatureSnapshot(
     feature_version: RESEARCH_FEATURE_VERSION,
     storage_contract: RESEARCH_STORAGE_CONTRACT,
     capture_source: captureSource,
+    canonical_slot: canonicalSlot,
     benchmark_close: benchmark.value,
     benchmark_observation_date: benchmark.observation_date,
     features: {},
@@ -174,7 +227,7 @@ export async function captureResearchFeatureSnapshot(
     );
   }
 
-  await db.prepare(`
+  const insertSql = `
     INSERT INTO research_feature_snapshots (
       snapshot_id,
       decision_date,
@@ -182,21 +235,52 @@ export async function captureResearchFeatureSnapshot(
       feature_version,
       storage_contract,
       capture_source,
+      canonical_slot,
       benchmark_close,
       benchmark_observation_date,
       payload_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ${canonicalSlot === null ? '' : `
+      ON CONFLICT(decision_date, feature_version, storage_contract, canonical_slot)
+      WHERE canonical_slot IS NOT NULL
+      DO NOTHING
+    `}
+  `;
+  const insertResult = await db.prepare(insertSql).bind(
     snapshotId,
     pxi.date,
     availableAt,
     RESEARCH_FEATURE_VERSION,
     RESEARCH_STORAGE_CONTRACT,
     captureSource,
+    canonicalSlot,
     benchmark.value,
     benchmark.observation_date,
     JSON.stringify(payload),
   ).run();
+
+  if (canonicalSlot !== null && insertResult.meta?.changes === 0) {
+    const existing = await db.prepare(`
+      SELECT payload_json
+      FROM research_feature_snapshots
+      WHERE decision_date = ?
+        AND feature_version = ?
+        AND storage_contract = ?
+        AND canonical_slot = ?
+      LIMIT 1
+    `).bind(
+      pxi.date,
+      RESEARCH_FEATURE_VERSION,
+      RESEARCH_STORAGE_CONTRACT,
+      canonicalSlot,
+    ).first<{ payload_json: string }>();
+    if (!existing?.payload_json) return null;
+    try {
+      return JSON.parse(existing.payload_json) as StoredResearchSnapshot;
+    } catch {
+      return null;
+    }
+  }
 
   return payload;
 }

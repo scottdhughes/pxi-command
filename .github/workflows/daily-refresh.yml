@@ -10,8 +10,14 @@ on:
     - cron: '0 6 * * *'   # 6 AM UTC (1 AM ET) - overnight data
     - cron: '0 14 * * *'  # 2 PM UTC (9 AM ET) - pre-market
     - cron: '0 18 * * *'  # 6 PM UTC (1 PM ET) - mid-day
-    - cron: '0 22 * * *'  # 10 PM UTC (5 PM ET) - post-market
-  workflow_dispatch: # Allow manual trigger
+    - cron: '0 22 * * 1-5'  # 10 PM UTC - post-market weekdays (5 PM EST / 6 PM EDT)
+  workflow_dispatch:
+    inputs:
+      record_research_evidence:
+        description: 'Reserve today canonical post-close evidence slot (run only after the US close)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   refresh:
@@ -41,20 +47,65 @@ jobs:
           SLA_SUMMARY_PATH: /tmp/pxi-sla-summary.json
           STALE_TOP_OFFENDERS_PATH: /tmp/pxi-stale-top-offenders.json
           MARKET_SUMMARY_PATH: /tmp/pxi-market-summary.json
+          RESEARCH_CAPTURE_SUMMARY_PATH: /tmp/pxi-research-capture-summary.json
+          RESEARCH_EVIDENCE_CAPTURE: ${{ github.event.schedule == '0 22 * * 1-5' || inputs.record_research_evidence == true }}
         run: npm run cron:daily
 
       - name: Verify immutable research snapshot capture
+        if: ${{ github.event.schedule == '0 22 * * 1-5' || inputs.record_research_evidence == true }}
         env:
           WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
         run: |
           set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const path = '/tmp/pxi-research-capture-summary.json';
+          if (!fs.existsSync(path)) throw new Error('Research capture summary was not produced');
+          const summary = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const parts = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'America/New_York',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+          }).formatToParts(new Date());
+          const part = (type) => parts.find((entry) => entry.type === type)?.value;
+          const expectedDecisionDate = `${part('year')}-${part('month')}-${part('day')}`;
+          if (summary.requested !== true || summary.decision_date !== expectedDecisionDate) {
+            throw new Error(`Capture summary does not match requested New York date ${expectedDecisionDate}`);
+          }
+          if (summary.trading_day_expected === false) {
+            if (summary.evidence_status !== 'skipped_canonical_capture') {
+              throw new Error(`Unexpected evidence status on a known market closure: ${summary.evidence_status}`);
+            }
+            fs.writeFileSync('/tmp/pxi-known-market-closure', '1');
+            console.log(`Canonical capture correctly skipped for known US market closure ${expectedDecisionDate}`);
+          } else if (!['inserted', 'existing'].includes(summary.evidence_status)) {
+            throw new Error(`Canonical capture failed on expected trading day: ${summary.evidence_status}`);
+          }
+          NODE
+          if [[ -f /tmp/pxi-known-market-closure ]]; then
+            exit 0
+          fi
           python3 research/export_d1_snapshot.py --out /tmp/pxi-d1-research-snapshot.json
           node <<'NODE'
           const fs = require('node:fs');
 
           const payload = JSON.parse(fs.readFileSync('/tmp/pxi-d1-research-snapshot.json', 'utf8'));
+          const now = new Date();
+          const parts = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'America/New_York',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+          }).formatToParts(now);
+          const part = (type) => parts.find((entry) => entry.type === type)?.value;
+          const expectedDecisionDate = `${part('year')}-${part('month')}-${part('day')}`;
           if (payload.point_in_time_guarantee !== true) {
             throw new Error('Research export did not assert point-in-time safety');
+          }
+          if (payload.canonical_slot !== 'daily_close_22z') {
+            throw new Error('Research export is not bound to the canonical daily close slot');
           }
           if (!Array.isArray(payload.rows) || payload.rows.length < 1) {
             throw new Error('Research export contains no immutable decision snapshots');
@@ -65,6 +116,12 @@ jobs:
           const sourceNames = Object.keys(latest.feature_sources || {});
           if (latest.immutable_snapshot !== true || !latest.snapshot_id) {
             throw new Error('Latest research row is not marked immutable');
+          }
+          if (latest.canonical_slot !== 'daily_close_22z') {
+            throw new Error('Latest research row is not the canonical daily close vintage');
+          }
+          if (latest.decision_date !== expectedDecisionDate) {
+            throw new Error(`Canonical evidence stream did not capture ${expectedDecisionDate}; latest is ${latest.decision_date}`);
           }
           if (featureNames.length < 1 || featureNames.length !== observationNames.length || featureNames.length !== sourceNames.length) {
             throw new Error('Latest research row has incomplete feature provenance');

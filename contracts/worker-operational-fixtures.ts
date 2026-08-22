@@ -51,6 +51,9 @@ export const recalculateFixture = {
   },
   categories: 8,
   embedded: true,
+  research_snapshot_id: 'snapshot-2026-03-05',
+  evidence_predictions_recorded: 1,
+  evidence_status: 'inserted',
 } satisfies RecalculateResponsePayload;
 
 export const backfillFixture = {
@@ -187,9 +190,16 @@ export const refreshProductsFixture = {
   },
   edge_diagnostics: {
     as_of: '2026-03-05',
+    integrity_gate: { pass: true, reasons: [] },
+    performance_gate: { pass: true, reasons: [] },
+    evidence_gate: { pass: true, reasons: [] },
     promotion_gate: {
-      pass: true,
-      reasons: [],
+      pass: false,
+      reasons: ['policy_alignment:validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy'],
+    },
+    policy_alignment_gate: {
+      pass: false,
+      reasons: ['validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy'],
     },
     windows: [
       {
@@ -201,6 +211,9 @@ export const refreshProductsFixture = {
         uplift_ci95_low: 0.02,
         uplift_ci95_high: 0.16,
         lower_bound_positive: true,
+        hac_bandwidth_days: 20,
+        performance_gate: { pass: true, reasons: [] },
+        evidence_gate: { pass: true, reasons: [] },
         leakage_sentinel: {
           pass: true,
           violation_count: 0,
@@ -286,9 +299,16 @@ export const refreshProductsBlockedFixture = {
   },
   edge_diagnostics: {
     as_of: '2026-03-05',
+    integrity_gate: { pass: true, reasons: [] },
+    performance_gate: { pass: true, reasons: [] },
+    evidence_gate: { pass: true, reasons: [] },
     promotion_gate: {
-      pass: true,
-      reasons: [],
+      pass: false,
+      reasons: ['policy_alignment:validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy'],
+    },
+    policy_alignment_gate: {
+      pass: false,
+      reasons: ['validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy'],
     },
     windows: [
       {
@@ -300,6 +320,9 @@ export const refreshProductsBlockedFixture = {
         uplift_ci95_low: 0.02,
         uplift_ci95_high: 0.16,
         lower_bound_positive: true,
+        hac_bandwidth_days: 20,
+        performance_gate: { pass: true, reasons: [] },
+        evidence_gate: { pass: true, reasons: [] },
         leakage_sentinel: {
           pass: true,
           violation_count: 0,
@@ -372,6 +395,8 @@ export const sendDigestFixture = {
   fail_count: 1,
   bounce_count: 0,
   active_subscribers: 13,
+  edge_evidence_gate: { pass: false, reasons: ['insufficient_paired_sample'] },
+  opportunities_included: 0,
 } satisfies SendDigestResponsePayload;
 
 export const skippedDigestFixture = {

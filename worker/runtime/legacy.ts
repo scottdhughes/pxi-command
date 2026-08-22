@@ -21,6 +21,11 @@ import {
   constantTimeEquals as constantTimeCompare,
   enforceAdminAuth as enforceAdminRouteAuth,
 } from '../lib/security';
+import {
+  HISTORICAL_BACKFILL_SEED_MARKER,
+  isHistoricalBackfillOpportunitySnapshot,
+  parseProspectiveOpportunitySnapshot as parseProspectiveOpportunitySnapshotPayload,
+} from '../lib/opportunity-snapshot-history';
 import { ensureMarketProductSchema as ensureMarketProductSchemaGuard } from '../db/schema';
 import { tryHandleMarketCoreRoute } from '../domain/market-core';
 import {
@@ -1069,6 +1074,7 @@ type UtilityEventType =
 type PlanActionabilityReasonCode =
   | 'critical_data_quality_block'
   | 'consistency_fail_block'
+  | 'edge_evidence_gate_block'
   | 'opportunity_reference_unavailable'
   | 'no_eligible_opportunities'
   | 'high_edge_override_no_eligible'
@@ -1261,10 +1267,15 @@ interface OpportunitySnapshot {
   items: OpportunityItem[];
 }
 
+function parseProspectiveOpportunitySnapshot(raw: string | null | undefined): OpportunitySnapshot | null {
+  return parseProspectiveOpportunitySnapshotPayload<OpportunitySnapshot>(raw);
+}
+
 interface OpportunitySuppressionByReason {
   coherence_failed: number;
   quality_filtered: number;
   data_quality_suppressed: number;
+  edge_evidence_suppressed: number;
 }
 
 interface OpportunityTtlMetadata {
@@ -3590,14 +3601,23 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
   const consistency = buildConsistencySnapshot(policyState);
   return {
     as_of: asIsoDateTime(new Date()),
-    setup_summary: 'Plan service is in degraded mode. Use neutral sizing until full context is restored.',
+    setup_summary: 'Plan service is in degraded mode. Allocation is withheld until full context and prospective evidence are restored.',
     policy_state: policyState,
+    edge_evidence_gate: {
+      pass: false,
+      reasons: [`fallback_${reason}`],
+    },
     actionability_state: 'NO_ACTION',
-    actionability_reason_codes: ['fallback_degraded_mode', `opportunity_${reason}`],
+    actionability_reason_codes: [
+      'edge_evidence_gate_block',
+      'fallback_degraded_mode',
+      `opportunity_${reason}`,
+    ],
     action_now: {
-      risk_allocation_target: 0.5,
+      action_authorized: false,
+      risk_allocation_target: null,
       raw_signal_allocation_target: 0.5,
-      risk_allocation_basis: 'fallback_neutral',
+      risk_allocation_basis: 'withheld_edge_evidence',
       horizon_bias: '7d_neutral_30d_neutral',
       primary_signal: 'REDUCED_RISK',
     },
@@ -4411,9 +4431,10 @@ async function buildConvictionCalibrationSnapshot(
       SELECT as_of, payload_json
       FROM opportunity_snapshots
       WHERE horizon = ?
+        AND instr(payload_json, ?) = 0
       ORDER BY as_of DESC
       LIMIT 730
-    `).bind(horizon).all<{ as_of: string; payload_json: string }>(),
+    `).bind(horizon, HISTORICAL_BACKFILL_SEED_MARKER).all<{ as_of: string; payload_json: string }>(),
     db.prepare(`
       SELECT date, value
       FROM indicator_values
@@ -4440,12 +4461,7 @@ async function buildConvictionCalibrationSnapshot(
 
   const byBin = new Map<string, { correct: number; total: number }>();
   for (const row of snapshots.results || []) {
-    let payload: OpportunitySnapshot | null = null;
-    try {
-      payload = JSON.parse(row.payload_json) as OpportunitySnapshot;
-    } catch {
-      payload = null;
-    }
+    const payload = parseProspectiveOpportunitySnapshot(row.payload_json);
     if (!payload?.items || payload.items.length === 0) continue;
 
     const asOfDate = (payload.as_of || row.as_of).slice(0, 10);
@@ -4628,9 +4644,10 @@ async function computeOpportunityOutcomeHistory(
       SELECT as_of, payload_json
       FROM opportunity_snapshots
       WHERE horizon = ?
+        AND instr(payload_json, ?) = 0
       ORDER BY as_of DESC
       LIMIT 730
-    `).bind(horizon).all<{ as_of: string; payload_json: string }>(),
+    `).bind(horizon, HISTORICAL_BACKFILL_SEED_MARKER).all<{ as_of: string; payload_json: string }>(),
     db.prepare(`
       SELECT date, value
       FROM indicator_values
@@ -4661,12 +4678,7 @@ async function computeOpportunityOutcomeHistory(
   };
 
   for (const row of snapshots.results || []) {
-    let payload: OpportunitySnapshot | null = null;
-    try {
-      payload = JSON.parse(row.payload_json) as OpportunitySnapshot;
-    } catch {
-      payload = null;
-    }
+    const payload = parseProspectiveOpportunitySnapshot(row.payload_json);
     if (!payload?.items || payload.items.length === 0) continue;
 
     const asOfDate = (payload.as_of || row.as_of).slice(0, 10);
@@ -4793,18 +4805,14 @@ function evaluateOpportunityCoherence(item: OpportunityItem): OpportunityEligibi
     failed.add('neutral_direction_not_actionable');
   }
 
-  if (calibrationProbability === null) {
-    if (item.calibration.quality !== 'INSUFFICIENT') {
-      failed.add('incomplete_contract');
-    }
+  if (calibrationProbability === null || item.calibration.quality === 'INSUFFICIENT') {
+    failed.add('incomplete_contract');
   } else if (calibrationProbability < OPPORTUNITY_COHERENCE_MIN_PROBABILITY) {
     failed.add('calibration_probability_below_threshold');
   }
 
-  if (expectedMove === null) {
-    if (item.expectancy.quality !== 'INSUFFICIENT') {
-      failed.add('incomplete_contract');
-    }
+  if (expectedMove === null || item.expectancy.quality === 'INSUFFICIENT') {
+    failed.add('incomplete_contract');
   } else if (item.direction === 'bullish' && expectedMove <= 0) {
     failed.add('expectancy_sign_conflict');
   } else if (item.direction === 'bearish' && expectedMove >= 0) {
@@ -4919,6 +4927,7 @@ function projectOpportunityFeed(
     coherence_failed: coherenceFiltered.suppressed_count,
     quality_filtered: qualityFiltered.filtered_count,
     data_quality_suppressed: dataQualitySuppressedCount,
+    edge_evidence_suppressed: 0,
   };
   const qualityFilterRate = totalCandidates > 0
     ? Number((qualityFiltered.filtered_count / totalCandidates).toFixed(4))
@@ -4968,12 +4977,17 @@ function resolvePlanActionability(args: {
   edge_quality: EdgeQualitySnapshot;
   freshness: FreshnessStatus;
   consistency: ConsistencySnapshot;
+  edge_evidence_gate?: { pass: boolean };
 }): {
   state: PlanActionabilityState;
   reason_codes: PlanActionabilityReasonCode[];
 } {
   const reasonCodes: PlanActionabilityReasonCode[] = [];
 
+  if (args.edge_evidence_gate?.pass !== true) {
+    reasonCodes.push('edge_evidence_gate_block');
+    return { state: 'NO_ACTION', reason_codes: reasonCodes };
+  }
   if (args.freshness.critical_stale_count > 0) {
     reasonCodes.push('critical_data_quality_block');
     return { state: 'NO_ACTION', reason_codes: reasonCodes };
@@ -5580,17 +5594,16 @@ async function generateMarketEvents(
       SELECT payload_json
       FROM opportunity_snapshots
       WHERE horizon = ?
+        AND instr(payload_json, ?) = 0
       ORDER BY as_of DESC
       LIMIT 1 OFFSET 1
-    `).bind(opportunities.horizon).first<{ payload_json: string }>();
+    `).bind(opportunities.horizon, HISTORICAL_BACKFILL_SEED_MARKER).first<{ payload_json: string }>();
 
     let previousTopConviction: number | null = null;
     if (previousSnapshot?.payload_json) {
-      try {
-        const previousPayload = JSON.parse(previousSnapshot.payload_json) as OpportunitySnapshot;
+      const previousPayload = parseProspectiveOpportunitySnapshot(previousSnapshot.payload_json);
+      if (previousPayload) {
         previousTopConviction = previousPayload.items?.[0]?.conviction_score ?? null;
-      } catch {
-        previousTopConviction = null;
       }
     }
 
@@ -7263,11 +7276,13 @@ async function fetchLatestMarketProductSnapshotWrite(db: D1Database): Promise<st
       FROM (
         SELECT created_at FROM market_brief_snapshots
         UNION ALL
-        SELECT created_at FROM opportunity_snapshots
+        SELECT created_at
+        FROM opportunity_snapshots
+        WHERE instr(payload_json, ?) = 0
         UNION ALL
         SELECT created_at FROM market_calibration_snapshots
       )
-    `).first<{ latest_created_at: string | null }>();
+    `).bind(HISTORICAL_BACKFILL_SEED_MARKER).first<{ latest_created_at: string | null }>();
     return row?.latest_created_at || null;
   } catch {
     return null;
@@ -7601,7 +7616,8 @@ async function calculatePXI(db: D1Database, targetDate: string): Promise<{
   const historyResult = await db.prepare(`
     SELECT indicator_id, value FROM indicator_values
     WHERE date >= date(?, '-5 years')
-  `).bind(targetDate).all<{ indicator_id: string; value: number }>();
+      AND date <= ?
+  `).bind(targetDate, targetDate).all<{ indicator_id: string; value: number }>();
 
   const historyMap = new Map<string, number[]>();
   for (const row of historyResult.results || []) {
@@ -8571,7 +8587,7 @@ async function detectDivergence(
       severity: 'HIGH',
       title: 'Stealth Weakness',
       description: `PXI at ${currentPxi.toFixed(0)} signals weakness, but VIX at ${vixValue?.toFixed(1)} shows no fear. Unusual - watch for delayed volatility spike.`,
-      actionable: true,
+      actionable: false,
       metrics: stealthMetrics,
     });
   }
@@ -8583,7 +8599,7 @@ async function detectDivergence(
       severity: 'MEDIUM',
       title: 'Resilient Strength',
       description: `PXI at ${currentPxi.toFixed(0)} shows strength despite VIX at ${vixValue?.toFixed(1)}. Market shrugging off fear - potentially bullish.`,
-      actionable: true,
+      actionable: false,
       metrics: resilientMetrics,
     });
   }
@@ -8595,7 +8611,7 @@ async function detectDivergence(
       severity: 'MEDIUM',
       title: 'Regime Divergence',
       description: `Regime signals RISK_OFF but PXI at ${currentPxi.toFixed(0)} remains elevated. Conflicting signals - proceed with caution.`,
-      actionable: true,
+      actionable: false,
     });
   }
 
@@ -8606,7 +8622,7 @@ async function detectDivergence(
       severity: 'HIGH',
       title: 'Hidden Risk',
       description: `Regime appears RISK_ON but PXI at ${currentPxi.toFixed(0)} shows underlying weakness. Structure looks OK but something's off.`,
-      actionable: true,
+      actionable: false,
       metrics: hiddenRiskMetrics,
     });
   }
@@ -8637,7 +8653,7 @@ async function detectDivergence(
           severity: 'HIGH',
           title: 'Rapid Deterioration',
           description: `PXI dropped ${Math.abs(weekChange).toFixed(0)} points in 7 days but regime still shows RISK_ON. Leading indicator of regime change?`,
-          actionable: true,
+          actionable: false,
           metrics: rapidDetMetrics,
         });
       }
@@ -8649,7 +8665,7 @@ async function detectDivergence(
           severity: 'MEDIUM',
           title: 'Potential Regime Shift',
           description: `PXI rose ${weekChange.toFixed(0)} points in 7 days despite RISK_OFF regime. Early signs of improvement.`,
-          actionable: true,
+          actionable: false,
         });
       }
     }
@@ -9945,12 +9961,17 @@ export default {
             SELECT horizon, as_of, payload_json
             FROM opportunity_snapshots
             WHERE horizon IN ('7d', '30d')
+              AND instr(payload_json, ?) = 0
               AND as_of = (
                 SELECT MAX(s2.as_of)
                 FROM opportunity_snapshots s2
                 WHERE s2.horizon = opportunity_snapshots.horizon
+                  AND instr(s2.payload_json, ?) = 0
               )
-          `).all<{ horizon: '7d' | '30d'; as_of: string; payload_json: string }>();
+          `).bind(
+            HISTORICAL_BACKFILL_SEED_MARKER,
+            HISTORICAL_BACKFILL_SEED_MARKER,
+          ).all<{ horizon: '7d' | '30d'; as_of: string; payload_json: string }>();
 
           const coherenceGateEnabled = isFeatureEnabled(
             env,
@@ -9963,7 +9984,7 @@ export default {
 
           for (const row of opportunityRows.results || []) {
             try {
-              const opportunitySnapshot = JSON.parse(row.payload_json) as OpportunitySnapshot;
+              const opportunitySnapshot = parseProspectiveOpportunitySnapshot(row.payload_json);
               if (
                 !opportunitySnapshot ||
                 (opportunitySnapshot.horizon !== '7d' && opportunitySnapshot.horizon !== '30d') ||
@@ -13736,6 +13757,7 @@ export {
   hashToken,
   isChronicStaleness,
   isFeatureEnabled,
+  isHistoricalBackfillOpportunitySnapshot,
   latestDateInSeries,
   loadLSTMModel,
   loadMLModel,

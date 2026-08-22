@@ -50,6 +50,10 @@ describe("report rendering", () => {
     expect(html).toContain("Signal Distribution")
     expect(html).toContain("Key Takeaways")
     expect(html).toContain("Not investment advice.")
+    expect(html).toContain("Research Timing Flags — Not Actionable")
+    expect(html).toContain("Research-only observation layer")
+    expect(html).not.toContain("Ready to act")
+    expect(html).not.toContain("Top 10 Opportunities")
     expect(html).toContain("Top Signal")
     for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
       expect(html).toContain(`href="${href}"`)
@@ -57,11 +61,17 @@ describe("report rendering", () => {
   })
 
   it("upgrades navigation in stored report snapshots", () => {
-    const legacy = `<html><head></head><body><div class="nav-dropdown-menu"><a href="/">/</a><a href="/spec">/SPEC</a><a href="/signals">/SIGNALS</a></div></body></html>`
+    const legacy = `<html><head></head><body><div class="nav-dropdown-menu"><a href="/">/</a><a href="/spec">/SPEC</a><a href="/signals">/SIGNALS</a></div><header></header><!-- Summary Dashboard --><div class="takeaway-title">Actionable Signals</div><span class="section-title">Top 8 Opportunities</span><div class="stat-label">"Now" Signals</div><div class="stat-sub">Ready to act</div></body></html>`
     const upgraded = upgradeStoredReportNavigation(legacy)
     for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
       expect(upgraded).toContain(`href="${href}"`)
     }
     expect(upgraded).toContain(".nav-dropdown-menu{width:224px")
+    expect(upgraded).toContain("Research Timing Flags — Not Actionable")
+    expect(upgraded).toContain("Top 8 Observed Themes")
+    expect(upgraded).toContain('"Now" Activity Flags')
+    expect(upgraded).toContain("Research only")
+    expect(upgraded).toContain("Research-only observation layer")
+    expect(upgraded).not.toContain("Ready to act")
   })
 })

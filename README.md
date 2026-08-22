@@ -145,7 +145,7 @@ pxi-command/
 | `/api/opportunities` | GET | Ranked opportunities for `7d` or `30d` horizon with calibration + expectancy + unavailable reasons |
 | `/api/decision-impact` | GET | Outcome attribution using matured opportunity ledger rows (market uses SPY forward proxy; theme uses proxy blend with SPY fallback, 30/90d windows) |
 | `/api/diagnostics/calibration` | GET | Calibration diagnostics (Brier/ECE/log loss + quality band) for conviction and edge-quality snapshots |
-| `/api/diagnostics/edge` | GET | Forward-chaining edge evidence (model vs lagged baseline uplift, CI, leakage sentinel, promotion gate) |
+| `/api/diagnostics/edge` | GET | Prospective point-in-time edge evidence (causal baseline, paired calendar-time HAC intervals, integrity/performance/promotion gates) |
 | `/api/alerts/feed` | GET | In-app alert timeline (`regime_change`, `threshold_cross`, `opportunity_spike`, `freshness_warning`) |
 | `/api/alerts/subscribe/start` | POST | Start email digest subscription with verification token |
 | `/api/alerts/subscribe/verify` | POST | Verify subscription token and activate email digest |
@@ -283,8 +283,12 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
 
 5. **Edge-proof diagnostics + promotion gate**
 - New endpoint: `GET /api/diagnostics/edge`
-- Reports forward-chaining directional uplift vs lagged baseline, CI bounds, and leakage sentinel health per horizon.
-- `/api/market/refresh-products` now fails closed when leakage sentinel checks fail, blocking publish/promotion.
+- Records at most one immutable canonical `daily_close_22z` feature snapshot and frozen-model forecast per New York decision date. Existing intraday research snapshots remain noncanonical and are never retroactively promoted.
+- Trains only from outcomes already observed in earlier rows of that same prospective ledger. Initial zero-sample forecasts are explicit warmups and contribute no evidence.
+- Reports strictly causal model-vs-last-observable baselines with paired calendar-time Bartlett/Newey-West intervals, sample/span/discordance/weekday/freshness requirements, signed-return uplift after costs, and provenance/leakage checks per horizon. A finite 5,000-look Bonferroni budget conservatively controls repeated promotion checks under the stated asymptotic HAC normal approximation; it is explicitly not represented as a finite-sample coverage guarantee.
+- `/api/opportunities`, `/api/plan`, publication-ledger writes, and opportunity alerts independently fail closed unless the selected horizon passes integrity, eligibility, and performance gates. Descriptive PXI refreshes continue while promotion is blocked.
+- Promotion is intentionally `NO-GO` until this validated SPY forecast is prospectively bound to the exact plan sizing and theme-selection policy; statistical edge in the diagnostic model alone cannot authorize an action.
+- The legacy XGBoost/LSTM card and `/api/ml/accuracy` are research-only and do not authorize actionable publication.
 
 6. **Decision-stack unification + cross-horizon coherence**
 - `/api/plan` now includes additive `decision_stack` and `cross_horizon` blocks.
@@ -349,7 +353,7 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
   - `DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS=10`
 - Theme attribution basis upgraded from pure SPY proxy to theme proxy blend (credit/vol/global/crypto mappings) with explicit SPY fallback when proxy coverage is unavailable.
 - Utility funnel CTA denominator now uses actionable sessions including CTA-click sessions (not only explicit actionable-view events) to reduce denominator undercount.
-- `POST /api/market/backfill-products` can now rebuild opportunity ledgers and regenerate decision-impact snapshots from historical opportunity snapshots (`rebuild_ledgers`, default `true`).
+- `POST /api/market/backfill-products` can explicitly rebuild historical ledgers (`rebuild_ledgers`, default `false`), but every rebuilt row is marked `historical_backfill_nonprospective`, remains unpublished, and is excluded from decision-impact evidence.
 
 13. **Go-live readiness + maturity-window correction (Phase 7)**
 - Decision-impact sampling now uses maturity-window semantics (outcome date in-window) instead of raw `as_of` filtering, so 30d attribution no longer collapses to zero in a 30d window.

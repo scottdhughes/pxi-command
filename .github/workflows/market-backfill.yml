@@ -31,6 +31,10 @@ on:
         description: "Recompute calibration snapshots"
         required: false
         default: "true"
+      rebuild_ledgers:
+        description: "Rebuild historical ledgers as explicitly non-prospective (never published)"
+        required: false
+        default: "false"
 
 jobs:
   backfill:
@@ -46,6 +50,7 @@ jobs:
       INPUT_OVERWRITE: ${{ github.event.inputs.overwrite }}
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
       INPUT_RECALIBRATE: ${{ github.event.inputs.recalibrate }}
+      INPUT_REBUILD_LEDGERS: ${{ github.event.inputs.rebuild_ledgers }}
     steps:
       - name: Build request payload
         run: |
@@ -57,12 +62,14 @@ jobs:
             --argjson overwrite "${INPUT_OVERWRITE}" \
             --argjson dry_run "${INPUT_DRY_RUN}" \
             --argjson recalibrate "${INPUT_RECALIBRATE}" \
+            --argjson rebuild_ledgers "${INPUT_REBUILD_LEDGERS}" \
             '
             {
               limit: $limit,
               overwrite: $overwrite,
               dry_run: $dry_run,
-              recalibrate: $recalibrate
+              recalibrate: $recalibrate,
+              rebuild_ledgers: $rebuild_ledgers
             }
             + (if ($start | length) > 0 then {start: $start} else {} end)
             + (if ($end | length) > 0 then {end: $end} else {} end)

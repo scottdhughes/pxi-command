@@ -147,6 +147,7 @@ export interface OpportunitySuppressionByReason {
   coherence_failed: number
   quality_filtered: number
   data_quality_suppressed: number
+  edge_evidence_suppressed: number
 }
 
 export interface OpportunitiesResponse {
@@ -162,6 +163,10 @@ export interface OpportunitiesResponse {
   coherence_fail_rate?: number
   actionability_state?: PlanActionabilityState
   actionability_reason_codes?: string[]
+  edge_evidence_gate?: {
+    pass: boolean
+    reasons: string[]
+  }
   cta_enabled?: boolean
   cta_disabled_reasons?: string[]
   data_age_seconds?: number | null
@@ -283,6 +288,21 @@ export interface CalibrationDiagnosticsResponse {
 export interface EdgeDiagnosticsResponse {
   as_of: string
   basis: string
+  model_version: string
+  method: 'paired_calendar_bartlett_newey_west'
+  inference_control: {
+    strategy: 'finite_horizon_bonferroni'
+    familywise_confidence_level: 0.95
+    maximum_unique_looks: 5000
+    simultaneous_comparisons_per_look: 4
+    critical_value: 5
+    coverage_basis: 'asymptotic_hac_normal_approximation'
+    finite_sample_guarantee: false
+  }
+  policy_alignment_gate: {
+    pass: boolean
+    reasons: string[]
+  }
   windows: Array<{
     horizon: '7d' | '30d'
     as_of: string | null
@@ -295,7 +315,49 @@ export interface EdgeDiagnosticsResponse {
     lower_bound_positive: boolean
     minimum_reliable_sample: number
     quality_band: CalibrationQuality
-    baseline_strategy: 'lagged_actual_direction'
+    baseline_strategy: 'last_observable_actual_direction'
+    model_version: string
+    horizon_days: number
+    hac_bandwidth_days: number
+    discordant_pairs: number
+    calendar_span_days: number
+    weekday_coverage_ratio: number
+    latest_prediction_date: string | null
+    latest_prediction_age_days: number | null
+    latest_evaluated_target_date: string | null
+    latest_actual_observation_date: string | null
+    latest_actual_observation_age_days: number | null
+    signed_return_after_cost_pct: {
+      method: 'paired_calendar_bartlett_newey_west'
+      bandwidth_days: number
+      confidence_level: 0.95
+      sample_size: number
+      mean: number | null
+      standard_error: number | null
+      ci95_low: number | null
+      ci95_high: number | null
+      lower_bound_positive: boolean
+      unavailable_reasons: string[]
+      model_mean: number | null
+      baseline_mean: number | null
+      uplift: number | null
+    }
+    integrity_gate: {
+      pass: boolean
+      reasons: string[]
+    }
+    eligibility_gate: {
+      pass: boolean
+      reasons: string[]
+    }
+    performance_gate: {
+      pass: boolean
+      reasons: string[]
+    }
+    evidence_gate: {
+      pass: boolean
+      reasons: string[]
+    }
     leakage_sentinel: {
       pass: boolean
       violation_count: number
@@ -303,6 +365,18 @@ export interface EdgeDiagnosticsResponse {
     }
     calibration_diagnostics: CalibrationDiagnosticsResponse['diagnostics']
   }>
+  integrity_gate: {
+    pass: boolean
+    reasons: string[]
+  }
+  performance_gate: {
+    pass: boolean
+    reasons: string[]
+  }
+  evidence_gate: {
+    pass: boolean
+    reasons: string[]
+  }
   promotion_gate: {
     pass: boolean
     reasons: string[]
@@ -332,10 +406,19 @@ export interface PlanData {
   actionability_state?: PlanActionabilityState
   actionability_reason_codes?: string[]
   policy_state?: PolicyStateContract
+  edge_evidence_gate?: {
+    pass: boolean
+    reasons: string[]
+  }
   action_now: {
-    risk_allocation_target: number
+    action_authorized?: boolean
+    risk_allocation_target: number | null
     raw_signal_allocation_target: number
-    risk_allocation_basis: 'penalized_playbook_target' | 'fallback_neutral'
+    risk_allocation_basis:
+      | 'penalized_playbook_target'
+      | 'fallback_neutral'
+      | 'withheld_edge_evidence'
+      | 'withheld_actionability'
     horizon_bias: string
     primary_signal: SignalType | string
   }
@@ -523,7 +606,13 @@ export interface SignalData {
   }
   signal: {
     type: SignalType
-    risk_allocation: number
+    action_authorized: boolean
+    risk_allocation: number | null
+    raw_risk_allocation: number
+    evidence_gate: {
+      pass: boolean
+      reasons: string[]
+    }
     volatility_percentile: number | null
     category_dispersion: number
     adjustments: string[]

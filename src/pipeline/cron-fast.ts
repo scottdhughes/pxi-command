@@ -30,6 +30,8 @@ const FRED_API_KEY = process.env.FRED_API_KEY ?? '';
 const SLA_SUMMARY_PATH = process.env.SLA_SUMMARY_PATH ?? '/tmp/pxi-sla-summary.json';
 const STALE_TOP_OFFENDERS_PATH = process.env.STALE_TOP_OFFENDERS_PATH ?? '/tmp/pxi-stale-top-offenders.json';
 const MARKET_SUMMARY_PATH = process.env.MARKET_SUMMARY_PATH ?? '/tmp/pxi-market-summary.json';
+const RESEARCH_CAPTURE_SUMMARY_PATH = process.env.RESEARCH_CAPTURE_SUMMARY_PATH
+  ?? '/tmp/pxi-research-capture-summary.json';
 
 interface IndicatorValue {
   indicator_id: string;
@@ -106,6 +108,9 @@ interface RecalculateResponsePayload {
     score?: number;
     label?: string;
   };
+  research_snapshot_id?: string | null;
+  evidence_predictions_recorded?: number;
+  evidence_status?: 'inserted' | 'existing' | 'skipped_canonical_capture' | 'not_requested';
 }
 
 interface EdgeDiagnosticsWindow {
@@ -119,12 +124,24 @@ interface EdgeDiagnosticsWindow {
     violation_count: number;
     reasons: string[];
   };
+  performance_gate?: {
+    pass: boolean;
+    reasons: string[];
+  };
+  evidence_gate?: {
+    pass: boolean;
+    reasons: string[];
+  };
 }
 
 interface EdgeDiagnosticsReport {
   as_of: string;
   basis: string;
   windows: EdgeDiagnosticsWindow[];
+  integrity_gate?: {
+    pass: boolean;
+    reasons: string[];
+  };
   promotion_gate?: {
     pass: boolean;
     reasons: string[];
@@ -349,6 +366,16 @@ export function evaluateEdgePromotionGate(report: EdgeDiagnosticsReport | null |
   }
 
   const reasons: string[] = [];
+  if (!report.integrity_gate) {
+    reasons.push('gate:integrity_gate_missing');
+  } else if (!report.integrity_gate.pass) {
+    const integrityReasons = Array.isArray(report.integrity_gate.reasons)
+      ? report.integrity_gate.reasons
+      : [];
+    reasons.push(...(integrityReasons.length > 0
+      ? integrityReasons.map((reason) => `integrity:${reason}`)
+      : ['integrity:integrity_gate_failed']));
+  }
   for (const window of report.windows) {
     const leakage = window?.leakage_sentinel;
     if (!leakage) {
@@ -363,6 +390,26 @@ export function evaluateEdgePromotionGate(report: EdgeDiagnosticsReport | null |
       } else {
         reasons.push(`${window.horizon}:leakage_sentinel_failed`);
       }
+    }
+    if (!window.performance_gate) {
+      reasons.push(`${window.horizon}:performance_gate_missing`);
+    } else if (!window.performance_gate.pass) {
+      const performanceReasons = Array.isArray(window.performance_gate.reasons)
+        ? window.performance_gate.reasons
+        : [];
+      reasons.push(...(performanceReasons.length > 0
+        ? performanceReasons.map((reason) => `${window.horizon}:${reason}`)
+        : [`${window.horizon}:performance_gate_failed`]));
+    }
+    if (!window.evidence_gate) {
+      reasons.push(`${window.horizon}:evidence_gate_missing`);
+    } else if (!window.evidence_gate.pass) {
+      const evidenceReasons = Array.isArray(window.evidence_gate.reasons)
+        ? window.evidence_gate.reasons
+        : [];
+      reasons.push(...(evidenceReasons.length > 0
+        ? evidenceReasons.map((reason) => `${window.horizon}:${reason}`)
+        : [`${window.horizon}:evidence_gate_failed`]));
     }
   }
 
@@ -383,7 +430,13 @@ export function evaluateEdgePromotionGate(report: EdgeDiagnosticsReport | null |
 
 export function normalizeRecalculateResponse(
   payload: RecalculateResponsePayload,
-): { score: number; label: string; categories: number; embedded: boolean } {
+): {
+  score: number;
+  label: string;
+  categories: number;
+  embedded: boolean;
+  evidenceStatus: string;
+} {
   const rawScore = payload.pxi?.score ?? payload.score;
   const label = payload.pxi?.label ?? payload.label;
   const categories = Number(payload.categories ?? 0);
@@ -400,6 +453,7 @@ export function normalizeRecalculateResponse(
     label,
     categories,
     embedded,
+    evidenceStatus: payload.evidence_status || 'not_requested',
   };
 }
 
@@ -1619,20 +1673,122 @@ async function postToWorkerAPI(): Promise<void> {
   }
 }
 
+export function shouldRecordResearchEvidence(raw = process.env.RESEARCH_EVIDENCE_CAPTURE): boolean {
+  return raw?.trim().toLowerCase() === 'true';
+}
+
+export function currentNewYorkDate(now = new Date()): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now);
+  const value = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value;
+  return `${value('year')}-${value('month')}-${value('day')}`;
+}
+
+function parseIsoCalendarDate(dateKey: string): { year: number; month: number; day: number; weekday: number } | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year
+    || date.getUTCMonth() !== month - 1
+    || date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return { year, month, day, weekday: date.getUTCDay() };
+}
+
+function isoDate(year: number, monthIndex: number, day: number): string {
+  return new Date(Date.UTC(year, monthIndex, day)).toISOString().slice(0, 10);
+}
+
+function observedFixedHoliday(year: number, monthIndex: number, day: number): string {
+  const date = new Date(Date.UTC(year, monthIndex, day));
+  const weekday = date.getUTCDay();
+  if (weekday === 6) date.setUTCDate(date.getUTCDate() - 1);
+  if (weekday === 0) date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
+function nthWeekdayOfMonth(year: number, monthIndex: number, weekday: number, occurrence: number): string {
+  const first = new Date(Date.UTC(year, monthIndex, 1));
+  const offset = (weekday - first.getUTCDay() + 7) % 7;
+  return isoDate(year, monthIndex, 1 + offset + (occurrence - 1) * 7);
+}
+
+function lastWeekdayOfMonth(year: number, monthIndex: number, weekday: number): string {
+  const last = new Date(Date.UTC(year, monthIndex + 1, 0));
+  const offset = (last.getUTCDay() - weekday + 7) % 7;
+  return isoDate(year, monthIndex, last.getUTCDate() - offset);
+}
+
+function goodFriday(year: number): string {
+  // Meeus/Jones/Butcher Gregorian computus, followed by a two-day UTC offset.
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  const easter = new Date(Date.UTC(year, month - 1, day));
+  easter.setUTCDate(easter.getUTCDate() - 2);
+  return easter.toISOString().slice(0, 10);
+}
+
+/** Deterministic full-day NYSE holiday calendar for the evidence-capture gate. */
+export function isUsEquityTradingDay(dateKey: string): boolean {
+  const parsed = parseIsoCalendarDate(dateKey);
+  if (!parsed || parsed.weekday === 0 || parsed.weekday === 6) return false;
+
+  const { year } = parsed;
+  const holidays = new Set<string>([
+    observedFixedHoliday(year, 0, 1),
+    // A Saturday New Year's Day is observed on December 31 of the prior year.
+    observedFixedHoliday(year + 1, 0, 1),
+    nthWeekdayOfMonth(year, 0, 1, 3),
+    nthWeekdayOfMonth(year, 1, 1, 3),
+    goodFriday(year),
+    lastWeekdayOfMonth(year, 4, 1),
+    observedFixedHoliday(year, 6, 4),
+    nthWeekdayOfMonth(year, 8, 1, 1),
+    nthWeekdayOfMonth(year, 10, 4, 4),
+    observedFixedHoliday(year, 11, 25),
+  ]);
+  if (year >= 2022) holidays.add(observedFixedHoliday(year, 5, 19));
+  return !holidays.has(dateKey);
+}
+
 async function triggerRecalculation(): Promise<void> {
   const { writeApiKey, baseUrl } = getWriteConfig();
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = currentNewYorkDate();
   console.log('\n━━━ Recalculating PXI ━━━');
   console.log(`  Date: ${today}`);
 
+  const recordEvidence = shouldRecordResearchEvidence();
   const response = await fetch(`${baseUrl}/api/recalculate`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${writeApiKey}`,
     },
-    body: JSON.stringify({ date: today }),
+    body: JSON.stringify({ date: today, record_evidence: recordEvidence }),
   });
 
   if (!response.ok) {
@@ -1641,10 +1797,28 @@ async function triggerRecalculation(): Promise<void> {
   }
 
   const result = normalizeRecalculateResponse((await response.json()) as RecalculateResponsePayload);
+  const tradingDayExpected = isUsEquityTradingDay(today);
+  await writeFile(RESEARCH_CAPTURE_SUMMARY_PATH, JSON.stringify({
+    requested: recordEvidence,
+    decision_date: today,
+    trading_day_expected: tradingDayExpected,
+    evidence_status: result.evidenceStatus,
+  }, null, 2));
 
   console.log(`  ✓ PXI: ${result.score.toFixed(1)} (${result.label})`);
   console.log(`  ✓ Categories: ${result.categories}`);
   console.log(`  ✓ Embedding: ${result.embedded ? 'generated' : 'skipped'}`);
+  console.log(`  ✓ Canonical evidence capture: ${recordEvidence ? 'requested' : 'not scheduled for this run'}`);
+  if (recordEvidence) {
+    if (result.evidenceStatus !== 'inserted' && result.evidenceStatus !== 'existing') {
+      if (!tradingDayExpected && result.evidenceStatus === 'skipped_canonical_capture') {
+        console.warn(`  ⚠ Canonical evidence capture skipped for known US market closure: ${today}`);
+        return;
+      }
+      throw new Error(`Canonical evidence capture failed closed: ${result.evidenceStatus}`);
+    }
+    console.log(`  ✓ Evidence status: ${result.evidenceStatus}`);
+  }
 }
 
 async function evaluatePredictions(): Promise<void> {
@@ -1665,9 +1839,26 @@ async function evaluatePredictions(): Promise<void> {
     throw new Error(`Evaluate error ${response.status}: ${errorText}`);
   }
 
-  const result = (await response.json()) as { pending: number; evaluated: number };
+  const result = (await response.json()) as {
+    pending: number;
+    evaluated: number;
+    market_evidence?: {
+      pending: number;
+      evaluated_7d: number;
+      evaluated_30d: number;
+      completed: number;
+      skipped_reason: string | null;
+    };
+  };
   console.log(`  ✓ Pending predictions: ${result.pending}`);
   console.log(`  ✓ Evaluated: ${result.evaluated}`);
+  if (result.market_evidence?.skipped_reason) {
+    console.log(`  • Prospective market evidence: skipped (${result.market_evidence.skipped_reason})`);
+  } else if (result.market_evidence) {
+    console.log(
+      `  ✓ Prospective evidence outcomes: 7d=${result.market_evidence.evaluated_7d}, 30d=${result.market_evidence.evaluated_30d}, completed=${result.market_evidence.completed}`,
+    );
+  }
 }
 
 async function enforceEdgePromotionGate(): Promise<void> {
@@ -1697,7 +1888,8 @@ async function enforceEdgePromotionGate(): Promise<void> {
   }
 
   if (!evaluation.pass) {
-    throw new Error(`Edge promotion gate failed: ${evaluation.reasons.join(',')}`);
+    console.warn(`  ! Promotion gate blocked actionables: ${evaluation.reasons.join(',')}`);
+    return;
   }
 
   console.log('  ✓ Promotion gate passed');

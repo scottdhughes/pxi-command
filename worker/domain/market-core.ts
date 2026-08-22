@@ -1,6 +1,7 @@
 import type {
   CanonicalMarketDecision,
   CategoryRow,
+  OpportunitySnapshot,
   PlanPayload,
   PXIResponsePayload,
   PXIRow,
@@ -8,8 +9,114 @@ import type {
   SparklineRow,
   WorkerRouteContext,
 } from '../types';
+import {
+  HISTORICAL_BACKFILL_SEED_MARKER,
+  parseProspectiveOpportunitySnapshot,
+} from '../lib/opportunity-snapshot-history';
 
 type MarketCoreDeps = Record<string, any>;
+
+export interface EdgeEvidenceGateResolution {
+  pass: boolean;
+  reasons: string[];
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object'
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function gateReasons(
+  gate: Record<string, unknown> | null,
+  prefix: string,
+): string[] {
+  if (!gate || !Array.isArray(gate.reasons)) return [];
+  return gate.reasons
+    .filter((reason): reason is string => typeof reason === 'string' && reason.length > 0)
+    .map((reason) => `${prefix}:${reason}`);
+}
+
+/**
+ * Resolve one horizon's actionable evidence gate. The consumer deliberately
+ * requires every new gate component so a stale or partially deployed payload
+ * cannot silently restore actionability.
+ */
+export function resolveEdgeEvidenceGate(
+  report: unknown,
+  horizon: '7d' | '30d',
+): EdgeEvidenceGateResolution {
+  const reportObject = asObject(report);
+  if (!reportObject || !Array.isArray(reportObject.windows)) {
+    return { pass: false, reasons: ['edge_diagnostics_unavailable'] };
+  }
+
+  const window = reportObject.windows
+    .map(asObject)
+    .find((candidate) => candidate?.horizon === horizon) || null;
+  const integrityGate = asObject(reportObject.integrity_gate);
+  const policyAlignmentGate = asObject(reportObject.policy_alignment_gate);
+  const performanceGate = asObject(window?.performance_gate);
+  const evidenceGate = asObject(window?.evidence_gate);
+  const reasons: string[] = [];
+
+  if (typeof integrityGate?.pass !== 'boolean') reasons.push('integrity_gate_missing');
+  if (typeof policyAlignmentGate?.pass !== 'boolean') reasons.push('policy_alignment_gate_missing');
+  if (!window) reasons.push(`${horizon}:diagnostic_window_missing`);
+  if (typeof performanceGate?.pass !== 'boolean') reasons.push(`${horizon}:performance_gate_missing`);
+  if (typeof evidenceGate?.pass !== 'boolean') reasons.push(`${horizon}:evidence_gate_missing`);
+
+  reasons.push(...gateReasons(integrityGate, 'integrity'));
+  reasons.push(...gateReasons(policyAlignmentGate, 'policy_alignment'));
+  reasons.push(...gateReasons(performanceGate, `${horizon}:performance`));
+  reasons.push(...gateReasons(evidenceGate, `${horizon}:evidence`));
+
+  if (integrityGate?.pass === false && gateReasons(integrityGate, 'integrity').length === 0) {
+    reasons.push('integrity_gate_failed');
+  }
+  if (performanceGate?.pass === false && gateReasons(performanceGate, `${horizon}:performance`).length === 0) {
+    reasons.push(`${horizon}:performance_gate_failed`);
+  }
+  if (evidenceGate?.pass === false && gateReasons(evidenceGate, `${horizon}:evidence`).length === 0) {
+    reasons.push(`${horizon}:evidence_gate_failed`);
+  }
+
+  return {
+    pass:
+      integrityGate?.pass === true &&
+      policyAlignmentGate?.pass === true &&
+      performanceGate?.pass === true &&
+      evidenceGate?.pass === true,
+    reasons: Array.from(new Set(reasons)),
+  };
+}
+
+export function suppressProjectionForEdgeEvidence<T extends Record<string, any>>(
+  projection: T,
+  gate: EdgeEvidenceGateResolution,
+): T {
+  if (gate.pass) return projection;
+
+  const publishedItems = Array.isArray(projection.items) ? projection.items : [];
+  const priorSuppressed = Number.isFinite(Number(projection.suppressed_count))
+    ? Math.max(0, Number(projection.suppressed_count))
+    : 0;
+  const suppressionByReason = asObject(projection.suppression_by_reason) || {};
+  const priorEdgeSuppressed = Number.isFinite(Number(suppressionByReason.edge_evidence_suppressed))
+    ? Math.max(0, Number(suppressionByReason.edge_evidence_suppressed))
+    : 0;
+
+  return {
+    ...projection,
+    items: [],
+    suppressed_count: priorSuppressed + publishedItems.length,
+    degraded_reason: 'edge_evidence_gate_failed',
+    suppression_by_reason: {
+      ...suppressionByReason,
+      edge_evidence_suppressed: priorEdgeSuppressed + publishedItems.length,
+    },
+  };
+}
 
 function resolvePlanFallbackReason(error: unknown): string {
   if (error instanceof Error && error.message === 'no_pxi_data') {
@@ -248,7 +355,13 @@ export async function tryHandleMarketCoreRoute(
         confidence: regime.confidence,
         description: regime.description,
       } : null,
-      divergence: divergence.has_divergence ? { alerts: divergence.alerts } : null,
+      divergence: divergence.has_divergence ? {
+        alerts: divergence.alerts.map((alert: any) => ({
+          ...alert,
+          actionable: false,
+          metrics: undefined,
+        })),
+      } : null,
       dataFreshness: {
         hasStaleData,
         staleCount: freshnessDiagnostics.status.stale_count,
@@ -317,6 +430,24 @@ export async function tryHandleMarketCoreRoute(
       ...edgeQuality,
       calibration: deps.buildEdgeQualityCalibrationFromSnapshot(edgeCalibrationSnapshot, edgeQuality.score),
     };
+    let signalEdgeDiagnostics: unknown = null;
+    if (deps.isFeatureEnabled(
+      env,
+      'FEATURE_ENABLE_EDGE_DIAGNOSTICS',
+      'ENABLE_EDGE_DIAGNOSTICS',
+      true,
+    )) {
+      try {
+        signalEdgeDiagnostics = await deps.buildEdgeDiagnosticsReport(env.DB, ['7d']);
+      } catch (err) {
+        console.warn('Signal edge diagnostics unavailable; allocation is withheld:', err);
+      }
+    }
+    const signalEdgeGate = resolveEdgeEvidenceGate(signalEdgeDiagnostics, '7d');
+    // `/api/plan` is the sole action-authority surface. The standalone signal
+    // remains descriptive even after its evidence window matures, avoiding a
+    // second, weaker authorization policy.
+    const signalActionAuthorized = false;
 
     const payload: SignalResponsePayload = {
       date: pxi.date,
@@ -337,7 +468,10 @@ export async function tryHandleMarketCoreRoute(
       },
       signal: {
         type: signal.signal_type,
-        risk_allocation: signal.risk_allocation,
+        action_authorized: signalActionAuthorized,
+        risk_allocation: signalActionAuthorized ? signal.risk_allocation : null,
+        raw_risk_allocation: signal.risk_allocation,
+        evidence_gate: signalEdgeGate,
         volatility_percentile: signal.volatility_percentile,
         category_dispersion: signal.category_dispersion,
         adjustments: signal.adjustments,
@@ -348,7 +482,13 @@ export async function tryHandleMarketCoreRoute(
         confidence: regime.confidence,
         description: regime.description,
       } : null,
-      divergence: divergence.has_divergence ? { alerts: divergence.alerts } : null,
+      divergence: divergence.has_divergence ? {
+        alerts: divergence.alerts.map((alert: any) => ({
+          ...alert,
+          actionable: false,
+          metrics: undefined,
+        })),
+      } : null,
       edge_quality: edgeQualityWithCalibration,
       freshness_status: freshness,
     };
@@ -356,7 +496,7 @@ export async function tryHandleMarketCoreRoute(
     return Response.json(payload, {
       headers: {
         ...corsHeaders,
-        'Cache-Control': 'public, max-age=60',
+        'Cache-Control': signalActionAuthorized ? 'public, max-age=60' : 'no-store',
       },
     });
   }
@@ -386,7 +526,7 @@ export async function tryHandleMarketCoreRoute(
 
     const { pxi, signal, regime, freshness, risk_band, edge_quality, policy_state, degraded_reasons, risk_sizing } = canonical;
     const stalePenaltyUnits = deps.freshnessPenaltyCount(freshness);
-    const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policy_state.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} tactical posture at ${risk_sizing.target_pct}% risk budget (raw ${Math.round(signal.risk_allocation * 100)}%).${
+    const setupContext = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policy_state.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} research posture.${
       stalePenaltyUnits > 0
         ? ` stale-input pressure ${stalePenaltyUnits} (critical stale: ${freshness.critical_stale_count}).`
         : ''
@@ -396,6 +536,10 @@ export async function tryHandleMarketCoreRoute(
     let opportunityRef: PlanPayload['opportunity_ref'] | undefined;
     let alertsRef: PlanPayload['alerts_ref'] | undefined;
     let crossHorizonRef: PlanPayload['cross_horizon'] | undefined;
+    const edgeEvidenceByHorizon: Record<'7d' | '30d', EdgeEvidenceGateResolution> = {
+      '7d': resolveEdgeEvidenceGate(null, '7d'),
+      '30d': resolveEdgeEvidenceGate(null, '30d'),
+    };
     try {
       await deps.ensureMarketProductSchema(env.DB);
 
@@ -439,12 +583,17 @@ export async function tryHandleMarketCoreRoute(
         SELECT horizon, as_of, payload_json
         FROM opportunity_snapshots
         WHERE horizon IN ('7d', '30d')
+          AND instr(payload_json, ?) = 0
           AND as_of = (
             SELECT MAX(s2.as_of)
             FROM opportunity_snapshots s2
             WHERE s2.horizon = opportunity_snapshots.horizon
+              AND instr(s2.payload_json, ?) = 0
           )
-      `).all<{ horizon: '7d' | '30d'; as_of: string; payload_json: string }>();
+      `).bind(
+        HISTORICAL_BACKFILL_SEED_MARKER,
+        HISTORICAL_BACKFILL_SEED_MARKER,
+      ).all<{ horizon: '7d' | '30d'; as_of: string; payload_json: string }>();
 
       const coherenceGateEnabled = deps.isFeatureEnabled(
         env,
@@ -452,12 +601,27 @@ export async function tryHandleMarketCoreRoute(
         'ENABLE_OPPORTUNITY_COHERENCE_GATE',
         true,
       );
+      let edgeDiagnosticsReport: unknown = null;
+      if (deps.isFeatureEnabled(
+        env,
+        'FEATURE_ENABLE_EDGE_DIAGNOSTICS',
+        'ENABLE_EDGE_DIAGNOSTICS',
+        true,
+      )) {
+        try {
+          edgeDiagnosticsReport = await deps.buildEdgeDiagnosticsReport(env.DB, ['7d', '30d']);
+        } catch (err) {
+          console.warn('Plan edge diagnostics unavailable; actionability is disabled:', err);
+        }
+      }
+      edgeEvidenceByHorizon['7d'] = resolveEdgeEvidenceGate(edgeDiagnosticsReport, '7d');
+      edgeEvidenceByHorizon['30d'] = resolveEdgeEvidenceGate(edgeDiagnosticsReport, '30d');
       const projectedByHorizon: Record<string, any> = {};
       const asOfByHorizon: Record<string, string> = {};
 
       for (const row of opportunityRows.results || []) {
         try {
-          const opportunitySnapshot = JSON.parse(row.payload_json);
+          const opportunitySnapshot = parseProspectiveOpportunitySnapshot<OpportunitySnapshot>(row.payload_json);
           if (
             !opportunitySnapshot ||
             (opportunitySnapshot.horizon !== '7d' && opportunitySnapshot.horizon !== '30d') ||
@@ -475,11 +639,17 @@ export async function tryHandleMarketCoreRoute(
             opportunitySnapshot.items,
             calibration
           );
-          const projected = deps.projectOpportunityFeed(normalized, {
+          const candidateProjection = deps.projectOpportunityFeed(normalized, {
             coherence_gate_enabled: coherenceGateEnabled,
             freshness,
             consistency_state: canonical.consistency.state,
           });
+          const edgeGate = opportunitySnapshot.horizon === '7d'
+            ? edgeEvidenceByHorizon['7d']
+            : opportunitySnapshot.horizon === '30d'
+              ? edgeEvidenceByHorizon['30d']
+              : { pass: false, reasons: ['opportunity_horizon_invalid'] };
+          const projected = suppressProjectionForEdgeEvidence(candidateProjection, edgeGate);
 
           projectedByHorizon[opportunitySnapshot.horizon] = projected;
           asOfByHorizon[opportunitySnapshot.horizon] = opportunitySnapshot.as_of;
@@ -522,13 +692,21 @@ export async function tryHandleMarketCoreRoute(
       console.warn('Failed to attach plan reference blocks:', err);
     }
 
+    const selectedEdgeEvidenceGate = opportunityRef
+      ? edgeEvidenceByHorizon[opportunityRef.horizon]
+      : { pass: false, reasons: ['opportunity_reference_unavailable'] };
     const actionability = deps.resolvePlanActionability({
       opportunity_ref: opportunityRef,
       edge_quality,
       freshness,
       consistency: canonical.consistency,
+      edge_evidence_gate: selectedEdgeEvidenceGate,
     });
     const actionabilityWithCrossHorizon = deps.applyCrossHorizonActionabilityOverride(actionability, crossHorizonRef || null);
+    const actionAuthorized = selectedEdgeEvidenceGate.pass && actionabilityWithCrossHorizon.state === 'ACTIONABLE';
+    const setupSummary = actionAuthorized
+      ? `${setupContext} Authorized target ${risk_sizing.target_pct}% under the prospective evidence and actionability gates.`
+      : `${setupContext} Allocation withheld until the prospective evidence and actionability gates pass.`;
     const decisionStack = deps.buildDecisionStack({
       actionability_state: actionabilityWithCrossHorizon.state,
       setup_summary: setupSummary,
@@ -554,12 +732,18 @@ export async function tryHandleMarketCoreRoute(
       as_of: canonical.as_of,
       setup_summary: setupSummary,
       policy_state,
+      edge_evidence_gate: selectedEdgeEvidenceGate,
       actionability_state: actionabilityWithCrossHorizon.state,
       actionability_reason_codes: actionabilityWithCrossHorizon.reason_codes,
       action_now: {
-        risk_allocation_target: risk_sizing.target_pct / 100,
+        action_authorized: actionAuthorized,
+        risk_allocation_target: actionAuthorized ? risk_sizing.target_pct / 100 : null,
         raw_signal_allocation_target: risk_sizing.raw_signal_allocation_target,
-        risk_allocation_basis: 'penalized_playbook_target',
+        risk_allocation_basis: actionAuthorized
+          ? 'penalized_playbook_target'
+          : selectedEdgeEvidenceGate.pass
+            ? 'withheld_actionability'
+            : 'withheld_edge_evidence',
         horizon_bias: deps.resolveHorizonBias(signal, regime, edge_quality.score),
         primary_signal: signal.signal_type,
       },

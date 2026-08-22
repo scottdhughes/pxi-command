@@ -333,7 +333,9 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
               </div>
             </div>
             <p className="text-[9px] text-[#949ba5]/40 mt-2">
-              ⚠️ In-sample metrics (trained on this data). Live OOS accuracy tracked via /api/ml/accuracy
+              ⚠️ In-sample metrics only. This legacy ensemble is not promoted. The current prospective,
+              point-in-time evidence gate is reported by /api/diagnostics/edge and remains NO-GO until
+              the validated SPY forecast is bound to the exact plan sizing and theme-selection policy.
             </p>
           </div>
         </section>

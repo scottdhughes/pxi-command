@@ -135,6 +135,7 @@ export type UtilityEventType =
 export type PlanActionabilityReasonCode =
   | 'critical_data_quality_block'
   | 'consistency_fail_block'
+  | 'edge_evidence_gate_block'
   | 'opportunity_reference_unavailable'
   | 'no_eligible_opportunities'
   | 'high_edge_override_no_eligible'
@@ -244,6 +245,27 @@ export interface EdgeLeakageSentinel {
   reasons: string[];
 }
 
+export interface EdgeEvidenceGate {
+  pass: boolean;
+  reasons: string[];
+}
+
+export interface EdgeHacEvidence {
+  method: 'paired_calendar_bartlett_newey_west';
+  bandwidth_days: number;
+  confidence_level: 0.95;
+  sample_size: number;
+  mean: number | null;
+  standard_error: number | null;
+  ci95_low: number | null;
+  ci95_high: number | null;
+  lower_bound_positive: boolean;
+  unavailable_reasons: string[];
+  model_mean: number | null;
+  baseline_mean: number | null;
+  uplift: number | null;
+}
+
 export interface EdgeDiagnosticsWindow {
   horizon: EdgeDiagnosticsHorizon;
   as_of: string | null;
@@ -256,7 +278,23 @@ export interface EdgeDiagnosticsWindow {
   lower_bound_positive: boolean;
   minimum_reliable_sample: number;
   quality_band: CalibrationQuality;
-  baseline_strategy: 'lagged_actual_direction';
+  baseline_strategy: 'last_observable_actual_direction';
+  model_version: string;
+  horizon_days: number;
+  hac_bandwidth_days: number;
+  discordant_pairs: number;
+  calendar_span_days: number;
+  weekday_coverage_ratio: number;
+  latest_prediction_date: string | null;
+  latest_prediction_age_days: number | null;
+  latest_evaluated_target_date: string | null;
+  latest_actual_observation_date: string | null;
+  latest_actual_observation_age_days: number | null;
+  signed_return_after_cost_pct: EdgeHacEvidence;
+  integrity_gate: EdgeEvidenceGate;
+  eligibility_gate: EdgeEvidenceGate;
+  performance_gate: EdgeEvidenceGate;
+  evidence_gate: EdgeEvidenceGate;
   leakage_sentinel: EdgeLeakageSentinel;
   calibration_diagnostics: CalibrationDiagnosticsSnapshot;
 }
@@ -264,11 +302,23 @@ export interface EdgeDiagnosticsWindow {
 export interface EdgeDiagnosticsReport {
   as_of: string;
   basis: string;
-  windows: EdgeDiagnosticsWindow[];
-  promotion_gate: {
-    pass: boolean;
-    reasons: string[];
+  model_version: string;
+  method: 'paired_calendar_bartlett_newey_west';
+  inference_control: {
+    strategy: 'finite_horizon_bonferroni';
+    familywise_confidence_level: 0.95;
+    maximum_unique_looks: 5000;
+    simultaneous_comparisons_per_look: 4;
+    critical_value: 5;
+    coverage_basis: 'asymptotic_hac_normal_approximation';
+    finite_sample_guarantee: false;
   };
+  policy_alignment_gate: EdgeEvidenceGate;
+  windows: EdgeDiagnosticsWindow[];
+  integrity_gate: EdgeEvidenceGate;
+  performance_gate: EdgeEvidenceGate;
+  evidence_gate: EdgeEvidenceGate;
+  promotion_gate: EdgeEvidenceGate;
 }
 
 export interface FreshnessStatus {
@@ -307,6 +357,7 @@ export interface OpportunitySuppressionByReason {
   coherence_failed: number;
   quality_filtered: number;
   data_quality_suppressed: number;
+  edge_evidence_suppressed: number;
 }
 
 export interface OpportunityTtlMetadata {
@@ -384,6 +435,9 @@ export interface RecalculateResponsePayload {
   };
   categories: number;
   embedded: boolean;
+  research_snapshot_id: string | null;
+  evidence_predictions_recorded: number;
+  evidence_status: 'inserted' | 'existing' | 'skipped_canonical_capture' | 'not_requested';
 }
 
 export interface BackfillRunResultItem {
@@ -475,6 +529,9 @@ export interface MarketEdgeDiagnosticsWindowSummary {
   uplift_ci95_low: number | null;
   uplift_ci95_high: number | null;
   lower_bound_positive: boolean;
+  hac_bandwidth_days: number;
+  performance_gate: EdgeEvidenceGate;
+  evidence_gate: EdgeEvidenceGate;
   leakage_sentinel: {
     pass: boolean;
     violation_count: number;
@@ -485,10 +542,11 @@ export interface MarketEdgeDiagnosticsWindowSummary {
 
 export interface MarketEdgeDiagnosticsSummary {
   as_of: string;
-  promotion_gate: {
-    pass: boolean;
-    reasons: string[];
-  };
+  integrity_gate: EdgeEvidenceGate;
+  performance_gate: EdgeEvidenceGate;
+  evidence_gate: EdgeEvidenceGate;
+  promotion_gate: EdgeEvidenceGate;
+  policy_alignment_gate: EdgeEvidenceGate;
   windows: MarketEdgeDiagnosticsWindowSummary[];
 }
 
@@ -607,6 +665,8 @@ export interface SendDigestDeliveredResponsePayload {
   fail_count: number;
   bounce_count: number;
   active_subscribers: number;
+  edge_evidence_gate: EdgeEvidenceGate;
+  opportunities_included: number;
 }
 
 export interface SendDigestSkippedResponsePayload {
@@ -636,7 +696,14 @@ export interface OpportunityItemLedgerInsertPayload {
   direction: OpportunityDirection;
   conviction_score: number;
   published: 0 | 1;
-  suppression_reason: 'coherence_failed' | 'quality_filtered' | 'suppressed_data_quality' | 'governance_blocked' | null;
+  suppression_reason:
+    | 'coherence_failed'
+    | 'quality_filtered'
+    | 'suppressed_data_quality'
+    | 'governance_blocked'
+    | 'edge_evidence_gate_failed'
+    | 'historical_backfill_nonprospective'
+    | null;
 }
 
 export interface OpportunityLedgerInsertPayload {

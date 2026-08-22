@@ -112,6 +112,17 @@ body::before {
   z-index: 0;
 }
 
+.research-posture {
+  margin: 0 0 var(--space-lg);
+  padding: 12px 14px;
+  color: var(--warning);
+  background: var(--warning-subtle);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    SITE NAVIGATION - Matching pxicommand.com main page
    ═══════════════════════════════════════════════════════════════════════════ */

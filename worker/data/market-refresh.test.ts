@@ -50,12 +50,11 @@ function createRefreshDb(initialRuns: RefreshRunRow[] = []) {
       }
 
       if (sql.includes('SELECT id') && sql.includes('FROM market_refresh_runs') && sql.includes("status = 'running'")) {
-        const [trigger, lookbackExpr] = args as [string, string];
+        const [lookbackExpr] = args as [string];
         const cutoff = cutoffFromExpr(lookbackExpr);
         const row = [...runs]
           .filter((candidate) =>
             candidate.status === 'running' &&
-            candidate.trigger === trigger &&
             new Date(candidate.started_at).getTime() >= cutoff,
           )
           .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime() || b.id - a.id)[0];
@@ -67,13 +66,12 @@ function createRefreshDb(initialRuns: RefreshRunRow[] = []) {
     all: async <T>() => ({ results: [] as T[] }),
     run: async () => {
       if (sql.includes("SET completed_at = ?") && sql.includes("error = 'abandoned_run'")) {
-        const [completedAt, trigger, lookbackExpr] = args as [string, string, string];
+        const [completedAt, lookbackExpr] = args as [string, string];
         const cutoff = cutoffFromExpr(lookbackExpr);
         let changes = 0;
         for (const row of runs) {
           if (
             row.status === 'running' &&
-            row.trigger === trigger &&
             new Date(row.started_at).getTime() < cutoff
           ) {
             row.status = 'failed';
@@ -86,11 +84,10 @@ function createRefreshDb(initialRuns: RefreshRunRow[] = []) {
       }
 
       if (sql.includes('INSERT INTO market_refresh_runs') && sql.includes('WHERE NOT EXISTS')) {
-        const [startedAt, trigger, existingTrigger, lookbackExpr] = args as [string, string, string, string];
+        const [startedAt, trigger, lookbackExpr] = args as [string, string, string];
         const cutoff = cutoffFromExpr(lookbackExpr);
         const hasFreshRunning = runs.some((row) =>
           row.status === 'running' &&
-          row.trigger === existingTrigger &&
           new Date(row.started_at).getTime() >= cutoff,
         );
         if (hasFreshRunning) {
@@ -139,7 +136,7 @@ function createRefreshDb(initialRuns: RefreshRunRow[] = []) {
   };
 }
 
-test('claimMarketRefreshRun skips when a fresh running row already exists for the same trigger', async () => {
+test('claimMarketRefreshRun skips when any fresh market refresh is already running', async () => {
   const db = createRefreshDb([
     {
       id: 7,
@@ -162,6 +159,30 @@ test('claimMarketRefreshRun skips when a fresh running row already exists for th
   });
   assert.equal(db.runs.length, 1);
   assert.equal(db.runs[0]?.status, 'running');
+});
+
+test('claimMarketRefreshRun applies the lock across different trigger names', async () => {
+  const db = createRefreshDb([
+    {
+      id: 8,
+      started_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+      completed_at: null,
+      status: 'running',
+      trigger: 'cron_fast_pipeline',
+      error: null,
+      created_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+    },
+  ]);
+
+  const result = await claimMarketRefreshRun(db as unknown as D1Database, 'github_actions_deploy_smoke');
+
+  assert.deepEqual(result, {
+    status: 'skipped',
+    run_id: 8,
+    refresh_trigger: 'github_actions_deploy_smoke',
+    reason: 'refresh_in_progress',
+  });
+  assert.equal(db.runs.length, 1);
 });
 
 test('claimMarketRefreshRun marks stale running rows as failed and starts a replacement run', async () => {

@@ -41,6 +41,10 @@ import {
   reserveDigestDeliveryForSubscriber as reserveDigestDeliveryForSubscriberService,
   sendDigestToSubscriber as sendDigestToSubscriberService,
 } from '../services/market-digest';
+import {
+  buildMarketEdgeDiagnosticsReport,
+  fetchCurrentMarketEvidenceEvaluationSampleSize,
+} from '../domain/edge-diagnostics';
 import * as legacy from '../runtime/legacy';
 
 export function createRouteDeps() {
@@ -58,7 +62,7 @@ export function createRouteDeps() {
     buildDecisionImpactMarketStats: legacy.buildDecisionImpactMarketStats,
     buildDecisionImpactThemeStats: legacy.buildDecisionImpactThemeStats,
     buildDecisionStack: legacy.buildDecisionStack,
-    buildEdgeDiagnosticsReport: legacy.buildEdgeDiagnosticsReport,
+    buildEdgeDiagnosticsReport: buildMarketEdgeDiagnosticsReport,
     buildEdgeQualityCalibrationFromSnapshot: legacy.buildEdgeQualityCalibrationFromSnapshot,
     buildEdgeQualityCalibrationSnapshot: legacy.buildEdgeQualityCalibrationSnapshot,
     buildHistoricalOpportunitySnapshot: legacy.buildHistoricalOpportunitySnapshot,
@@ -97,7 +101,7 @@ export function createRouteDeps() {
     fetchDecisionImpactSnapshotAtOrBefore: fetchDecisionImpactSnapshotAtOrBeforeData,
     fetchLatestCalibrationSnapshot: fetchLatestCalibrationSnapshotData,
     fetchLatestConsistencyCheck: fetchLatestConsistencyCheckData,
-    fetchPredictionEvaluationSampleSize: legacy.fetchPredictionEvaluationSampleSize,
+    fetchPredictionEvaluationSampleSize: fetchCurrentMarketEvidenceEvaluationSampleSize,
     formatDate: legacy.formatDate,
     freshnessPenaltyCount: legacy.freshnessPenaltyCount,
     generateEmbeddingText: legacy.generateEmbeddingText,
