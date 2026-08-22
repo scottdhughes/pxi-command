@@ -97,6 +97,20 @@ test('first claimant acquires the one production mutation lease', async () => {
   assert.equal(state.lock?.holder_id, 'cron:2026-08-21T22:00:00Z');
 });
 
+test('manual market backfill is a first-class mutation lease holder', async () => {
+  const state = createMutationLockDb();
+  const claim = await claimRefreshMutationLock(state.db, {
+    holderId: 'market-backfill:123:1',
+    holderType: 'market_backfill',
+    now: new Date('2026-08-21T12:00:00.000Z'),
+    leaseMinutes: 60,
+  });
+
+  assert.equal(claim.status, 'claimed');
+  assert.equal(claim.holder_type, 'market_backfill');
+  assert.equal(state.lock?.holder_id, 'market-backfill:123:1');
+});
+
 test('an active lease blocks every holder type without exposing its holder ID', async () => {
   const state = createMutationLockDb();
   await claimRefreshMutationLock(state.db, {

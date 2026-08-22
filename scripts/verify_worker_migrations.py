@@ -13,7 +13,12 @@ ADMIN_INGESTION_PATH = REPO_ROOT / "worker" / "routes" / "admin-ingestion.ts"
 PUBLIC_READ_PATH = REPO_ROOT / "worker" / "routes" / "public-read.ts"
 SYSTEM_ROUTE_PATH = REPO_ROOT / "worker" / "routes" / "system.ts"
 LEGACY_RUNTIME_PATH = REPO_ROOT / "worker" / "runtime" / "legacy.ts"
+WRANGLER_CONFIG_PATH = REPO_ROOT / "worker" / "wrangler.toml"
 DAILY_REFRESH_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "daily-refresh.yml"
+MARKET_BACKFILL_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "market-backfill.yml"
+REFRESH_WATCHDOG_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "refresh-watchdog.yml"
+)
 DEPLOY_WORKER_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "deploy-worker.yml"
 OPERATIONAL_ISOLATION_PATH = REPO_ROOT / ".github" / "workflows" / "OPERATIONAL_ISOLATION.md"
 RECONSTRUCTION_WORKFLOW_PATH = (
@@ -77,6 +82,14 @@ EXPECTED_TRIGGERS = {
     "category_score_reconstructions_no_delete",
 }
 
+EXPECTED_PRODUCTION_CRONS = (
+    "0 6 * * *",
+    "0 14 * * *",
+    "0 18 * * *",
+    "0 22 * * 1-5",
+    "30 23 * * 1-5",
+)
+
 
 def migration_files() -> list[Path]:
     files = sorted(MIGRATIONS_DIR.glob("*.sql"))
@@ -90,6 +103,57 @@ def apply_sql_file(connection: sqlite3.Connection, path: Path) -> None:
     if not sql.strip():
         raise SystemExit(f"Migration file is empty: {path}")
     connection.executescript(sql)
+
+
+def assert_scheduler_control_plane_configuration() -> None:
+    config = WRANGLER_CONFIG_PATH.read_text(encoding="utf-8")
+    staging_start = config.index("[env.staging]")
+    production_start = config.index("[env.production]")
+    fallback_start = config.index("[env.fallback]")
+    root = config[:staging_start]
+    staging = config[staging_start:production_start]
+    production = config[production_start:fallback_start]
+    fallback = config[fallback_start:]
+
+    cron_match = re.search(
+        r"(?m)^\[env\.production\.triggers\]\s*$\n"
+        r"(?:\#.*\n)*crons\s*=\s*\[(?P<values>[\s\S]*?)\]",
+        production,
+    )
+    if not cron_match:
+        raise SystemExit("Production Cloudflare Cron Trigger list is missing")
+    crons = tuple(re.findall(r'"([^"]+)"', cron_match.group("values")))
+    if crons != EXPECTED_PRODUCTION_CRONS:
+        raise SystemExit(f"Production Cloudflare Cron Trigger list drifted: {crons!r}")
+    for label, block, pattern in (
+        ("root", root, r"(?m)^\[triggers\]\s*$"),
+        ("staging", staging, r"(?m)^\[env\.staging\.triggers\]\s*$"),
+        ("fallback", fallback, r"(?m)^\[env\.fallback\.triggers\]\s*$"),
+    ):
+        if re.search(pattern, block):
+            raise SystemExit(f"Automatic PXI Cron Triggers escaped production into {label}")
+
+    daily = DAILY_REFRESH_WORKFLOW_PATH.read_text(encoding="utf-8")
+    if re.search(r"(?m)^\s{2}schedule:\s*$", daily) or re.search(
+        r"(?m)^\s*-\s*cron:\s*", daily
+    ):
+        raise SystemExit("Daily PXI Refresh must remain a manual-only fallback")
+    for marker in ("  workflow_dispatch:", "      record_research_evidence:"):
+        if marker not in daily:
+            raise SystemExit(f"Manual daily refresh fallback is missing: {marker.strip()}")
+
+    watchdog = REFRESH_WATCHDOG_WORKFLOW_PATH.read_text(encoding="utf-8")
+    watchdog_crons = tuple(re.findall(r"(?m)^\s*-\s*cron:\s*'([^']+)'", watchdog))
+    if watchdog_crons != ("50 23 * * 1-5",):
+        raise SystemExit(f"Independent refresh watchdog schedule drifted: {watchdog_crons!r}")
+    for marker in (
+        "  schedule:",
+        "  workflow_dispatch:",
+        "https://api.pxicommand.com/health/refresh",
+        "['healthy', 'not_expected']",
+    ):
+        if marker not in watchdog:
+            raise SystemExit(f"Independent refresh watchdog is missing: {marker}")
 
 
 def assert_score_history_code_isolation() -> None:
@@ -290,11 +354,13 @@ def assert_score_history_code_isolation() -> None:
         raise SystemExit("The deployed-build health/capability gate must run before reconstruction POST")
 
     daily_workflow = DAILY_REFRESH_WORKFLOW_PATH.read_text(encoding="utf-8")
+    market_backfill_workflow = MARKET_BACKFILL_WORKFLOW_PATH.read_text(encoding="utf-8")
     deploy_workflow = DEPLOY_WORKER_WORKFLOW_PATH.read_text(encoding="utf-8")
     concurrency_group = "group: pxi-production-indicator-score-mutation"
     for path, source in (
         (DAILY_REFRESH_WORKFLOW_PATH, daily_workflow),
         (RECONSTRUCTION_WORKFLOW_PATH, workflow),
+        (MARKET_BACKFILL_WORKFLOW_PATH, market_backfill_workflow),
     ):
         if concurrency_group not in source or "cancel-in-progress: false" not in source:
             raise SystemExit(f"Operational isolation concurrency contract is missing: {path}")
@@ -316,6 +382,12 @@ def assert_score_history_code_isolation() -> None:
             deploy_workflow,
             'HOLDER_ID="deploy:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"',
             "--arg holder_type 'deploy'",
+        ),
+        (
+            MARKET_BACKFILL_WORKFLOW_PATH,
+            market_backfill_workflow,
+            'HOLDER_ID="market_backfill:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"',
+            "--arg holder_type 'market_backfill'",
         ),
     )
     for path, source, holder_id, holder_type in workflow_lease_markers:
@@ -341,6 +413,22 @@ def assert_score_history_code_isolation() -> None:
         raise SystemExit("Daily refresh mutation lease does not surround cron:daily")
     if "timeout-minutes: 55" not in daily_workflow:
         raise SystemExit("Daily refresh timeout must remain shorter than its 60-minute mutation lease")
+    backfill_post = market_backfill_workflow.index(
+        '-X POST "${BASE_URL}/api/market/backfill-products"'
+    )
+    backfill_refresh = market_backfill_workflow.index(
+        '-X POST "${BASE_URL}/api/market/refresh-products"'
+    )
+    if (
+        market_backfill_workflow.index("Acquire production mutation lease") >= backfill_post
+        or backfill_post >= backfill_refresh
+        or backfill_refresh >= market_backfill_workflow.index("Release production mutation lease")
+    ):
+        raise SystemExit("Market backfill mutation lease does not surround both write stages")
+    if "timeout-minutes: 55" not in market_backfill_workflow:
+        raise SystemExit("Market backfill timeout must remain shorter than its 60-minute mutation lease")
+    if market_backfill_workflow.count("github.event.inputs.dry_run != 'true'") < 3:
+        raise SystemExit("Market backfill lease and post-refresh must remain disabled for dry runs")
     if workflow.index("Acquire production mutation lease") >= reconstruction_post or reconstruction_post >= workflow.index(
         "Release production mutation lease"
     ):
@@ -373,6 +461,12 @@ def assert_score_history_code_isolation() -> None:
 
     isolation_contract = OPERATIONAL_ISOLATION_PATH.read_text(encoding="utf-8")
     for marker in (
+        "sole automatic PXI refresh",
+        "manual-only",
+        "refresh_mutation_locks",
+        "refresh_scheduler_runs",
+        "refresh_scheduler_incidents",
+        "refresh-watchdog.yml",
         "pxi-production-indicator-score-mutation",
         "cancel-in-progress: false",
         "isolated-missing-only-v1",
@@ -399,6 +493,25 @@ def assert_expected_schema(connection: sqlite3.Connection) -> None:
         raise SystemExit(f"Missing expected indexes after migration apply: {', '.join(missing_indexes)}")
     if missing_triggers:
         raise SystemExit(f"Missing expected triggers after migration apply: {', '.join(missing_triggers)}")
+
+    mutation_lock_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'refresh_mutation_locks'"
+    ).fetchone()
+    mutation_lock_sql = mutation_lock_sql_row[0] if mutation_lock_sql_row else ""
+    if "'market_backfill'" not in mutation_lock_sql:
+        raise SystemExit("refresh_mutation_locks does not admit the manual market-backfill holder")
+    connection.execute(
+        """
+        INSERT INTO refresh_mutation_locks (
+          lock_name, holder_id, holder_type, acquired_at, expires_at, updated_at
+        ) VALUES (
+          'indicator_score_mutation', 'migration-test', 'market_backfill',
+          '2026-08-22T18:00:00.000Z', '2026-08-22T19:00:00.000Z',
+          '2026-08-22T18:00:00.000Z'
+        )
+        """
+    )
+    connection.execute("DELETE FROM refresh_mutation_locks WHERE holder_id = 'migration-test'")
 
     for table in ("pxi_scores", "category_scores"):
         columns = {
@@ -1056,6 +1169,7 @@ def apply_migrations_to_current_schema_db() -> None:
 
 
 if __name__ == "__main__":
+    assert_scheduler_control_plane_configuration()
     assert_score_history_code_isolation()
     apply_migrations_to_empty_db()
     apply_migrations_to_current_schema_db()

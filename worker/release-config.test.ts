@@ -25,6 +25,14 @@ function captures(block: string, pattern: RegExp): string[] {
   return Array.from(block.matchAll(pattern), (match) => match[1]);
 }
 
+const EXPECTED_PRODUCTION_CRONS = [
+  '0 6 * * *',
+  '0 14 * * *',
+  '0 18 * * *',
+  '0 22 * * 1-5',
+  '30 23 * * 1-5',
+] as const;
+
 test('worker staging bindings are isolated from production', () => {
   const configPath = path.resolve(process.cwd(), 'worker/wrangler.toml');
   const config = readFileSync(configPath, 'utf8');
@@ -48,10 +56,46 @@ test('worker staging bindings are isolated from production', () => {
 
   assert.match(staging, /name = "pxi-api-staging"/);
   assert.match(production, /name = "pxi-api-production"/);
+  assert.match(
+    production,
+    /\[\[env\.production\.services\]\]\s+binding = "SIGNALS_SERVICE"\s+service = "pxi-signals"/,
+  );
+  assert.doesNotMatch(staging, /SIGNALS_SERVICE/);
   assert.doesNotMatch(staging, /\[\[env\.staging\.send_email\]\]/);
   assert.match(staging, /FEATURE_ENABLE_ALERTS_EMAIL = "false"/);
   assert.match(staging, /DEPLOY_ENV = "staging"/);
   assert.match(production, /DEPLOY_ENV = "production"/);
+});
+
+test('Cloudflare exclusively owns the production automatic refresh schedule', () => {
+  const configPath = path.resolve(process.cwd(), 'worker/wrangler.toml');
+  const dailyPath = path.resolve(process.cwd(), '.github/workflows/daily-refresh.yml');
+  const watchdogPath = path.resolve(process.cwd(), '.github/workflows/refresh-watchdog.yml');
+  const config = readFileSync(configPath, 'utf8');
+  const daily = readFileSync(dailyPath, 'utf8');
+  const watchdog = readFileSync(watchdogPath, 'utf8');
+
+  const staging = extractEnvBlock(config, 'staging', 'production');
+  const production = extractEnvBlock(config, 'production', 'fallback');
+  const fallback = extractEnvBlock(config, 'fallback');
+  const cronBlock = production.match(
+    /^\[env\.production\.triggers\]\s*$\n(?:#.*\n)*crons\s*=\s*\[(?<values>[\s\S]*?)\]/m,
+  );
+  assert.ok(cronBlock?.groups?.values, 'Missing production Cron Trigger list');
+  assert.deepEqual(captures(cronBlock.groups.values, /"([^"]+)"/g), EXPECTED_PRODUCTION_CRONS);
+  assert.doesNotMatch(staging, /^\[env\.staging\.triggers\]\s*$/m);
+  assert.doesNotMatch(fallback, /^\[env\.fallback\.triggers\]\s*$/m);
+  assert.doesNotMatch(config.slice(0, config.indexOf('[env.staging]')), /^\[triggers\]\s*$/m);
+
+  assert.doesNotMatch(daily, /^\s{2}schedule:\s*$/m);
+  assert.doesNotMatch(daily, /^\s*-\s*cron:\s*/m);
+  assert.match(daily, /^\s{2}workflow_dispatch:\s*$/m);
+  assert.match(daily, /^\s{6}record_research_evidence:\s*$/m);
+
+  assert.match(watchdog, /^\s{2}schedule:\s*$/m);
+  assert.deepEqual(captures(watchdog, /^\s*-\s*cron:\s*'([^']+)'/gm), ['50 23 * * 1-5']);
+  assert.match(watchdog, /^\s{2}workflow_dispatch:\s*$/m);
+  assert.match(watchdog, /https:\/\/api\.pxicommand\.com\/health\/refresh/);
 });
 
 test('worker deploy workflow targets the configured production and staging script names', () => {
@@ -87,9 +131,11 @@ test('score reconstruction workflow is versioned, bounded, and serialized with p
     '.github/workflows/score-history-reconstruction.yml',
   );
   const dailyPath = path.resolve(process.cwd(), '.github/workflows/daily-refresh.yml');
+  const marketBackfillPath = path.resolve(process.cwd(), '.github/workflows/market-backfill.yml');
   const deployPath = path.resolve(process.cwd(), '.github/workflows/deploy-worker.yml');
   const reconstruction = readFileSync(reconstructionPath, 'utf8');
   const daily = readFileSync(dailyPath, 'utf8');
+  const marketBackfill = readFileSync(marketBackfillPath, 'utf8');
   const deploy = readFileSync(deployPath, 'utf8');
 
   assert.match(reconstruction, /\/api\/history\/reconstruct-missing-v1/);
@@ -99,7 +145,7 @@ test('score reconstruction workflow is versioned, bounded, and serialized with p
   assert.match(reconstruction, /if \(\(index \+ 1 < CHUNK_COUNT\)\); then\s+sleep 4/);
   assert.match(reconstruction, /"expected_build_sha": build_sha/);
 
-  for (const workflow of [reconstruction, daily]) {
+  for (const workflow of [reconstruction, daily, marketBackfill]) {
     assert.match(workflow, /group: pxi-production-indicator-score-mutation/);
     assert.match(workflow, /cancel-in-progress: false/);
   }
@@ -149,7 +195,20 @@ test('score reconstruction workflow is versioned, bounded, and serialized with p
   );
   assert.match(deploy, /Best-effort production mutation lease cleanup/);
 
-  for (const workflow of [daily, reconstruction, deploy]) {
+  assert.match(marketBackfill, /HOLDER_ID="market_backfill:\$\{GITHUB_RUN_ID\}:\$\{GITHUB_RUN_ATTEMPT\}"/);
+  assert.match(marketBackfill, /--arg holder_type 'market_backfill'/);
+  assert.match(marketBackfill, /timeout-minutes: 55/);
+  assert.ok(
+    marketBackfill.indexOf('Acquire production mutation lease')
+      < marketBackfill.indexOf('-X POST "${BASE_URL}/api/market/backfill-products"'),
+  );
+  assert.ok(
+    marketBackfill.indexOf('-X POST "${BASE_URL}/api/market/refresh-products"')
+      < marketBackfill.indexOf('Release production mutation lease'),
+  );
+  assert.match(marketBackfill, /always\(\) && github\.event\.inputs\.dry_run != 'true'/);
+
+  for (const workflow of [daily, reconstruction, deploy, marketBackfill]) {
     const leaseMinutes = Array.from(
       workflow.matchAll(/--argjson lease_minutes (\d+)/g),
       (match) => Number(match[1]),

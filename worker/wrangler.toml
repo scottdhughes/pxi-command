@@ -68,10 +68,24 @@ routes = [
   { pattern = "www.pxicommand.com/*", zone_name = "pxicommand.com" }
 ]
 
+[env.production.triggers]
+# Cloudflare is the sole automatic PXI refresh scheduler. Times are UTC.
+crons = [
+  "0 6 * * *",
+  "0 14 * * *",
+  "0 18 * * *",
+  "0 22 * * 1-5",
+  "30 23 * * 1-5"
+]
+
 [env.production.limits]
 # The authenticated deploy smoke runs the same pipeline as Cron. Cloudflare's
 # Standard plan supports at most five minutes of CPU for an HTTP invocation.
 cpu_ms = 300000
+
+[[env.production.services]]
+binding = "SIGNALS_SERVICE"
+service = "pxi-signals"
 
 [[env.production.d1_databases]]
 binding = "DB"
@@ -165,7 +179,3 @@ FEATURE_ENABLE_DECISION_IMPACT_ENFORCE = "true"
 DECISION_IMPACT_ENFORCE_MIN_SAMPLE = "30"
 DECISION_IMPACT_ENFORCE_MIN_ACTIONABLE_SESSIONS = "10"
 ALERTS_FROM_EMAIL = "alerts@pxicommand.com"
-
-# Cron Triggers - Disabled (using GitHub Actions instead due to Yahoo API blocking Workers)
-# [triggers]
-# crons = ["0 6 * * *"]

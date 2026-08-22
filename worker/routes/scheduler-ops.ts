@@ -37,6 +37,7 @@ const HEALTHY_STATES = new Set<RefreshSchedulerHealth['state']>([
 const EXTERNAL_MUTATION_HOLDERS = new Set<RefreshMutationHolderType>([
   'github_daily_refresh',
   'history_reconstruction',
+  'market_backfill',
   'deploy',
 ]);
 

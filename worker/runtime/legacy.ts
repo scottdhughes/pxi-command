@@ -4333,27 +4333,68 @@ function sanitizeSignalsTickers(values: unknown[]): string[] {
 }
 
 async function fetchLatestSignalsThemes(
-  options?: { sanitize_tickers?: boolean }
+  options?: {
+    sanitize_tickers?: boolean;
+    signals_service?: Pick<Fetcher, 'fetch'>;
+  }
 ): Promise<SignalsThemeRecord[]> {
   const sanitizeTickers = options?.sanitize_tickers !== false;
-  try {
-    const runsRes = await fetch('https://pxicommand.com/signals/api/runs?status=ok');
-    if (!runsRes.ok) {
-      return [];
+  const fetchSignals = (url: string): Promise<Response> => {
+    const request = new Request(url, {
+      headers: { Accept: 'application/json' },
+    });
+    return options?.signals_service
+      ? options.signals_service.fetch(request)
+      : fetch(request);
+  };
+  const readJsonRecord = async (response: Response): Promise<Record<string, unknown> | null> => {
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+    const isJson = contentType === 'application/json' || Boolean(contentType?.endsWith('+json'));
+    if (!response.ok || !isJson) {
+      try {
+        await response.body?.cancel();
+      } catch {
+        // The response is already unusable; cancellation is best effort.
+      }
+      return null;
     }
-    const runsJson = await runsRes.json() as { runs?: Array<{ id?: string }> };
-    const latestRunId = runsJson.runs?.[0]?.id;
+
+    try {
+      const value: unknown = await response.json();
+      return typeof value === 'object' && value !== null && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null;
+    } catch {
+      return null;
+    }
+  };
+
+  try {
+    const runsRes = await fetchSignals('https://pxicommand.com/signals/api/runs?status=ok');
+    const runsJson = await readJsonRecord(runsRes);
+    const runs = Array.isArray(runsJson?.runs) ? runsJson.runs : [];
+    const latestRun = runs[0];
+    const latestRunId = typeof latestRun === 'object' && latestRun !== null
+      && typeof (latestRun as Record<string, unknown>).id === 'string'
+      ? (latestRun as Record<string, unknown>).id as string
+      : null;
     if (!latestRunId) {
       return [];
     }
 
-    const detailRes = await fetch(`https://pxicommand.com/signals/api/runs/${encodeURIComponent(latestRunId)}`);
-    if (!detailRes.ok) {
+    const detailRes = await fetchSignals(
+      `https://pxicommand.com/signals/api/runs/${encodeURIComponent(latestRunId)}`,
+    );
+    const detailJson = await readJsonRecord(detailRes);
+    if (!detailJson) {
       return [];
     }
 
-    const detailJson = await detailRes.json() as { themes?: Array<Record<string, unknown>> };
-    const themes = detailJson.themes || [];
+    const themes = Array.isArray(detailJson.themes)
+      ? detailJson.themes.filter(
+        (theme): theme is Record<string, unknown> => typeof theme === 'object' && theme !== null && !Array.isArray(theme),
+      )
+      : [];
     return themes.map((theme) => ({
       theme_id: String(theme.theme_id || 'unknown_theme'),
       theme_name: String(theme.theme_name || theme.theme_id || 'Unknown Theme'),
@@ -5635,6 +5676,7 @@ async function buildOpportunitySnapshot(
   calibrationSnapshot?: MarketCalibrationSnapshotPayload | null,
   options?: {
     sanitize_signals_tickers?: boolean;
+    signals_service?: Pick<Fetcher, 'fetch'>;
   }
 ): Promise<OpportunitySnapshot | null> {
   const latestPxi = await db.prepare(`
@@ -5668,7 +5710,10 @@ async function buildOpportunitySnapshot(
       confidence_30d: string | null;
     }>(),
     computeHistoricalHitStats(db, horizon),
-    fetchLatestSignalsThemes({ sanitize_tickers: options?.sanitize_signals_tickers !== false }),
+    fetchLatestSignalsThemes({
+      sanitize_tickers: options?.sanitize_signals_tickers !== false,
+      signals_service: options?.signals_service,
+    }),
     calibrationSnapshot ? Promise.resolve(calibrationSnapshot) : fetchLatestCalibrationSnapshot(db, 'conviction', horizon),
     computeOpportunityOutcomeHistory(db, horizon),
     computeFreshnessStatus(db),
@@ -14036,6 +14081,7 @@ export {
   extractLSTMFeatures,
   extractMLFeatures,
   fetchAllIndicators,
+  fetchLatestSignalsThemes,
   fetchWithRetry,
   fetchPredictionEvaluationSampleSize,
   formatDate,

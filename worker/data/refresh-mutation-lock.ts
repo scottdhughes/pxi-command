@@ -5,6 +5,7 @@ export type RefreshMutationHolderType =
   | 'deploy_smoke'
   | 'github_daily_refresh'
   | 'history_reconstruction'
+  | 'market_backfill'
   | 'deploy';
 
 const DEFAULT_LEASE_MINUTES = 30;
@@ -15,6 +16,7 @@ const HOLDER_TYPES = new Set<RefreshMutationHolderType>([
   'deploy_smoke',
   'github_daily_refresh',
   'history_reconstruction',
+  'market_backfill',
   'deploy',
 ]);
 

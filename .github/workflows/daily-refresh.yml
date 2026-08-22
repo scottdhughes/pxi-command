@@ -8,12 +8,6 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  schedule:
-    # Run 4x daily to capture market movements
-    - cron: '0 6 * * *'   # 6 AM UTC (1 AM ET) - overnight data
-    - cron: '0 14 * * *'  # 2 PM UTC (9 AM ET) - pre-market
-    - cron: '0 18 * * *'  # 6 PM UTC (1 PM ET) - mid-day
-    - cron: '0 22 * * 1-5'  # 10 PM UTC - post-market weekdays (5 PM EST / 6 PM EDT)
   workflow_dispatch:
     inputs:
       record_research_evidence:

@@ -365,9 +365,11 @@ export async function tryHandleMarketLifecycleRoute(
       if (opportunitiesEnabled) {
         opportunities7d = await deps.buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d, {
           sanitize_signals_tickers: signalsSanitizerEnabled,
+          signals_service: env.SIGNALS_SERVICE,
         });
         opportunities30d = await deps.buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d, {
           sanitize_signals_tickers: signalsSanitizerEnabled,
+          signals_service: env.SIGNALS_SERVICE,
         });
       }
 
@@ -866,9 +868,11 @@ export async function tryHandleMarketLifecycleRoute(
       try {
         const latest7d = await deps.buildOpportunitySnapshot(env.DB, '7d', convictionCalibration7d, {
           sanitize_signals_tickers: signalsSanitizerEnabled,
+          signals_service: env.SIGNALS_SERVICE,
         });
         const latest30d = await deps.buildOpportunitySnapshot(env.DB, '30d', convictionCalibration30d, {
           sanitize_signals_tickers: signalsSanitizerEnabled,
+          signals_service: env.SIGNALS_SERVICE,
         });
         if (latest7d) await deps.storeOpportunitySnapshot(env.DB, latest7d);
         if (latest30d) await deps.storeOpportunitySnapshot(env.DB, latest30d);

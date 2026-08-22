@@ -25,6 +25,7 @@ export interface Env {
   AI: Ai;
   ML_MODELS: KVNamespace;
   RATE_LIMIT_KV?: KVNamespace;
+  SIGNALS_SERVICE?: Fetcher;
   BUILD_SHA?: string;
   BUILD_TIMESTAMP?: string;
   WORKER_VERSION?: string;

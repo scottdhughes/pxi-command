@@ -786,6 +786,7 @@ CREATE TABLE IF NOT EXISTS refresh_mutation_locks (
         'deploy_smoke',
         'github_daily_refresh',
         'history_reconstruction',
+        'market_backfill',
         'deploy'
     )),
     acquired_at TEXT NOT NULL,

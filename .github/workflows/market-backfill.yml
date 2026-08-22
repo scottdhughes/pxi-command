@@ -1,7 +1,9 @@
 name: Market Backfill Products
 
 concurrency:
-  group: pxi-market-backfill-${{ github.ref_name }}
+  # Secondary GitHub serialization; the D1 lease below also fences Cloudflare
+  # Cron and every other production mutation path.
+  group: pxi-production-indicator-score-mutation
   cancel-in-progress: false
 
 on:
@@ -39,6 +41,7 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
+    timeout-minutes: 55
     environment:
       name: production
     env:
@@ -75,6 +78,40 @@ jobs:
             + (if ($end | length) > 0 then {end: $end} else {} end)
             ' > /tmp/backfill-request.json
           cat /tmp/backfill-request.json
+
+      - name: Acquire production mutation lease
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          BASE_URL="${WRITE_API_URL%/api/write}"
+          HOLDER_ID="market_backfill:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          REQUEST_BODY="$(jq -cn \
+            --arg holder_id "${HOLDER_ID}" \
+            --arg holder_type 'market_backfill' \
+            --argjson lease_minutes 60 \
+            '{holder_id: $holder_id, holder_type: $holder_type, lease_minutes: $lease_minutes}')"
+          if ! HTTP_CODE="$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -o /tmp/pxi-market-backfill-lease-acquire.json \
+            -w '%{http_code}' \
+            -X POST "${BASE_URL}/api/admin/refresh/lease/acquire" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H 'Content-Type: application/json' \
+            --data "${REQUEST_BODY}")"; then
+            echo "::error::Production mutation lease request failed"
+            exit 1
+          fi
+          if [[ "${HTTP_CODE}" != "200" ]] || ! jq -e \
+            '.status == "claimed" and
+             .lock_name == "indicator_score_mutation" and
+             .holder_type == "market_backfill"' \
+            /tmp/pxi-market-backfill-lease-acquire.json >/dev/null; then
+            echo "::error::Production mutation lease was not acquired (HTTP ${HTTP_CODE})"
+            jq -c . /tmp/pxi-market-backfill-lease-acquire.json 2>/dev/null || true
+            exit 1
+          fi
+          : > /tmp/pxi-market-backfill-lease-acquired
 
       - name: Run market backfill products
         run: |
@@ -116,6 +153,36 @@ jobs:
             console.warn(`Governance breaches: ${payload.governance_breaches.join(', ')}`);
           }
           NODE
+
+      - name: Release production mutation lease
+        if: ${{ always() && github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f /tmp/pxi-market-backfill-lease-acquired ]]; then
+            exit 0
+          fi
+          BASE_URL="${WRITE_API_URL%/api/write}"
+          HOLDER_ID="market_backfill:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          REQUEST_BODY="$(jq -cn --arg holder_id "${HOLDER_ID}" '{holder_id: $holder_id}')"
+          if ! HTTP_CODE="$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -o /tmp/pxi-market-backfill-lease-release.json \
+            -w '%{http_code}' \
+            -X POST "${BASE_URL}/api/admin/refresh/lease/release" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H 'Content-Type: application/json' \
+            --data "${REQUEST_BODY}")"; then
+            echo "::error::Production mutation lease release request failed"
+            exit 1
+          fi
+          if [[ "${HTTP_CODE}" != "200" ]] || ! jq -e '.released == true' \
+            /tmp/pxi-market-backfill-lease-release.json >/dev/null; then
+            echo "::error::Production mutation lease was not released (HTTP ${HTTP_CODE})"
+            jq -c . /tmp/pxi-market-backfill-lease-release.json 2>/dev/null || true
+            exit 1
+          fi
+          rm /tmp/pxi-market-backfill-lease-acquired
 
       - name: Append summary
         if: always()

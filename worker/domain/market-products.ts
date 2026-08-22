@@ -511,6 +511,7 @@ export async function tryHandleMarketProductsRoute(
 	      try {
 	        snapshot = await deps.buildOpportunitySnapshot(env.DB, horizon, undefined, {
           sanitize_signals_tickers: signalsSanitizerEnabled,
+          signals_service: env.SIGNALS_SERVICE,
         });
       } catch (err) {
         console.error('Failed to build opportunity snapshot:', err);

@@ -263,6 +263,37 @@ test('mutation lease acquisition is authenticated, strict, and public-safe', asy
   assert.doesNotMatch(JSON.stringify(await response!.json()), /github:123:1/);
 });
 
+test('mutation lease acquisition accepts the manual market-backfill holder', async () => {
+  const route = createRoute('/api/admin/refresh/lease/acquire', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      holder_id: 'market_backfill:123:1',
+      holder_type: 'market_backfill',
+      lease_minutes: 60,
+    }),
+  });
+  let receivedHolderType = '';
+  const response = await tryHandleSchedulerOpsRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    claimRefreshMutationLock: async (_db, received) => {
+      receivedHolderType = received.holderType;
+      return {
+        status: 'claimed',
+        lock_name: 'indicator_score_mutation',
+        holder_type: 'market_backfill',
+        acquired_at: '2026-08-21T12:00:00.000Z',
+        expires_at: '2026-08-21T13:00:00.000Z',
+        lease_version: 1,
+        reclaimed: false,
+      };
+    },
+  });
+
+  assert.equal(response?.status, 200);
+  assert.equal(receivedHolderType, 'market_backfill');
+});
+
 test('mutation lease reports contention and exact-holder release', async () => {
   const acquire = createRoute('/api/admin/refresh/lease/acquire', {
     method: 'POST',

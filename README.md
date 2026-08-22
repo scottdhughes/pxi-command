@@ -27,7 +27,7 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
 
 ### Core Index
 - **28 indicators** across 7 categories normalized to 0-100 scale
-- **Real-time updates** via GitHub Actions cron (4x daily)
+- **Real-time updates** via Cloudflare Cron (four refresh slots plus a missed-close watchdog)
 - **Historical backtest** with 1000+ observations since Dec 2022
 
 ### ML & Predictions (v1.2)
@@ -75,8 +75,8 @@ PXI (Positioning Index) synthesizes signals from liquidity, credit spreads, vola
                     ┌─────────────────────────┐                 ┌─────────────────────────┐
                     │                         │                 │                         │
 ┌─────────────────┐ │  ┌──────────────────┐   │  ┌───────────┐  │  ┌──────────────────┐   │
-│   Data Sources  │───▶│  GitHub Actions  │   │  │  Reddit   │────▶│  Cloudflare Cron │   │
-│  FRED, Yahoo,   │ │  │   (Daily Cron)   │   │  │   API     │  │  │   (Weekly)       │   │
+│   Data Sources  │───▶│  Cloudflare Cron │   │  │  Reddit   │────▶│  Cloudflare Cron │   │
+│  FRED, Yahoo,   │ │  │  (PXI refresh)   │   │  │   API     │  │  │   (Weekly)       │   │
 │  DeFiLlama...   │ │  └────────┬─────────┘   │  └───────────┘  │  └────────┬─────────┘   │
 └─────────────────┘ │           │             │                 │           │             │
                     │           ▼             │                 │           ▼             │
@@ -118,7 +118,7 @@ pxi-command/
 - **API:** Cloudflare Workers
 - **Frontend:** React 19, Vite, Tailwind CSS
 - **Hosting:** Cloudflare Pages
-- **Scheduler:** GitHub Actions (PXI daily) + Cloudflare Cron (Signals weekly)
+- **Scheduler:** Cloudflare Cron (PXI daily + Signals weekly); GitHub Actions is the PXI manual fallback and independent alarm
 - **Agent Integration:** MCP Server (Model Context Protocol)
 
 ## API Endpoints
@@ -368,16 +368,46 @@ Taylor’s PXI audit findings are being remediated with trust-first controls:
 
 ## Scheduler Ownership Runbook
 
-Target ownership is GitHub Actions (`Daily PXI Refresh`) only. Keep Cloudflare cron enabled during hardening, then cut over after stability validation.
+Cloudflare Cron on `pxi-api-production` is the sole automatic owner of the PXI
+refresh schedule. All times are UTC:
 
-### 72-hour Shadow Procedure
+| Cron | Purpose |
+|---|---|
+| `0 6 * * *` | Overnight refresh |
+| `0 14 * * *` | Premarket refresh |
+| `0 18 * * *` | Midday refresh |
+| `0 22 * * 1-5` | Weekday close refresh and canonical research-evidence capture |
+| `30 23 * * 1-5` | In-Worker missed-close watchdog |
 
-1. Keep Cloudflare and GitHub schedulers active.
-2. Require 12 consecutive successful scheduled GitHub runs (4/day over 72 hours) with zero critical SLA violations.
-3. Disable Cloudflare cron triggers for:
-   - `pxi-api-production`
-   - `pxi-api`
-4. Re-verify Cloudflare schedules are empty and GitHub continues refreshing data.
+The four refresh slots run the same native Worker pipeline. D1 provides the
+cross-control-plane safety contract:
+
+- `refresh_scheduler_runs` uses a deterministic slot key for at-least-once
+  delivery, records every attempt, and fences completion to the claiming
+  attempt.
+- `refresh_mutation_locks` is the global lease shared by Cloudflare Cron,
+  deploy smoke, the manual GitHub fallback, production deployment, and score
+  reconstruction, including manual market-product backfills.
+- `refresh_scheduler_incidents` deduplicates a missed close by decision date
+  and retains the incident after recovery; a successful close run resolves
+  only its matching date.
+
+`.github/workflows/daily-refresh.yml` is manual-only. Its
+`workflow_dispatch` input can request canonical research evidence when an
+operator runs it after the US close, but it must not regain a `schedule`
+trigger. Do not run Cloudflare and GitHub as dual automatic schedulers.
+
+The independent `PXI Refresh Watchdog` GitHub workflow runs at 23:50 UTC on
+weekdays and requires `GET https://api.pxicommand.com/health/refresh` to report
+`healthy` (or `not_expected` on a known market closure). Its failed Actions run
+is the operator-visible alarm if the Cloudflare control plane or the native
+23:30 watchdog fails to leave a healthy close state.
+
+After a schedule-changing deploy, allow Cloudflare's propagation window, then
+verify the production Worker has exactly the five cron expressions above,
+`Daily PXI Refresh` remains manual-only, and `PXI Refresh Watchdog` retains its
+independent weekday schedule. Never use a shadow period with both automatic
+refresh schedulers enabled.
 
 ## Development
 
