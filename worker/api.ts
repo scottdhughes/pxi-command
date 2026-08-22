@@ -1,4 +1,4 @@
-import { handleScheduled } from './runtime/legacy';
+import { runScheduledRefresh } from './services/scheduled-refresh';
 import {
   getCorsHeaders as buildCorsHeaders,
   methodNotAllowedResponse,
@@ -13,6 +13,7 @@ import { tryHandleMarketCoreRoute } from './domain/market-core';
 import { tryHandleMarketProductsRoute } from './domain/market-products';
 import { tryHandleMarketOpsRoute } from './domain/market-ops';
 import { tryHandleMarketLifecycleRoute } from './routes/market-lifecycle';
+import { tryHandleSchedulerOpsRoute } from './routes/scheduler-ops';
 import { tryHandleSystemRoute } from './routes/system';
 import { tryHandlePublicReadRoute } from './routes/public-read';
 import { tryHandleSimilarityRoute } from './routes/similarity';
@@ -128,6 +129,9 @@ export default {
       const marketOpsResponse = await tryHandleMarketOpsRoute(routeContext, routeDeps);
       if (marketOpsResponse) return marketOpsResponse;
 
+      const schedulerOpsResponse = await tryHandleSchedulerOpsRoute(routeContext);
+      if (schedulerOpsResponse) return schedulerOpsResponse;
+
       const systemResponse = await tryHandleSystemRoute(routeContext);
       if (systemResponse) return systemResponse;
 
@@ -150,7 +154,7 @@ export default {
     }
   },
 
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(handleScheduled(env));
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    await runScheduledRefresh(controller, env);
   },
 };

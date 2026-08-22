@@ -602,13 +602,43 @@ function extractLSTMFeatures(
 }
 
 // FRED API fetcher
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit = {},
+  maxAttempts = 3,
+): Promise<Response> {
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: init.signal ?? AbortSignal.timeout(15_000),
+      });
+      if (response.ok || (response.status < 500 && response.status !== 429)) {
+        return response;
+      }
+      lastError = new Error(`upstream status ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (attempt < maxAttempts) {
+      const delayMs = 250 * (2 ** (attempt - 1));
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('upstream request failed');
+}
+
 async function fetchFredSeries(seriesId: string, indicatorId: string, apiKey: string): Promise<IndicatorValue[]> {
   const startDate = formatDate(subYears(new Date(), 3));
   const endDate = formatDate(new Date());
 
   const url = `https://api.stlouisfed.org/fred/series/observations?series_id=${seriesId}&api_key=${apiKey}&file_type=json&observation_start=${startDate}&observation_end=${endDate}&sort_order=desc&limit=100`;
 
-  const response = await fetch(url);
+  const response = await fetchWithRetry(url);
   if (!response.ok) throw new Error(`FRED API error: ${response.status}`);
 
   const data = await response.json() as { observations: { date: string; value: string }[] };
@@ -622,36 +652,46 @@ async function fetchFredSeries(seriesId: string, indicatorId: string, apiKey: st
     }));
 }
 
-// Yahoo Finance fetcher (using query2.finance.yahoo.com)
+// Yahoo Finance fetcher. Cloudflare egress is verified against both chart hosts;
+// keeping a second host avoids turning a single Yahoo edge failure into stale data.
 async function fetchYahooSeries(symbol: string, indicatorId: string): Promise<IndicatorValue[]> {
   const period1 = Math.floor(subYears(new Date(), 3).getTime() / 1000);
   const period2 = Math.floor(Date.now() / 1000);
 
-  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d`;
-
-  const response = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0' },
-  });
-  if (!response.ok) throw new Error(`Yahoo API error: ${response.status}`);
-
-  const data = await response.json() as any;
-  const result = data.chart?.result?.[0];
-  if (!result) return [];
+  let result: any = null;
+  let lastStatus: number | null = null;
+  for (const host of ['query2.finance.yahoo.com', 'query1.finance.yahoo.com']) {
+    const url = `https://${host}/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d`;
+    try {
+      const response = await fetchWithRetry(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 PXI-Command/1.0' },
+      });
+      lastStatus = response.status;
+      if (!response.ok) continue;
+      const data = await response.json() as any;
+      result = data.chart?.result?.[0] ?? null;
+      if (result) break;
+    } catch {
+      // Try the alternate Yahoo chart host before failing the indicator.
+    }
+  }
+  if (!result) throw new Error(`Yahoo API unavailable${lastStatus ? ` (${lastStatus})` : ''}`);
 
   const timestamps = result.timestamp || [];
+  const adjustedCloses = result.indicators?.adjclose?.[0]?.adjclose || [];
   const closes = result.indicators?.quote?.[0]?.close || [];
 
   return timestamps.map((ts: number, i: number) => ({
     indicator_id: indicatorId,
     date: formatDate(new Date(ts * 1000)),
-    value: closes[i],
-    source: 'yahoo',
+    value: Number.isFinite(adjustedCloses[i]) ? adjustedCloses[i] : closes[i],
+    source: 'yahoo_chart',
   })).filter((v: IndicatorValue) => v.value !== null && v.value !== undefined);
 }
 
 // DeFiLlama stablecoin fetcher
 async function fetchStablecoinMcap(): Promise<IndicatorValue[]> {
-  const response = await fetch('https://stablecoins.llama.fi/stablecoincharts/all');
+  const response = await fetchWithRetry('https://stablecoins.llama.fi/stablecoincharts/all');
   if (!response.ok) throw new Error(`DeFiLlama API error: ${response.status}`);
 
   const data = await response.json() as any[];
@@ -678,18 +718,40 @@ async function fetchStablecoinMcap(): Promise<IndicatorValue[]> {
 
 // CNN Fear & Greed
 async function fetchFearGreed(): Promise<IndicatorValue[]> {
+  const today = formatDate(new Date());
   try {
-    const response = await fetch('https://production.dataviz.cnn.io/index/fearandgreed/graphdata');
-    if (!response.ok) return [];
+    const response = await fetchWithRetry(
+      'https://production.dataviz.cnn.io/index/fearandgreed/graphdata',
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 PXI-Command/1.0',
+          Accept: 'application/json, text/plain, */*',
+        },
+      },
+      2,
+    );
+    if (response.ok) {
+      const data = await response.json() as any;
+      const score = Number(data?.fear_and_greed?.score);
+      if (Number.isFinite(score)) {
+        return [{ indicator_id: 'fear_greed', date: today, value: score, source: 'cnn' }];
+      }
+    }
+  } catch { }
 
-    const data = await response.json() as any;
-    if (data?.fear_and_greed?.score) {
-      return [{
-        indicator_id: 'fear_greed',
-        date: formatDate(new Date()),
-        value: data.fear_and_greed.score,
-        source: 'cnn',
-      }];
+  try {
+    const response = await fetchWithRetry('https://api.alternative.me/fng/?limit=1', {}, 2);
+    if (response.ok) {
+      const data = await response.json() as any;
+      const score = Number.parseFloat(String(data?.data?.[0]?.value ?? ''));
+      if (Number.isFinite(score)) {
+        return [{
+          indicator_id: 'fear_greed',
+          date: today,
+          value: score,
+          source: 'alternative_me_proxy',
+        }];
+      }
     }
   } catch { }
   return [];
@@ -704,10 +766,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     { ticker: 'WALCL', id: 'fed_balance_sheet' },
     { ticker: 'RRPONTSYD', id: 'reverse_repo' },
     { ticker: 'WTREGEN', id: 'treasury_general_account' },
-    { ticker: 'BAMLH0A0HYM2', id: 'high_yield_spread' },
-    { ticker: 'BAMLC0A4CBBB', id: 'investment_grade_spread' },
-    { ticker: 'T10Y2Y', id: 'yield_curve' },
-    { ticker: 'DGS10', id: 'ten_year_yield' },
+    { ticker: 'DCOILWTICO', id: 'wti_crude' },
     { ticker: 'DTWEXBGS', id: 'dollar_index' },
   ];
 
@@ -734,6 +793,28 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     if (t !== undefined && r !== undefined) {
       all.push({ indicator_id: 'net_liquidity', date: w.date, value: w.value - t - r, source: 'fred' });
     }
+  }
+
+  // M2 year-over-year growth from the monthly M2SL level series.
+  try {
+    const m2 = (await fetchFredSeries('M2SL', 'm2_raw', fredApiKey))
+      .sort((left, right) => left.date.localeCompare(right.date));
+    for (let index = 12; index < m2.length; index += 1) {
+      const current = m2[index];
+      const prior = m2[index - 12];
+      if (!prior || prior.value === 0) continue;
+      const value = ((current.value - prior.value) / prior.value) * 100;
+      if (!Number.isFinite(value)) continue;
+      all.push({
+        indicator_id: 'm2_yoy',
+        date: current.date,
+        value,
+        source: 'fred',
+      });
+    }
+    console.log('M2 YoY: calculated');
+  } catch (e) {
+    console.error('M2 YoY failed:', e);
   }
 
   // Yahoo indicators
@@ -941,6 +1022,57 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     console.error('DXY failed:', e);
   }
 
+  // Copper/Gold growth proxy used by the canonical global-risk category.
+  try {
+    const [copper, gold] = await Promise.all([
+      fetchYahooSeries('HG=F', 'copper_temp'),
+      fetchYahooSeries('GC=F', 'gold_temp'),
+    ]);
+    const goldByDate = new Map(gold.map((row) => [row.date, row.value]));
+    let calculated = 0;
+    for (const row of copper) {
+      const goldValue = goldByDate.get(row.date);
+      if (!goldValue) continue;
+      const value = (row.value / goldValue) * 1000;
+      if (!Number.isFinite(value)) continue;
+      all.push({
+        indicator_id: 'copper_gold_ratio',
+        date: row.date,
+        value,
+        source: 'yahoo_chart',
+      });
+      calculated += 1;
+    }
+    console.log(`Copper/Gold ratio: ${calculated} values`);
+  } catch (e) {
+    console.error('Copper/Gold ratio failed:', e);
+  }
+
+  // The public contract labels this as a volatility-surface proxy rather than
+  // dealer gamma. Keep it deterministic and available when the options source
+  // is not suitable for an edge Worker.
+  try {
+    const latestVix = all
+      .filter((row) => row.indicator_id === 'vix')
+      .sort((left, right) => right.date.localeCompare(left.date))[0];
+    const latestTerm = all
+      .filter((row) => row.indicator_id === 'vix_term_structure')
+      .sort((left, right) => right.date.localeCompare(left.date))[0];
+    if (latestVix) {
+      const termAdjustment = latestTerm ? -latestTerm.value * 3 : 0;
+      const value = Math.max(-25, Math.min(25, ((20 - latestVix.value) * 1.2) + termAdjustment));
+      all.push({
+        indicator_id: 'gex',
+        date: latestVix.date,
+        value,
+        source: 'proxy_vol_surface',
+      });
+      console.log('Volatility-surface proxy: calculated');
+    }
+  } catch (e) {
+    console.error('Volatility-surface proxy failed:', e);
+  }
+
   // Credit spreads from FRED (map to expected IDs)
   try {
     const hySpread = await fetchFredSeries('BAMLH0A0HYM2', 'hy_oas_spread', fredApiKey);
@@ -1005,7 +1137,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
 
   // Initial Jobless Claims
   try {
-    const claims = await fetchFredSeries('ICSA', 'jobless_claims', fredApiKey);
+    const claims = await fetchFredSeries('IC4WSA', 'jobless_claims', fredApiKey);
     all.push(...claims);
     console.log(`Jobless claims: ${claims.length} values`);
   } catch (e) {

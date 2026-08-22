@@ -1,0 +1,44 @@
+name: PXI Refresh Watchdog
+
+on:
+  schedule:
+    # Independent of Cloudflare Cron: verify the canonical close after its
+    # 23:30 UTC in-Worker cutoff. A failed job is the operator-visible alarm.
+    - cron: '50 23 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: pxi-refresh-watchdog
+  cancel-in-progress: true
+
+jobs:
+  verify-daily-close:
+    if: github.repository == 'scottdhughes/pxi-command'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require healthy canonical refresh state
+        run: |
+          set -euo pipefail
+          http_code="$(curl -sS \
+            -o /tmp/pxi-refresh-health.json \
+            -w '%{http_code}' \
+            --max-time 30 \
+            'https://api.pxicommand.com/health/refresh')"
+          if [[ "${http_code}" != "200" ]]; then
+            echo "::error::PXI refresh health returned HTTP ${http_code}"
+            cat /tmp/pxi-refresh-health.json || true
+            exit 1
+          fi
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const payload = JSON.parse(fs.readFileSync('/tmp/pxi-refresh-health.json', 'utf8'));
+          if (!['healthy', 'not_expected'].includes(payload?.state)) {
+            console.error(`::error::Unexpected PXI refresh health state: ${String(payload?.state)}`);
+            console.error(JSON.stringify(payload, null, 2));
+            process.exit(1);
+          }
+          NODE

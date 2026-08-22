@@ -56,6 +56,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           set -euo pipefail
           if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
@@ -68,6 +69,10 @@ jobs:
           fi
           if [[ -z "${WRITE_API_KEY:-}" ]]; then
             echo "::error::Missing environment secret WRITE_API_KEY"
+            exit 1
+          fi
+          if [[ "${TARGET_ENV}" == "production" && -z "${FRED_API_KEY:-}" ]]; then
+            echo "::error::Missing production environment secret FRED_API_KEY"
             exit 1
           fi
 
@@ -114,6 +119,19 @@ jobs:
             echo "BUILD_TIMESTAMP=${BUILD_TIMESTAMP}"
             echo "WORKER_VERSION=${WORKER_VERSION}"
           } >> "$GITHUB_ENV"
+
+      - name: Sync production FRED secret to Worker
+        if: ${{ inputs.environment == 'production' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${FRED_API_KEY}" | npx wrangler secret put FRED_API_KEY \
+            --config worker/wrangler.toml \
+            --env production \
+            --name "${WORKER_SCRIPT_NAME}"
 
       - name: Apply remote D1 migrations
         env:
@@ -185,11 +203,16 @@ jobs:
           WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
         run: |
           set -euo pipefail
-          trigger="github_actions_deploy_smoke_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
-          http_code="$(curl -sS -o /tmp/pxi-worker-refresh-smoke.json -w '%{http_code}' --max-time 240 -X POST "${TARGET_BASE_URL}/api/market/refresh-products" \
+          if [[ "${TARGET_ENV}" == "production" ]]; then
+            smoke_path="/api/admin/refresh/run"
+            max_time=840
+          else
+            smoke_path="/api/market/refresh-products"
+            max_time=240
+          fi
+          http_code="$(curl -sS -o /tmp/pxi-worker-refresh-smoke.json -w '%{http_code}' --max-time "${max_time}" -X POST "${TARGET_BASE_URL}${smoke_path}" \
             -H "Authorization: Bearer ${WRITE_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -H "X-Refresh-Trigger: ${trigger}")"
+            -H "Content-Type: application/json")"
           if [[ "${http_code}" != "200" ]]; then
             echo "::error::Refresh smoke failed with HTTP ${http_code}"
             cat /tmp/pxi-worker-refresh-smoke.json || true
@@ -199,22 +222,27 @@ jobs:
           const fs = require('node:fs');
 
           const payload = JSON.parse(fs.readFileSync('/tmp/pxi-worker-refresh-smoke.json', 'utf8'));
-          const passed =
-            payload?.ok === true &&
-            (
-              (
-                payload?.skipped === true &&
-                payload?.reason === 'refresh_in_progress'
-              ) ||
-              (
-                payload?.blocked === true &&
-                payload?.reason === 'decision_impact_enforcement_failed'
-              ) ||
-              (
-                payload?.blocked !== true &&
-                payload?.skipped !== true
+          const production = process.env.TARGET_ENV === 'production';
+          const passed = production
+            ? (
+                payload?.schedule_id === 'deploy_smoke' &&
+                /^\d{4}-\d{2}-\d{2}$/.test(String(payload?.decision_date || '')) &&
+                Number(payload?.indicators_fetched) > 0 &&
+                Number(payload?.indicators_written) > 0 &&
+                Array.isArray(payload?.sla?.critical_failures) &&
+                payload.sla.critical_failures.length === 0 &&
+                payload?.recalculate &&
+                payload?.evaluation &&
+                payload?.products
               )
-            );
+            : (
+                payload?.ok === true &&
+                (
+                  (payload?.skipped === true && payload?.reason === 'refresh_in_progress') ||
+                  (payload?.blocked === true && payload?.reason === 'decision_impact_enforcement_failed') ||
+                  (payload?.blocked !== true && payload?.skipped !== true)
+                )
+              );
 
           if (!passed) {
             console.error('Refresh smoke returned an unexpected payload.');

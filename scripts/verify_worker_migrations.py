@@ -37,6 +37,9 @@ EXPECTED_TABLES = {
     "research_feature_snapshots",
     "market_prediction_evidence",
     "request_rate_limit_buckets",
+    "refresh_scheduler_runs",
+    "refresh_scheduler_incidents",
+    "refresh_mutation_locks",
 }
 
 EXPECTED_INDEXES = {
@@ -51,6 +54,9 @@ EXPECTED_INDEXES = {
     "idx_category_scores_origin_date",
     "idx_pxi_score_reconstructions_date",
     "idx_category_score_reconstructions_date",
+    "idx_refresh_scheduler_runs_decision",
+    "idx_refresh_scheduler_runs_status",
+    "idx_refresh_scheduler_incidents_status",
 }
 
 EXPECTED_TRIGGERS = {

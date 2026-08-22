@@ -17,11 +17,11 @@ import type {
   OpportunityTtlMetadata,
   WorkerRouteContext,
 } from '../types';
+import { nextScheduledRefreshAt } from '../config/refresh-schedule';
 
 type MarketProductsDeps = Record<string, any>;
 
 const BRIEF_CONTRACT_VERSION = '2026-02-17-v2';
-const REFRESH_HOURS_UTC = [6, 14, 18, 22];
 const OPPORTUNITY_REFRESH_TTL_GRACE_SECONDS = 90 * 60;
 const VALID_ALERT_TYPES: MarketAlertType[] = ['regime_change', 'threshold_cross', 'opportunity_spike', 'freshness_warning'];
 
@@ -37,28 +37,7 @@ export function isBriefSnapshotCompatible(snapshot: BriefSnapshot | null): boole
 
 export function computeNextExpectedRefresh(now = new Date()): { at: string; in_minutes: number } {
   const nowMs = now.getTime();
-  const candidateDates: Date[] = [];
-
-  for (let dayOffset = 0; dayOffset <= 2; dayOffset += 1) {
-    for (const hour of REFRESH_HOURS_UTC) {
-      const candidate = new Date(Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate() + dayOffset,
-        hour,
-        0,
-        0,
-        0,
-      ));
-      if (candidate.getTime() >= nowMs) {
-        candidateDates.push(candidate);
-      }
-    }
-  }
-
-  const next = candidateDates.length > 0
-    ? candidateDates.sort((a, b) => a.getTime() - b.getTime())[0]
-    : new Date(nowMs + (6 * 60 * 60 * 1000));
+  const next = nextScheduledRefreshAt(now);
 
   return {
     at: next.toISOString(),
