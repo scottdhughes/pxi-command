@@ -300,6 +300,25 @@ test('pending evidence evaluates each horizon from the first SPY observation wit
   assert.deepEqual(updates[2].args, [evaluatedAt, row.evidence_id]);
 });
 
+test('pending market evidence query has a fixed 25-row budget', async () => {
+  let pendingSql = '';
+  const db = {
+    prepare(sql: string) {
+      const statement = () => ({
+        bind: () => statement(),
+        all: async () => {
+          if (sql.includes('FROM market_prediction_evidence')) pendingSql = sql;
+          return { results: [] };
+        },
+      });
+      return statement();
+    },
+  };
+
+  await evaluatePendingMarketPredictionEvidence(db as any, '2026-02-04T22:00:00.000Z');
+  assert.match(pendingSql, /LIMIT 25/);
+});
+
 test('outcome evaluation uses per-horizon compare-and-set writes for concurrent runners', async () => {
   const row = evidenceFixture({ target_date_30d: '2026-12-01' });
   const updateSql: string[] = [];

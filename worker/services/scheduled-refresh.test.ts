@@ -61,9 +61,24 @@ test('native refresh writes only the newest valid row per indicator', () => {
     { indicator_id: 'spy_close', date: '2026-08-21', value: 650, source: 'yahoo' },
     { indicator_id: 'vix', date: '2026-08-21', value: 17, source: 'newer' },
     { indicator_id: 'vix', date: 'invalid', value: 19, source: 'bad' },
+    { indicator_id: 'vix', date: '2026-02-30', value: 19, source: 'impossible' },
+    { indicator_id: 'vix', date: '9999-12-31', value: 99, source: 'future' },
     { indicator_id: 'broken', date: '2026-08-21', value: Number.NaN, source: 'bad' },
-  ]), [
+  ], '2026-08-22'), [
     { indicator_id: 'spy_close', date: '2026-08-21', value: 650, source: 'yahoo' },
     { indicator_id: 'vix', date: '2026-08-21', value: 17, source: 'newer' },
   ]);
+});
+
+test('candidate SLA ignores impossible and future observations', () => {
+  const candidates = criticalCandidates().filter((row) => row.indicator_id !== 'spy_close');
+  candidates.push(
+    { indicator_id: 'spy_close', date: '2026-02-30', value: 650, source: 'impossible' },
+    { indicator_id: 'spy_close', date: '9999-12-31', value: 651, source: 'future' },
+  );
+  const summary = evaluateCandidateSla(candidates, new Date('2026-08-22T12:00:00Z'));
+  assert.deepEqual(
+    summary.critical_failures.find((failure) => failure.indicator_id === 'spy_close'),
+    { indicator_id: 'spy_close', latest_date: null, status: 'missing' },
+  );
 });

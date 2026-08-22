@@ -298,6 +298,68 @@ def assert_score_history_code_isolation() -> None:
     ):
         if concurrency_group not in source or "cancel-in-progress: false" not in source:
             raise SystemExit(f"Operational isolation concurrency contract is missing: {path}")
+    workflow_lease_markers = (
+        (
+            DAILY_REFRESH_WORKFLOW_PATH,
+            daily_workflow,
+            'HOLDER_ID="github_daily_refresh:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"',
+            "--arg holder_type 'github_daily_refresh'",
+        ),
+        (
+            RECONSTRUCTION_WORKFLOW_PATH,
+            workflow,
+            'HOLDER_ID="history_reconstruction:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"',
+            "--arg holder_type 'history_reconstruction'",
+        ),
+        (
+            DEPLOY_WORKER_WORKFLOW_PATH,
+            deploy_workflow,
+            'HOLDER_ID="deploy:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"',
+            "--arg holder_type 'deploy'",
+        ),
+    )
+    for path, source, holder_id, holder_type in workflow_lease_markers:
+        for marker in (
+            holder_id,
+            holder_type,
+            "/api/admin/refresh/lease/acquire",
+            "/api/admin/refresh/lease/release",
+            ".status == \"claimed\"",
+            ".released == true",
+        ):
+            if marker not in source:
+                raise SystemExit(f"Production mutation lease guard is missing from {path}: {marker}")
+        lease_minutes = [int(value) for value in re.findall(r"--argjson lease_minutes (\d+)", source)]
+        if not lease_minutes or any(value < 1 or value > 60 for value in lease_minutes):
+            raise SystemExit(f"Production mutation lease duration is missing or out of bounds: {path}")
+
+    if daily_workflow.index("Acquire production mutation lease") >= daily_workflow.index(
+        "npm run cron:daily"
+    ) or daily_workflow.index("npm run cron:daily") >= daily_workflow.index(
+        "Release production mutation lease"
+    ):
+        raise SystemExit("Daily refresh mutation lease does not surround cron:daily")
+    if "timeout-minutes: 55" not in daily_workflow:
+        raise SystemExit("Daily refresh timeout must remain shorter than its 60-minute mutation lease")
+    if workflow.index("Acquire production mutation lease") >= reconstruction_post or reconstruction_post >= workflow.index(
+        "Release production mutation lease"
+    ):
+        raise SystemExit("Reconstruction mutation lease does not surround reconstruction POSTs")
+    if deploy_workflow.index("Acquire production mutation lease") >= deploy_workflow.index(
+        "Apply remote D1 migrations"
+    ):
+        raise SystemExit("Production deploy mutation lease must be acquired before migrations")
+    if deploy_workflow.index("Release production mutation lease before refresh smoke") >= deploy_workflow.index(
+        "- name: Run refresh smoke"
+    ):
+        raise SystemExit("Production deploy mutation lease must be released before native refresh smoke")
+
+    fred_secret_sync = deploy_workflow[
+        deploy_workflow.index("Sync production FRED secret to Worker"):
+        deploy_workflow.index("Acquire production mutation lease")
+    ]
+    if "--env production" not in fred_secret_sync or "--name" in fred_secret_sync:
+        raise SystemExit("Production FRED secret sync must target wrangler env production exactly once")
     for marker in (
         "inputs.environment == 'production'",
         "pxi-production-indicator-score-mutation",

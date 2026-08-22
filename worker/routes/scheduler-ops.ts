@@ -58,6 +58,17 @@ function unknownHealth(now: Date, decisionDate: string | null): RefreshScheduler
   };
 }
 
+function smokeFailureCode(error: unknown): string {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  if (message.includes('fred_api_key')) return 'missing_fred_api_key';
+  if (message.includes('critical sla')) return 'critical_sla_failure';
+  if (message.includes('mutation lock')) return 'mutation_lock_busy';
+  if (message.includes('date drift')) return 'scheduled_date_drift';
+  if (message.includes('canonical evidence')) return 'canonical_evidence_failure';
+  if (message.includes('deadline') || message.includes('timed out')) return 'provider_deadline_exceeded';
+  return 'refresh_pipeline_failure';
+}
+
 /** Public scheduler health plus a narrowly scoped authenticated deploy smoke. */
 export async function tryHandleSchedulerOpsRoute(
   route: WorkerRouteContext,
@@ -99,16 +110,28 @@ export async function tryHandleSchedulerOpsRoute(
 
     const refreshPipeline = deps.runNativeRefreshPipeline
       ?? (await import('../services/scheduled-refresh')).runNativeRefreshPipeline;
-    const summary: NativeRefreshSummary = await refreshPipeline(
-      env,
-      {
-        schedule_id: 'deploy_smoke',
-        record_research_evidence: false,
-      },
-      now.getTime(),
-    );
+    try {
+      const summary: NativeRefreshSummary = await refreshPipeline(
+        env,
+        {
+          schedule_id: 'deploy_smoke',
+          record_research_evidence: false,
+        },
+        now.getTime(),
+      );
 
-    return Response.json(summary, { headers });
+      return Response.json(summary, { headers });
+    } catch (error) {
+      const failureCode = smokeFailureCode(error);
+      console.error(JSON.stringify({
+        event: 'pxi_refresh_smoke_failed',
+        failure_code: failureCode,
+      }));
+      return Response.json({
+        error: 'Refresh smoke failed',
+        failure_code: failureCode,
+      }, { status: 503, headers });
+    }
   }
 
   if (url.pathname === '/api/admin/refresh/lease/acquire' && method === 'POST') {

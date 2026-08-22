@@ -630,7 +630,7 @@ export interface RefreshProductsSkippedResponsePayload {
   ok: true;
   publication_status: 'skipped';
   skipped: true;
-  reason: 'refresh_in_progress';
+  reason: 'refresh_in_progress' | 'already_completed';
   refresh_run_id: number | null;
   refresh_trigger: string;
 }

@@ -33,6 +33,15 @@ function createRefreshDb(initialRuns: RefreshRunRow[] = []) {
   const buildStatement = (sql: string, args: unknown[] = []) => ({
     bind: (...boundArgs: unknown[]) => buildStatement(sql, boundArgs),
     first: async <T>() => {
+      if (sql.includes('FROM market_refresh_runs') && sql.includes("status IN ('success', 'blocked')") && sql.includes('"trigger" = ?')) {
+        const [trigger] = args as [string];
+        const row = [...runs]
+          .filter((candidate) => candidate.trigger === trigger)
+          .filter((candidate) => (candidate.status === 'success' || candidate.status === 'blocked') && candidate.completed_at)
+          .sort((a, b) => b.id - a.id)[0];
+        return (row ? { id: row.id } : null) as T | null;
+      }
+
       if (sql.includes('SELECT completed_at, "trigger" as trigger') && sql.includes("WHERE status IN ('success', 'blocked')")) {
         const row = [...runs]
           .filter((candidate) => (candidate.status === 'success' || candidate.status === 'blocked') && candidate.completed_at)
@@ -183,6 +192,54 @@ test('claimMarketRefreshRun applies the lock across different trigger names', as
     reason: 'refresh_in_progress',
   });
   assert.equal(db.runs.length, 1);
+});
+
+test('claimMarketRefreshRun treats a completed deterministic trigger as idempotent', async () => {
+  const completedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+  const db = createRefreshDb([
+    {
+      id: 9,
+      started_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+      completed_at: completedAt,
+      status: 'success',
+      trigger: 'cloudflare_cron_daily_close_1787436000000',
+      error: null,
+      created_at: completedAt,
+    },
+  ]);
+
+  const result = await claimMarketRefreshRun(
+    db as unknown as D1Database,
+    'cloudflare_cron_daily_close_1787436000000',
+  );
+
+  assert.deepEqual(result, {
+    status: 'skipped',
+    run_id: 9,
+    refresh_trigger: 'cloudflare_cron_daily_close_1787436000000',
+    reason: 'already_completed',
+  });
+  assert.equal(db.runs.length, 1);
+});
+
+test('claimMarketRefreshRun does not deduplicate reusable manual trigger labels', async () => {
+  const completedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+  const db = createRefreshDb([
+    {
+      id: 10,
+      started_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+      completed_at: completedAt,
+      status: 'success',
+      trigger: 'github_actions',
+      error: null,
+      created_at: completedAt,
+    },
+  ]);
+
+  const result = await claimMarketRefreshRun(db as unknown as D1Database, 'github_actions');
+
+  assert.equal(result.status, 'claimed');
+  assert.equal(db.runs.length, 2);
 });
 
 test('claimMarketRefreshRun marks stale running rows as failed and starts a replacement run', async () => {

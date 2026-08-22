@@ -13,7 +13,7 @@ export const MARKET_EVIDENCE_TARGET_METRIC = 'spy_return_pct';
 const DEFAULT_HISTORY_LIMIT = 2500;
 const MAX_HISTORY_LIMIT = 5000;
 const OUTCOME_LOOKAHEAD_DAYS = 4;
-const EVALUATION_BATCH_LIMIT = 100;
+const EVALUATION_BATCH_LIMIT = 25;
 const BUCKET_BOUNDARIES = [20, 40, 60, 80] as const;
 
 interface ProspectiveTrainingRow {

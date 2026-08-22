@@ -130,8 +130,42 @@ jobs:
           set -euo pipefail
           printf '%s' "${FRED_API_KEY}" | npx wrangler secret put FRED_API_KEY \
             --config worker/wrangler.toml \
-            --env production \
-            --name "${WORKER_SCRIPT_NAME}"
+            --env production
+
+      - name: Acquire production mutation lease
+        if: ${{ inputs.environment == 'production' }}
+        env:
+          WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+        run: |
+          set -euo pipefail
+          HOLDER_ID="deploy:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          REQUEST_BODY="$(jq -cn \
+            --arg holder_id "${HOLDER_ID}" \
+            --arg holder_type 'deploy' \
+            --argjson lease_minutes 60 \
+            '{holder_id: $holder_id, holder_type: $holder_type, lease_minutes: $lease_minutes}')"
+          if ! HTTP_CODE="$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -o /tmp/pxi-deploy-lease-acquire.json \
+            -w '%{http_code}' \
+            -X POST "${TARGET_BASE_URL}/api/admin/refresh/lease/acquire" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H 'Content-Type: application/json' \
+            --data "${REQUEST_BODY}")"; then
+            echo "::error::Production mutation lease request failed"
+            exit 1
+          fi
+          if [[ "${HTTP_CODE}" != "200" ]] || ! jq -e \
+            '.status == "claimed" and
+             .lock_name == "indicator_score_mutation" and
+             .holder_type == "deploy"' \
+            /tmp/pxi-deploy-lease-acquire.json >/dev/null; then
+            echo "::error::Production mutation lease was not acquired (HTTP ${HTTP_CODE})"
+            jq -c . /tmp/pxi-deploy-lease-acquire.json 2>/dev/null || true
+            exit 1
+          fi
+          : > /tmp/pxi-deploy-lease-acquired
 
       - name: Apply remote D1 migrations
         env:
@@ -197,8 +231,40 @@ jobs:
           EDGE_EVIDENCE_V2_REQUIRED: '1'
         run: bash scripts/api-product-contract-check.sh "${TARGET_BASE_URL}"
 
+      - name: Release production mutation lease before refresh smoke
+        if: ${{ always() && inputs.environment == 'production' }}
+        env:
+          WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f /tmp/pxi-deploy-lease-acquired ]]; then
+            exit 0
+          fi
+
+          HOLDER_ID="deploy:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          REQUEST_BODY="$(jq -cn --arg holder_id "${HOLDER_ID}" '{holder_id: $holder_id}')"
+          if ! HTTP_CODE="$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -o /tmp/pxi-deploy-lease-release.json \
+            -w '%{http_code}' \
+            -X POST "${TARGET_BASE_URL}/api/admin/refresh/lease/release" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H 'Content-Type: application/json' \
+            --data "${REQUEST_BODY}")"; then
+            echo "::error::Production mutation lease release request failed"
+            exit 1
+          fi
+          if [[ "${HTTP_CODE}" != "200" ]] || ! jq -e '.released == true' \
+            /tmp/pxi-deploy-lease-release.json >/dev/null; then
+            echo "::error::Production mutation lease was not released (HTTP ${HTTP_CODE})"
+            jq -c . /tmp/pxi-deploy-lease-release.json 2>/dev/null || true
+            exit 1
+          fi
+          rm /tmp/pxi-deploy-lease-acquired
+
       - name: Run refresh smoke
-        if: ${{ inputs.run_refresh_smoke }}
+        if: ${{ success() && inputs.run_refresh_smoke }}
         env:
           WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
         run: |
@@ -250,3 +316,23 @@ jobs:
             process.exit(1);
           }
           NODE
+
+      - name: Best-effort production mutation lease cleanup
+        if: ${{ always() && inputs.environment == 'production' }}
+        env:
+          WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+        run: |
+          if [[ ! -f /tmp/pxi-deploy-lease-acquired ]]; then
+            exit 0
+          fi
+
+          HOLDER_ID="deploy:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          REQUEST_BODY="$(jq -cn --arg holder_id "${HOLDER_ID}" '{holder_id: $holder_id}')"
+          curl -sS \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -o /tmp/pxi-deploy-lease-cleanup.json \
+            -X POST "${TARGET_BASE_URL}/api/admin/refresh/lease/release" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H 'Content-Type: application/json' \
+            --data "${REQUEST_BODY}" >/dev/null || true

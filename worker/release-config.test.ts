@@ -61,6 +61,14 @@ test('worker deploy workflow targets the configured production and staging scrip
   assert.match(workflow, /worker_script_name="pxi-api-production"/);
   assert.match(workflow, /worker_script_name="pxi-api-staging"/);
   assert.match(workflow, /--name "\$\{WORKER_SCRIPT_NAME\}"/);
+
+  const secretSync = workflow.slice(
+    workflow.indexOf('Sync production FRED secret to Worker'),
+    workflow.indexOf('Acquire production mutation lease'),
+  );
+  assert.match(secretSync, /wrangler secret put FRED_API_KEY/);
+  assert.match(secretSync, /--env production/);
+  assert.doesNotMatch(secretSync, /--name/);
 });
 
 test('frontend production verify workflow tolerates non-JSON build responses while polling', () => {
@@ -99,4 +107,54 @@ test('score reconstruction workflow is versioned, bounded, and serialized with p
   assert.match(deploy, /pxi-production-indicator-score-mutation/);
   assert.match(deploy, /Verify legacy backfill kill switch/);
   assert.match(deploy, /"\$\{http_code\}" != "410"/);
+
+  assert.match(daily, /HOLDER_ID="github_daily_refresh:\$\{GITHUB_RUN_ID\}:\$\{GITHUB_RUN_ATTEMPT\}"/);
+  assert.match(daily, /--arg holder_type 'github_daily_refresh'/);
+  assert.match(daily, /timeout-minutes: 55/);
+  assert.match(daily, /\/api\/admin\/refresh\/lease\/acquire/);
+  assert.match(daily, /\/api\/admin\/refresh\/lease\/release/);
+  assert.ok(daily.indexOf('Acquire production mutation lease') < daily.indexOf('npm run cron:daily'));
+  assert.ok(daily.indexOf('npm run cron:daily') < daily.indexOf('Release production mutation lease'));
+  const dailyRelease = daily.slice(
+    daily.indexOf('Release production mutation lease'),
+    daily.indexOf('Verify immutable research snapshot capture'),
+  );
+  assert.match(dailyRelease, /if: \$\{\{ always\(\) \}\}/);
+
+  assert.match(reconstruction, /HOLDER_ID="history_reconstruction:\$\{GITHUB_RUN_ID\}:\$\{GITHUB_RUN_ATTEMPT\}"/);
+  assert.match(reconstruction, /--arg holder_type 'history_reconstruction'/);
+  assert.ok(
+    reconstruction.indexOf('Acquire production mutation lease')
+      < reconstruction.indexOf('-X POST "${BASE_URL}/api/history/reconstruct-missing-v1"'),
+  );
+  assert.ok(
+    reconstruction.indexOf('-X POST "${BASE_URL}/api/history/reconstruct-missing-v1"')
+      < reconstruction.indexOf('Release production mutation lease'),
+  );
+  const reconstructionRelease = reconstruction.slice(
+    reconstruction.indexOf('Release production mutation lease'),
+    reconstruction.indexOf('Append audit summary'),
+  );
+  assert.match(reconstructionRelease, /if: \$\{\{ always\(\) \}\}/);
+
+  assert.match(deploy, /HOLDER_ID="deploy:\$\{GITHUB_RUN_ID\}:\$\{GITHUB_RUN_ATTEMPT\}"/);
+  assert.match(deploy, /--arg holder_type 'deploy'/);
+  assert.ok(
+    deploy.indexOf('Acquire production mutation lease')
+      < deploy.indexOf('Apply remote D1 migrations'),
+  );
+  assert.ok(
+    deploy.indexOf('Release production mutation lease before refresh smoke')
+      < deploy.indexOf('- name: Run refresh smoke'),
+  );
+  assert.match(deploy, /Best-effort production mutation lease cleanup/);
+
+  for (const workflow of [daily, reconstruction, deploy]) {
+    const leaseMinutes = Array.from(
+      workflow.matchAll(/--argjson lease_minutes (\d+)/g),
+      (match) => Number(match[1]),
+    );
+    assert.ok(leaseMinutes.length > 0);
+    assert.ok(leaseMinutes.every((minutes) => minutes >= 1 && minutes <= 60));
+  }
 });

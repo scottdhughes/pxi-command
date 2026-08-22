@@ -68,6 +68,11 @@ routes = [
   { pattern = "www.pxicommand.com/*", zone_name = "pxicommand.com" }
 ]
 
+[env.production.limits]
+# The authenticated deploy smoke runs the same pipeline as Cron. Cloudflare's
+# Standard plan supports at most five minutes of CPU for an HTTP invocation.
+cpu_ms = 300000
+
 [[env.production.d1_databases]]
 binding = "DB"
 database_name = "pxi-db"

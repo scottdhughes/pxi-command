@@ -187,6 +187,39 @@ jobs:
           fi
           echo "Verified deployed build ${EXPECTED_BUILD_SHA} with ${EXPECTED_CONTRACT} capability"
 
+      - name: Acquire production mutation lease
+        run: |
+          set -euo pipefail
+          BASE_URL="${WRITE_API_URL%/api/write}"
+          HOLDER_ID="history_reconstruction:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          REQUEST_BODY="$(jq -cn \
+            --arg holder_id "${HOLDER_ID}" \
+            --arg holder_type 'history_reconstruction' \
+            --argjson lease_minutes 45 \
+            '{holder_id: $holder_id, holder_type: $holder_type, lease_minutes: $lease_minutes}')"
+          if ! HTTP_CODE="$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -o /tmp/pxi-score-reconstruction-lease-acquire.json \
+            -w '%{http_code}' \
+            -X POST "${BASE_URL}/api/admin/refresh/lease/acquire" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H 'Content-Type: application/json' \
+            --data "${REQUEST_BODY}")"; then
+            echo "::error::Production mutation lease request failed"
+            exit 1
+          fi
+          if [[ "${HTTP_CODE}" != "200" ]] || ! jq -e \
+            '.status == "claimed" and
+             .lock_name == "indicator_score_mutation" and
+             .holder_type == "history_reconstruction"' \
+            /tmp/pxi-score-reconstruction-lease-acquire.json >/dev/null; then
+            echo "::error::Production mutation lease was not acquired (HTTP ${HTTP_CODE})"
+            jq -c . /tmp/pxi-score-reconstruction-lease-acquire.json 2>/dev/null || true
+            exit 1
+          fi
+          : > /tmp/pxi-score-reconstruction-lease-acquired
+
       - name: Invoke and verify bounded score-only reconstruction chunks
         run: |
           set -euo pipefail
@@ -305,6 +338,37 @@ jobs:
             > /tmp/pxi-score-reconstruction-aggregate.json
 
           jq . /tmp/pxi-score-reconstruction-aggregate.json
+
+      - name: Release production mutation lease
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f /tmp/pxi-score-reconstruction-lease-acquired ]]; then
+            exit 0
+          fi
+
+          BASE_URL="${WRITE_API_URL%/api/write}"
+          HOLDER_ID="history_reconstruction:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+          REQUEST_BODY="$(jq -cn --arg holder_id "${HOLDER_ID}" '{holder_id: $holder_id}')"
+          if ! HTTP_CODE="$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -o /tmp/pxi-score-reconstruction-lease-release.json \
+            -w '%{http_code}' \
+            -X POST "${BASE_URL}/api/admin/refresh/lease/release" \
+            -H "Authorization: Bearer ${WRITE_API_KEY}" \
+            -H 'Content-Type: application/json' \
+            --data "${REQUEST_BODY}")"; then
+            echo "::error::Production mutation lease release request failed"
+            exit 1
+          fi
+          if [[ "${HTTP_CODE}" != "200" ]] || ! jq -e '.released == true' \
+            /tmp/pxi-score-reconstruction-lease-release.json >/dev/null; then
+            echo "::error::Production mutation lease was not released (HTTP ${HTTP_CODE})"
+            jq -c . /tmp/pxi-score-reconstruction-lease-release.json 2>/dev/null || true
+            exit 1
+          fi
+          rm /tmp/pxi-score-reconstruction-lease-acquired
 
       - name: Append audit summary
         if: always()

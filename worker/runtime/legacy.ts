@@ -601,44 +601,188 @@ function extractLSTMFeatures(
   });
 }
 
+const PROVIDER_FETCH_STAGE_TIMEOUT_MS = 8 * 60 * 1000;
+const PROVIDER_REQUEST_TIMEOUT_MS = 8_000;
+const PROVIDER_FETCH_MAX_CONCURRENCY = 4;
+
+interface FetchWithRetryRuntime {
+  fetchImpl?: typeof fetch;
+  requestTimeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+interface ProviderFetchRuntime {
+  fetchImpl: typeof fetch;
+  requestTimeoutMs: number;
+  signal: AbortSignal;
+}
+
+interface FetchAllIndicatorsOptions {
+  fetchImpl?: typeof fetch;
+  stageTimeoutMs?: number;
+  requestTimeoutMs?: number;
+  concurrency?: number;
+}
+
+class UpstreamStatusError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`upstream status ${status}`);
+    this.name = 'UpstreamStatusError';
+    this.status = status;
+  }
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error('Provider fetch stage aborted');
+}
+
+function throwIfAborted(signal: AbortSignal | null | undefined): void {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+function combineAbortSignals(signals: Array<AbortSignal | null | undefined>): AbortSignal | undefined {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal));
+  if (activeSignals.length === 0) return undefined;
+  if (activeSignals.length === 1) return activeSignals[0];
+  return AbortSignal.any(activeSignals);
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  if (!response.body) return;
+  try {
+    await response.body.cancel();
+  } catch {
+    // A failed cancellation must not mask the upstream status or retry path.
+  }
+}
+
+async function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  if (!signal) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      callback();
+    };
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      finish(() => reject(abortError(signal)));
+    };
+    const timeoutId = setTimeout(() => finish(resolve), delayMs);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
+async function waitForAll<T>(promises: readonly Promise<T>[]): Promise<T[]> {
+  const settled = await Promise.allSettled(promises);
+  const failed = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failed) throw failed.reason;
+  return settled.map((result) => (result as PromiseFulfilledResult<T>).value);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  requestedConcurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+  signal?: AbortSignal,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+
+  const concurrency = Math.min(
+    PROVIDER_FETCH_MAX_CONCURRENCY,
+    Math.max(1, Math.floor(requestedConcurrency)),
+  );
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (true) {
+      throwIfAborted(signal);
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+
+  const settled = await Promise.allSettled(workers);
+  const failed = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failed) throw failed.reason;
+  return results;
+}
+
 // FRED API fetcher
 async function fetchWithRetry(
   url: string,
   init: RequestInit = {},
   maxAttempts = 3,
+  runtime: FetchWithRetryRuntime = {},
 ): Promise<Response> {
+  const fetchImpl = runtime.fetchImpl ?? fetch;
+  const requestTimeoutMs = Math.min(
+    10_000,
+    Math.max(1, Math.floor(runtime.requestTimeoutMs ?? PROVIDER_REQUEST_TIMEOUT_MS)),
+  );
+  const lifetimeSignal = combineAbortSignals([runtime.signal, init.signal]);
   let lastError: unknown = null;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  for (let attempt = 1; attempt <= Math.max(1, Math.floor(maxAttempts)); attempt += 1) {
+    throwIfAborted(lifetimeSignal);
+    const attemptSignal = combineAbortSignals([
+      lifetimeSignal,
+      AbortSignal.timeout(requestTimeoutMs),
+    ]);
+
     try {
-      const response = await fetch(url, {
+      const response = await fetchImpl(url, {
         ...init,
-        signal: init.signal ?? AbortSignal.timeout(15_000),
+        signal: attemptSignal,
       });
       if (response.ok || (response.status < 500 && response.status !== 429)) {
+        if (!response.ok) await cancelResponseBody(response);
         return response;
       }
-      lastError = new Error(`upstream status ${response.status}`);
+      lastError = new UpstreamStatusError(response.status);
+      await cancelResponseBody(response);
     } catch (error) {
+      throwIfAborted(runtime.signal);
+      throwIfAborted(init.signal);
       lastError = error;
     }
 
     if (attempt < maxAttempts) {
       const delayMs = 250 * (2 ** (attempt - 1));
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await waitForRetry(delayMs, lifetimeSignal);
     }
   }
 
   throw lastError instanceof Error ? lastError : new Error('upstream request failed');
 }
 
-async function fetchFredSeries(seriesId: string, indicatorId: string, apiKey: string): Promise<IndicatorValue[]> {
+async function fetchFredSeries(
+  seriesId: string,
+  indicatorId: string,
+  apiKey: string,
+  runtime: ProviderFetchRuntime,
+): Promise<IndicatorValue[]> {
   const startDate = formatDate(subYears(new Date(), 3));
   const endDate = formatDate(new Date());
 
   const url = `https://api.stlouisfed.org/fred/series/observations?series_id=${seriesId}&api_key=${apiKey}&file_type=json&observation_start=${startDate}&observation_end=${endDate}&sort_order=desc&limit=100`;
 
-  const response = await fetchWithRetry(url);
+  const response = await fetchWithRetry(url, {}, 3, runtime);
   if (!response.ok) throw new Error(`FRED API error: ${response.status}`);
 
   const data = await response.json() as { observations: { date: string; value: string }[] };
@@ -654,7 +798,11 @@ async function fetchFredSeries(seriesId: string, indicatorId: string, apiKey: st
 
 // Yahoo Finance fetcher. Cloudflare egress is verified against both chart hosts;
 // keeping a second host avoids turning a single Yahoo edge failure into stale data.
-async function fetchYahooSeries(symbol: string, indicatorId: string): Promise<IndicatorValue[]> {
+async function fetchYahooSeries(
+  symbol: string,
+  indicatorId: string,
+  runtime: ProviderFetchRuntime,
+): Promise<IndicatorValue[]> {
   const period1 = Math.floor(subYears(new Date(), 3).getTime() / 1000);
   const period2 = Math.floor(Date.now() / 1000);
 
@@ -665,13 +813,15 @@ async function fetchYahooSeries(symbol: string, indicatorId: string): Promise<In
     try {
       const response = await fetchWithRetry(url, {
         headers: { 'User-Agent': 'Mozilla/5.0 PXI-Command/1.0' },
-      });
+      }, 3, runtime);
       lastStatus = response.status;
       if (!response.ok) continue;
       const data = await response.json() as any;
       result = data.chart?.result?.[0] ?? null;
       if (result) break;
-    } catch {
+    } catch (error) {
+      throwIfAborted(runtime.signal);
+      if (error instanceof UpstreamStatusError) lastStatus = error.status;
       // Try the alternate Yahoo chart host before failing the indicator.
     }
   }
@@ -690,8 +840,13 @@ async function fetchYahooSeries(symbol: string, indicatorId: string): Promise<In
 }
 
 // DeFiLlama stablecoin fetcher
-async function fetchStablecoinMcap(): Promise<IndicatorValue[]> {
-  const response = await fetchWithRetry('https://stablecoins.llama.fi/stablecoincharts/all');
+async function fetchStablecoinMcap(runtime: ProviderFetchRuntime): Promise<IndicatorValue[]> {
+  const response = await fetchWithRetry(
+    'https://stablecoins.llama.fi/stablecoincharts/all',
+    {},
+    3,
+    runtime,
+  );
   if (!response.ok) throw new Error(`DeFiLlama API error: ${response.status}`);
 
   const data = await response.json() as any[];
@@ -717,7 +872,7 @@ async function fetchStablecoinMcap(): Promise<IndicatorValue[]> {
 }
 
 // CNN Fear & Greed
-async function fetchFearGreed(): Promise<IndicatorValue[]> {
+async function fetchFearGreed(runtime: ProviderFetchRuntime): Promise<IndicatorValue[]> {
   const today = formatDate(new Date());
   try {
     const response = await fetchWithRetry(
@@ -729,6 +884,7 @@ async function fetchFearGreed(): Promise<IndicatorValue[]> {
         },
       },
       2,
+      runtime,
     );
     if (response.ok) {
       const data = await response.json() as any;
@@ -737,10 +893,17 @@ async function fetchFearGreed(): Promise<IndicatorValue[]> {
         return [{ indicator_id: 'fear_greed', date: today, value: score, source: 'cnn' }];
       }
     }
-  } catch { }
+  } catch {
+    throwIfAborted(runtime.signal);
+  }
 
   try {
-    const response = await fetchWithRetry('https://api.alternative.me/fng/?limit=1', {}, 2);
+    const response = await fetchWithRetry(
+      'https://api.alternative.me/fng/?limit=1',
+      {},
+      2,
+      runtime,
+    );
     if (response.ok) {
       const data = await response.json() as any;
       const score = Number.parseFloat(String(data?.data?.[0]?.value ?? ''));
@@ -753,12 +916,51 @@ async function fetchFearGreed(): Promise<IndicatorValue[]> {
         }];
       }
     }
-  } catch { }
+  } catch {
+    throwIfAborted(runtime.signal);
+  }
   return [];
 }
 
 // Fetch all indicator data
-async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]> {
+async function fetchAllIndicators(
+  fredApiKey: string,
+  options: FetchAllIndicatorsOptions = {},
+): Promise<IndicatorValue[]> {
+  const stageTimeoutMs = Math.min(
+    PROVIDER_FETCH_STAGE_TIMEOUT_MS,
+    Math.max(1, Math.floor(options.stageTimeoutMs ?? PROVIDER_FETCH_STAGE_TIMEOUT_MS)),
+  );
+  const requestTimeoutMs = Math.min(
+    10_000,
+    Math.max(1, Math.floor(options.requestTimeoutMs ?? PROVIDER_REQUEST_TIMEOUT_MS)),
+  );
+  const concurrency = Math.min(
+    PROVIDER_FETCH_MAX_CONCURRENCY,
+    Math.max(1, Math.floor(options.concurrency ?? PROVIDER_FETCH_MAX_CONCURRENCY)),
+  );
+  const stageController = new AbortController();
+  const timeoutId = setTimeout(() => {
+    stageController.abort(new Error(`Provider fetch stage exceeded ${stageTimeoutMs}ms deadline`));
+  }, stageTimeoutMs);
+  const runtime: ProviderFetchRuntime = {
+    fetchImpl: options.fetchImpl ?? fetch,
+    requestTimeoutMs,
+    signal: stageController.signal,
+  };
+
+  try {
+    return await fetchAllIndicatorsWithinStage(fredApiKey, runtime, concurrency);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function fetchAllIndicatorsWithinStage(
+  fredApiKey: string,
+  runtime: ProviderFetchRuntime,
+  concurrency: number,
+): Promise<IndicatorValue[]> {
   const all: IndicatorValue[] = [];
 
   // FRED indicators
@@ -770,14 +972,24 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     { ticker: 'DTWEXBGS', id: 'dollar_index' },
   ];
 
-  for (const { ticker, id } of fredIndicators) {
-    try {
-      const data = await fetchFredSeries(ticker, id, fredApiKey);
-      all.push(...data);
-      console.log(`FRED ${id}: ${data.length} values`);
-    } catch (e) {
-      console.error(`FRED ${id} failed:`, e);
-    }
+  const fredResults = await mapWithConcurrency(
+    fredIndicators,
+    concurrency,
+    async ({ ticker, id }) => {
+      try {
+        const data = await fetchFredSeries(ticker, id, fredApiKey, runtime);
+        console.log(`FRED ${id}: ${data.length} values`);
+        return data;
+      } catch (e) {
+        throwIfAborted(runtime.signal);
+        console.error(`FRED ${id} failed:`, e);
+        return [];
+      }
+    },
+    runtime.signal,
+  );
+  for (const data of fredResults) {
+    all.push(...data);
   }
 
   // Calculate net liquidity
@@ -797,7 +1009,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
 
   // M2 year-over-year growth from the monthly M2SL level series.
   try {
-    const m2 = (await fetchFredSeries('M2SL', 'm2_raw', fredApiKey))
+    const m2 = (await fetchFredSeries('M2SL', 'm2_raw', fredApiKey, runtime))
       .sort((left, right) => left.date.localeCompare(right.date));
     for (let index = 12; index < m2.length; index += 1) {
       const current = m2[index];
@@ -814,6 +1026,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('M2 YoY: calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('M2 YoY failed:', e);
   }
 
@@ -828,21 +1041,31 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     { ticker: 'SPY', id: 'spy_close' },  // For backtesting forward returns
   ];
 
-  for (const { ticker, id } of yahooIndicators) {
-    try {
-      const data = await fetchYahooSeries(ticker, id);
-      all.push(...data);
-      console.log(`Yahoo ${id}: ${data.length} values`);
-    } catch (e) {
-      console.error(`Yahoo ${id} failed:`, e);
-    }
+  const yahooResults = await mapWithConcurrency(
+    yahooIndicators,
+    concurrency,
+    async ({ ticker, id }) => {
+      try {
+        const data = await fetchYahooSeries(ticker, id, runtime);
+        console.log(`Yahoo ${id}: ${data.length} values`);
+        return data;
+      } catch (e) {
+        throwIfAborted(runtime.signal);
+        console.error(`Yahoo ${id} failed:`, e);
+        return [];
+      }
+    },
+    runtime.signal,
+  );
+  for (const data of yahooResults) {
+    all.push(...data);
   }
 
   // Computed Yahoo indicators
   try {
-    const [vix, vix3m] = await Promise.all([
-      fetchYahooSeries('^VIX', 'vix_temp'),
-      fetchYahooSeries('^VIX3M', 'vix3m_temp'),
+    const [vix, vix3m] = await waitForAll([
+      fetchYahooSeries('^VIX', 'vix_temp', runtime),
+      fetchYahooSeries('^VIX3M', 'vix3m_temp', runtime),
     ]);
     const vix3mMap = new Map(vix3m.map(v => [v.date, v.value]));
     for (const v of vix) {
@@ -853,13 +1076,14 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('VIX term structure: calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('VIX term structure failed:', e);
   }
 
   try {
-    const [rsp, spy] = await Promise.all([
-      fetchYahooSeries('RSP', 'rsp_temp'),
-      fetchYahooSeries('SPY', 'spy_temp'),
+    const [rsp, spy] = await waitForAll([
+      fetchYahooSeries('RSP', 'rsp_temp', runtime),
+      fetchYahooSeries('SPY', 'spy_temp', runtime),
     ]);
     const spyMap = new Map(spy.map(s => [s.date, s.value]));
     for (const r of rsp) {
@@ -870,32 +1094,35 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('RSP/SPY ratio: calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('RSP/SPY ratio failed:', e);
   }
 
   // Crypto
   try {
-    const stableData = await fetchStablecoinMcap();
+    const stableData = await fetchStablecoinMcap(runtime);
     all.push(...stableData);
     console.log(`Stablecoin mcap: ${stableData.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Stablecoin mcap failed:', e);
   }
 
   // Alternative
   try {
-    const fgData = await fetchFearGreed();
+    const fgData = await fetchFearGreed(runtime);
     all.push(...fgData);
     console.log(`Fear & Greed: ${fgData.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Fear & Greed failed:', e);
   }
 
   // Small cap strength (IWM vs SPY)
   try {
-    const [iwm, spy] = await Promise.all([
-      fetchYahooSeries('IWM', 'iwm_temp'),
-      fetchYahooSeries('SPY', 'spy_temp2'),
+    const [iwm, spy] = await waitForAll([
+      fetchYahooSeries('IWM', 'iwm_temp', runtime),
+      fetchYahooSeries('SPY', 'spy_temp2', runtime),
     ]);
     const spyMap = new Map(spy.map(s => [s.date, s.value]));
     for (const i of iwm) {
@@ -906,14 +1133,15 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('Small cap strength: calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Small cap strength failed:', e);
   }
 
   // Mid cap strength (IJH vs SPY)
   try {
-    const [ijh, spy] = await Promise.all([
-      fetchYahooSeries('IJH', 'ijh_temp'),
-      fetchYahooSeries('SPY', 'spy_temp3'),
+    const [ijh, spy] = await waitForAll([
+      fetchYahooSeries('IJH', 'ijh_temp', runtime),
+      fetchYahooSeries('SPY', 'spy_temp3', runtime),
     ]);
     const spyMap = new Map(spy.map(s => [s.date, s.value]));
     for (const i of ijh) {
@@ -924,13 +1152,19 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('Midcap strength: calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Midcap strength failed:', e);
   }
 
   // Sector breadth (% of sector ETFs above their 50-day MA)
   try {
     const sectorETFs = ['XLB', 'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY'];
-    const sectorData = await Promise.all(sectorETFs.map(t => fetchYahooSeries(t, t.toLowerCase())));
+    const sectorData = await mapWithConcurrency(
+      sectorETFs,
+      concurrency,
+      (ticker) => fetchYahooSeries(ticker, ticker.toLowerCase(), runtime),
+      runtime.signal,
+    );
 
     // Get all unique dates across all sectors
     const allDates = new Set<string>();
@@ -972,6 +1206,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('Sector breadth: calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Sector breadth failed:', e);
   }
 
@@ -984,6 +1219,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('AAII sentiment (proxy): calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('AAII sentiment failed:', e);
   }
 
@@ -1001,32 +1237,35 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('BTC vs 200dma: calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('BTC vs 200dma failed:', e);
   }
 
   // AUD/JPY (risk sentiment indicator)
   try {
-    const audjpy = await fetchYahooSeries('AUDJPY=X', 'audjpy');
+    const audjpy = await fetchYahooSeries('AUDJPY=X', 'audjpy', runtime);
     all.push(...audjpy);
     console.log(`AUDJPY: ${audjpy.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('AUDJPY failed:', e);
   }
 
   // DXY (dollar index)
   try {
-    const dxy = await fetchYahooSeries('DX-Y.NYB', 'dxy');
+    const dxy = await fetchYahooSeries('DX-Y.NYB', 'dxy', runtime);
     all.push(...dxy);
     console.log(`DXY: ${dxy.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('DXY failed:', e);
   }
 
   // Copper/Gold growth proxy used by the canonical global-risk category.
   try {
-    const [copper, gold] = await Promise.all([
-      fetchYahooSeries('HG=F', 'copper_temp'),
-      fetchYahooSeries('GC=F', 'gold_temp'),
+    const [copper, gold] = await waitForAll([
+      fetchYahooSeries('HG=F', 'copper_temp', runtime),
+      fetchYahooSeries('GC=F', 'gold_temp', runtime),
     ]);
     const goldByDate = new Map(gold.map((row) => [row.date, row.value]));
     let calculated = 0;
@@ -1045,6 +1284,7 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log(`Copper/Gold ratio: ${calculated} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Copper/Gold ratio failed:', e);
   }
 
@@ -1070,39 +1310,43 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
       console.log('Volatility-surface proxy: calculated');
     }
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Volatility-surface proxy failed:', e);
   }
 
   // Credit spreads from FRED (map to expected IDs)
   try {
-    const hySpread = await fetchFredSeries('BAMLH0A0HYM2', 'hy_oas_spread', fredApiKey);
+    const hySpread = await fetchFredSeries('BAMLH0A0HYM2', 'hy_oas_spread', fredApiKey, runtime);
     all.push(...hySpread);
     console.log(`HY OAS Spread: ${hySpread.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('HY OAS Spread failed:', e);
   }
 
   try {
-    const igSpread = await fetchFredSeries('BAMLC0A0CM', 'ig_oas_spread', fredApiKey);
+    const igSpread = await fetchFredSeries('BAMLC0A0CM', 'ig_oas_spread', fredApiKey, runtime);
     all.push(...igSpread);
     console.log(`IG OAS Spread: ${igSpread.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('IG OAS Spread failed:', e);
   }
 
   try {
-    const yieldCurve = await fetchFredSeries('T10Y2Y', 'yield_curve_2s10s', fredApiKey);
+    const yieldCurve = await fetchFredSeries('T10Y2Y', 'yield_curve_2s10s', fredApiKey, runtime);
     all.push(...yieldCurve);
     console.log(`Yield curve 2s10s: ${yieldCurve.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Yield curve failed:', e);
   }
 
   // BBB-AAA spread
   try {
-    const [bbb, aaa] = await Promise.all([
-      fetchFredSeries('BAMLC0A4CBBBEY', 'bbb_temp', fredApiKey),
-      fetchFredSeries('BAMLC0A1CAAAEY', 'aaa_temp', fredApiKey),
+    const [bbb, aaa] = await waitForAll([
+      fetchFredSeries('BAMLC0A4CBBBEY', 'bbb_temp', fredApiKey, runtime),
+      fetchFredSeries('BAMLC0A1CAAAEY', 'aaa_temp', fredApiKey, runtime),
     ]);
     const aaaMap = new Map(aaa.map(a => [a.date, a.value]));
     for (const b of bbb) {
@@ -1113,46 +1357,52 @@ async function fetchAllIndicators(fredApiKey: string): Promise<IndicatorValue[]>
     }
     console.log('BBB-AAA spread: calculated');
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('BBB-AAA spread failed:', e);
   }
 
   // EM Spread
   try {
-    const emSpread = await fetchFredSeries('BAMLEMCBPIOAS', 'em_spread', fredApiKey);
+    const emSpread = await fetchFredSeries('BAMLEMCBPIOAS', 'em_spread', fredApiKey, runtime);
     all.push(...emSpread);
     console.log(`EM Spread: ${emSpread.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('EM Spread failed:', e);
   }
 
   // Manufacturing payrolls (FRED MANEMP). The legacy ID is retained so existing
   // history and model weights remain stable; this is not an ISM PMI series.
   try {
-    const ism = await fetchFredSeries('MANEMP', 'ism_manufacturing', fredApiKey);
+    const ism = await fetchFredSeries('MANEMP', 'ism_manufacturing', fredApiKey, runtime);
     all.push(...ism);
     console.log(`Manufacturing payrolls: ${ism.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Manufacturing payrolls failed:', e);
   }
 
   // Initial Jobless Claims
   try {
-    const claims = await fetchFredSeries('IC4WSA', 'jobless_claims', fredApiKey);
+    const claims = await fetchFredSeries('IC4WSA', 'jobless_claims', fredApiKey, runtime);
     all.push(...claims);
     console.log(`Jobless claims: ${claims.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('Jobless claims failed:', e);
   }
 
   // CFNAI
   try {
-    const cfnai = await fetchFredSeries('CFNAI', 'cfnai', fredApiKey);
+    const cfnai = await fetchFredSeries('CFNAI', 'cfnai', fredApiKey, runtime);
     all.push(...cfnai);
     console.log(`CFNAI: ${cfnai.length} values`);
   } catch (e) {
+    throwIfAborted(runtime.signal);
     console.error('CFNAI failed:', e);
   }
 
+  throwIfAborted(runtime.signal);
   return all;
 }
 
@@ -1833,7 +2083,7 @@ async function checkRateLimitKV(
   }
 
   const nextResetTime = resetTime > now ? resetTime : now + windowMs;
-  const nextTtl = Math.max(1, Math.ceil((nextResetTime - now) / 1000));
+  const nextTtl = Math.max(60, Math.ceil((nextResetTime - now) / 1000));
   const nextCount = count >= limit ? 1 : count + 1;
 
   await kv.put(key, JSON.stringify({ count: nextCount, resetTime: nextResetTime }), {
@@ -13786,6 +14036,7 @@ export {
   extractLSTMFeatures,
   extractMLFeatures,
   fetchAllIndicators,
+  fetchWithRetry,
   fetchPredictionEvaluationSampleSize,
   formatDate,
   freshnessPenaltyCount,
@@ -13803,6 +14054,7 @@ export {
   loadMLModel,
   loadSPYReturnModel,
   lstmForward,
+  mapWithConcurrency,
   normalizeAlertTypes,
   normalizeCadence,
   normalizeOpportunityItemsForPublishing,

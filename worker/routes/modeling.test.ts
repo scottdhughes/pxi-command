@@ -134,6 +134,29 @@ test('tryHandleModelingRoute enforces auth on /api/evaluate', async () => {
   assert.equal(response?.status, 401);
 });
 
+test('tryHandleModelingRoute bounds due prediction evaluation work', async () => {
+  const queries: Array<{ sql: string; args: unknown[] }> = [];
+  const route = createRouteContext('https://pxi.test/api/evaluate', { method: 'POST' }, {
+    DB: createFakeDb((sql, args) => {
+      queries.push({ sql, args });
+      return [];
+    }),
+  });
+  const response = await tryHandleModelingRoute(route as any, {
+    enforceAdminAuth: async () => null,
+  });
+
+  assert.equal(response?.status, 200);
+  const predictionQuery = queries.find((query) => query.sql.includes('FROM prediction_log'));
+  assert.ok(predictionQuery);
+  assert.match(predictionQuery.sql, /target_date_7d <= \?/);
+  assert.match(predictionQuery.sql, /target_date_30d <= \?/);
+  assert.match(predictionQuery.sql, /LIMIT 25/);
+  assert.equal(predictionQuery.args.length, 2);
+  const payload = await response!.json() as Record<string, unknown>;
+  assert.equal(payload.batch_limit, 25);
+});
+
 test('tryHandleModelingRoute returns 503 for missing /api/ml/predict model', async () => {
   const route = createRouteContext('https://pxi.test/api/ml/predict');
   const response = await tryHandleModelingRoute(route as any, {

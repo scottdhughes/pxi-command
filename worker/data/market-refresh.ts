@@ -44,12 +44,16 @@ export type MarketRefreshRunClaim =
       status: 'skipped';
       run_id: number | null;
       refresh_trigger: string;
-      reason: 'refresh_in_progress';
+      reason: 'refresh_in_progress' | 'already_completed';
     };
 
 function normalizeRefreshTrigger(trigger: string): string {
   const trimmed = trigger.trim();
   return trimmed.length > 0 ? trimmed.slice(0, 128) : 'unknown';
+}
+
+function isDeterministicCloudflareTrigger(trigger: string): boolean {
+  return /^cloudflare_cron_(overnight|premarket|midday|daily_close)_\d{13}$/.test(trigger);
 }
 
 export async function claimMarketRefreshRun(
@@ -63,6 +67,30 @@ export async function claimMarketRefreshRun(
   const nowIso = asIsoDateTime(new Date());
 
   try {
+    // Deterministic Cloudflare slot triggers are also publication idempotency
+    // keys. If a prior product publication completed but the outer scheduler
+    // lost its finalization fence, a retry must not append duplicate ledgers.
+    if (isDeterministicCloudflareTrigger(normalizedTrigger)) {
+      const completed = await db.prepare(`
+        SELECT id
+        FROM market_refresh_runs
+        WHERE "trigger" = ?
+          AND status IN ('success', 'blocked')
+          AND completed_at IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+      `).bind(normalizedTrigger).first<{ id: number | null }>();
+
+      if (completed?.id) {
+        return {
+          status: 'skipped',
+          run_id: completed.id,
+          refresh_trigger: normalizedTrigger,
+          reason: 'already_completed',
+        };
+      }
+    }
+
     await db.prepare(`
       UPDATE market_refresh_runs
       SET completed_at = ?,

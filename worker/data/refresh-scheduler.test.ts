@@ -180,7 +180,7 @@ function createSchedulerDb() {
             if (
               row.incident_type === incidentType
               && row.status === 'open'
-              && row.decision_date <= decisionDate
+              && row.decision_date === decisionDate
             ) {
               row.status = 'resolved';
               row.resolved_at = resolvedAt;
@@ -406,11 +406,12 @@ test('latest health is public-safe and distinguishes missed from healthy', async
     });
   }
 
-  const healthy = await fetchRefreshSchedulerHealth(state.db, {
+  const stillMissed = await fetchRefreshSchedulerHealth(state.db, {
     decisionDate: '2026-08-22',
     isUsMarketDay: true,
     now: new Date('2026-08-22T22:11:00.000Z'),
   });
-  assert.equal(healthy.state, 'healthy');
-  assert.equal(healthy.latest_daily_close?.status, 'success');
+  assert.equal(stillMissed.state, 'missed');
+  assert.equal(stillMissed.latest_daily_close?.status, 'success');
+  assert.equal(stillMissed.latest_incident?.decision_date, '2026-08-21');
 });

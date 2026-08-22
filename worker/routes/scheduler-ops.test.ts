@@ -186,6 +186,35 @@ test('POST /api/admin/refresh/run invokes a non-evidence deploy smoke at current
   assert.deepEqual(await response!.json(), summary);
 });
 
+test('POST /api/admin/refresh/run returns only a stable failure code', async () => {
+  const route = createRoute(
+    '/api/admin/refresh/run',
+    {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-secret' },
+    },
+    { WRITE_API_KEY: 'test-secret' },
+  );
+  const originalConsoleError = console.error;
+  console.error = () => undefined;
+  try {
+    const response = await tryHandleSchedulerOpsRoute(route as any, {
+      now: () => new Date('2026-08-21T14:00:00.000Z'),
+      runNativeRefreshPipeline: async () => {
+        throw new Error('FRED_API_KEY not configured: private detail');
+      },
+    });
+
+    assert.equal(response?.status, 503);
+    assert.deepEqual(await response!.json(), {
+      error: 'Refresh smoke failed',
+      failure_code: 'missing_fred_api_key',
+    });
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
 test('scheduler operations route ignores unrelated paths and methods', async () => {
   const unrelated = await tryHandleSchedulerOpsRoute(
     createRoute('/health') as any,

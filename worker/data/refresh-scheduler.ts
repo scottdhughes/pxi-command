@@ -319,7 +319,7 @@ export async function finishRefreshScheduleSlot(
           resolution_slot_key = ?
       WHERE incident_type = ?
         AND status = 'open'
-        AND decision_date <= ?
+        AND decision_date = ?
     `).bind(
       completedAt,
       completedAt,

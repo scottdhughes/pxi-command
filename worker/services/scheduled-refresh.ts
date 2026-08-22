@@ -54,6 +54,8 @@ function failureCode(error: unknown): string {
   if (message.includes('canonical evidence')) return 'canonical_evidence_failure';
   if (message.includes('date drift')) return 'scheduled_date_drift';
   if (message.includes('mutation lock')) return 'mutation_lock_busy';
+  if (message.includes('scheduler fence')) return 'scheduler_fence_lost';
+  if (message.includes('deadline') || message.includes('timed out')) return 'provider_deadline_exceeded';
   if (message.includes('already in progress')) return 'refresh_in_progress';
   return 'refresh_pipeline_failure';
 }
@@ -105,8 +107,12 @@ async function requireJsonResponse(
   return payload;
 }
 
-async function writeIndicatorCandidates(env: Env, candidates: IndicatorCandidate[]): Promise<number> {
-  const valid = selectLatestIndicatorCandidates(candidates);
+async function writeIndicatorCandidates(
+  env: Env,
+  candidates: IndicatorCandidate[],
+  decisionDate: string,
+): Promise<number> {
+  const valid = selectLatestIndicatorCandidates(candidates, decisionDate);
   const batchSize = 100;
   let written = 0;
   for (let index = 0; index < valid.length; index += batchSize) {
@@ -176,7 +182,7 @@ export async function runNativeRefreshPipeline(
       throw new Error(`Critical SLA violation(s): ${names}`);
     }
 
-    const indicatorsWritten = await writeIndicatorCandidates(env, candidates);
+    const indicatorsWritten = await writeIndicatorCandidates(env, candidates, actualDecisionDate);
 
     const recalculate = await requireJsonResponse(
       'recalculate',
@@ -297,18 +303,29 @@ export async function runScheduledRefresh(
 
   try {
     await runNativeRefreshPipeline(env, schedule, controller.scheduledTime);
-    await finishRefreshScheduleSlot(env.DB, {
+    const recorded = await finishRefreshScheduleSlot(env.DB, {
       slotKey: claim.slot_key,
       attempt: claim.attempt,
       status: 'success',
     });
+    if (!recorded) {
+      throw new Error('Scheduler fence lost after refresh pipeline completion');
+    }
   } catch (error) {
-    await finishRefreshScheduleSlot(env.DB, {
+    const recorded = await finishRefreshScheduleSlot(env.DB, {
       slotKey: claim.slot_key,
       attempt: claim.attempt,
       status: 'failed',
       error: `${failureCode(error)}: ${boundedFailureDetail(error)}`,
     });
+    if (!recorded) {
+      console.error(JSON.stringify({
+        event: 'pxi_refresh_scheduler_fence_lost',
+        schedule_id: schedule.schedule_id,
+        scheduled_at: new Date(controller.scheduledTime).toISOString(),
+        attempt: claim.attempt,
+      }));
+    }
     console.error(JSON.stringify({
       event: 'pxi_refresh_failed',
       schedule_id: schedule.schedule_id,

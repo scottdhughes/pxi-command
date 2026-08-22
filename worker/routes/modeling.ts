@@ -414,13 +414,19 @@ async function handleEvaluateRoute(route: WorkerRouteContext, deps: ModelingDeps
     return adminAuthFailure;
   }
 
+  const today = asDateKey(new Date());
   const pendingPredictions = await env.DB.prepare(`
     SELECT id, prediction_date, target_date_7d, target_date_30d, current_score,
            predicted_change_7d, predicted_change_30d, actual_change_7d, actual_change_30d
     FROM prediction_log
     WHERE evaluated_at IS NULL
+      AND (
+        (actual_change_7d IS NULL AND target_date_7d IS NOT NULL AND target_date_7d <= ?)
+        OR (actual_change_30d IS NULL AND target_date_30d IS NOT NULL AND target_date_30d <= ?)
+      )
     ORDER BY prediction_date ASC
-  `).all<{
+    LIMIT 25
+  `).bind(today, today).all<{
     id: number;
     prediction_date: string;
     target_date_7d: string | null;
@@ -432,7 +438,6 @@ async function handleEvaluateRoute(route: WorkerRouteContext, deps: ModelingDeps
     actual_change_30d: number | null;
   }>();
 
-  const today = asDateKey(new Date());
   let evaluated = 0;
 
   for (const prediction of pendingPredictions.results || []) {
@@ -484,6 +489,7 @@ async function handleEvaluateRoute(route: WorkerRouteContext, deps: ModelingDeps
 
   return Response.json({
     success: true,
+    batch_limit: 25,
     pending: pendingPredictions.results?.length || 0,
     evaluated,
     market_evidence: marketEvidence,

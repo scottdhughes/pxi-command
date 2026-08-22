@@ -65,7 +65,9 @@ export async function checkRateLimitKV(
   }
 
   const nextResetTime = resetTime > now ? resetTime : now + windowMs;
-  const nextTtl = Math.max(1, Math.ceil((nextResetTime - now) / 1000));
+  // Workers KV rejects expiration_ttl values below 60 seconds. The logical
+  // reset timestamp remains authoritative if the record outlives its window.
+  const nextTtl = Math.max(60, Math.ceil((nextResetTime - now) / 1000));
   const nextCount = count + 1;
 
   await kv.put(key, JSON.stringify({ count: nextCount, resetTime: nextResetTime }), {

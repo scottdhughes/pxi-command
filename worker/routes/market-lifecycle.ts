@@ -281,7 +281,7 @@ export async function tryHandleMarketLifecycleRoute(
         ok: true,
         skipped: true,
         publication_status: 'skipped',
-        reason: 'refresh_in_progress',
+        reason: refreshClaim.reason,
         refresh_run_id: refreshClaim.run_id,
         refresh_trigger: refreshClaim.refresh_trigger,
       };

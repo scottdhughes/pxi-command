@@ -1,7 +1,6 @@
 const BRIEF_CONTRACT_VERSION = '2026-02-17-v2';
 const MARKET_SCHEMA_CACHE_MS = 5 * 60 * 1000;
 
-let marketSchemaInitPromise: Promise<void> | null = null;
 let marketSchemaInitializedAt = 0;
 
 export async function tableHasColumn(
@@ -189,12 +188,10 @@ export async function ensureMarketProductSchema(db: D1Database): Promise<void> {
     return;
   }
 
-  if (marketSchemaInitPromise) {
-    await marketSchemaInitPromise;
-    return;
-  }
-
-  marketSchemaInitPromise = (async () => {
+  // Do not cache a D1-backed Promise in module-global state. A Worker isolate
+  // may serve concurrent requests, and I/O objects must not cross request
+  // contexts. We retain only the primitive success timestamp.
+  await (async () => {
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS market_brief_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -423,9 +420,4 @@ export async function ensureMarketProductSchema(db: D1Database): Promise<void> {
     marketSchemaInitializedAt = Date.now();
   })();
 
-  try {
-    await marketSchemaInitPromise;
-  } finally {
-    marketSchemaInitPromise = null;
-  }
 }

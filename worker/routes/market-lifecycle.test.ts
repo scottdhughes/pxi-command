@@ -278,6 +278,32 @@ test('tryHandleMarketLifecycleRoute returns a skip payload when refresh-products
   assert.equal(payload.refresh_run_id, 42);
 });
 
+test('tryHandleMarketLifecycleRoute returns an idempotent skip for an already completed trigger', async () => {
+  const route = createRouteContext('https://pxi.test/api/market/refresh-products', { method: 'POST' });
+
+  const response = await tryHandleMarketLifecycleRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    ensureMarketProductSchema: async () => undefined,
+    isFeatureEnabled: () => true,
+    resolveDecisionImpactGovernance: () => ({
+      enforce_enabled: false,
+      min_sample_size: 30,
+      min_actionable_sessions: 10,
+    }),
+    claimMarketRefreshRun: async () => ({
+      status: 'skipped',
+      run_id: 43,
+      refresh_trigger: 'cloudflare_cron_daily_close_1787436000000',
+      reason: 'already_completed',
+    }),
+  });
+
+  assert.equal(response?.status, 200);
+  const payload = await response!.json() as Record<string, unknown>;
+  assert.equal(payload.reason, 'already_completed');
+  assert.equal(payload.refresh_run_id, 43);
+});
+
 test('tryHandleMarketLifecycleRoute returns a blocked payload when governance blocks live publication', async () => {
   const storeBriefCalls: unknown[] = [];
   const storeOpportunityCalls: unknown[] = [];
