@@ -23,6 +23,7 @@ import type {
   BriefData,
   EnsembleData,
   HistoryDataPoint,
+  HistoryMetadata,
   MLAccuracyData,
   OpportunitiesResponse,
   PlanData,
@@ -279,6 +280,7 @@ type HomePageProps = {
   data: PXIData
   ensemble: EnsembleData | null
   historyData: HistoryDataPoint[]
+  historyMetadata: HistoryMetadata | null
   historyRange: '7d' | '30d' | '90d'
   menuOpen: boolean
   menuRef: RefObject<HTMLDivElement | null>
@@ -308,6 +310,7 @@ export function HomePage({
   briefData,
   data,
   historyData,
+  historyMetadata,
   historyRange,
   menuOpen,
   menuRef,
@@ -483,6 +486,7 @@ export function HomePage({
         {chartData.length > 0 && (
           <HistoricalChart
             data={chartData}
+            metadata={historyData.length > 0 ? historyMetadata : null}
             range={historyRange}
             onRangeChange={setHistoryRange}
           />

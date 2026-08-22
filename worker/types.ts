@@ -82,6 +82,7 @@ export interface WorkerHealthResponsePayload {
   build_sha: string;
   build_timestamp: string;
   worker_version: string;
+  history_reconstruction_contract: 'isolated-missing-only-v1' | 'unavailable';
 }
 
 export interface PXIRow {
@@ -442,20 +443,32 @@ export interface RecalculateResponsePayload {
 
 export interface BackfillRunResultItem {
   date: string;
+  status: 'inserted' | 'skipped_existing' | 'conflict' | 'failed';
   error?: string;
 }
 
 export interface BackfillResponsePayload {
-  success: true;
-  run_id: number | null;
+  success: boolean;
   start: string;
   end: string;
   requested_limit: number;
-  refresh_products: boolean;
-  include_decision_impact: boolean;
-  include_decision_grade: boolean;
+  history_origin: 'retrospective_reconstruction';
+  missing_only: true;
+  point_in_time_guarantee: false;
+  reconstructed_at: string;
+  reconstruction_method: string;
+  reconstruction_build_sha: string;
+  source_data_as_of: string;
+  research_evidence_captured: false;
+  market_products_refreshed: false;
+  decision_impact_refreshed: false;
+  embeddings_generated: 0;
   succeeded: number;
-  embedded: number;
+  skipped_existing: number;
+  failed: number;
+  stopped_early: boolean;
+  unprocessed: number;
+  replaced: 0;
   results: BackfillRunResultItem[];
 }
 

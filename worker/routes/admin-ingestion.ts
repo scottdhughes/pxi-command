@@ -455,6 +455,26 @@ export async function tryHandleAdminIngestionRoute(
       pxi?: { date: string; score: number; label: string; status: string; delta_1d: number | null; delta_7d: number | null; delta_30d: number | null };
     };
 
+    const currentDate = deps.currentNewYorkDate();
+    const liveScoreDates: Array<{ field: string; date: unknown }> = [];
+    if (body.type === 'category' || body.type === 'pxi') {
+      liveScoreDates.push({ field: `data.${body.type}.date`, date: body.data?.date });
+    }
+    for (let index = 0; index < (body.categories || []).length; index += 1) {
+      liveScoreDates.push({ field: `categories[${index}].date`, date: body.categories![index].date });
+    }
+    if (body.pxi) {
+      liveScoreDates.push({ field: 'pxi.date', date: body.pxi.date });
+    }
+    const invalidLiveScoreDates = liveScoreDates.filter(({ date }) => date !== currentDate);
+    if (invalidLiveScoreDates.length > 0) {
+      return Response.json({
+        error: 'PXI and category live writes are restricted to the current America/New_York date.',
+        current_date: currentDate,
+        invalid_fields: invalidLiveScoreDates.map(({ field, date }) => ({ field, date })),
+      }, { status: 400, headers: corsHeaders });
+    }
+
     const stmts: D1PreparedStatement[] = [];
 
     if (body.type) {
@@ -467,14 +487,16 @@ export async function tryHandleAdminIngestionRoute(
       } else if (body.type === 'category') {
         const { category, date, score, weight, weighted_score } = body.data;
         stmts.push(env.DB.prepare(`
-          INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-          VALUES (?, ?, ?, ?, ?)
+          INSERT OR REPLACE INTO category_scores
+          (category, date, score, weight, weighted_score, history_origin)
+          VALUES (?, ?, ?, ?, ?, 'live_recorded')
         `).bind(category, date, score, weight, weighted_score));
       } else if (body.type === 'pxi') {
         const { date, score, label, status, delta_1d, delta_7d, delta_30d } = body.data;
         stmts.push(env.DB.prepare(`
-          INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+          INSERT OR REPLACE INTO pxi_scores
+          (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
         `).bind(date, score, label, status, delta_1d, delta_7d, delta_30d));
       }
     }
@@ -488,15 +510,17 @@ export async function tryHandleAdminIngestionRoute(
 
     for (const category of body.categories || []) {
       stmts.push(env.DB.prepare(`
-        INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO category_scores
+        (category, date, score, weight, weighted_score, history_origin)
+        VALUES (?, ?, ?, ?, ?, 'live_recorded')
       `).bind(category.category, category.date, category.score, category.weight, category.weighted_score));
     }
 
     if (body.pxi) {
       stmts.push(env.DB.prepare(`
-        INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO pxi_scores
+        (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
       `).bind(
         body.pxi.date,
         body.pxi.score,
@@ -583,13 +607,14 @@ export async function tryHandleAdminIngestionRoute(
       written += batch.length;
     }
 
-    const today = deps.formatDate(new Date());
+    const today = deps.currentNewYorkDate();
     const result = await deps.calculatePXI(env.DB, today);
 
     if (result) {
       await env.DB.prepare(`
-        INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO pxi_scores
+        (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
       `).bind(
         result.pxi.date, result.pxi.score, result.pxi.label, result.pxi.status,
         result.pxi.delta_1d, result.pxi.delta_7d, result.pxi.delta_30d,
@@ -597,8 +622,9 @@ export async function tryHandleAdminIngestionRoute(
 
       const catStmts = result.categories.map((category: any) =>
         env.DB.prepare(`
-          INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-          VALUES (?, ?, ?, ?, ?)
+          INSERT OR REPLACE INTO category_scores
+          (category, date, score, weight, weighted_score, history_origin)
+          VALUES (?, ?, ?, ?, ?, 'live_recorded')
         `).bind(category.category, category.date, category.score, category.weight, category.weighted_score)
       );
       if (catStmts.length > 0) {
@@ -624,7 +650,15 @@ export async function tryHandleAdminIngestionRoute(
     }
 
     const body = await request.json() as { date?: string; record_evidence?: boolean };
-    const targetDate = body.date || deps.formatDate(new Date());
+    const currentDate = deps.currentNewYorkDate();
+    const targetDate = body.date || currentDate;
+    if (targetDate !== currentDate) {
+      return Response.json({
+        error: 'Live PXI recalculation is restricted to the current America/New_York date.',
+        current_date: currentDate,
+        requested_date: targetDate,
+      }, { status: 400, headers: corsHeaders });
+    }
     const recordEvidence = body.record_evidence === true;
     const result = await deps.calculatePXI(env.DB, targetDate);
 
@@ -633,8 +667,9 @@ export async function tryHandleAdminIngestionRoute(
     }
 
     await env.DB.prepare(`
-      INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO pxi_scores
+      (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
     `).bind(
       result.pxi.date,
       result.pxi.score,
@@ -647,8 +682,9 @@ export async function tryHandleAdminIngestionRoute(
 
     const catStmts = result.categories.map((category: any) =>
       env.DB.prepare(`
-        INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO category_scores
+        (category, date, score, weight, weighted_score, history_origin)
+        VALUES (?, ?, ?, ?, ?, 'live_recorded')
       `).bind(category.category, category.date, category.score, category.weight, category.weighted_score)
     );
     if (catStmts.length > 0) {
@@ -715,157 +751,376 @@ export async function tryHandleAdminIngestionRoute(
   }
 
   if (url.pathname === '/api/backfill' && method === 'POST') {
+    return Response.json({
+      error: 'The legacy backfill endpoint is permanently disabled.',
+    }, { status: 410, headers: corsHeaders });
+  }
+
+  if (url.pathname === '/api/history/reconstruct-missing-v1' && method === 'POST') {
     const adminAuthFailure = await deps.enforceAdminAuth(request, env, corsHeaders, clientIP);
     if (adminAuthFailure) {
       return adminAuthFailure;
     }
 
-    const body = await deps.parseJsonBody(request);
-    if (!body) {
+    const parsedBody = await deps.parseJsonBody(request);
+    if (!parsedBody || typeof parsedBody !== 'object' || Array.isArray(parsedBody)) {
       return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: corsHeaders });
     }
+    const body = parsedBody as Record<string, unknown>;
 
-    const range = deps.parseBackfillDateRange(body.start, body.end);
-    if (!range) {
+    const allowedKeys = new Set([
+      'start',
+      'end',
+      'limit',
+      'expected_build_sha',
+      'missing_only',
+      'record_evidence',
+      'refresh_products',
+      'include_decision_impact',
+      'include_decision_grade',
+      'rebuild_ledgers',
+      'generate_embeddings',
+      'recalibrate',
+      'overwrite',
+    ]);
+    const unknownKeys = Object.keys(body).filter((key) => !allowedKeys.has(key));
+    if (unknownKeys.length > 0) {
       return Response.json({
-        error: 'Invalid date range. Use ISO dates and ensure start <= end.',
+        error: `Unsupported backfill option(s): ${unknownKeys.join(', ')}`,
       }, { status: 400, headers: corsHeaders });
     }
 
-    const limit = deps.parseBackfillLimit(body.limit);
-    const refreshProducts = body.refresh_products !== false;
-    const includeDecisionImpact = body.include_decision_impact !== false;
-    const includeDecisionGrade = body.include_decision_grade !== false;
-
-    const refreshRunId = await deps.recordMarketRefreshRunStart(
-      env.DB,
-      `backfill ${range.start} -> ${range.end}`,
-    );
-
-    try {
-      const results: Array<{ date: string; error?: string }> = [];
-      let succeeded = 0;
-      let embedded = 0;
-
-      const startDate = new Date(`${range.start}T00:00:00.000Z`);
-      const endDate = new Date(`${range.end}T00:00:00.000Z`);
-      const dates: string[] = [];
-      for (let cursor = new Date(startDate); cursor <= endDate; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
-        dates.push(deps.formatDate(cursor));
-        if (dates.length >= limit) break;
-      }
-
-      for (const date of dates) {
-        try {
-          const result = await deps.calculatePXI(env.DB, date);
-          if (!result) {
-            results.push({ date, error: 'Insufficient data for calculation' });
-            continue;
-          }
-
-          await env.DB.prepare(`
-            INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `).bind(
-            result.pxi.date,
-            result.pxi.score,
-            result.pxi.label,
-            result.pxi.status,
-            result.pxi.delta_1d,
-            result.pxi.delta_7d,
-            result.pxi.delta_30d,
-          ).run();
-
-          const catStmts = result.categories.map((category: any) =>
-            env.DB.prepare(`
-              INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-              VALUES (?, ?, ?, ?, ?)
-            `).bind(category.category, category.date, category.score, category.weight, category.weighted_score)
-          );
-          if (catStmts.length > 0) {
-            await env.DB.batch(catStmts);
-          }
-
-          const indicators = await env.DB.prepare(`
-            SELECT indicator_id, value FROM indicator_values WHERE date = ? ORDER BY indicator_id
-          `).bind(date).all<{ indicator_id: string; value: number }>();
-
-          if (indicators.results && indicators.results.length >= 5) {
-            try {
-              const embeddingText = deps.generateEmbeddingText({
-                indicators: indicators.results,
-                pxi: {
-                  score: result.pxi.score,
-                  delta_7d: result.pxi.delta_7d,
-                  delta_30d: result.pxi.delta_30d,
-                },
-                categories: result.categories.map((category: any) => ({ category: category.category, score: category.score })),
-              });
-
-              const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-                text: embeddingText,
-              });
-              const embeddingVector = deps.getEmbeddingVector(embedding);
-
-              await env.VECTORIZE.upsert([{
-                id: date,
-                values: embeddingVector,
-                metadata: { date, score: result.pxi.score, label: result.pxi.label },
-              }]);
-              embedded += 1;
-            } catch (error) {
-              console.error(`Embedding failed for ${date}:`, error);
-            }
-          }
-
-          succeeded += 1;
-          results.push({ date });
-        } catch (error) {
-          results.push({ date, error: error instanceof Error ? error.message : 'Unknown error' });
-        }
-      }
-
-      if (refreshProducts) {
-        try {
-          await deps.ensureMarketProductSchema(env.DB);
-        } catch (error) {
-          console.warn('Backfill product schema guard failed:', error);
-        }
-      }
-
-      await deps.recordMarketRefreshRunFinish(env.DB, refreshRunId, {
-        status: 'success',
-        as_of: range.end,
-        error: null,
-      });
-
-      const payload: BackfillResponsePayload = {
-        success: true,
-        run_id: refreshRunId,
-        start: range.start,
-        end: range.end,
-        requested_limit: limit,
-        refresh_products: refreshProducts,
-        include_decision_impact: includeDecisionImpact,
-        include_decision_grade: includeDecisionGrade,
-        succeeded,
-        embedded,
-        results,
-      };
-
-      return Response.json(payload, { headers: corsHeaders });
-    } catch (error) {
-      await deps.recordMarketRefreshRunFinish(
-        env.DB,
-        refreshRunId,
-        {
-          status: 'failed',
-          as_of: range.end,
-          error: error instanceof Error ? error.message : 'Unknown backfill failure',
-        },
-      );
-      throw error;
+    const prohibitedOptions = [
+      'record_evidence',
+      'refresh_products',
+      'include_decision_impact',
+      'include_decision_grade',
+      'rebuild_ledgers',
+      'generate_embeddings',
+      'recalibrate',
+      'overwrite',
+    ].filter((key) => body[key] !== undefined && body[key] !== false);
+    if (prohibitedOptions.length > 0) {
+      return Response.json({
+        error: 'Retrospective score reconstruction cannot enable evidence, products, embeddings, ledgers, recalibration, or overwrite mode.',
+        prohibited_options: prohibitedOptions,
+      }, { status: 400, headers: corsHeaders });
     }
+
+    if (body.missing_only === false) {
+      return Response.json({
+        error: 'Retrospective score reconstruction is missing-only; existing rows cannot be replaced.',
+      }, { status: 400, headers: corsHeaders });
+    }
+
+    let range: { start: string | null; end: string | null };
+    try {
+      range = deps.parseBackfillDateRange(body.start, body.end);
+    } catch (error) {
+      return Response.json({
+        error: error instanceof Error ? error.message : 'Invalid date range',
+      }, { status: 400, headers: corsHeaders });
+    }
+
+    if (!range?.start || !range?.end) {
+      return Response.json({
+        error: 'Both start and end are required ISO dates for retrospective score reconstruction.',
+      }, { status: 400, headers: corsHeaders });
+    }
+
+    const limit = body.limit;
+    if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 3) {
+      return Response.json({
+        error: 'limit must be an integer from 1 through 3 for one bounded reconstruction request.',
+      }, { status: 400, headers: corsHeaders });
+    }
+
+    const startDate = new Date(`${range.start}T00:00:00.000Z`);
+    const endDate = new Date(`${range.end}T00:00:00.000Z`);
+    const spanDays = Math.floor((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000)) + 1;
+    if (spanDays > limit) {
+      return Response.json({
+        error: `Requested range contains ${spanDays} days, which exceeds limit=${limit}. No rows were written.`,
+      }, { status: 400, headers: corsHeaders });
+    }
+
+    const today = deps.currentNewYorkDate();
+    if (range.end >= today) {
+      return Response.json({
+        error: 'Retrospective score reconstruction may only target dates before today.',
+      }, { status: 400, headers: corsHeaders });
+    }
+
+    const buildSha = typeof env.BUILD_SHA === 'string' ? env.BUILD_SHA.trim() : '';
+    if (!/^[0-9a-f]{7,64}$/i.test(buildSha)) {
+      return Response.json({
+        error: 'A deployed Git build SHA is required to record reconstruction provenance.',
+      }, { status: 503, headers: corsHeaders });
+    }
+    const expectedBuildSha = typeof body.expected_build_sha === 'string'
+      ? body.expected_build_sha.trim()
+      : '';
+    if (!/^[0-9a-f]{12}$/i.test(expectedBuildSha)) {
+      return Response.json({
+        error: 'expected_build_sha must be the triggering 12-character Git SHA.',
+      }, { status: 400, headers: corsHeaders });
+    }
+    if (expectedBuildSha.toLowerCase() !== buildSha.toLowerCase()) {
+      return Response.json({
+        error: 'Deployed build changed or does not match the authorized reconstruction build.',
+        expected_build_sha: expectedBuildSha,
+        deployed_build_sha: buildSha,
+      }, { status: 409, headers: corsHeaders });
+    }
+
+    const sourceData = await env.DB.prepare(`
+      SELECT MAX(fetched_at) AS source_data_as_of
+      FROM indicator_values
+      WHERE date <= ?
+    `).bind(range.end).first<{ source_data_as_of: string | null }>();
+    const sourceDataAsOf = sourceData?.source_data_as_of?.trim() || '';
+    if (!sourceDataAsOf) {
+      return Response.json({
+        error: 'No source-data fetch timestamp is available for the requested range.',
+      }, { status: 409, headers: corsHeaders });
+    }
+
+    const configuredCategories = Array.isArray(deps.PXI_SCORE_CATEGORIES)
+      ? deps.PXI_SCORE_CATEGORIES.filter((category: unknown): category is string =>
+        typeof category === 'string' && category.length > 0)
+      : [];
+    const expectedCategories = new Set(configuredCategories);
+    if (expectedCategories.size === 0 || expectedCategories.size !== configuredCategories.length) {
+      return Response.json({
+        error: 'PXI category completeness contract is unavailable.',
+      }, { status: 503, headers: corsHeaders });
+    }
+
+    type ExistingHistoryRow = {
+      date: string;
+      storage_kind: 'live_pxi' | 'live_category' | 'reconstruction_pxi' | 'reconstruction_category';
+      history_origin: string;
+      reconstructed_at: string | null;
+      reconstruction_method: string | null;
+      reconstruction_build_sha: string | null;
+      source_data_as_of: string | null;
+      category: string | null;
+    };
+    const existingRows = await env.DB.prepare(`
+      SELECT date, 'live_pxi' AS storage_kind, history_origin,
+             NULL AS reconstructed_at, NULL AS reconstruction_method,
+             NULL AS reconstruction_build_sha, NULL AS source_data_as_of,
+             NULL AS category
+      FROM pxi_scores WHERE date BETWEEN ? AND ?
+      UNION ALL
+      SELECT date, 'live_category' AS storage_kind, history_origin,
+             NULL AS reconstructed_at, NULL AS reconstruction_method,
+             NULL AS reconstruction_build_sha, NULL AS source_data_as_of,
+             category
+      FROM category_scores WHERE date BETWEEN ? AND ?
+      UNION ALL
+      SELECT date, 'reconstruction_pxi' AS storage_kind, history_origin,
+             reconstructed_at, reconstruction_method,
+             reconstruction_build_sha, source_data_as_of,
+             NULL AS category
+      FROM pxi_score_reconstructions WHERE date BETWEEN ? AND ?
+      UNION ALL
+      SELECT date, 'reconstruction_category' AS storage_kind, history_origin,
+             reconstructed_at, reconstruction_method,
+             reconstruction_build_sha, source_data_as_of,
+             category
+      FROM category_score_reconstructions WHERE date BETWEEN ? AND ?
+    `).bind(
+      range.start, range.end,
+      range.start, range.end,
+      range.start, range.end,
+      range.start, range.end,
+    ).all<ExistingHistoryRow>();
+
+    const existingStateByDate = new Map<string, {
+      storageKinds: Set<ExistingHistoryRow['storage_kind']>;
+      liveOrigins: Set<string>;
+      reconstructionMetadata: Set<string>;
+      categories: Set<string>;
+    }>();
+    for (const row of existingRows.results || []) {
+      const state = existingStateByDate.get(row.date) || {
+        storageKinds: new Set<ExistingHistoryRow['storage_kind']>(),
+        liveOrigins: new Set<string>(),
+        reconstructionMetadata: new Set<string>(),
+        categories: new Set<string>(),
+      };
+      state.storageKinds.add(row.storage_kind);
+      if (row.storage_kind === 'live_pxi' || row.storage_kind === 'live_category') {
+        state.liveOrigins.add(row.history_origin);
+      } else {
+        state.reconstructionMetadata.add(JSON.stringify([
+          row.history_origin,
+          row.reconstructed_at,
+          row.reconstruction_method,
+          row.reconstruction_build_sha,
+          row.source_data_as_of,
+        ]));
+      }
+      if (row.category) state.categories.add(row.category);
+      existingStateByDate.set(row.date, state);
+    }
+
+    const hasCompleteCategorySet = (categories: Set<string>) =>
+      categories.size === expectedCategories.size
+      && [...expectedCategories].every((category) => categories.has(category));
+
+    const dates: string[] = [];
+    for (let cursor = new Date(startDate); cursor <= endDate; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+      dates.push(deps.formatDate(cursor));
+    }
+
+    const historyOrigin = 'retrospective_reconstruction' as const;
+    const reconstructedAt = new Date().toISOString();
+    const reconstructionMethod = 'current_indicator_store_percentile_v1';
+    const results: BackfillResponsePayload['results'] = [];
+    let succeeded = 0;
+    let skippedExisting = 0;
+    let failed = 0;
+    let stoppedEarly = false;
+
+    for (const date of dates) {
+      const existingState = existingStateByDate.get(date);
+      if (existingState) {
+        const kinds = existingState.storageKinds;
+        const fullyLive = kinds.size === 2
+          && kinds.has('live_pxi')
+          && kinds.has('live_category')
+          && existingState.liveOrigins.size === 1
+          && existingState.reconstructionMetadata.size === 0
+          && hasCompleteCategorySet(existingState.categories);
+        const fullyReconstructed = kinds.size === 2
+          && kinds.has('reconstruction_pxi')
+          && kinds.has('reconstruction_category')
+          && existingState.liveOrigins.size === 0
+          && existingState.reconstructionMetadata.size === 1
+          && hasCompleteCategorySet(existingState.categories);
+        if (fullyLive || fullyReconstructed) {
+          skippedExisting += 1;
+          results.push({ date, status: 'skipped_existing' });
+          continue;
+        }
+
+        failed += 1;
+        stoppedEarly = true;
+        results.push({
+          date,
+          status: 'conflict',
+          error: `Existing history is partial or mixed across stores: ${[...kinds].sort().join(', ')}`,
+        });
+        break;
+      }
+
+      try {
+        const result = await deps.calculatePXI(env.DB, date, { includeRetrospectiveHistory: true });
+        if (!result) {
+          failed += 1;
+          stoppedEarly = true;
+          results.push({ date, status: 'failed', error: 'Insufficient data for calculation' });
+          break;
+        }
+        const resultCategories = new Set<string>(
+          result.categories.map((category: { category: string }) => category.category),
+        );
+        if (result.pxi.date !== date
+          || result.categories.some((category: { date: string }) => category.date !== date)
+          || resultCategories.size !== result.categories.length
+          || !hasCompleteCategorySet(resultCategories)) {
+          throw new Error('Calculation returned incomplete or mismatched score history');
+        }
+
+        const statements: D1PreparedStatement[] = [];
+
+        for (const category of result.categories) {
+          statements.push(env.DB.prepare(`
+            INSERT INTO category_score_reconstructions (
+              category, date, score, weight, weighted_score, history_origin,
+              reconstructed_at, reconstruction_method, reconstruction_build_sha,
+              source_data_as_of
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            category.category,
+            category.date,
+            category.score,
+            category.weight,
+            category.weighted_score,
+            historyOrigin,
+            reconstructedAt,
+            reconstructionMethod,
+            buildSha,
+            sourceDataAsOf,
+          ));
+        }
+
+        // D1 batch executes sequentially in one transaction. Categories must
+        // be present first; the PXI insert is the aggregate-completeness seal.
+        statements.push(env.DB.prepare(`
+          INSERT INTO pxi_score_reconstructions (
+            date, score, label, status, delta_1d, delta_7d, delta_30d,
+            history_origin, reconstructed_at, reconstruction_method,
+            reconstruction_build_sha, source_data_as_of
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          result.pxi.date,
+          result.pxi.score,
+          result.pxi.label,
+          result.pxi.status,
+          result.pxi.delta_1d,
+          result.pxi.delta_7d,
+          result.pxi.delta_30d,
+          historyOrigin,
+          reconstructedAt,
+          reconstructionMethod,
+          buildSha,
+          sourceDataAsOf,
+        ));
+
+        await env.DB.batch(statements);
+        succeeded += 1;
+        results.push({ date, status: 'inserted' });
+      } catch (error) {
+        failed += 1;
+        stoppedEarly = true;
+        results.push({
+          date,
+          status: 'failed',
+          error: error instanceof Error ? error.message : 'Unknown reconstruction error',
+        });
+        break;
+      }
+    }
+
+    const payload: BackfillResponsePayload = {
+      success: failed === 0,
+      start: range.start,
+      end: range.end,
+      requested_limit: limit,
+      history_origin: historyOrigin,
+      missing_only: true,
+      point_in_time_guarantee: false,
+      reconstructed_at: reconstructedAt,
+      reconstruction_method: reconstructionMethod,
+      reconstruction_build_sha: buildSha,
+      source_data_as_of: sourceDataAsOf,
+      research_evidence_captured: false,
+      market_products_refreshed: false,
+      decision_impact_refreshed: false,
+      embeddings_generated: 0,
+      succeeded,
+      skipped_existing: skippedExisting,
+      failed,
+      stopped_early: stoppedEarly,
+      unprocessed: dates.length - results.length,
+      replaced: 0,
+      results,
+    };
+
+    return Response.json(payload, { headers: corsHeaders });
   }
 
   if (url.pathname === '/api/recalculate-all-signals' && method === 'POST') {

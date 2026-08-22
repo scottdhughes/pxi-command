@@ -37,8 +37,35 @@ const RESEARCH_POSTURE_BANNER = `<div class="research-posture">
       Research-only observation layer. Timing labels, rankings, confidence, and historical accuracy do not authorize a trade or allocation. PXI action authority remains withheld until the prospective evidence and exact-policy gates pass.
     </div>`
 
+// Historical report snapshots used Dataset without publishing a dataset license.
+// Correct the semantic type at serve time so old immutable HTML stays untouched in storage.
+function upgradeStoredReportStructuredData(html: string): string {
+  return html.replace(
+    /(<script\b[^>]*\btype=["']application\/ld\+json["'][^>]*>)([\s\S]*?)(<\/script>)/gi,
+    (script, openingTag: string, json: string, closingTag: string) => {
+      try {
+        const structuredData = JSON.parse(json) as {
+          mainEntity?: { "@type"?: unknown }
+        }
+
+        if (structuredData.mainEntity?.["@type"] !== "Dataset") {
+          return script
+        }
+
+        structuredData.mainEntity["@type"] = "Report"
+        const safeJson = JSON.stringify(structuredData)
+          .replace(/</g, "\\u003c")
+          .replace(/>/g, "\\u003e")
+        return `${openingTag}${safeJson}${closingTag}`
+      } catch {
+        return script
+      }
+    },
+  )
+}
+
 export function upgradeStoredReportNavigation(html: string): string {
-  let upgraded = html
+  let upgraded = upgradeStoredReportStructuredData(html)
     .replace(/<div class="nav-dropdown-menu">[\s\S]*?<\/div>/, COMPLETE_SITE_NAV)
     .replace(/>Actionable Signals</g, ">Research Timing Flags — Not Actionable<")
     .replace(/>Top (\d+) Opportunities</g, ">Top $1 Observed Themes<")

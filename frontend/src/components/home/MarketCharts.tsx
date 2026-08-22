@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import { fetchApi } from '../../lib/api'
@@ -6,6 +6,8 @@ import { formatUnavailableReason } from '../../lib/display'
 import type {
   CategoryDetailData,
   HistoryDataPoint,
+  HistoryMetadata,
+  HistoryOrigin,
   MLAccuracyData,
   PXIData,
 } from '../../lib/types'
@@ -31,17 +33,30 @@ function Tooltip({ children, content }: { children: ReactNode; content: string }
   )
 }
 
+const historyOriginLabel: Record<HistoryOrigin, string> = {
+  live_recorded: 'Recorded',
+  retrospective_reconstruction: 'Reconstructed',
+  legacy_unclassified: 'Legacy / unclassified',
+}
+
+function getHistoryOrigin(point: HistoryDataPoint): HistoryOrigin {
+  return point.history_origin || 'legacy_unclassified'
+}
+
 export function HistoricalChart({
   data,
+  metadata,
   range,
   onRangeChange,
 }: {
   data: HistoryDataPoint[]
+  metadata: HistoryMetadata | null
   range: '7d' | '30d' | '90d'
   onRangeChange: (range: '7d' | '30d' | '90d') => void
 }) {
   const [hoveredPoint, setHoveredPoint] = useState<HistoryDataPoint | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
+  const chartId = useId().replace(/:/g, '')
 
   if (!data || data.length < 2) return null
 
@@ -73,25 +88,112 @@ export function HistoricalChart({
     }
   }
 
+  const timestamps = displayData.map((point) => Date.parse(`${point.date}T00:00:00.000Z`))
+  const hasChronologicalScale = timestamps.every((timestamp, index) => (
+    Number.isFinite(timestamp) && (index === 0 || timestamp > timestamps[index - 1])
+  )) && timestamps[timestamps.length - 1] > timestamps[0]
+  const timeSpan = hasChronologicalScale ? timestamps[timestamps.length - 1] - timestamps[0] : 1
+
   const points = displayData.map((d, i) => {
-    const x = padding.left + (i / (displayData.length - 1)) * chartWidth
+    const position = hasChronologicalScale
+      ? (timestamps[i] - timestamps[0]) / timeSpan
+      : i / (displayData.length - 1)
+    const x = padding.left + position * chartWidth
     const y = padding.top + chartHeight - ((d.score - min) / scoreRange) * chartHeight
     return { x, y, data: d }
   })
 
-  const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`).join(' ')
-  const areaD = `${pathD} L${points[points.length - 1].x},${height - padding.bottom} L${points[0].x},${height - padding.bottom} Z`
+  type HistoryPoint = (typeof points)[number]
+  type HistoryGap = NonNullable<HistoryMetadata['continuity']>['gaps'][number]
+
+  const gapsBeforeIndex = new Map<number, HistoryGap>()
+  for (let index = 1; index < points.length; index += 1) {
+    const previousDate = points[index - 1].data.date
+    const currentDate = points[index].data.date
+    const gap = metadata?.continuity?.gaps.find((candidate) => (
+      candidate.start_date > previousDate && candidate.end_date < currentDate
+    ))
+    if (gap) gapsBeforeIndex.set(index, gap)
+  }
+
+  const continuousRuns: HistoryPoint[][] = []
+  let currentRun: HistoryPoint[] = [points[0]]
+  for (let index = 1; index < points.length; index += 1) {
+    if (gapsBeforeIndex.has(index)) {
+      continuousRuns.push(currentRun)
+      currentRun = [points[index]]
+    } else {
+      currentRun.push(points[index])
+    }
+  }
+  continuousRuns.push(currentRun)
+
+  const originForEdge = (left: HistoryDataPoint, right: HistoryDataPoint): HistoryOrigin => {
+    const origins = [getHistoryOrigin(left), getHistoryOrigin(right)]
+    if (origins.includes('retrospective_reconstruction')) return 'retrospective_reconstruction'
+    if (origins.includes('legacy_unclassified')) return 'legacy_unclassified'
+    return 'live_recorded'
+  }
+
+  const lineSegments: Array<{ origin: HistoryOrigin; points: HistoryPoint[] }> = []
+  for (const run of continuousRuns) {
+    if (run.length < 2) continue
+    let origin = originForEdge(run[0].data, run[1].data)
+    let segment = [run[0], run[1]]
+    for (let index = 2; index < run.length; index += 1) {
+      const nextOrigin = originForEdge(run[index - 1].data, run[index].data)
+      if (nextOrigin === origin) {
+        segment.push(run[index])
+      } else {
+        lineSegments.push({ origin, points: segment })
+        origin = nextOrigin
+        segment = [run[index - 1], run[index]]
+      }
+    }
+    lineSegments.push({ origin, points: segment })
+  }
+
+  const pathFor = (pathPoints: HistoryPoint[]) => pathPoints
+    .map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x},${point.y}`)
+    .join(' ')
+  const areaFor = (run: HistoryPoint[]) => run.length < 2
+    ? null
+    : `${pathFor(run)} L${run[run.length - 1].x},${height - padding.bottom} L${run[0].x},${height - padding.bottom} Z`
+
+  const originStyles: Record<HistoryOrigin, { dash?: string; opacity: number }> = {
+    live_recorded: { opacity: 1 },
+    retrospective_reconstruction: { dash: '3,2', opacity: 1 },
+    legacy_unclassified: { dash: '1,2', opacity: 0.78 },
+  }
+  const visibleOrigins = new Set(displayData.map(getHistoryOrigin))
+  const visibleGaps = Array.from(gapsBeforeIndex.values())
+  const visibleMissingDays = visibleGaps.reduce((sum, gap) => sum + gap.missing_days, 0)
+  const reconstructedCount = displayData.filter(
+    (point) => getHistoryOrigin(point) === 'retrospective_reconstruction',
+  ).length
+  const gapBoundaryIndexes = new Set<number>()
+  for (const index of gapsBeforeIndex.keys()) {
+    gapBoundaryIndexes.add(index - 1)
+    gapBoundaryIndexes.add(index)
+  }
+
+  const titleId = `${chartId}-title`
+  const descriptionId = `${chartId}-description`
+  const gradientId = `${chartId}-history-gradient`
+  const areaGradientId = `${chartId}-area-gradient`
 
   return (
     <div className="w-full mt-8">
-      <div className="flex justify-between items-center mb-4">
+      <div className="flex justify-between items-center mb-4 gap-3">
         <div className="text-[10px] text-[#949ba5]/50 uppercase tracking-widest">
           Historical Trend
         </div>
-        <div className="flex gap-1">
+        <div className="flex gap-1" role="group" aria-label="Historical chart range">
           {(['7d', '30d', '90d'] as const).map((r) => (
             <button
               key={r}
+              type="button"
+              aria-pressed={range === r}
               onClick={() => onRangeChange(r)}
               className={`px-2 py-0.5 text-[9px] uppercase tracking-wider rounded transition-all ${
                 range === r
@@ -110,24 +212,32 @@ export function HistoricalChart({
           viewBox={`0 0 ${width} ${height}`}
           className="w-full h-32"
           preserveAspectRatio="none"
+          role="img"
+          aria-labelledby={`${titleId} ${descriptionId}`}
           onMouseLeave={() => {
             setHoveredPoint(null)
             setHoveredIndex(null)
           }}
         >
+          <title id={titleId}>PXI historical trend</title>
+          <desc id={descriptionId}>
+            {`PXI scores from ${displayData[0].date} through ${displayData[displayData.length - 1].date}. `}
+            {`${reconstructedCount} reconstructed observations and ${visibleGaps.length} data gaps are visible. `}
+            Solid lines are recorded observations, dashed lines are reconstructed, and dotted lines are unclassified.
+          </desc>
           <defs>
-            <linearGradient id="historyGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+            <linearGradient id={gradientId} x1="0%" y1="0%" x2="100%" y2="0%">
               {displayData.map((d, i) => (
                 <stop
                   key={i}
-                  offset={`${(i / (displayData.length - 1)) * 100}%`}
+                  offset={`${((points[i].x - padding.left) / chartWidth) * 100}%`}
                   stopColor={getRegimeColor(d.regime)}
                 />
               ))}
             </linearGradient>
 
-            <linearGradient id="areaGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stopColor="#00a3ff" stopOpacity="0.15" />
+            <linearGradient id={areaGradientId} x1="0%" y1="0%" x2="0%" y2="100%">
+              <stop offset="0%" stopColor="#00a3ff" stopOpacity="0.12" />
               <stop offset="100%" stopColor="#00a3ff" stopOpacity="0" />
             </linearGradient>
           </defs>
@@ -149,57 +259,83 @@ export function HistoricalChart({
             )
           })}
 
-          <path d={areaD} fill="url(#areaGradient)" />
+          {continuousRuns.map((run, index) => {
+            const area = areaFor(run)
+            return area ? <path key={`area-${index}`} d={area} fill={`url(#${areaGradientId})`} /> : null
+          })}
 
-          <path
-            d={pathD}
-            fill="none"
-            stroke="url(#historyGradient)"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-
-          {points.map((p, i) => (
-            <g key={i}>
-              <rect
-                x={p.x - chartWidth / displayData.length / 2}
-                y={padding.top}
-                width={chartWidth / displayData.length}
-                height={chartHeight}
-                fill="transparent"
-                onMouseEnter={() => {
-                  setHoveredPoint(p.data)
-                  setHoveredIndex(i)
-                }}
-              />
-              {hoveredIndex === i && (
-                <>
-                  <line
-                    x1={p.x}
-                    y1={padding.top}
-                    x2={p.x}
-                    y2={height - padding.bottom}
-                    stroke="#26272b"
-                    strokeWidth="1"
-                  />
-                  <circle
-                    cx={p.x}
-                    cy={p.y}
-                    r="3"
-                    fill={getRegimeColor(p.data.regime)}
-                    stroke="#0a0a0a"
-                    strokeWidth="1.5"
-                  />
-                </>
-              )}
-            </g>
+          {lineSegments.map((segment, index) => (
+            <path
+              key={`${segment.origin}-${index}`}
+              d={pathFor(segment.points)}
+              fill="none"
+              stroke={`url(#${gradientId})`}
+              strokeWidth={segment.origin === 'retrospective_reconstruction' ? '1.7' : '1.5'}
+              strokeDasharray={originStyles[segment.origin].dash}
+              strokeOpacity={originStyles[segment.origin].opacity}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
           ))}
+
+          {points.map((point, index) => {
+            const origin = getHistoryOrigin(point.data)
+            const showProvenancePoint = origin === 'retrospective_reconstruction' || gapBoundaryIndexes.has(index)
+            return (
+              <g key={`${point.data.date}-${index}`}>
+                {showProvenancePoint && (
+                  <circle
+                    cx={point.x}
+                    cy={point.y}
+                    r="1.5"
+                    fill={getRegimeColor(point.data.regime)}
+                    stroke={origin === 'retrospective_reconstruction' ? '#f59e0b' : '#949ba5'}
+                    strokeWidth="0.7"
+                  />
+                )}
+                <rect
+                  x={index === 0 ? padding.left : (points[index - 1].x + point.x) / 2}
+                  y={padding.top}
+                  width={(index === points.length - 1 ? width - padding.right : (point.x + points[index + 1].x) / 2)
+                    - (index === 0 ? padding.left : (points[index - 1].x + point.x) / 2)}
+                  height={chartHeight}
+                  fill="transparent"
+                  onMouseEnter={() => {
+                    setHoveredPoint(point.data)
+                    setHoveredIndex(index)
+                  }}
+                />
+                {hoveredIndex === index && (
+                  <>
+                    <line
+                      x1={point.x}
+                      y1={padding.top}
+                      x2={point.x}
+                      y2={height - padding.bottom}
+                      stroke="#26272b"
+                      strokeWidth="1"
+                    />
+                    <circle
+                      cx={point.x}
+                      cy={point.y}
+                      r="3"
+                      fill={getRegimeColor(point.data.regime)}
+                      stroke="#0a0a0a"
+                      strokeWidth="1.5"
+                    />
+                  </>
+                )}
+              </g>
+            )
+          })}
         </svg>
 
         {hoveredPoint && hoveredIndex !== null && (
-          <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-[#1a1a1a] border border-[#26272b] rounded px-3 py-2 text-center shadow-lg pointer-events-none z-10">
-            <div className="text-[9px] text-[#949ba5]/60 mb-1">
+          <div
+            className="absolute top-2 left-1/2 -translate-x-1/2 max-w-[calc(100%-1rem)] bg-[#1a1a1a] border border-[#26272b] rounded px-3 py-2 text-center shadow-lg pointer-events-none z-10"
+            aria-live="polite"
+          >
+            <div className="text-[9px] text-[#949ba5]/60 mb-1 whitespace-nowrap">
               {new Date(hoveredPoint.date + 'T12:00:00').toLocaleDateString('en-US', {
                 month: 'short',
                 day: 'numeric',
@@ -217,8 +353,59 @@ export function HistoricalChart({
                 {hoveredPoint.regime.replace('_', ' ')}
               </div>
             )}
+            <div className={`text-[8px] uppercase tracking-wider mt-1 ${
+              getHistoryOrigin(hoveredPoint) === 'retrospective_reconstruction'
+                ? 'text-[#f59e0b]'
+                : 'text-[#949ba5]/70'
+            }`}>
+              {historyOriginLabel[getHistoryOrigin(hoveredPoint)]}
+            </div>
+            {hoveredPoint.source_data_as_of && (
+              <div className="text-[8px] text-[#949ba5]/50 mt-1 whitespace-nowrap">
+                source through {hoveredPoint.source_data_as_of}
+              </div>
+            )}
+            {hoveredPoint.reconstruction_method && (
+              <div className="text-[8px] text-[#949ba5]/50 mt-1 whitespace-nowrap">
+                {hoveredPoint.reconstruction_method.replace(/_/g, ' ')}
+              </div>
+            )}
           </div>
         )}
+
+        <div
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-[8px] text-[#949ba5]/65 uppercase tracking-wider"
+          role="group"
+          aria-label="History provenance legend"
+        >
+          {visibleOrigins.has('live_recorded') && (
+            <span className="inline-flex items-center gap-1.5">
+              <span className="inline-block w-5 border-t border-[#00a3ff]" /> recorded
+            </span>
+          )}
+          {visibleOrigins.has('retrospective_reconstruction') && (
+            <span className="inline-flex items-center gap-1.5 text-[#f59e0b]">
+              <span className="inline-block w-5 border-t border-dashed border-[#f59e0b]" /> reconstructed
+            </span>
+          )}
+          {visibleOrigins.has('legacy_unclassified') && (
+            <span className="inline-flex items-center gap-1.5">
+              <span className="inline-block w-5 border-t border-dotted border-[#949ba5]" /> unclassified
+            </span>
+          )}
+          {visibleGaps.length > 0 && (
+            <span className="text-[#ff6b6b]">
+              {visibleGaps.length} gap{visibleGaps.length === 1 ? '' : 's'} · {visibleMissingDays} missing day{visibleMissingDays === 1 ? '' : 's'}
+            </span>
+          )}
+        </div>
+
+        <p className="mt-2 text-[9px] leading-relaxed text-[#949ba5]/55">
+          {hasChronologicalScale
+            ? 'Calendar spacing is preserved. '
+            : 'Points are evenly spaced because valid chronological dates were unavailable. '}
+          Solid segments are recorded observations; dashed segments are retrospective reconstructions and dotted segments lack provenance classification. Line breaks mark missing dates; no values are interpolated across them.
+        </p>
 
         <div className="flex justify-between mt-3 pt-3 border-t border-[#1a1a1a]">
           <div className="text-center">

@@ -11,7 +11,9 @@ import type {
   DecisionImpactResponse,
   EdgeDiagnosticsResponse,
   EnsembleData,
+  HistoryApiResponse,
   HistoryDataPoint,
+  HistoryMetadata,
   MLAccuracyApiResponse,
   MLAccuracyData,
   OpsDecisionImpactResponse,
@@ -76,6 +78,7 @@ export function usePxiAppShell() {
   const [ensemble, setEnsemble] = useState<EnsembleData | null>(null)
   const [mlAccuracy, setMlAccuracy] = useState<MLAccuracyData | null>(null)
   const [historyData, setHistoryData] = useState<HistoryDataPoint[]>([])
+  const [historyMetadata, setHistoryMetadata] = useState<HistoryMetadata | null>(null)
   const [historyRange, setHistoryRange] = useState<'7d' | '30d' | '90d'>('30d')
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [alertsData, setAlertsData] = useState<AlertsApiResponse | null>(null)
@@ -511,9 +514,22 @@ export function usePxiAppShell() {
         }
 
         if (historyRes?.ok) {
-          const historyJson = await historyRes.json() as { data?: HistoryDataPoint[]; error?: string }
+          const historyJson = await historyRes.json() as Partial<HistoryApiResponse>
           if (historyJson.data && Array.isArray(historyJson.data)) {
             setHistoryData(historyJson.data)
+            const derivedCounts = historyJson.data.reduce((counts, point) => {
+              const origin = point.history_origin || 'legacy_unclassified'
+              counts[origin] += 1
+              return counts
+            }, {
+              legacy_unclassified: 0,
+              live_recorded: 0,
+              retrospective_reconstruction: 0,
+            })
+            setHistoryMetadata({
+              provenance_counts: historyJson.provenance_counts || derivedCounts,
+              continuity: historyJson.continuity || null,
+            })
           }
         }
 
@@ -717,6 +733,7 @@ export function usePxiAppShell() {
     ensemble,
     mlAccuracy,
     historyData,
+    historyMetadata,
     historyRange,
     setHistoryRange,
     showOnboarding,

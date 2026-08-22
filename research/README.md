@@ -70,3 +70,125 @@ minimum walk-forward sample gate can pass.
 versioned snapshot. It does not authorize a production deployment. Any promoted
 model still needs an immutable model record, independent review, shadow-mode
 monitoring, and an explicit deployment decision.
+
+## HMM regime challenger
+
+`hmm_challenger.py` is a separate, research-only test of the useful part of the
+HMM/RL paper: probabilistic regime detection. It does **not** implement RL and
+has no import or write path into the Worker. Its controls are intentionally
+stricter than the paper's reported backtest:
+
+- diagonal Gaussian HMMs with two and three states are compared by BIC inside
+  every expanding training window;
+- all restarts and seeds are frozen in `hmm_config.json`;
+- cross-restart stability is measured by brute-force label alignment of each
+  forward-filtered training-state path, with frozen minimum restart and
+  agreement gates;
+- training-window standardization is never fit on test observations;
+- policy fitting uses one-sided filtered state probabilities, while test-time
+  inference forbids Viterbi paths and backward-smoothed probabilities;
+- every slice records the latest filtered posterior, normalized regime entropy,
+  transition persistence, and implied state duration;
+- nonconverged fits, materially decreasing EM likelihoods, and states below the
+  frozen effective-mass thresholds are excluded from selection and fail the
+  research screen when either candidate state count cannot be fit safely;
+- a signal observed through close t executes at close t+1 and is evaluated only
+  on the close-t+1 to close-t+2 return, excluding the intervening overnight;
+- the frozen action set contains SPY, equal-weight, and a 50/50 TLT/GLD
+  defensive portfolio;
+- frozen benchmarks are SPY, equal-weight, and a transparent shadow mapping of
+  the existing PXI regime (`RISK_ON` to SPY, `TRANSITION` to equal-weight, and
+  `RISK_OFF` to 50/50 TLT/GLD);
+- every strategy is evaluated at both 10 and 25 bps per 100% one-way turnover;
+- turnover is measured from the prior portfolio's post-return drifted holdings,
+  and holdings carry continuously across walk-forward refit boundaries;
+- at 25 bps, paired candidate-minus-benchmark daily returns must have a strictly
+  positive Newey-West/Bartlett HAC lower bound against every benchmark. The lag
+  is frozen at five observations and the one-sided bounds use a Bonferroni 5%
+  familywise error rate across the three comparisons. This is an asymptotic
+  normal approximation and has no finite-sample guarantee;
+- retrospective reports are always governance `NO_GO`, even if their separate
+  robustness screen passes.
+
+The input contract is `hmm_snapshot.schema.json`. SPY, TLT, and GLD must be
+adjusted-total-return price series with explicit corporate-action methodology.
+Each row also carries a unique snapshot id, a VIX observation, its historical
+PXI regime, per-series observation dates and sources, and hashed source
+artifacts. The PXI regime row must carry `history_origin` as one of
+`live_recorded`, `retrospective_reconstruction`, or `legacy_unclassified`.
+Point-in-time rows must additionally assert immutability and every regime row
+must be `live_recorded`; retrospective or unclassified history invalidates the
+point-in-time claim. Do not set
+`point_in_time_guarantee=true` for a current historical download.
+Observation dates must equal the decision session exactly; stale or
+forward-filled prices are rejected. Every row's source fields contain artifact
+ids that must resolve to the snapshot's hashed `source_artifacts` map. The
+point-in-time flag remains an ingestion assertion: structural validation can
+bind declared hashes, but it cannot independently prove a provider's historical
+first-availability claim.
+
+The cadence contract freezes SPY as the trading-session reference, binds its
+session-ordinal source to a hashed artifact, lists every expected decision date,
+and requires consecutive per-row ordinals. A missing interior expected session
+or ordinal jump suppresses all portfolio, annualized, Sharpe, and HAC metrics;
+the report is still emitted with `metrics_valid=false` and explicit blockers.
+
+### Evidence and exploratory configs
+
+`hmm_config.json` is the canonical evidence-strength profile. It requires at
+least 15 years/3,780 input sessions, 1,260 training sessions, 1,260 OOS sessions
+spanning five years, five annual walk-forward folds, and 30 effective rows per
+state. Unknown config keys are rejected so a misspelled threshold cannot fall
+back silently. Canonical mode freezes every control exactly to the checked-in
+file—including seeds, restart count, convergence tolerance, policy shrinkage,
+HAC lag, familywise alpha, stability requirement, cost scenarios, and promotion
+margins. A stronger-looking or weaker ad hoc deviation is rejected; changes
+must be made prospectively by updating the canonical manifest and its tests.
+
+`hmm_exploratory_smoke_config.json` exists only to exercise the short public
+history path. Its profile is hard-coded as `exploratory_smoke`; that profile
+adds an unconditional evidence-screen blocker and can never produce a PASS.
+
+### Public-data smoke run
+
+The exporter below downloads current Yahoo adjusted-close responses for SPY,
+TLT, GLD, and VIX and joins them to current PXI public history. This exercises
+the full path without extra Python dependencies:
+
+```bash
+python3 research/export_hmm_public_snapshot.py \
+  --out research/out/hmm_public_snapshot.json
+python3 research/hmm_challenger.py \
+  --input research/out/hmm_public_snapshot.json \
+  --config research/hmm_exploratory_smoke_config.json \
+  --out research/out/hmm_challenger
+```
+
+Every report hashes the exact bytes of the executed `hmm_challenger.py` and
+records the result under `implementation_provenance.source_sha256`. The library
+does not invoke Git. CI or an operator may supply a build/Git revision with
+`--build-revision REVISION` or the `PXI_BUILD_REVISION` environment variable;
+when neither is supplied, the report records a null revision with the explicit
+status `absent_not_supplied`.
+
+That public input is a mutable reconstruction, not a historical vintage. The
+exporter marks it `point_in_time_guarantee=false`, and the challenger therefore
+forces both the evidence screen and production governance to `NO_GO`. It is a
+pipeline smoke test—not evidence of an investable edge. The PXI public history
+row's `history_origin` is propagated exactly. An older API response without the
+field defaults explicitly to `legacy_unclassified`; unknown values are
+rejected. Reports count all three categories, and reconstructed and legacy rows
+receive distinct screen blockers. The endpoint is capped at 365 calendar rows,
+so the exact-date join normally yields
+only about 250 trading rows even though the Yahoo request is longer. The smoke
+run therefore tests wiring and fail-closed behavior; it is not a long-history
+market backtest, and the exporter never fabricates older PXI regimes.
+Its expected-session calendar is the full SPY series over the PXI-history date
+range, before the multi-series join; the exporter prints and records any current
+join gap rather than hiding it through forward filling.
+
+For an evidence-bearing run, preserve adjusted prices, corporate-action
+treatment, PXI decisions, first-availability timestamps, and raw provider
+artifacts prospectively under the append-only contract. A retrospective screen
+that passes still requires independent review and a prospective shadow ledger
+before any explicit production decision.

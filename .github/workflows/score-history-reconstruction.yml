@@ -1,0 +1,324 @@
+name: Reconstruct Missing PXI Score History
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'First missing calendar date (YYYY-MM-DD)'
+        required: true
+        default: '2026-06-09'
+      end:
+        description: 'Last missing calendar date (YYYY-MM-DD)'
+        required: true
+        default: '2026-08-02'
+      limit:
+        description: 'Maximum inclusive calendar-day span (1-90)'
+        required: true
+        default: '55'
+      confirm_non_point_in_time:
+        description: 'I understand these rows are retrospective reconstructions, not point-in-time evidence'
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  # Operational isolation contract: keep this exact non-cancelling group in
+  # lockstep with daily-refresh.yml and production deploy-worker.yml so neither
+  # indicator writes nor code rollovers race retrospective reconstruction.
+  group: pxi-production-indicator-score-mutation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  reconstruct-missing-scores:
+    if: github.repository == 'scottdhughes/pxi-command'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+    env:
+      WRITE_API_URL: ${{ secrets.WRITE_API_URL }}
+      WRITE_API_KEY: ${{ secrets.WRITE_API_KEY }}
+      INPUT_START: ${{ inputs.start }}
+      INPUT_END: ${{ inputs.end }}
+      INPUT_LIMIT: ${{ inputs.limit }}
+      INPUT_CONFIRM: ${{ inputs.confirm_non_point_in_time }}
+
+    steps:
+      - name: Validate bounded reconstruction request
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${WRITE_API_URL:-}" || -z "${WRITE_API_KEY:-}" ]]; then
+            echo "::error::Production WRITE_API_URL and WRITE_API_KEY are required"
+            exit 1
+          fi
+          if [[ "${INPUT_CONFIRM}" != "true" ]]; then
+            echo "::error::Explicit non-point-in-time acknowledgement is required"
+            exit 1
+          fi
+          if [[ ! "${INPUT_LIMIT}" =~ ^[0-9]+$ ]]; then
+            echo "::error::limit must be an integer"
+            exit 1
+          fi
+          if [[ ! "${WRITE_API_URL}" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "::error::WRITE_API_URL must resolve to an HTTPS endpoint"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          start_raw = os.environ["INPUT_START"]
+          end_raw = os.environ["INPUT_END"]
+          limit = int(os.environ["INPUT_LIMIT"])
+
+          for name, value in (("start", start_raw), ("end", end_raw)):
+              if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                  raise SystemExit(f"{name} must use exact YYYY-MM-DD format")
+
+          start = dt.date.fromisoformat(start_raw)
+          end = dt.date.fromisoformat(end_raw)
+          if start > end:
+              raise SystemExit("start must be on or before end")
+          current_new_york_date = dt.datetime.now(ZoneInfo("America/New_York")).date()
+          if end >= current_new_york_date:
+              raise SystemExit("end must be before the current America/New_York date")
+          if not 1 <= limit <= 90:
+              raise SystemExit("limit must be from 1 through 90")
+
+          span = (end - start).days + 1
+          if span > limit:
+              raise SystemExit(f"inclusive range has {span} days, exceeding limit={limit}")
+
+          build_sha = os.environ["GITHUB_SHA"][:12]
+          if not re.fullmatch(r"[0-9A-Fa-f]{12}", build_sha):
+              raise SystemExit("GITHUB_SHA did not resolve to a 12-character Git SHA")
+
+          chunks = []
+          cursor = start
+          while cursor <= end:
+              chunk_end = min(cursor + dt.timedelta(days=2), end)
+              chunk_span = (chunk_end - cursor).days + 1
+              chunks.append({
+                  "start": cursor.isoformat(),
+                  "end": chunk_end.isoformat(),
+                  "limit": chunk_span,
+                  "expected_dates": [
+                      (cursor + dt.timedelta(days=offset)).isoformat()
+                      for offset in range(chunk_span)
+                  ],
+                  "expected_build_sha": build_sha,
+                  "missing_only": True,
+                  "overwrite": False,
+                  "record_evidence": False,
+                  "refresh_products": False,
+                  "include_decision_impact": False,
+                  "include_decision_grade": False,
+                  "rebuild_ledgers": False,
+                  "generate_embeddings": False,
+                  "recalibrate": False,
+              })
+              cursor = chunk_end + dt.timedelta(days=1)
+
+          Path("/tmp/pxi-score-reconstruction-chunks.json").write_text(
+              json.dumps(chunks, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(
+              f"Validated missing-only retrospective span: {span} calendar days "
+              f"in {len(chunks)} sequential chunks of at most 3 days"
+          )
+          PY
+
+      - name: Require matching deployed reconstruction contract
+        run: |
+          set -euo pipefail
+          BASE_URL="${WRITE_API_URL%/api/write}"
+          EXPECTED_BUILD_SHA="${GITHUB_SHA:0:12}"
+          EXPECTED_CONTRACT='isolated-missing-only-v1'
+
+          if [[ ! "${EXPECTED_BUILD_SHA}" =~ ^[0-9A-Fa-f]{12}$ ]]; then
+            echo "::error::github.sha did not resolve to a 12-character Git SHA"
+            exit 1
+          fi
+
+          ready=false
+          for attempt in $(seq 1 15); do
+            if HTTP_CODE="$(curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -o /tmp/pxi-reconstruction-health.json \
+              -w '%{http_code}' \
+              "${BASE_URL}/health")"; then
+              if [[ "${HTTP_CODE}" == "200" ]] && jq -e \
+                --arg sha "${EXPECTED_BUILD_SHA}" \
+                --arg contract "${EXPECTED_CONTRACT}" \
+                '.status == "healthy" and
+                 .db == true and
+                 ((.build_sha | ascii_downcase) == ($sha | ascii_downcase)) and
+                 .history_reconstruction_contract == $contract' \
+                /tmp/pxi-reconstruction-health.json >/dev/null; then
+                ready=true
+                break
+              fi
+            else
+              HTTP_CODE='000'
+            fi
+
+            observed="$(jq -c '{status, db, build_sha, history_reconstruction_contract}' \
+              /tmp/pxi-reconstruction-health.json 2>/dev/null || printf '{}')"
+            echo "Health/capability gate attempt ${attempt}/15 not ready (HTTP ${HTTP_CODE}): ${observed}"
+            if [[ "${attempt}" -lt 15 ]]; then
+              sleep 4
+            fi
+          done
+
+          if [[ "${ready}" != "true" ]]; then
+            echo "::error::Refusing reconstruction POST: deployed build/migration capability does not match ${EXPECTED_BUILD_SHA}"
+            exit 1
+          fi
+          echo "Verified deployed build ${EXPECTED_BUILD_SHA} with ${EXPECTED_CONTRACT} capability"
+
+      - name: Invoke and verify bounded score-only reconstruction chunks
+        run: |
+          set -euo pipefail
+          BASE_URL="${WRITE_API_URL%/api/write}"
+          CHUNK_COUNT="$(jq 'length' /tmp/pxi-score-reconstruction-chunks.json)"
+          if [[ ! "${CHUNK_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Validated reconstruction plan contains no chunks"
+            exit 1
+          fi
+          : > /tmp/pxi-score-reconstruction-responses.jsonl
+
+          for ((index = 0; index < CHUNK_COUNT; index += 1)); do
+            request_path="/tmp/pxi-score-reconstruction-request-${index}.json"
+            response_path="/tmp/pxi-score-reconstruction-response-${index}.json"
+            jq ".[$index] | del(.expected_dates)" /tmp/pxi-score-reconstruction-chunks.json > "${request_path}"
+            chunk_start="$(jq -r '.start' "${request_path}")"
+            chunk_end="$(jq -r '.end' "${request_path}")"
+            chunk_limit="$(jq -r '.limit' "${request_path}")"
+            expected_dates="$(jq -c ".[$index].expected_dates" /tmp/pxi-score-reconstruction-chunks.json)"
+
+            HTTP_CODE="$(curl -sS \
+              --connect-timeout 15 \
+              --max-time 120 \
+              -o "${response_path}" \
+              -w '%{http_code}' \
+              -X POST "${BASE_URL}/api/history/reconstruct-missing-v1" \
+              -H "Authorization: Bearer ${WRITE_API_KEY}" \
+              -H 'Content-Type: application/json' \
+              --data @"${request_path}")"
+
+            if [[ "${HTTP_CODE}" != "200" ]]; then
+              echo "::error::Reconstruction chunk ${index} (${chunk_start} through ${chunk_end}) failed with HTTP ${HTTP_CODE}"
+              jq -c '{error, prohibited_options, expected_build_sha, deployed_build_sha}' "${response_path}" 2>/dev/null || true
+              exit 1
+            fi
+
+            jq -e \
+              --arg start "${chunk_start}" \
+              --arg end "${chunk_end}" \
+              --argjson limit "${chunk_limit}" \
+              --argjson expected_dates "${expected_dates}" \
+              --arg build_sha "${GITHUB_SHA:0:12}" \
+              '
+                .success == true and
+                .start == $start and
+                .end == $end and
+                .requested_limit == $limit and
+                .history_origin == "retrospective_reconstruction" and
+                .missing_only == true and
+                .point_in_time_guarantee == false and
+                .research_evidence_captured == false and
+                .market_products_refreshed == false and
+                .decision_impact_refreshed == false and
+                .embeddings_generated == 0 and
+                .replaced == 0 and
+                .failed == 0 and
+                .stopped_early == false and
+                .unprocessed == 0 and
+                ((.reconstruction_build_sha | ascii_downcase) == ($build_sha | ascii_downcase)) and
+                (.reconstructed_at | type == "string" and length > 0) and
+                (.reconstruction_method | type == "string" and length > 0) and
+                (.source_data_as_of | type == "string" and length > 0) and
+                (.results | type == "array") and
+                ((.results | length) == $limit) and
+                ([.results[].date] == $expected_dates) and
+                ([.results[].status] | all(. == "inserted" or . == "skipped_existing")) and
+                ((.succeeded + .skipped_existing + .failed) == (.results | length))
+              ' "${response_path}" >/dev/null || {
+                echo "::error::Reconstruction chunk ${index} failed strict provenance/side-effect verification"
+                jq -c . "${response_path}" 2>/dev/null || true
+                exit 1
+              }
+
+            jq -c . "${response_path}" >> /tmp/pxi-score-reconstruction-responses.jsonl
+            echo "Verified chunk $((index + 1))/${CHUNK_COUNT}: ${chunk_start} through ${chunk_end}"
+            if ((index + 1 < CHUNK_COUNT)); then
+              sleep 4
+            fi
+          done
+
+          jq -s \
+            --arg start "${INPUT_START}" \
+            --arg end "${INPUT_END}" \
+            --arg build_sha "${GITHUB_SHA:0:12}" \
+            '{
+              success: all(.[]; .success == true),
+              start: $start,
+              end: $end,
+              chunk_count: length,
+              history_origin: "retrospective_reconstruction",
+              point_in_time_guarantee: false,
+              succeeded: (map(.succeeded) | add // 0),
+              skipped_existing: (map(.skipped_existing) | add // 0),
+              failed: (map(.failed) | add // 0),
+              stopped_early: any(.[]; .stopped_early == true),
+              unprocessed: (map(.unprocessed) | add // 0),
+              replaced: (map(.replaced) | add // 0),
+              research_evidence_captured: false,
+              market_products_refreshed: false,
+              decision_impact_refreshed: false,
+              embeddings_generated: (map(.embeddings_generated) | add // 0),
+              reconstruction_build_sha: $build_sha,
+              reconstructed_at_values: (map(.reconstructed_at) | unique),
+              reconstruction_method_values: (map(.reconstruction_method) | unique),
+              source_data_as_of_values: (map(.source_data_as_of) | unique),
+              chunks: map({
+                start,
+                end,
+                succeeded,
+                skipped_existing,
+                failed,
+                stopped_early,
+                unprocessed
+              })
+            }' /tmp/pxi-score-reconstruction-responses.jsonl \
+            > /tmp/pxi-score-reconstruction-aggregate.json
+
+          jq . /tmp/pxi-score-reconstruction-aggregate.json
+
+      - name: Append audit summary
+        if: always()
+        run: |
+          {
+            echo '### Missing PXI score reconstruction'
+            echo ''
+            echo 'This workflow reconstructs score continuity only. It does not create point-in-time research evidence, embeddings, market products, decision-impact artifacts, or refresh-run freshness records.'
+            echo ''
+            if [[ -f /tmp/pxi-score-reconstruction-aggregate.json ]]; then
+              echo '| Origin | Chunks | Inserted | Existing skipped | Failed | Unprocessed | Stopped early | Replaced | Point-in-time guarantee |'
+              echo '|---|---:|---:|---:|---:|---:|---|---:|---|'
+              jq -r '"| \(.history_origin // "unknown") | \(.chunk_count // 0) | \(.succeeded // 0) | \(.skipped_existing // 0) | \(.failed // 0) | \(.unprocessed // 0) | \(.stopped_early // true) | \(.replaced // 0) | \(.point_in_time_guarantee // false) |"' /tmp/pxi-score-reconstruction-aggregate.json
+            else
+              echo 'No fully verified aggregate response was produced; the workflow stopped at the first failed chunk.'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

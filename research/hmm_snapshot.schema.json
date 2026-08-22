@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pxicommand.com/schemas/hmm-market-snapshot-v1.json",
+  "title": "PXI HMM adjusted-total-return market snapshot",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "dataset_id",
+    "generated_at",
+    "point_in_time_guarantee",
+    "storage_contract",
+    "price_contract",
+    "cadence_contract",
+    "source_artifacts",
+    "rows"
+  ],
+  "properties": {
+    "schema_version": { "const": "pxi-hmm-market-snapshot/v1" },
+    "dataset_id": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "point_in_time_guarantee": { "type": "boolean" },
+    "storage_contract": { "type": "string", "minLength": 1 },
+    "price_contract": {
+      "type": "object",
+      "required": [
+        "portfolio_assets",
+        "regime_indicator",
+        "price_field",
+        "total_return_adjusted_assets",
+        "corporate_action_policy"
+      ],
+      "properties": {
+        "portfolio_assets": { "const": ["SPY", "TLT", "GLD"] },
+        "regime_indicator": { "const": "^VIX" },
+        "price_field": { "const": "adjusted_close" },
+        "total_return_adjusted_assets": { "const": true },
+        "corporate_action_policy": { "type": "string", "minLength": 1 },
+        "currency": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "cadence_contract": {
+      "type": "object",
+      "required": [
+        "trading_session",
+        "calendar_id",
+        "annualization_periods",
+        "session_ordinal_source",
+        "consecutive_required",
+        "expected_decision_dates"
+      ],
+      "properties": {
+        "trading_session": { "const": "SPY" },
+        "calendar_id": { "type": "string", "minLength": 1 },
+        "annualization_periods": { "const": 252 },
+        "session_ordinal_source": { "type": "string", "minLength": 1 },
+        "consecutive_required": { "const": true },
+        "expected_decision_dates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "format": "date" },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "source_artifacts": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["sha256", "fetched_at"],
+        "properties": {
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "url": { "type": "string" },
+          "fetched_at": { "type": "string", "format": "date-time" },
+          "mutability": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "snapshot_id",
+          "decision_date",
+          "session_ordinal",
+          "available_at",
+          "adjusted_closes",
+          "price_observation_dates",
+          "price_available_at",
+          "price_sources",
+          "pxi_regime",
+          "history_origin",
+          "pxi_regime_observation_date",
+          "pxi_regime_available_at",
+          "pxi_regime_source"
+        ],
+        "properties": {
+          "snapshot_id": { "type": "string", "minLength": 1 },
+          "decision_date": { "type": "string", "format": "date" },
+          "session_ordinal": { "type": "integer", "minimum": 0 },
+          "available_at": { "type": "string", "format": "date-time" },
+          "immutable_snapshot": { "type": "boolean" },
+          "adjusted_closes": {
+            "type": "object",
+            "required": ["SPY", "TLT", "GLD", "^VIX"],
+            "properties": {
+              "SPY": { "type": "number", "exclusiveMinimum": 0 },
+              "TLT": { "type": "number", "exclusiveMinimum": 0 },
+              "GLD": { "type": "number", "exclusiveMinimum": 0 },
+              "^VIX": { "type": "number", "exclusiveMinimum": 0 }
+            },
+            "additionalProperties": false
+          },
+          "price_observation_dates": {
+            "type": "object",
+            "required": ["SPY", "TLT", "GLD", "^VIX"],
+            "additionalProperties": { "type": "string", "format": "date" }
+          },
+          "price_sources": {
+            "type": "object",
+            "description": "Values are source_artifacts object keys, binding every price to a declared content hash.",
+            "required": ["SPY", "TLT", "GLD", "^VIX"],
+            "additionalProperties": { "type": "string", "minLength": 1 }
+          },
+          "price_available_at": {
+            "type": "object",
+            "required": ["SPY", "TLT", "GLD", "^VIX"],
+            "additionalProperties": { "type": "string", "format": "date-time" }
+          },
+          "pxi_regime": { "enum": ["RISK_ON", "TRANSITION", "RISK_OFF"] },
+          "history_origin": {
+            "enum": ["legacy_unclassified", "live_recorded", "retrospective_reconstruction"],
+            "description": "PXI regime history provenance; point-in-time snapshots may contain only live_recorded rows."
+          },
+          "pxi_regime_observation_date": { "type": "string", "format": "date" },
+          "pxi_regime_available_at": { "type": "string", "format": "date-time" },
+          "pxi_regime_source": {
+            "type": "string",
+            "minLength": 1,
+            "description": "A source_artifacts object key binding the regime observation to a declared content hash."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": true
+}

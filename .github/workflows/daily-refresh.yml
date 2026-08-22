@@ -1,8 +1,11 @@
 name: Daily PXI Refresh
 
 concurrency:
-  group: pxi-daily-refresh-${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
+  # Operational isolation contract: this exact non-cancelling group is shared
+  # with score-history-reconstruction.yml and production deploy-worker.yml.
+  # Reconstruction reads current indicators, so these operations may not race.
+  group: pxi-production-indicator-score-mutation
+  cancel-in-progress: false
 
 on:
   schedule:

@@ -17,8 +17,10 @@ on:
         type: boolean
 
 concurrency:
-  group: deploy-worker-${{ inputs.environment }}
-  cancel-in-progress: true
+  # Production code rollovers share the score-mutation lock. The versioned
+  # endpoint remains the primary fail-closed control against older Workers.
+  group: ${{ inputs.environment == 'production' && 'pxi-production-indicator-score-mutation' || format('deploy-worker-{0}', inputs.environment) }}
+  cancel-in-progress: ${{ inputs.environment != 'production' }}
 
 jobs:
   deploy:
@@ -153,6 +155,22 @@ jobs:
           if [[ "${success}" != "true" ]]; then
             echo "::error::Timed out waiting for deployed /health build_sha to match ${BUILD_SHA}"
             cat /tmp/pxi-worker-health.json || true
+            exit 1
+          fi
+
+      - name: Verify legacy backfill kill switch
+        run: |
+          set -euo pipefail
+          http_code="$(curl -sS \
+            -o /tmp/pxi-legacy-backfill-kill-switch.json \
+            -w '%{http_code}' \
+            --max-time 20 \
+            -X POST "${TARGET_BASE_URL}/api/backfill" \
+            -H 'Content-Type: application/json' \
+            --data '{"start":"invalid","end":"invalid","limit":1}')"
+          if [[ "${http_code}" != "410" ]]; then
+            echo "::error::Deployed legacy /api/backfill route is not fail-closed (HTTP ${http_code})"
+            cat /tmp/pxi-legacy-backfill-kill-switch.json || true
             exit 1
           fi
 

@@ -58,10 +58,16 @@ describe("report rendering", () => {
     for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
       expect(html).toContain(`href="${href}"`)
     }
+
+    const jsonLd = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)?.[1]
+    expect(jsonLd).toBeDefined()
+    const structuredData = JSON.parse(jsonLd!)
+    expect(structuredData.mainEntity["@type"]).toBe("Report")
+    expect(JSON.stringify(structuredData)).not.toContain('"@type":"Dataset"')
   })
 
-  it("upgrades navigation in stored report snapshots", () => {
-    const legacy = `<html><head></head><body><div class="nav-dropdown-menu"><a href="/">/</a><a href="/spec">/SPEC</a><a href="/signals">/SIGNALS</a></div><header></header><!-- Summary Dashboard --><div class="takeaway-title">Actionable Signals</div><span class="section-title">Top 8 Opportunities</span><div class="stat-label">"Now" Signals</div><div class="stat-sub">Ready to act</div></body></html>`
+  it("upgrades stored report snapshots", () => {
+    const legacy = `<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","mainEntity":{"@type":"Dataset","name":"Legacy signals","description":"Legacy sector rotation research derived from discussion patterns."}}</script></head><body><div class="nav-dropdown-menu"><a href="/">/</a><a href="/spec">/SPEC</a><a href="/signals">/SIGNALS</a></div><header></header><!-- Summary Dashboard --><div class="takeaway-title">Actionable Signals</div><span class="section-title">Top 8 Opportunities</span><div class="stat-label">"Now" Signals</div><div class="stat-sub">Ready to act</div></body></html>`
     const upgraded = upgradeStoredReportNavigation(legacy)
     for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
       expect(upgraded).toContain(`href="${href}"`)
@@ -73,5 +79,11 @@ describe("report rendering", () => {
     expect(upgraded).toContain("Research only")
     expect(upgraded).toContain("Research-only observation layer")
     expect(upgraded).not.toContain("Ready to act")
+
+    const jsonLd = upgraded.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)?.[1]
+    expect(jsonLd).toBeDefined()
+    const structuredData = JSON.parse(jsonLd!)
+    expect(structuredData.mainEntity["@type"]).toBe("Report")
+    expect(JSON.stringify(structuredData)).not.toContain('"@type":"Dataset"')
   })
 })

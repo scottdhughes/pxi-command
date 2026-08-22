@@ -35,6 +35,7 @@ import {
   insertUtilityEvent as insertUtilityEventData,
 } from '../data/market-utility';
 import { constantTimeEquals as constantTimeCompare, enforceAdminAuth as enforceAdminRouteAuth } from '../lib/security';
+import { currentNewYorkDate } from '../lib/history-provenance';
 import {
   finalizeDigestDeliveryFailure as finalizeDigestDeliveryFailureService,
   finalizeDigestDeliverySent as finalizeDigestDeliverySentService,
@@ -89,6 +90,7 @@ export function createRouteDeps() {
     computeNextExpectedRefresh: computeNextExpectedRefreshModule,
     computeUtilityFunnelSummary: computeUtilityFunnelSummaryData,
     constantTimeEquals: constantTimeCompare,
+    currentNewYorkDate,
     detectDivergence: legacy.detectDivergence,
     detectRegime: legacy.detectRegime,
     enforceAdminAuth: enforceAdminRouteAuth,
@@ -122,6 +124,7 @@ export function createRouteDeps() {
     loadSPYReturnModel: legacy.loadSPYReturnModel,
     lstmForward: legacy.lstmForward,
     MINIMUM_RELIABLE_SAMPLE: legacy.MINIMUM_RELIABLE_SAMPLE,
+    PXI_SCORE_CATEGORIES: legacy.PXI_SCORE_CATEGORIES,
     normalizeAlertTypes: legacy.normalizeAlertTypes,
     normalizeCadence: legacy.normalizeCadence,
     normalizeOpportunityItemsForPublishing: legacy.normalizeOpportunityItemsForPublishing,

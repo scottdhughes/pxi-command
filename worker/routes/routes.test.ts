@@ -15,6 +15,8 @@ type QueryResult =
 
 function createFakeDb(handler: (sql: string, args: unknown[]) => QueryResult) {
   const buildStatement = (sql: string, args: unknown[] = []) => ({
+    sql,
+    args,
     bind: (...boundArgs: unknown[]) => buildStatement(sql, boundArgs),
     all: async <T>() => {
       const result = handler(sql, args);
@@ -69,10 +71,21 @@ function createRouteContext(url: string, init?: RequestInit, envOverrides: Recor
   };
 }
 
+const CANONICAL_PXI_CATEGORIES = [
+  'breadth',
+  'credit',
+  'crypto',
+  'global',
+  'macro',
+  'positioning',
+  'volatility',
+];
+
 test('tryHandleSystemRoute serves /health', async () => {
   const route = createRouteContext('https://pxi.test/health', undefined, {
     DB: createFakeDb((sql) => {
       if (sql.includes('SELECT 1 as ok')) return { ok: 1 };
+      if (sql.includes('FROM sqlite_master')) return { ready: 1 };
       throw new Error(`Unhandled query: ${sql}`);
     }),
     DEPLOY_ENV: 'production',
@@ -91,12 +104,14 @@ test('tryHandleSystemRoute serves /health', async () => {
   assert.equal(body.build_sha, 'a1b2c3d4e5f6');
   assert.equal(body.build_timestamp, '2026-03-06T14:22:00.000Z');
   assert.equal(body.worker_version, 'pxi-a1b2c3d4e5f6-2026-03-06T14:22:00.000Z');
+  assert.equal(body.history_reconstruction_contract, 'isolated-missing-only-v1');
 });
 
 test('tryHandleSystemRoute serves safe defaults on /health when deploy metadata is absent', async () => {
   const route = createRouteContext('https://pxi.test/health', undefined, {
     DB: createFakeDb((sql) => {
       if (sql.includes('SELECT 1 as ok')) return { ok: 1 };
+      if (sql.includes('FROM sqlite_master')) return { ready: 0 };
       throw new Error(`Unhandled query: ${sql}`);
     }),
   });
@@ -108,6 +123,7 @@ test('tryHandleSystemRoute serves safe defaults on /health when deploy metadata 
   assert.equal(body.build_sha, 'local-dev');
   assert.equal(body.build_timestamp, '1970-01-01T00:00:00.000Z');
   assert.equal(body.worker_version, 'pxi-dev');
+  assert.equal(body.history_reconstruction_contract, 'unavailable');
 });
 
 test('tryHandleSystemRoute serves /og-image.svg', async () => {
@@ -135,8 +151,28 @@ test('tryHandlePublicReadRoute serves /api/history in chronological order', asyn
     DB: createFakeDb((sql) => {
       if (sql.includes('FROM pxi_scores p')) {
         return [
-          { date: '2026-03-05', score: 70, label: 'risk-on', status: 'bullish' },
-          { date: '2026-03-04', score: 55, label: 'neutral', status: 'neutral' },
+          {
+            date: '2026-03-05',
+            score: 70,
+            label: 'risk-on',
+            status: 'bullish',
+            history_origin: 'live_recorded',
+            reconstructed_at: null,
+            reconstruction_method: null,
+            reconstruction_build_sha: null,
+            source_data_as_of: null,
+          },
+          {
+            date: '2026-03-02',
+            score: 55,
+            label: 'neutral',
+            status: 'neutral',
+            history_origin: 'retrospective_reconstruction',
+            reconstructed_at: '2026-08-22T18:00:00.000Z',
+            reconstruction_method: 'current_indicator_store_percentile_v1',
+            reconstruction_build_sha: 'a1b2c3d4e5f6',
+            source_data_as_of: '2026-08-22T17:55:00.000Z',
+          },
         ];
       }
       throw new Error(`Unhandled query: ${sql}`);
@@ -145,9 +181,24 @@ test('tryHandlePublicReadRoute serves /api/history in chronological order', asyn
 
   const response = await tryHandlePublicReadRoute(route as any, {});
   assert.ok(response);
-  const payload = await response!.json() as { data: Array<{ date: string; regime: string }> };
-  assert.equal(payload.data[0].date, '2026-03-04');
+  const payload = await response!.json() as any;
+  assert.equal(payload.data[0].date, '2026-03-02');
   assert.equal(payload.data[1].regime, 'RISK_ON');
+  assert.deepEqual(payload.provenance_counts, {
+    legacy_unclassified: 0,
+    live_recorded: 1,
+    retrospective_reconstruction: 1,
+  });
+  assert.deepEqual(payload.continuity, {
+    is_contiguous: false,
+    start_date: '2026-03-02',
+    end_date: '2026-03-05',
+    observed_days: 2,
+    expected_days: 4,
+    missing_days: 2,
+    gap_count: 1,
+    gaps: [{ start_date: '2026-03-03', end_date: '2026-03-04', missing_days: 2 }],
+  });
 });
 
 test('tryHandlePublicReadRoute serves /api/alerts summaries', async () => {
@@ -323,6 +374,7 @@ test('tryHandleAdminIngestionRoute keeps /api/write successful when embedding fa
 
   const response = await tryHandleAdminIngestionRoute(route as any, {
     enforceAdminAuth: async () => null,
+    currentNewYorkDate: () => '2026-03-05',
     getEmbeddingVector: () => [0.1, 0.2],
   });
   const payload = await response!.json() as Record<string, unknown>;
@@ -330,8 +382,138 @@ test('tryHandleAdminIngestionRoute keeps /api/write successful when embedding fa
   assert.equal(payload.written, 1);
 });
 
-test('tryHandleAdminIngestionRoute validates /api/backfill date ranges', async () => {
+test('tryHandleAdminIngestionRoute rejects historical score/category writes before touching D1', async () => {
+  let databaseTouched = false;
+  const route = createRouteContext('https://pxi.test/api/write', {
+    method: 'POST',
+    body: JSON.stringify({
+      categories: [{
+        category: 'macro',
+        date: '2026-03-04',
+        score: 70,
+        weight: 0.3,
+        weighted_score: 21,
+      }],
+      pxi: {
+        date: '2026-03-04',
+        score: 72,
+        label: 'risk-on',
+        status: 'bullish',
+        delta_1d: 1,
+        delta_7d: 2,
+        delta_30d: 4,
+      },
+    }),
+    headers: { 'Content-Type': 'application/json' },
+  }, {
+    DB: {
+      prepare() {
+        databaseTouched = true;
+        throw new Error('D1 must not be touched for rejected historical score writes');
+      },
+      async batch() {
+        databaseTouched = true;
+        throw new Error('D1 must not be touched for rejected historical score writes');
+      },
+    },
+  });
+
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    currentNewYorkDate: () => '2026-03-05',
+  });
+  assert.equal(response?.status, 400);
+  const payload = await response!.json() as any;
+  assert.equal(payload.current_date, '2026-03-05');
+  assert.deepEqual(payload.invalid_fields, [
+    { field: 'categories[0].date', date: '2026-03-04' },
+    { field: 'pxi.date', date: '2026-03-04' },
+  ]);
+  assert.equal(databaseTouched, false);
+});
+
+test('tryHandleAdminIngestionRoute still accepts historical indicator-only writes', async () => {
+  const batches: unknown[][] = [];
+  const route = createRouteContext('https://pxi.test/api/write', {
+    method: 'POST',
+    body: JSON.stringify({
+      type: 'indicator',
+      data: {
+        indicator_id: 'vix',
+        date: '2026-02-20',
+        value: 18.5,
+        source: 'test',
+      },
+    }),
+    headers: { 'Content-Type': 'application/json' },
+  }, {
+    DB: {
+      ...createFakeDb(() => null),
+      async batch(statements: unknown[]) {
+        batches.push(statements);
+        return { success: true };
+      },
+    },
+  });
+
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    currentNewYorkDate: () => '2026-03-05',
+  });
+  assert.equal(response?.status, 200);
+  const payload = await response!.json() as any;
+  assert.equal(payload.written, 1);
+  assert.equal(batches.length, 1);
+});
+
+test('tryHandleAdminIngestionRoute rejects historical /api/recalculate before calculation', async () => {
+  let calculateCalls = 0;
+  const route = createRouteContext('https://pxi.test/api/recalculate', {
+    method: 'POST',
+    body: JSON.stringify({ date: '2026-03-04' }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    currentNewYorkDate: () => '2026-03-05',
+    calculatePXI: async () => {
+      calculateCalls += 1;
+      return null;
+    },
+  });
+  assert.equal(response?.status, 400);
+  const payload = await response!.json() as any;
+  assert.equal(payload.current_date, '2026-03-05');
+  assert.equal(payload.requested_date, '2026-03-04');
+  assert.equal(calculateCalls, 0);
+});
+
+test('tryHandleAdminIngestionRoute permanently disables the unversioned /api/backfill route', async () => {
+  let authCalls = 0;
   const route = createRouteContext('https://pxi.test/api/backfill', {
+    method: 'POST',
+    body: JSON.stringify({
+      start: '2026-03-01',
+      end: '2026-03-02',
+      limit: 2,
+      expected_build_sha: 'a1b2c3d4e5f6',
+    }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => {
+      authCalls += 1;
+      return null;
+    },
+  });
+  assert.equal(response?.status, 410);
+  assert.equal(authCalls, 0);
+});
+
+test('tryHandleAdminIngestionRoute validates versioned reconstruction date ranges', async () => {
+  const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
     method: 'POST',
     body: JSON.stringify({ start: 'bad', end: 'bad' }),
     headers: {
@@ -347,60 +529,571 @@ test('tryHandleAdminIngestionRoute validates /api/backfill date ranges', async (
   assert.equal(response?.status, 400);
 });
 
-test('tryHandleAdminIngestionRoute records /api/backfill runs with the current helper contract', async () => {
-  const finishCalls: Array<{ runId: unknown; payload: unknown }> = [];
-  const route = createRouteContext('https://pxi.test/api/backfill', {
+test('tryHandleAdminIngestionRoute reconstructs only missing scores with explicit nonclaims', async () => {
+  const batches: Array<Array<{ sql: string; args: unknown[] }>> = [];
+  const calculateCalls: Array<{ date: string; options: unknown }> = [];
+  const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
     method: 'POST',
-    body: JSON.stringify({ start: '2026-03-01', end: '2026-03-02', limit: 5 }),
+    body: JSON.stringify({
+      start: '2026-03-01',
+      end: '2026-03-03',
+      limit: 3,
+      expected_build_sha: 'a1b2c3d4e5f6',
+      missing_only: true,
+      overwrite: false,
+      record_evidence: false,
+      refresh_products: false,
+      include_decision_impact: false,
+      include_decision_grade: false,
+      rebuild_ledgers: false,
+      generate_embeddings: false,
+      recalibrate: false,
+    }),
     headers: {
       'Content-Type': 'application/json',
     },
   }, {
-    DB: createFakeDb((sql) => {
-      if (sql.includes('SELECT indicator_id, value FROM indicator_values')) {
-        return [];
-      }
+    BUILD_SHA: 'a1b2c3d4e5f6',
+    DB: {
+      ...createFakeDb((sql) => {
+        if (sql.includes('MAX(fetched_at) AS source_data_as_of')) {
+          return { source_data_as_of: '2026-08-22T17:55:00.000Z' };
+        }
+        if (sql.includes("SELECT date, 'live_pxi' AS storage_kind")) {
+          return [
+            {
+              date: '2026-03-01',
+              storage_kind: 'live_pxi',
+              history_origin: 'live_recorded',
+              reconstructed_at: null,
+              reconstruction_method: null,
+              reconstruction_build_sha: null,
+              source_data_as_of: null,
+              category: null,
+            },
+            ...CANONICAL_PXI_CATEGORIES.map((category) => ({
+              date: '2026-03-01',
+              storage_kind: 'live_category',
+              history_origin: 'live_recorded',
+              reconstructed_at: null,
+              reconstruction_method: null,
+              reconstruction_build_sha: null,
+              source_data_as_of: null,
+              category,
+            })),
+            {
+              date: '2026-03-02',
+              storage_kind: 'reconstruction_pxi',
+              history_origin: 'retrospective_reconstruction',
+              reconstructed_at: '2026-08-21T18:00:00.000Z',
+              reconstruction_method: 'current_indicator_store_percentile_v1',
+              reconstruction_build_sha: '112233445566',
+              source_data_as_of: '2026-08-21T17:55:00.000Z',
+              category: null,
+            },
+            ...CANONICAL_PXI_CATEGORIES.map((category) => ({
+              date: '2026-03-02',
+              storage_kind: 'reconstruction_category',
+              history_origin: 'retrospective_reconstruction',
+              reconstructed_at: '2026-08-21T18:00:00.000Z',
+              reconstruction_method: 'current_indicator_store_percentile_v1',
+              reconstruction_build_sha: '112233445566',
+              source_data_as_of: '2026-08-21T17:55:00.000Z',
+              category,
+            })),
+          ];
+        }
+        throw new Error(`Unexpected database query: ${sql}`);
+      }),
+      async batch(statements: Array<{ sql: string; args: unknown[] }>) {
+        batches.push(statements);
+        return { success: true };
+      },
+    },
+    AI: {
+      run: async () => {
+        throw new Error('backfill must not invoke Workers AI');
+      },
+    },
+    VECTORIZE: {
+      upsert: async () => {
+        throw new Error('backfill must not write Vectorize');
+      },
+    },
+  });
+
+  const requestBody = {
+    start: '2026-03-01',
+    end: '2026-03-03',
+    limit: 3,
+    expected_build_sha: 'a1b2c3d4e5f6',
+    missing_only: true,
+    overwrite: false,
+    record_evidence: false,
+    refresh_products: false,
+    include_decision_impact: false,
+    include_decision_grade: false,
+    rebuild_ledgers: false,
+    generate_embeddings: false,
+    recalibrate: false,
+  };
+  const forbiddenDependency = async () => {
+    throw new Error('backfill called a forbidden evidence/product/refresh dependency');
+  };
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    parseJsonBody: async () => requestBody,
+    parseBackfillDateRange: () => ({ start: '2026-03-01', end: '2026-03-03' }),
+    currentNewYorkDate: () => '2026-03-05',
+    formatDate: (value: Date) => value.toISOString().slice(0, 10),
+    PXI_SCORE_CATEGORIES: CANONICAL_PXI_CATEGORIES,
+    calculatePXI: async (_db: unknown, date: string, options: unknown) => {
+      calculateCalls.push({ date, options });
+      return {
+        pxi: {
+          date,
+          score: 70,
+          label: 'risk-on',
+          status: 'bullish',
+          delta_1d: 1,
+          delta_7d: 2,
+          delta_30d: 4,
+        },
+        categories: CANONICAL_PXI_CATEGORIES.map((category) => ({
+          category,
+          date,
+          score: 72,
+          weight: 1 / CANONICAL_PXI_CATEGORIES.length,
+          weighted_score: 72 / CANONICAL_PXI_CATEGORIES.length,
+        })),
+      };
+    },
+    recordMarketRefreshRunStart: forbiddenDependency,
+    recordMarketRefreshRunFinish: forbiddenDependency,
+    ensureMarketProductSchema: forbiddenDependency,
+    generateEmbeddingText: forbiddenDependency,
+    getEmbeddingVector: forbiddenDependency,
+  });
+
+  assert.equal(response?.status, 200);
+  const payload = await response!.json() as any;
+  assert.equal(payload.success, true);
+  assert.equal(payload.history_origin, 'retrospective_reconstruction');
+  assert.equal(payload.missing_only, true);
+  assert.equal(payload.point_in_time_guarantee, false);
+  assert.equal(payload.research_evidence_captured, false);
+  assert.equal(payload.market_products_refreshed, false);
+  assert.equal(payload.decision_impact_refreshed, false);
+  assert.equal(payload.embeddings_generated, 0);
+  assert.equal(payload.replaced, 0);
+  assert.equal(payload.succeeded, 1);
+  assert.equal(payload.skipped_existing, 2);
+  assert.equal(payload.failed, 0);
+  assert.equal(payload.stopped_early, false);
+  assert.equal(payload.unprocessed, 0);
+  assert.deepEqual(payload.results, [
+    { date: '2026-03-01', status: 'skipped_existing' },
+    { date: '2026-03-02', status: 'skipped_existing' },
+    { date: '2026-03-03', status: 'inserted' },
+  ]);
+  assert.deepEqual(calculateCalls, [{
+    date: '2026-03-03',
+    options: { includeRetrospectiveHistory: true },
+  }]);
+  assert.equal(batches.length, 1);
+  assert.equal(batches[0].length, 8);
+  assert.ok(batches[0].slice(0, 7).every((statement) =>
+    /INSERT INTO category_score_reconstructions/.test(statement.sql)));
+  assert.ok(batches[0].slice(0, 7).every((statement) => !/OR REPLACE/.test(statement.sql)));
+  assert.match(batches[0][7].sql, /INSERT INTO pxi_score_reconstructions/);
+  assert.doesNotMatch(batches[0][7].sql, /OR REPLACE/);
+  assert.ok(batches[0].every((statement) => statement.args.includes('retrospective_reconstruction')));
+  assert.ok(batches[0].every((statement) => statement.args.includes('a1b2c3d4e5f6')));
+});
+
+test('tryHandleAdminIngestionRoute fail-stops on partial or mixed existing history', async (t) => {
+  const provenance = {
+    reconstructed_at: null,
+    reconstruction_method: null,
+    reconstruction_build_sha: null,
+    source_data_as_of: null,
+  };
+  const scenarios = [
+    {
+      name: 'category-only live state',
+      rows: [{
+        date: '2026-03-01',
+        storage_kind: 'live_category',
+        history_origin: 'live_recorded',
+        category: 'macro',
+        ...provenance,
+      }],
+      expectedCategories: ['macro'],
+    },
+    {
+      name: 'mixed live/reconstruction state',
+      rows: [
+        {
+          date: '2026-03-01',
+          storage_kind: 'live_pxi',
+          history_origin: 'live_recorded',
+          category: null,
+          ...provenance,
+        },
+        {
+          date: '2026-03-01',
+          storage_kind: 'reconstruction_category',
+          history_origin: 'retrospective_reconstruction',
+          reconstructed_at: '2026-08-22T18:00:00.000Z',
+          reconstruction_method: 'current_indicator_store_percentile_v1',
+          reconstruction_build_sha: 'a1b2c3d4e5f6',
+          source_data_as_of: '2026-08-22T17:55:00.000Z',
+          category: 'macro',
+        },
+      ],
+      expectedCategories: ['macro'],
+    },
+    {
+      name: 'live category subset',
+      rows: [
+        {
+          date: '2026-03-01',
+          storage_kind: 'live_pxi',
+          history_origin: 'live_recorded',
+          category: null,
+          ...provenance,
+        },
+        {
+          date: '2026-03-01',
+          storage_kind: 'live_category',
+          history_origin: 'live_recorded',
+          category: 'macro',
+          ...provenance,
+        },
+      ],
+      expectedCategories: ['macro', 'credit'],
+    },
+    {
+      name: 'reconstructed category subset',
+      rows: [
+        {
+          date: '2026-03-01',
+          storage_kind: 'reconstruction_pxi',
+          history_origin: 'retrospective_reconstruction',
+          reconstructed_at: '2026-08-22T18:00:00.000Z',
+          reconstruction_method: 'current_indicator_store_percentile_v1',
+          reconstruction_build_sha: 'a1b2c3d4e5f6',
+          source_data_as_of: '2026-08-22T17:55:00.000Z',
+          category: null,
+        },
+        {
+          date: '2026-03-01',
+          storage_kind: 'reconstruction_category',
+          history_origin: 'retrospective_reconstruction',
+          reconstructed_at: '2026-08-22T18:00:00.000Z',
+          reconstruction_method: 'current_indicator_store_percentile_v1',
+          reconstruction_build_sha: 'a1b2c3d4e5f6',
+          source_data_as_of: '2026-08-22T17:55:00.000Z',
+          category: 'macro',
+        },
+      ],
+      expectedCategories: ['macro', 'credit'],
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      let calculateCalls = 0;
+      let batchCalls = 0;
+      const body = {
+        start: '2026-03-01',
+        end: '2026-03-02',
+        limit: 2,
+        expected_build_sha: 'a1b2c3d4e5f6',
+      };
+      const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json' },
+      }, {
+        BUILD_SHA: 'a1b2c3d4e5f6',
+        DB: {
+          ...createFakeDb((sql) => {
+            if (sql.includes('MAX(fetched_at) AS source_data_as_of')) {
+              return { source_data_as_of: '2026-08-22T17:55:00.000Z' };
+            }
+            if (sql.includes("SELECT date, 'live_pxi' AS storage_kind")) {
+              return scenario.rows;
+            }
+            throw new Error(`Unexpected database query: ${sql}`);
+          }),
+          async batch() {
+            batchCalls += 1;
+            return { success: true };
+          },
+        },
+      });
+
+      const response = await tryHandleAdminIngestionRoute(route as any, {
+        enforceAdminAuth: async () => null,
+        parseJsonBody: async () => body,
+        parseBackfillDateRange: () => ({ start: body.start, end: body.end }),
+        currentNewYorkDate: () => '2026-03-05',
+        formatDate: (value: Date) => value.toISOString().slice(0, 10),
+        PXI_SCORE_CATEGORIES: scenario.expectedCategories,
+        calculatePXI: async () => {
+          calculateCalls += 1;
+          return null;
+        },
+      });
+
+      assert.equal(response?.status, 200);
+      const payload = await response!.json() as any;
+      assert.equal(payload.success, false);
+      assert.equal(payload.failed, 1);
+      assert.equal(payload.stopped_early, true);
+      assert.equal(payload.unprocessed, 1);
+      assert.equal(payload.results.length, 1);
+      assert.equal(payload.results[0].status, 'conflict');
+      assert.match(payload.results[0].error, /partial or mixed/);
+      assert.equal(calculateCalls, 0);
+      assert.equal(batchCalls, 0);
+    });
+  }
+});
+
+test('tryHandleAdminIngestionRoute stops before later dates after calculate or batch failure', async (t) => {
+  const runScenario = async (failure: 'calculate' | 'batch' | 'calculated_subset') => {
+    const calculateDates: string[] = [];
+    let batchCalls = 0;
+    const body = {
+      start: '2026-03-01',
+      end: '2026-03-03',
+      limit: 3,
+      expected_build_sha: 'a1b2c3d4e5f6',
+    };
+    const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+    }, {
+      BUILD_SHA: 'a1b2c3d4e5f6',
+      DB: {
+        ...createFakeDb((sql) => {
+          if (sql.includes('MAX(fetched_at) AS source_data_as_of')) {
+            return { source_data_as_of: '2026-08-22T17:55:00.000Z' };
+          }
+          if (sql.includes("SELECT date, 'live_pxi' AS storage_kind")) return [];
+          throw new Error(`Unexpected database query: ${sql}`);
+        }),
+        async batch() {
+          batchCalls += 1;
+          if (failure === 'batch') throw new Error('simulated batch failure');
+          return { success: true };
+        },
+      },
+    });
+
+    const response = await tryHandleAdminIngestionRoute(route as any, {
+      enforceAdminAuth: async () => null,
+      parseJsonBody: async () => body,
+      parseBackfillDateRange: () => ({ start: body.start, end: body.end }),
+      currentNewYorkDate: () => '2026-03-05',
+      formatDate: (value: Date) => value.toISOString().slice(0, 10),
+      PXI_SCORE_CATEGORIES: failure === 'calculated_subset' ? ['macro', 'credit'] : ['macro'],
+      calculatePXI: async (_db: unknown, date: string) => {
+        calculateDates.push(date);
+        if (failure === 'calculate' && date === '2026-03-02') return null;
+        return {
+          pxi: {
+            date,
+            score: 70,
+            label: 'risk-on',
+            status: 'bullish',
+            delta_1d: 1,
+            delta_7d: 2,
+            delta_30d: 4,
+          },
+          categories: [{
+            category: 'macro',
+            date,
+            score: 72,
+            weight: 0.3,
+            weighted_score: 21.6,
+          }],
+        };
+      },
+    });
+    const payload = await response!.json() as any;
+    return { payload, calculateDates, batchCalls };
+  };
+
+  await t.test('calculation failure', async () => {
+    const { payload, calculateDates, batchCalls } = await runScenario('calculate');
+    assert.deepEqual(calculateDates, ['2026-03-01', '2026-03-02']);
+    assert.equal(batchCalls, 1);
+    assert.deepEqual(payload.results.map((item: any) => item.status), ['inserted', 'failed']);
+    assert.equal(payload.stopped_early, true);
+    assert.equal(payload.unprocessed, 1);
+  });
+
+  await t.test('batch failure', async () => {
+    const { payload, calculateDates, batchCalls } = await runScenario('batch');
+    assert.deepEqual(calculateDates, ['2026-03-01']);
+    assert.equal(batchCalls, 1);
+    assert.deepEqual(payload.results.map((item: any) => item.status), ['failed']);
+    assert.match(payload.results[0].error, /simulated batch failure/);
+    assert.equal(payload.stopped_early, true);
+    assert.equal(payload.unprocessed, 2);
+  });
+
+  await t.test('calculated category subset', async () => {
+    const { payload, calculateDates, batchCalls } = await runScenario('calculated_subset');
+    assert.deepEqual(calculateDates, ['2026-03-01']);
+    assert.equal(batchCalls, 0);
+    assert.deepEqual(payload.results.map((item: any) => item.status), ['failed']);
+    assert.match(payload.results[0].error, /incomplete or mismatched/);
+    assert.equal(payload.stopped_early, true);
+    assert.equal(payload.unprocessed, 2);
+  });
+});
+
+test('tryHandleAdminIngestionRoute uses the New York date for reconstruction cutoff', async () => {
+  let databaseTouched = false;
+  const body = { start: '2026-03-04', end: '2026-03-05', limit: 2 };
+  const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+  }, {
+    BUILD_SHA: 'a1b2c3d4e5f6',
+    DB: createFakeDb(() => {
+      databaseTouched = true;
       return null;
     }),
   });
 
   const response = await tryHandleAdminIngestionRoute(route as any, {
     enforceAdminAuth: async () => null,
-    parseJsonBody: async () => ({ start: '2026-03-01', end: '2026-03-02', limit: 5 }),
-    parseBackfillDateRange: () => ({ start: '2026-03-01', end: '2026-03-02' }),
-    parseBackfillLimit: () => 5,
-    recordMarketRefreshRunStart: async () => 77,
-    recordMarketRefreshRunFinish: async (_db: unknown, runId: unknown, payload: unknown) => {
-      finishCalls.push({ runId, payload });
-    },
-    formatDate: (value: Date) => value.toISOString().slice(0, 10),
-    calculatePXI: async (db: unknown, date: string) => ({
-      pxi: {
-        date,
-        score: 70,
-        label: 'risk-on',
-        status: 'bullish',
-        delta_1d: 1,
-        delta_7d: 2,
-        delta_30d: 4,
-      },
-      categories: [
-        { category: 'macro', date, score: 72, weight: 0.3, weighted_score: 21.6 },
-      ],
+    parseJsonBody: async () => body,
+    parseBackfillDateRange: () => ({ start: body.start, end: body.end }),
+    currentNewYorkDate: () => '2026-03-05',
+  });
+  assert.equal(response?.status, 400);
+  assert.equal(databaseTouched, false);
+});
+
+test('tryHandleAdminIngestionRoute rejects unsafe reconstruction options before writes', async () => {
+  let databaseTouched = false;
+  const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
+    method: 'POST',
+    body: JSON.stringify({
+      start: '2026-03-01',
+      end: '2026-03-02',
+      limit: 2,
+      overwrite: true,
     }),
-    generateEmbeddingText: () => 'embedding text',
-    getEmbeddingVector: () => [0.1, 0.2],
-    ensureMarketProductSchema: async () => undefined,
+    headers: { 'Content-Type': 'application/json' },
+  }, {
+    BUILD_SHA: 'a1b2c3d4e5f6',
+    DB: createFakeDb(() => {
+      databaseTouched = true;
+      return null;
+    }),
   });
 
-  assert.equal(response?.status, 200);
-  const payload = await response!.json() as any;
-  assert.equal(payload.success, true);
-  assert.equal(payload.run_id, 77);
-  assert.equal(finishCalls.length, 1);
-  assert.equal(finishCalls[0]?.runId, 77);
-  assert.equal((finishCalls[0]?.payload as any).status, 'success');
-  assert.equal((finishCalls[0]?.payload as any).as_of, '2026-03-02');
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    parseJsonBody: async () => ({
+      start: '2026-03-01',
+      end: '2026-03-02',
+      limit: 2,
+      overwrite: true,
+    }),
+  });
+  assert.equal(response?.status, 400);
+  assert.equal(databaseTouched, false);
+});
+
+test('tryHandleAdminIngestionRoute rejects reconstruction without a deployed build SHA', async () => {
+  const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
+    method: 'POST',
+    body: JSON.stringify({ start: '2026-03-01', end: '2026-03-02', limit: 2 }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    parseJsonBody: async () => ({
+      start: '2026-03-01',
+      end: '2026-03-02',
+      limit: 2,
+      expected_build_sha: 'a1b2c3d4e5f6',
+    }),
+    parseBackfillDateRange: () => ({ start: '2026-03-01', end: '2026-03-02' }),
+    currentNewYorkDate: () => '2026-03-05',
+    formatDate: (value: Date) => value.toISOString().slice(0, 10),
+  });
+  assert.equal(response?.status, 503);
+});
+
+test('tryHandleAdminIngestionRoute rejects a build SHA mismatch before D1 access', async () => {
+  let databaseTouched = false;
+  const body = {
+    start: '2026-03-01',
+    end: '2026-03-02',
+    limit: 2,
+    expected_build_sha: 'ffeeddccbbaa',
+  };
+  const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+  }, {
+    BUILD_SHA: 'a1b2c3d4e5f6',
+    DB: createFakeDb(() => {
+      databaseTouched = true;
+      return null;
+    }),
+  });
+
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    parseJsonBody: async () => body,
+    parseBackfillDateRange: () => ({ start: body.start, end: body.end }),
+    currentNewYorkDate: () => '2026-03-05',
+  });
+  assert.equal(response?.status, 409);
+  assert.equal(databaseTouched, false);
+});
+
+test('tryHandleAdminIngestionRoute caps each reconstruction request at three days', async () => {
+  let databaseTouched = false;
+  const body = {
+    start: '2026-03-01',
+    end: '2026-03-04',
+    limit: 4,
+    expected_build_sha: 'a1b2c3d4e5f6',
+  };
+  const route = createRouteContext('https://pxi.test/api/history/reconstruct-missing-v1', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+  }, {
+    BUILD_SHA: 'a1b2c3d4e5f6',
+    DB: createFakeDb(() => {
+      databaseTouched = true;
+      return null;
+    }),
+  });
+
+  const response = await tryHandleAdminIngestionRoute(route as any, {
+    enforceAdminAuth: async () => null,
+    parseJsonBody: async () => body,
+    parseBackfillDateRange: () => ({ start: body.start, end: body.end }),
+  });
+  assert.equal(response?.status, 400);
+  assert.equal(databaseTouched, false);
 });
 
 test('tryHandleAdminIngestionRoute serves /api/recalculate-all-signals summaries', async () => {

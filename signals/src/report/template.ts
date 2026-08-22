@@ -565,7 +565,8 @@ export function renderHtml(
   const pageUrl = "https://pxicommand.com/signals"
   const ogImage = "https://pxicommand.com/signals/og-image.png"
 
-  // JSON-LD structured data
+  // This page publishes an analysis report, not a separately licensed dataset.
+  // Do not use Dataset unless PXI publishes an explicit data license and provenance contract.
   const structuredData = {
     "@context": "https://schema.org",
     "@type": "WebPage",
@@ -579,7 +580,7 @@ export function renderHtml(
       "url": "https://pxicommand.com"
     },
     "mainEntity": {
-      "@type": "Dataset",
+      "@type": "Report",
       "name": "Sector Rotation Research Signals",
       "description": "Research-only theme analysis derived from Reddit discussion patterns",
       "dateModified": report.generated_at_utc,

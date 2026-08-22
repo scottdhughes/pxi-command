@@ -26,6 +26,7 @@ import {
   isHistoricalBackfillOpportunitySnapshot,
   parseProspectiveOpportunitySnapshot as parseProspectiveOpportunitySnapshotPayload,
 } from '../lib/opportunity-snapshot-history';
+import { currentNewYorkDate } from '../lib/history-provenance';
 import { ensureMarketProductSchema as ensureMarketProductSchemaGuard } from '../db/schema';
 import { tryHandleMarketCoreRoute } from '../domain/market-core';
 import {
@@ -1807,7 +1808,8 @@ function parseIsoDate(value: string): string | null {
   if (!ISO_DATE_RE.test(value)) return null;
   const date = new Date(`${value}T00:00:00.000Z`);
   if (Number.isNaN(date.getTime())) return null;
-  return date.toISOString().slice(0, 10);
+  const normalized = date.toISOString().slice(0, 10);
+  return normalized === value ? normalized : null;
 }
 
 function parseBackfillLimit(rawLimit: unknown): number {
@@ -7555,6 +7557,10 @@ const INDICATOR_CONFIG: IndicatorConfig[] = [
   { id: 'btc_price', category: 'crypto', weight: 0.03, invert: false },
 ];
 
+const PXI_SCORE_CATEGORIES = Object.freeze(
+  [...new Set(INDICATOR_CONFIG.map((indicator) => indicator.category))].sort(),
+);
+
 // Proper empirical percentile calculation
 function calculatePercentile(value: number, history: number[]): number {
   if (history.length === 0) return 50;
@@ -7589,7 +7595,11 @@ function getStatus(score: number): string {
   return 'dumping';
 }
 
-async function calculatePXI(db: D1Database, targetDate: string): Promise<{
+async function calculatePXI(
+  db: D1Database,
+  targetDate: string,
+  options: { includeRetrospectiveHistory?: boolean } = {},
+): Promise<{
   pxi: { date: string; score: number; label: string; status: string; delta_1d: number | null; delta_7d: number | null; delta_30d: number | null };
   categories: { category: string; date: string; score: number; weight: number; weighted_score: number }[];
 } | null> {
@@ -7685,12 +7695,23 @@ async function calculatePXI(db: D1Database, targetDate: string): Promise<{
   date30d.setDate(date30d.getDate() - 30);
 
   const formatDate = (d: Date) => d.toISOString().split('T')[0];
+  const historicalScoreSource = options.includeRetrospectiveHistory
+    ? `(
+        SELECT date, score FROM pxi_scores
+        UNION ALL
+        SELECT reconstruction.date, reconstruction.score
+        FROM pxi_score_reconstructions reconstruction
+        WHERE NOT EXISTS (
+          SELECT 1 FROM pxi_scores live WHERE live.date = reconstruction.date
+        )
+      )`
+    : 'pxi_scores';
 
   // Get closest available scores to target dates
   const [hist1d, hist7d, hist30d] = await Promise.all([
-    db.prepare(`SELECT score FROM pxi_scores WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date1d)).first<{ score: number }>(),
-    db.prepare(`SELECT score FROM pxi_scores WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date7d)).first<{ score: number }>(),
-    db.prepare(`SELECT score FROM pxi_scores WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date30d)).first<{ score: number }>(),
+    db.prepare(`SELECT score FROM ${historicalScoreSource} WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date1d)).first<{ score: number }>(),
+    db.prepare(`SELECT score FROM ${historicalScoreSource} WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date7d)).first<{ score: number }>(),
+    db.prepare(`SELECT score FROM ${historicalScoreSource} WHERE date <= ? ORDER BY date DESC LIMIT 1`).bind(formatDate(date30d)).first<{ score: number }>(),
   ]);
 
   const delta_1d = hist1d ? pxiScore - hist1d.score : null;
@@ -7743,7 +7764,7 @@ async function handleScheduled(env: Env): Promise<void> {
   console.log(`💾 Wrote ${written} indicator values to D1`);
 
   // Calculate and store PXI score for today
-  const today = formatDate(new Date());
+  const today = currentNewYorkDate();
   console.log(`🧮 Calculating PXI for ${today}...`);
 
   const result = await calculatePXI(env.DB, today);
@@ -7751,8 +7772,9 @@ async function handleScheduled(env: Env): Promise<void> {
   if (result) {
     // Write PXI score
     await env.DB.prepare(`
-      INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO pxi_scores
+      (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
     `).bind(
       result.pxi.date,
       result.pxi.score,
@@ -7766,8 +7788,9 @@ async function handleScheduled(env: Env): Promise<void> {
     // Write category scores
     const catStmts = result.categories.map(cat =>
       env.DB.prepare(`
-        INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO category_scores
+        (category, date, score, weight, weighted_score, history_origin)
+        VALUES (?, ?, ?, ?, ?, 'live_recorded')
       `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score)
     );
     if (catStmts.length > 0) {
@@ -10398,6 +10421,24 @@ export default {
           pxi?: { date: string; score: number; label: string; status: string; delta_1d: number | null; delta_7d: number | null; delta_30d: number | null };
         };
 
+        const currentDate = currentNewYorkDate();
+        const liveScoreDates: unknown[] = [];
+        if (body.type === 'category' || body.type === 'pxi') {
+          liveScoreDates.push(body.data?.date);
+        }
+        for (const category of body.categories || []) {
+          liveScoreDates.push(category.date);
+        }
+        if (body.pxi) {
+          liveScoreDates.push(body.pxi.date);
+        }
+        if (liveScoreDates.some((date) => date !== currentDate)) {
+          return Response.json({
+            error: 'PXI and category live writes are restricted to the current America/New_York date.',
+            current_date: currentDate,
+          }, { status: 400, headers: corsHeaders });
+        }
+
         const stmts: D1PreparedStatement[] = [];
 
         // Handle legacy single-record format
@@ -10411,14 +10452,16 @@ export default {
           } else if (body.type === 'category') {
             const { category, date, score, weight, weighted_score } = body.data;
             stmts.push(env.DB.prepare(`
-              INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-              VALUES (?, ?, ?, ?, ?)
+              INSERT OR REPLACE INTO category_scores
+              (category, date, score, weight, weighted_score, history_origin)
+              VALUES (?, ?, ?, ?, ?, 'live_recorded')
             `).bind(category, date, score, weight, weighted_score));
           } else if (body.type === 'pxi') {
             const { date, score, label, status, delta_1d, delta_7d, delta_30d } = body.data;
             stmts.push(env.DB.prepare(`
-              INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-              VALUES (?, ?, ?, ?, ?, ?, ?)
+              INSERT OR REPLACE INTO pxi_scores
+              (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+              VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
             `).bind(date, score, label, status, delta_1d, delta_7d, delta_30d));
           }
         }
@@ -10434,8 +10477,9 @@ export default {
         // Handle batch category scores
         for (const cat of body.categories || []) {
           stmts.push(env.DB.prepare(`
-            INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO category_scores
+            (category, date, score, weight, weighted_score, history_origin)
+            VALUES (?, ?, ?, ?, ?, 'live_recorded')
           `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score));
         }
 
@@ -10443,8 +10487,9 @@ export default {
         if (body.pxi) {
           const p = body.pxi;
           stmts.push(env.DB.prepare(`
-            INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO pxi_scores
+            (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
           `).bind(p.date, p.score, p.label, p.status, p.delta_1d, p.delta_7d, p.delta_30d));
         }
 
@@ -10521,13 +10566,14 @@ export default {
         }
 
         // Calculate PXI for today
-        const today = formatDate(new Date());
+        const today = currentNewYorkDate();
         const result = await calculatePXI(env.DB, today);
 
         if (result) {
           await env.DB.prepare(`
-            INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO pxi_scores
+            (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
           `).bind(
             result.pxi.date, result.pxi.score, result.pxi.label, result.pxi.status,
             result.pxi.delta_1d, result.pxi.delta_7d, result.pxi.delta_30d
@@ -10535,8 +10581,9 @@ export default {
 
           const catStmts = result.categories.map(cat =>
             env.DB.prepare(`
-              INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-              VALUES (?, ?, ?, ?, ?)
+              INSERT OR REPLACE INTO category_scores
+              (category, date, score, weight, weighted_score, history_origin)
+              VALUES (?, ?, ?, ?, ?, 'live_recorded')
             `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score)
           );
           if (catStmts.length > 0) {
@@ -10560,7 +10607,15 @@ export default {
         }
 
         const body = await request.json() as { date?: string };
-        const targetDate = body.date || formatDate(new Date());
+        const currentDate = currentNewYorkDate();
+        const targetDate = body.date || currentDate;
+        if (targetDate !== currentDate) {
+          return Response.json({
+            error: 'Live PXI recalculation is restricted to the current America/New_York date.',
+            current_date: currentDate,
+            requested_date: targetDate,
+          }, { status: 400, headers: corsHeaders });
+        }
 
         const result = await calculatePXI(env.DB, targetDate);
 
@@ -10570,8 +10625,9 @@ export default {
 
         // Write PXI score
         await env.DB.prepare(`
-          INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+          INSERT OR REPLACE INTO pxi_scores
+          (date, score, label, status, delta_1d, delta_7d, delta_30d, history_origin)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'live_recorded')
         `).bind(
           result.pxi.date,
           result.pxi.score,
@@ -10585,8 +10641,9 @@ export default {
         // Write category scores
         const catStmts = result.categories.map(cat =>
           env.DB.prepare(`
-            INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO category_scores
+            (category, date, score, weight, weighted_score, history_origin)
+            VALUES (?, ?, ?, ?, ?, 'live_recorded')
           `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score)
         );
         if (catStmts.length > 0) {
@@ -10711,162 +10768,12 @@ export default {
         }, { headers: corsHeaders });
       }
 
-      // Backfill historical PXI scores and embeddings (requires auth)
+      // The monolithic legacy worker is not deployed, but keep its former
+      // destructive backfill route closed if it is ever restored.
       if (url.pathname === '/api/backfill' && method === 'POST') {
-        const adminAuthFailure = await enforceAdminAuth(request, env, corsHeaders, clientIP);
-        if (adminAuthFailure) {
-          return adminAuthFailure;
-        }
-
-        let body: { start?: string; end?: string; limit?: number };
-        try {
-          body = await request.json() as { start?: string; end?: string; limit?: number };
-        } catch {
-          return Response.json(
-            { error: 'Invalid JSON body' },
-            { status: 400, headers: corsHeaders }
-          );
-        }
-        const limit = parseBackfillLimit(body.limit);
-        let dateFilter: ReturnType<typeof parseBackfillDateRange>;
-        try {
-          dateFilter = parseBackfillDateRange(body.start, body.end);
-        } catch (err) {
-          return Response.json({
-            error: err instanceof Error ? err.message : 'Invalid date range',
-          }, { status: 400, headers: corsHeaders });
-        }
-
-        // Get all unique dates with indicator data that don't have PXI scores yet
-        const dateClauses: string[] = [];
-        const dateParams: string[] = [];
-
-        if (dateFilter.start) {
-          dateClauses.push('iv.date >= ?');
-          dateParams.push(dateFilter.start);
-        }
-
-        if (dateFilter.end) {
-          dateClauses.push('iv.date <= ?');
-          dateParams.push(dateFilter.end);
-        }
-
-        const remainingFilterClause = dateClauses.length > 0
-          ? `AND ${dateClauses.join(' AND ')}`
-          : '';
-
-        const remainingParams = [...dateParams];
-
-        const datesResult = await env.DB.prepare(`
-          SELECT DISTINCT iv.date
-          FROM indicator_values iv
-          LEFT JOIN pxi_scores ps ON iv.date = ps.date
-          WHERE ps.date IS NULL
-          ${remainingFilterClause}
-          ORDER BY iv.date DESC
-          LIMIT ?
-        `).bind(...remainingParams, limit).all<{ date: string }>();
-
-        const dates = datesResult.results || [];
-        let processed = 0;
-        let succeeded = 0;
-        let embedded = 0;
-        const results: { date: string; score?: number; categories?: number; error?: string }[] = [];
-
-        for (const { date } of dates) {
-          processed++;
-          try {
-            const result = await calculatePXI(env.DB, date);
-
-            if (!result || result.categories.length < 2) {
-              results.push({ date, error: 'Insufficient data' });
-              continue;
-            }
-
-            // Write PXI score
-            await env.DB.prepare(`
-              INSERT OR REPLACE INTO pxi_scores (date, score, label, status, delta_1d, delta_7d, delta_30d)
-              VALUES (?, ?, ?, ?, ?, ?, ?)
-            `).bind(
-              result.pxi.date,
-              result.pxi.score,
-              result.pxi.label,
-              result.pxi.status,
-              result.pxi.delta_1d,
-              result.pxi.delta_7d,
-              result.pxi.delta_30d
-            ).run();
-
-            // Write category scores
-            const catStmts = result.categories.map(cat =>
-              env.DB.prepare(`
-                INSERT OR REPLACE INTO category_scores (category, date, score, weight, weighted_score)
-                VALUES (?, ?, ?, ?, ?)
-              `).bind(cat.category, cat.date, cat.score, cat.weight, cat.weighted_score)
-            );
-            if (catStmts.length > 0) {
-              await env.DB.batch(catStmts);
-            }
-
-            succeeded++;
-            results.push({ date, score: result.pxi.score, categories: result.categories.length });
-
-            // Generate embedding for Vectorize with engineered features
-            try {
-              const indicators = await env.DB.prepare(`
-                SELECT indicator_id, value FROM indicator_values WHERE date = ? ORDER BY indicator_id
-              `).bind(date).all<{ indicator_id: string; value: number }>();
-
-              if (indicators.results && indicators.results.length >= 5) {
-                // Generate rich embedding text with engineered features
-                const embeddingText = generateEmbeddingText({
-                  indicators: indicators.results,
-                  pxi: {
-                    score: result.pxi.score,
-                    delta_7d: result.pxi.delta_7d,
-                    delta_30d: result.pxi.delta_30d,
-                  },
-                  categories: result.categories.map(c => ({ category: c.category, score: c.score })),
-                });
-
-                const embedding = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
-                  text: embeddingText,
-                });
-                const embeddingVector = getEmbeddingVector(embedding);
-
-                await env.VECTORIZE.upsert([{
-                  id: date,
-                  values: embeddingVector,
-                  metadata: { date, score: result.pxi.score, label: result.pxi.label },
-                }]);
-                embedded++;
-              }
-            } catch (e) {
-              // Embedding is best-effort
-              console.error(`Embedding failed for ${date}:`, e);
-            }
-          } catch (e) {
-            results.push({ date, error: e instanceof Error ? e.message : 'Unknown error' });
-          }
-        }
-
-        // Check remaining dates
-        const remainingResult = await env.DB.prepare(`
-          SELECT COUNT(DISTINCT iv.date) as cnt
-          FROM indicator_values iv
-          LEFT JOIN pxi_scores ps ON iv.date = ps.date
-          WHERE ps.date IS NULL
-          ${remainingFilterClause}
-        `).bind(...remainingParams).first<{ cnt: number }>();
-
         return Response.json({
-          success: true,
-          processed,
-          succeeded,
-          embedded,
-          remaining: remainingResult?.cnt || 0,
-          results,
-        }, { headers: corsHeaders });
+          error: 'Legacy backfill is disabled. Use the versioned modular /api/history/reconstruct-missing-v1 route.',
+        }, { status: 410, headers: corsHeaders });
       }
 
       // Predict SPY returns based on empirical backtest data
@@ -13706,6 +13613,7 @@ Focus on: What's strong? What's weak? What does this suggest for risk appetite?`
 export {
   INDICATOR_FREQUENCY_HINTS,
   MINIMUM_RELIABLE_SAMPLE,
+  PXI_SCORE_CATEGORIES,
   addCalendarDays,
   applyCrossHorizonActionabilityOverride,
   asIsoDate,

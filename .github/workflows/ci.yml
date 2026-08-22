@@ -186,12 +186,13 @@ jobs:
             exit 1
           fi
 
-          # Backfill validation path (should fail validation without valid credentials)
+          # During rollout the live Worker may be the old authenticated route
+          # or the new 410 kill switch; the deploy workflow enforces strict 410.
           code=$(curl -sS -o /tmp/backfill.out -w "%{http_code}" --max-time 20 -X POST \
             -H "Content-Type: application/json" \
             -d '{"start":"not-a-date","end":"also-bad","limit":"bad"}' \
             "$API_URL/api/backfill")
-          if [[ "$code" != "400" && "$code" != "401" ]]; then
-            echo "Expected 400 or 401 for invalid backfill payload but got $code"
+          if [[ "$code" != "400" && "$code" != "401" && "$code" != "410" ]]; then
+            echo "Expected rolling-state 400/401/410 for legacy backfill but got $code"
             exit 1
           fi

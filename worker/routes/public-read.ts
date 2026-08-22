@@ -7,6 +7,102 @@ import { INDICATORS } from '../../src/config/indicators.js';
 
 type PublicReadDeps = Record<string, any>;
 
+type HistoryOrigin =
+  | 'legacy_unclassified'
+  | 'live_recorded'
+  | 'retrospective_reconstruction';
+
+interface HistoryRow {
+  date: string;
+  score: number;
+  label: string;
+  status: string;
+  history_origin: HistoryOrigin;
+  reconstructed_at: string | null;
+  reconstruction_method: string | null;
+  reconstruction_build_sha: string | null;
+  source_data_as_of: string | null;
+}
+
+interface HistoryGap {
+  start_date: string;
+  end_date: string;
+  missing_days: number;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function utcDay(date: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  const timestamp = Date.parse(`${date}T00:00:00.000Z`);
+  return Number.isFinite(timestamp) ? Math.floor(timestamp / DAY_MS) : null;
+}
+
+function isoDateFromUtcDay(day: number): string {
+  return new Date(day * DAY_MS).toISOString().slice(0, 10);
+}
+
+export function summarizeHistoryContinuity(rows: Array<Pick<HistoryRow, 'date'>>) {
+  if (rows.length === 0) {
+    return {
+      is_contiguous: true,
+      start_date: '',
+      end_date: '',
+      observed_days: 0,
+      expected_days: 0,
+      missing_days: 0,
+      gap_count: 0,
+      gaps: [] as HistoryGap[],
+    };
+  }
+
+  const datedRows = rows
+    .map((row) => ({ date: row.date, day: utcDay(row.date) }))
+    .filter((row): row is { date: string; day: number } => row.day !== null)
+    .sort((left, right) => left.day - right.day);
+
+  if (datedRows.length === 0) {
+    return {
+      is_contiguous: false,
+      start_date: rows[0]?.date || '',
+      end_date: rows[rows.length - 1]?.date || '',
+      observed_days: rows.length,
+      expected_days: rows.length,
+      missing_days: 0,
+      gap_count: 0,
+      gaps: [] as HistoryGap[],
+    };
+  }
+
+  const gaps: HistoryGap[] = [];
+  for (let index = 1; index < datedRows.length; index += 1) {
+    const previous = datedRows[index - 1].day;
+    const current = datedRows[index].day;
+    if (current - previous <= 1) continue;
+    gaps.push({
+      start_date: isoDateFromUtcDay(previous + 1),
+      end_date: isoDateFromUtcDay(current - 1),
+      missing_days: current - previous - 1,
+    });
+  }
+
+  const first = datedRows[0];
+  const last = datedRows[datedRows.length - 1];
+  const expectedDays = last.day - first.day + 1;
+  const missingDays = gaps.reduce((total, gap) => total + gap.missing_days, 0);
+
+  return {
+    is_contiguous: gaps.length === 0 && datedRows.length === rows.length,
+    start_date: first.date,
+    end_date: last.date,
+    observed_days: rows.length,
+    expected_days: expectedDays,
+    missing_days: missingDays,
+    gap_count: gaps.length,
+    gaps,
+  };
+}
+
 export async function tryHandlePublicReadRoute(
   route: WorkerRouteContext,
   deps: PublicReadDeps,
@@ -49,16 +145,49 @@ export async function tryHandlePublicReadRoute(
   if (url.pathname === '/api/history') {
     const days = Math.min(365, Math.max(7, parseInt(url.searchParams.get('days') || '90', 10)));
     const historyResult = await env.DB.prepare(`
-      SELECT p.date, p.score, p.label, p.status
-      FROM pxi_scores p
-      ORDER BY p.date DESC
+      SELECT
+        history.date,
+        history.score,
+        history.label,
+        history.status,
+        history.history_origin,
+        history.reconstructed_at,
+        history.reconstruction_method,
+        history.reconstruction_build_sha,
+        history.source_data_as_of
+      FROM (
+        SELECT
+          p.date,
+          p.score,
+          p.label,
+          p.status,
+          p.history_origin,
+          NULL AS reconstructed_at,
+          NULL AS reconstruction_method,
+          NULL AS reconstruction_build_sha,
+          NULL AS source_data_as_of
+        FROM pxi_scores p
+        UNION ALL
+        SELECT
+          reconstruction.date,
+          reconstruction.score,
+          reconstruction.label,
+          reconstruction.status,
+          reconstruction.history_origin,
+          reconstruction.reconstructed_at,
+          reconstruction.reconstruction_method,
+          reconstruction.reconstruction_build_sha,
+          reconstruction.source_data_as_of
+        FROM pxi_score_reconstructions reconstruction
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM pxi_scores live
+          WHERE live.date = reconstruction.date
+        )
+      ) history
+      ORDER BY history.date DESC
       LIMIT ?
-    `).bind(days).all<{
-      date: string;
-      score: number;
-      label: string;
-      status: string;
-    }>();
+    `).bind(days).all<HistoryRow>();
 
     if (!historyResult.results || historyResult.results.length === 0) {
       return Response.json({ error: 'No historical data' }, { status: 404, headers: corsHeaders });
@@ -70,11 +199,28 @@ export async function tryHandlePublicReadRoute(
       label: row.label,
       status: row.status,
       regime: row.score >= 60 ? 'RISK_ON' : row.score <= 40 ? 'RISK_OFF' : 'TRANSITION',
+      history_origin: row.history_origin,
+      reconstructed_at: row.reconstructed_at,
+      reconstruction_method: row.reconstruction_method,
+      reconstruction_build_sha: row.reconstruction_build_sha,
+      source_data_as_of: row.source_data_as_of,
     }));
 
+    const data = [...dataWithRegimes].reverse();
+    const provenanceCounts = data.reduce<Record<HistoryOrigin, number>>((counts, row) => {
+      counts[row.history_origin] += 1;
+      return counts;
+    }, {
+      legacy_unclassified: 0,
+      live_recorded: 0,
+      retrospective_reconstruction: 0,
+    });
+
     return Response.json({
-      data: dataWithRegimes.reverse(),
-      count: dataWithRegimes.length,
+      data,
+      count: data.length,
+      provenance_counts: provenanceCounts,
+      continuity: summarizeHistoryContinuity(data),
     }, {
       headers: {
         ...corsHeaders,

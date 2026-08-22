@@ -18,6 +18,7 @@ function App() {
     ensemble,
     mlAccuracy,
     historyData,
+    historyMetadata,
     historyRange,
     setHistoryRange,
     showOnboarding,
@@ -141,6 +142,7 @@ function App() {
       data={data}
       ensemble={ensemble}
       historyData={historyData}
+      historyMetadata={historyMetadata}
       historyRange={historyRange}
       menuOpen={menuOpen}
       menuRef={menuRef}

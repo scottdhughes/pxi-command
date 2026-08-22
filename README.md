@@ -428,7 +428,7 @@ curl -X OPTIONS https://api.pxicommand.com/api/refresh \
   -H "Access-Control-Request-Method: POST" \
   -H "Access-Control-Request-Headers: Content-Type, Authorization, X-Admin-Token"
 
-# Backfill validation check (expect 400/401 depending on auth mode)
+# Legacy backfill kill-switch check (expect 410)
 curl -X POST https://api.pxicommand.com/api/backfill \
   -H "Content-Type: application/json" \
   -d '{"start":"invalid-date","limit":"bad"}'

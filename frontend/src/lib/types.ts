@@ -57,10 +57,54 @@ export interface MLAccuracyData {
   }
 }
 
+export type HistoryOrigin =
+  | 'live_recorded'
+  | 'retrospective_reconstruction'
+  | 'legacy_unclassified'
+
 export interface HistoryDataPoint {
   date: string
   score: number
   regime?: 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
+  history_origin?: HistoryOrigin
+  reconstructed_at?: string | null
+  reconstruction_method?: string | null
+  reconstruction_build_sha?: string | null
+  source_data_as_of?: string | null
+}
+
+export interface HistoryContinuityGap {
+  start_date: string
+  end_date: string
+  missing_days: number
+}
+
+export interface HistoryContinuity {
+  is_contiguous: boolean
+  start_date: string
+  end_date: string
+  observed_days: number
+  expected_days: number
+  missing_days: number
+  gap_count: number
+  gaps: HistoryContinuityGap[]
+}
+
+export interface HistoryProvenanceCounts {
+  legacy_unclassified: number
+  live_recorded: number
+  retrospective_reconstruction: number
+}
+
+export interface HistoryMetadata {
+  provenance_counts: HistoryProvenanceCounts
+  continuity: HistoryContinuity | null
+}
+
+export interface HistoryApiResponse extends HistoryMetadata {
+  data: HistoryDataPoint[]
+  count: number
+  error?: string
 }
 
 export interface SignalTheme {

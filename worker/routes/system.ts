@@ -1,10 +1,40 @@
 import type { WorkerHealthResponsePayload, WorkerRouteContext } from '../types';
+import { HISTORY_RECONSTRUCTION_CONTRACT } from '../lib/history-provenance';
 
 export async function tryHandleSystemRoute(route: WorkerRouteContext): Promise<Response | null> {
   const { env, url, corsHeaders } = route;
 
   if (url.pathname === '/health') {
-    const result = await env.DB.prepare('SELECT 1 as ok').first<{ ok: number }>();
+    const [result, historyContractSchema] = await Promise.all([
+      env.DB.prepare('SELECT 1 as ok').first<{ ok: number }>(),
+      env.DB.prepare(`
+        SELECT CASE WHEN
+          (SELECT COUNT(*) FROM sqlite_master
+           WHERE type = 'table'
+             AND name IN (
+               'pxi_scores',
+               'category_scores',
+               'pxi_score_reconstructions',
+               'category_score_reconstructions'
+             )) = 4
+          AND
+          (SELECT COUNT(*) FROM sqlite_master
+           WHERE type = 'trigger'
+             AND name IN (
+               'pxi_scores_no_reconstruction_insert',
+               'pxi_scores_no_reconstruction_update',
+               'category_scores_no_reconstruction_insert',
+               'category_scores_no_reconstruction_update',
+               'pxi_score_reconstructions_missing_only',
+               'category_score_reconstructions_missing_only',
+               'pxi_score_reconstructions_no_update',
+               'pxi_score_reconstructions_no_delete',
+               'category_score_reconstructions_no_update',
+               'category_score_reconstructions_no_delete'
+             )) = 10
+          THEN 1 ELSE 0 END AS ready
+      `).first<{ ready: number }>(),
+    ]);
     const payload: WorkerHealthResponsePayload = {
       status: 'healthy',
       db: result?.ok === 1,
@@ -13,6 +43,9 @@ export async function tryHandleSystemRoute(route: WorkerRouteContext): Promise<R
       build_sha: env.BUILD_SHA || 'local-dev',
       build_timestamp: env.BUILD_TIMESTAMP || '1970-01-01T00:00:00.000Z',
       worker_version: env.WORKER_VERSION || 'pxi-dev',
+      history_reconstruction_contract: historyContractSchema?.ready === 1
+        ? HISTORY_RECONSTRUCTION_CONTRACT
+        : 'unavailable',
     };
     return Response.json(
       payload,
