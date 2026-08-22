@@ -92,7 +92,7 @@ test('tryHandleModelingRoute serves /api/predict with empirical stats', async ()
       if (sql.includes('SELECT date, score, label FROM pxi_scores ORDER BY date DESC LIMIT 1')) {
         return { date: '2026-03-05', score: 72, label: 'risk-on' };
       }
-      if (sql.includes('SELECT date, score FROM pxi_scores ORDER BY date ASC')) {
+      if (sql.includes('SELECT date, score FROM (') && sql.includes('FROM pxi_scores ORDER BY date DESC LIMIT ?')) {
         return [
           { date: '2026-02-20', score: 72 },
           { date: '2026-02-25', score: 74 },
@@ -244,6 +244,26 @@ test('tryHandleModelingRoute returns 503 for /api/ml/backtest without models', a
   assert.equal(response?.status, 503);
 });
 
+test('tryHandleModelingRoute clamps attacker-controlled ML backtest bounds', async () => {
+  let queryBounds: unknown[] = [];
+  const route = createRouteContext('https://pxi.test/api/ml/backtest?limit=999999999&offset=-50', undefined, {
+    DB: createFakeDb((sql, args) => {
+      if (sql.includes('FROM pxi_scores p')) {
+        queryBounds = args;
+        return [];
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+  const response = await tryHandleModelingRoute(route as any, {
+    loadMLModel: async () => ({ m: {}, f: [] }),
+    loadLSTMModel: async () => null,
+  });
+
+  assert.equal(response?.status, 400);
+  assert.deepEqual(queryBounds, [500, 0]);
+});
+
 test('tryHandleModelingRoute returns no-op summary for /api/retrain without evaluated predictions', async () => {
   const route = createRouteContext('https://pxi.test/api/retrain', { method: 'POST' });
   const response = await tryHandleModelingRoute(route as any, {
@@ -276,7 +296,7 @@ test('tryHandleModelingRoute serves /api/model', async () => {
 test('tryHandleModelingRoute returns 400 for /api/backtest without SPY data', async () => {
   const route = createRouteContext('https://pxi.test/api/backtest', undefined, {
     DB: createFakeDb((sql) => {
-      if (sql.includes('SELECT date, score FROM pxi_scores ORDER BY date ASC')) {
+      if (sql.includes('SELECT date, score FROM (') && sql.includes('FROM pxi_scores ORDER BY date DESC LIMIT ?')) {
         return [{ date: '2026-03-05', score: 70 }];
       }
       if (sql.includes("WHERE indicator_id = 'spy_close'")) {
@@ -290,10 +310,34 @@ test('tryHandleModelingRoute returns 400 for /api/backtest without SPY data', as
   assert.equal(response?.status, 400);
 });
 
+test('tryHandleModelingRoute caps public raw backtest output', async () => {
+  const rows = Array.from({ length: 600 }, (_, index) => {
+    const date = new Date(Date.UTC(2024, 0, 1 + index)).toISOString().slice(0, 10);
+    return { date, score: 50 + (index % 20), value: 100 + index };
+  });
+  const route = createRouteContext('https://pxi.test/api/backtest?raw=true', undefined, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('FROM pxi_scores ORDER BY date DESC LIMIT ?')) {
+        return rows.map(({ date, score }) => ({ date, score }));
+      }
+      if (sql.includes("WHERE indicator_id = 'spy_close'")) {
+        return rows.map(({ date, value }) => ({ date, value }));
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandleModelingRoute(route as any, {});
+  const payload = await response!.json() as any;
+  assert.equal(response?.status, 200);
+  assert.equal(payload.raw_data.length, 500);
+  assert.equal(payload.raw_data_truncated, true);
+});
+
 test('tryHandleModelingRoute returns 400 for /api/backtest/signal with insufficient signal history', async () => {
   const route = createRouteContext('https://pxi.test/api/backtest/signal', undefined, {
     DB: createFakeDb((sql) => {
-      if (sql.includes('FROM pxi_signal ORDER BY date ASC')) {
+      if (sql.includes('FROM pxi_signal ORDER BY date DESC LIMIT ?')) {
         return [{ date: '2026-03-05', pxi_level: 70, risk_allocation: 0.8, signal_type: 'FULL_RISK', regime: 'RISK_ON' }];
       }
       if (sql.includes("WHERE indicator_id = 'spy_close'")) {
@@ -307,6 +351,36 @@ test('tryHandleModelingRoute returns 400 for /api/backtest/signal with insuffici
     formatDate: () => '2026-03-05',
   });
   assert.equal(response?.status, 400);
+});
+
+test('public signal backtest computes results without writing to D1', async () => {
+  const spyRows = Array.from({ length: 230 }, (_, index) => {
+    const date = new Date(Date.UTC(2025, 0, 1 + index)).toISOString().slice(0, 10);
+    return { date, value: 100 + index };
+  });
+  const signalRows = spyRows.slice(-30).map(({ date }, index) => ({
+    date,
+    pxi_level: 60,
+    risk_allocation: 0.75,
+    signal_type: index % 2 === 0 ? 'FULL_RISK' : 'REDUCED_RISK',
+    regime: 'RISK_ON',
+  }));
+  let writeAttempted = false;
+  const route = createRouteContext('https://pxi.test/api/backtest/signal', undefined, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('INSERT OR REPLACE INTO backtest_results')) {
+        writeAttempted = true;
+        throw new Error('public GET attempted a write');
+      }
+      if (sql.includes('FROM pxi_signal ORDER BY date DESC LIMIT ?')) return signalRows;
+      if (sql.includes("WHERE indicator_id = 'spy_close'")) return spyRows;
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandleModelingRoute(route as any, {});
+  assert.equal(response?.status, 200);
+  assert.equal(writeAttempted, false);
 });
 
 test('tryHandleModelingRoute serves /api/backtest/history', async () => {

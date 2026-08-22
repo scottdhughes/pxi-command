@@ -237,6 +237,9 @@ test('tryHandleSimilarityRoute surfaces Workers AI failures on /api/similar', as
     getEmbeddingVector: () => [0.1, 0.2],
   });
   assert.equal(response?.status, 503);
+  const payload = await response!.json() as Record<string, unknown>;
+  assert.equal(payload.error, 'AI embedding failed');
+  assert.equal(Object.hasOwn(payload, 'details'), false);
 });
 
 test('tryHandleSimilarityRoute embeds historical dates on /api/embed', async () => {

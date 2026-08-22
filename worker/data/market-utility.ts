@@ -1,7 +1,15 @@
 import { toNumber } from '../lib/market-primitives';
 import type { UtilityEventInsertPayload, UtilityFunnelSummary } from '../types';
 
+const UTILITY_EVENT_RETENTION_DAYS = 90;
+
 export async function insertUtilityEvent(db: D1Database, payload: UtilityEventInsertPayload): Promise<void> {
+  const retentionCutoff = new Date(Date.now() - (UTILITY_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000)).toISOString();
+  await db.prepare(`
+    DELETE FROM market_utility_events
+    WHERE created_at < ?
+  `).bind(retentionCutoff).run();
+
   await db.prepare(`
     INSERT INTO market_utility_events
       (session_id, event_type, route, actionability_state, payload_json, created_at)
@@ -21,7 +29,7 @@ export async function computeUtilityFunnelSummary(
   windowDays: number,
 ): Promise<UtilityFunnelSummary> {
   const boundedWindowDays = Math.max(1, Math.floor(windowDays));
-  const lookbackExpr = `-${Math.max(0, boundedWindowDays - 1)} days`;
+  const lookbackStart = new Date(Date.now() - (Math.max(0, boundedWindowDays - 1) * 24 * 60 * 60 * 1000)).toISOString();
 
   const [aggregate, daysRow] = await Promise.all([
     db.prepare(`
@@ -40,8 +48,8 @@ export async function computeUtilityFunnelSummary(
         COUNT(DISTINCT CASE WHEN event_type IN ('decision_actionable_view', 'cta_action_click') THEN session_id END) as actionable_sessions,
         MAX(created_at) as last_event_at
       FROM market_utility_events
-      WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
-    `).bind(lookbackExpr).first<{
+      WHERE created_at >= ?
+    `).bind(lookbackStart).first<{
       total_events: number | null;
       unique_sessions: number | null;
       plan_views: number | null;
@@ -59,8 +67,8 @@ export async function computeUtilityFunnelSummary(
     db.prepare(`
       SELECT COUNT(DISTINCT substr(replace(created_at, 'T', ' '), 1, 10)) as days_observed
       FROM market_utility_events
-      WHERE datetime(replace(replace(created_at, 'T', ' '), 'Z', '')) >= datetime('now', ?)
-    `).bind(lookbackExpr).first<{ days_observed: number | null }>(),
+      WHERE created_at >= ?
+    `).bind(lookbackStart).first<{ days_observed: number | null }>(),
   ]);
 
   const totalEvents = Math.max(0, Math.floor(toNumber(aggregate?.total_events, 0)));

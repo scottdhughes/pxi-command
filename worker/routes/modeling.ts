@@ -11,6 +11,11 @@ import {
 
 type ModelingDeps = Record<string, any>;
 
+const MAX_PUBLIC_HISTORY_ROWS = 2500;
+const MAX_PUBLIC_RAW_ROWS = 500;
+const MAX_ML_BACKTEST_LIMIT = 500;
+const MAX_ML_BACKTEST_OFFSET = 5000;
+
 const DIRECTION_THRESHOLDS = {
   strongUp: 5,
   up: 2,
@@ -20,6 +25,12 @@ const DIRECTION_THRESHOLDS = {
 
 function asDateKey(date: Date): string {
   return date.toISOString().split('T')[0];
+}
+
+function parseBoundedInteger(raw: string | null, fallback: number, min: number, max: number): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(parsed, max));
 }
 
 function interpretDirectionalPrediction(prediction: number | null): string | null {
@@ -209,11 +220,17 @@ async function handlePredictRoute(route: WorkerRouteContext): Promise<Response> 
   }
 
   const [pxiScores, spyPrices, thresholdParams] = await Promise.all([
-    env.DB.prepare('SELECT date, score FROM pxi_scores ORDER BY date ASC').all<{ date: string; score: number }>(),
     env.DB.prepare(`
-      SELECT date, value FROM indicator_values
-      WHERE indicator_id = 'spy_close' ORDER BY date ASC
-    `).all<{ date: string; value: number }>(),
+      SELECT date, score FROM (
+        SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT ?
+      ) ORDER BY date ASC
+    `).bind(MAX_PUBLIC_HISTORY_ROWS).all<{ date: string; score: number }>(),
+    env.DB.prepare(`
+      SELECT date, value FROM (
+        SELECT date, value FROM indicator_values
+        WHERE indicator_id = 'spy_close' ORDER BY date DESC LIMIT ?
+      ) ORDER BY date ASC
+    `).bind(MAX_PUBLIC_HISTORY_ROWS + 37).all<{ date: string; value: number }>(),
     env.DB.prepare(`
       SELECT param_key, param_value FROM model_params
       WHERE param_key LIKE 'bucket_threshold_%'
@@ -1379,8 +1396,8 @@ async function handleMlAccuracyRoute(route: WorkerRouteContext, deps: ModelingDe
 
 async function handleMlBacktestRoute(route: WorkerRouteContext, deps: ModelingDeps): Promise<Response> {
   const { env, url, corsHeaders } = route;
-  const limit = parseInt(url.searchParams.get('limit') || '500', 10);
-  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+  const limit = parseBoundedInteger(url.searchParams.get('limit'), 500, 1, MAX_ML_BACKTEST_LIMIT);
+  const offset = parseBoundedInteger(url.searchParams.get('offset'), 0, 0, MAX_ML_BACKTEST_OFFSET);
 
   const [xgboostModel, lstmModel] = await Promise.all([
     deps.loadMLModel(env.ML_MODELS),
@@ -1914,13 +1931,16 @@ async function handleBacktestRoute(route: WorkerRouteContext): Promise<Response>
 
   const [pxiScores, spyPrices] = await Promise.all([
     env.DB.prepare(`
-      SELECT date, score FROM pxi_scores ORDER BY date ASC
-    `).all<{ date: string; score: number }>(),
+      SELECT date, score FROM (
+        SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT ?
+      ) ORDER BY date ASC
+    `).bind(MAX_PUBLIC_HISTORY_ROWS).all<{ date: string; score: number }>(),
     env.DB.prepare(`
-      SELECT date, value FROM indicator_values
-      WHERE indicator_id = 'spy_close'
-      ORDER BY date ASC
-    `).all<{ date: string; value: number }>(),
+      SELECT date, value FROM (
+        SELECT date, value FROM indicator_values
+        WHERE indicator_id = 'spy_close' ORDER BY date DESC LIMIT ?
+      ) ORDER BY date ASC
+    `).bind(MAX_PUBLIC_HISTORY_ROWS + 37).all<{ date: string; value: number }>(),
   ]);
 
   if (!spyPrices.results || spyPrices.results.length === 0) {
@@ -2021,23 +2041,27 @@ async function handleBacktestRoute(route: WorkerRouteContext): Promise<Response>
         win_rate_30d: calculateWinRate(extremeHighReturns30d),
       },
     },
-    raw_data: url.searchParams.get('raw') === 'true' ? results : undefined,
+    raw_data: url.searchParams.get('raw') === 'true' ? results.slice(-MAX_PUBLIC_RAW_ROWS) : undefined,
+    raw_data_truncated: url.searchParams.get('raw') === 'true' && results.length > MAX_PUBLIC_RAW_ROWS,
   }, { headers: corsHeaders });
 }
 
-async function handleBacktestSignalRoute(route: WorkerRouteContext, deps: ModelingDeps): Promise<Response> {
+async function handleBacktestSignalRoute(route: WorkerRouteContext): Promise<Response> {
   const { env, corsHeaders } = route;
 
   const [signals, spyPrices] = await Promise.all([
     env.DB.prepare(`
-      SELECT date, pxi_level, risk_allocation, signal_type, regime
-      FROM pxi_signal ORDER BY date ASC
-    `).all<{ date: string; pxi_level: number; risk_allocation: number; signal_type: string; regime: string }>(),
+      SELECT date, pxi_level, risk_allocation, signal_type, regime FROM (
+        SELECT date, pxi_level, risk_allocation, signal_type, regime
+        FROM pxi_signal ORDER BY date DESC LIMIT ?
+      ) ORDER BY date ASC
+    `).bind(MAX_PUBLIC_HISTORY_ROWS).all<{ date: string; pxi_level: number; risk_allocation: number; signal_type: string; regime: string }>(),
     env.DB.prepare(`
-      SELECT date, value FROM indicator_values
-      WHERE indicator_id = 'spy_close'
-      ORDER BY date ASC
-    `).all<{ date: string; value: number }>(),
+      SELECT date, value FROM (
+        SELECT date, value FROM indicator_values
+        WHERE indicator_id = 'spy_close' ORDER BY date DESC LIMIT ?
+      ) ORDER BY date ASC
+    `).bind(MAX_PUBLIC_HISTORY_ROWS + 200).all<{ date: string; value: number }>(),
   ]);
 
   if (!signals.results || signals.results.length < 30) {
@@ -2156,38 +2180,6 @@ async function handleBacktestSignalRoute(route: WorkerRouteContext, deps: Modeli
 
   for (const signalType of Object.keys(avgAllocationBySignal)) {
     avgAllocationBySignal[signalType] = avgAllocationBySignal[signalType] / signalDistribution[signalType];
-  }
-
-  const runDate = deps.formatDate(new Date());
-  if (pxiSignalMetrics) {
-    await env.DB.prepare(`
-      INSERT OR REPLACE INTO backtest_results
-      (run_date, strategy, lookback_start, lookback_end, cagr, volatility, sharpe, max_drawdown, total_trades, win_rate, baseline_comparison)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      runDate,
-      'PXI-Signal',
-      dailyReturns[0]?.date || '',
-      dailyReturns[dailyReturns.length - 1]?.date || '',
-      pxiSignalMetrics.cagr_pct,
-      pxiSignalMetrics.volatility_pct,
-      pxiSignalMetrics.sharpe_ratio,
-      pxiSignalMetrics.max_drawdown_pct,
-      dailyReturns.length,
-      pxiSignalMetrics.win_rate_pct,
-      JSON.stringify({
-        vs_buy_hold: buyHoldMetrics ? {
-          cagr_diff: pxiSignalMetrics.cagr_pct - buyHoldMetrics.cagr_pct,
-          vol_diff: pxiSignalMetrics.volatility_pct - buyHoldMetrics.volatility_pct,
-          sharpe_diff: pxiSignalMetrics.sharpe_ratio - buyHoldMetrics.sharpe_ratio,
-        } : null,
-        vs_200dma: dma200Metrics ? {
-          cagr_diff: pxiSignalMetrics.cagr_pct - dma200Metrics.cagr_pct,
-          vol_diff: pxiSignalMetrics.volatility_pct - dma200Metrics.volatility_pct,
-          sharpe_diff: pxiSignalMetrics.sharpe_ratio - dma200Metrics.sharpe_ratio,
-        } : null,
-      }),
-    ).run();
   }
 
   return Response.json({
@@ -2518,7 +2510,7 @@ export async function tryHandleModelingRoute(
   }
 
   if (url.pathname === '/api/backtest/signal' && method === 'GET') {
-    return handleBacktestSignalRoute(route, deps);
+    return handleBacktestSignalRoute(route);
   }
 
   if (url.pathname === '/api/backtest/history' && method === 'GET') {

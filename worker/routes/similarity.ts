@@ -52,7 +52,6 @@ export async function tryHandleSimilarityRoute(
         console.error('Workers AI embedding error:', aiError);
         return Response.json({
           error: 'AI embedding failed',
-          details: aiError instanceof Error ? aiError.message : String(aiError),
         }, { status: 503, headers: corsHeaders });
       }
 
@@ -71,7 +70,6 @@ export async function tryHandleSimilarityRoute(
         console.error('Vectorize query error:', vecError);
         return Response.json({
           error: 'Vectorize query failed',
-          details: vecError instanceof Error ? vecError.message : String(vecError),
         }, { status: 503, headers: corsHeaders });
       }
 
@@ -213,7 +211,6 @@ export async function tryHandleSimilarityRoute(
       console.error('Similar endpoint error:', err);
       return Response.json({
         error: 'Similar search failed',
-        details: err instanceof Error ? err.message : String(err),
       }, { status: 500, headers: corsHeaders });
     }
   }

@@ -752,6 +752,18 @@ export async function tryHandleMarketProductsRoute(
       return Response.json({ ok: true }, { headers: corsHeaders });
     }
 
+    const existingSubscriber = await env.DB.prepare(`
+      SELECT status
+      FROM email_subscribers
+      WHERE email = ?
+      LIMIT 1
+    `).bind(email).first<{ status: string }>();
+    if (existingSubscriber?.status === 'active') {
+      // Starting a public verification flow must never demote or mutate an
+      // already verified subscription. Keep the response non-enumerating.
+      return Response.json({ ok: true }, { headers: corsHeaders });
+    }
+
     const subscriberId = `sub_${deps.stableHash(`${email}:${Date.now()}:${deps.generateToken(4)}`)}`;
     const cadence = deps.normalizeCadence(body?.cadence);
     const types = deps.normalizeAlertTypes(body?.types);
@@ -763,9 +775,18 @@ export async function tryHandleMarketProductsRoute(
       INSERT INTO email_subscribers (id, email, status, cadence, types_json, timezone, created_at, updated_at)
       VALUES (?, ?, 'pending', ?, ?, 'America/New_York', datetime('now'), datetime('now'))
       ON CONFLICT(email) DO UPDATE SET
-        status = 'pending',
-        cadence = excluded.cadence,
-        types_json = excluded.types_json,
+        status = CASE
+          WHEN email_subscribers.status = 'active' THEN email_subscribers.status
+          ELSE 'pending'
+        END,
+        cadence = CASE
+          WHEN email_subscribers.status = 'active' THEN email_subscribers.cadence
+          ELSE excluded.cadence
+        END,
+        types_json = CASE
+          WHEN email_subscribers.status = 'active' THEN email_subscribers.types_json
+          ELSE excluded.types_json
+        END,
         updated_at = datetime('now')
     `).bind(subscriberId, email, cadence, JSON.stringify(types)).run();
 
@@ -824,7 +845,7 @@ export async function tryHandleMarketProductsRoute(
       FROM email_verification_tokens
       WHERE token_hash = ?
         AND used_at IS NULL
-        AND expires_at > datetime('now')
+        AND datetime(expires_at) > datetime('now')
       ORDER BY id DESC
       LIMIT 1
     `).bind(tokenHash).first<{ id: number; email: string }>();

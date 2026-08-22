@@ -21,12 +21,13 @@ vi.mock("../../src/scheduled", () => ({
 }))
 
 import { handleRequest } from "../../src/routes"
+import { createMockKV } from "../fixtures/mock_env"
 
 function createEnv(overrides: Partial<Env> = {}): Env {
   return {
     SIGNALS_DB: {} as D1Database,
     SIGNALS_BUCKET: {} as R2Bucket,
-    SIGNALS_KV: {} as KVNamespace,
+    SIGNALS_KV: createMockKV(),
     PUBLIC_BASE_PATH: "/signals",
     DEFAULT_LOOKBACK_DAYS: 7,
     DEFAULT_BASELINE_DAYS: 30,
@@ -75,5 +76,19 @@ describe("GET /api/version", () => {
 
     expect(response.status).toBe(200)
     expect(body.build_timestamp).toBeNull()
+  })
+
+  it("durably rate limits repeated public API reads", async () => {
+    const env = createEnv()
+    const request = new Request("https://example.com/signals/api/version", {
+      headers: { "CF-Connecting-IP": "203.0.113.20" },
+    })
+
+    for (let index = 0; index < 60; index += 1) {
+      expect((await handleRequest(request, env)).status).toBe(200)
+    }
+    const blocked = await handleRequest(request, env)
+    expect(blocked.status).toBe(429)
+    expect(blocked.headers.get("Retry-After")).toBe("60")
   })
 })

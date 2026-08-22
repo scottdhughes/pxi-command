@@ -21,6 +21,7 @@ vi.mock("../../src/scheduled", () => ({
 
 import { handleRequest } from "../../src/routes"
 import { getPipelineFreshness } from "../../src/db"
+import { createMockKV } from "../fixtures/mock_env"
 
 const getPipelineFreshnessMock = vi.mocked(getPipelineFreshness)
 
@@ -28,7 +29,7 @@ function createEnv(): Env {
   return {
     SIGNALS_DB: {} as D1Database,
     SIGNALS_BUCKET: {} as R2Bucket,
-    SIGNALS_KV: {} as KVNamespace,
+    SIGNALS_KV: createMockKV(),
     PUBLIC_BASE_PATH: "/signals",
     DEFAULT_LOOKBACK_DAYS: 7,
     DEFAULT_BASELINE_DAYS: 30,

@@ -113,6 +113,14 @@ jobs:
             echo "WORKER_VERSION=${WORKER_VERSION}"
           } >> "$GITHUB_ENV"
 
+      - name: Apply remote D1 migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler d1 migrations apply DB --config worker/wrangler.toml --remote --env "${TARGET_ENV}"
+
       - name: Deploy worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -126,14 +134,6 @@ jobs:
             --var "BUILD_SHA:${BUILD_SHA}" \
             --var "BUILD_TIMESTAMP:${BUILD_TIMESTAMP}" \
             --var "WORKER_VERSION:${WORKER_VERSION}"
-
-      - name: Apply remote D1 migrations
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          npx wrangler d1 migrations apply DB --config worker/wrangler.toml --remote --env "${TARGET_ENV}"
 
       - name: Poll deployed health until build SHA matches
         run: |

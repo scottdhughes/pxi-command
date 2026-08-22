@@ -22,6 +22,7 @@ EXPECTED_TABLES = {
     "market_calibration_snapshots",
     "market_utility_events",
     "research_feature_snapshots",
+    "request_rate_limit_buckets",
 }
 
 EXPECTED_INDEXES = {
@@ -29,6 +30,7 @@ EXPECTED_INDEXES = {
     "idx_market_refresh_runs_completed",
     "idx_market_decision_impact_lookup",
     "idx_research_feature_snapshots_decision",
+    "idx_request_rate_limit_window",
 }
 
 EXPECTED_TRIGGERS = {
@@ -97,6 +99,22 @@ def assert_expected_schema(connection: sqlite3.Connection) -> None:
     refresh_runs_sql = refresh_runs_sql_row[0] if refresh_runs_sql_row else ""
     if "'blocked'" not in refresh_runs_sql:
         raise SystemExit("market_refresh_runs schema does not allow status='blocked' after migration apply")
+
+    consume_sql = """
+        INSERT INTO request_rate_limit_buckets
+          (scope, subject_hash, window_start, count, updated_at)
+        VALUES ('test', 'subject', 1000, 1, datetime('now'))
+        ON CONFLICT(scope, subject_hash, window_start) DO UPDATE SET
+          count = request_rate_limit_buckets.count + 1,
+          updated_at = datetime('now')
+        WHERE request_rate_limit_buckets.count < 2
+        RETURNING count
+    """
+    first = connection.execute(consume_sql).fetchone()
+    second = connection.execute(consume_sql).fetchone()
+    blocked = connection.execute(consume_sql).fetchone()
+    if first != (1,) or second != (2,) or blocked is not None:
+        raise SystemExit("request_rate_limit_buckets did not enforce its atomic window budget")
 
 
 def apply_migrations_to_empty_db() -> None:

@@ -8805,7 +8805,7 @@ export default {
 
     // Rate limiting
     const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-    if (!checkPublicRequestRateLimit(clientIP)) {
+    if (!(await checkPublicRequestRateLimit(clientIP, env))) {
       return Response.json(
         { error: 'Too many requests' },
         { status: 429, headers: { ...corsHeaders, 'Retry-After': '60' } }

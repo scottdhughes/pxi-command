@@ -4,7 +4,10 @@ import {
   methodNotAllowedResponse,
   preflightResponse,
 } from './lib/http';
-import { checkPublicRateLimit as checkPublicRequestRateLimit } from './lib/security';
+import {
+  checkPublicRateLimit as checkPublicRequestRateLimit,
+  checkRouteRateLimit,
+} from './lib/security';
 import { createRouteDeps } from './bootstrap/create-route-deps';
 import { tryHandleMarketCoreRoute } from './domain/market-core';
 import { tryHandleMarketProductsRoute } from './domain/market-products';
@@ -15,6 +18,7 @@ import { tryHandlePublicReadRoute } from './routes/public-read';
 import { tryHandleSimilarityRoute } from './routes/similarity';
 import { tryHandleAdminIngestionRoute } from './routes/admin-ingestion';
 import { tryHandleModelingRoute } from './routes/modeling';
+import { consumeRequestBudget } from './data/request-rate-limits';
 import type { Env, WorkerRouteContext } from './types';
 
 export default {
@@ -30,11 +34,66 @@ export default {
     const method = request.method === 'HEAD' ? 'GET' : request.method;
     const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
 
-    if (!checkPublicRequestRateLimit(clientIP)) {
+    if (!(await checkPublicRequestRateLimit(clientIP, env))) {
       return Response.json(
         { error: 'Too many requests' },
         { status: 429, headers: { ...corsHeaders, 'Retry-After': '60' } },
       );
+    }
+
+    const routeLimits: Record<string, { limit: number; windowMs: number }> = {
+      '/api/predict': { limit: 20, windowMs: 60_000 },
+      '/api/ml/backtest': { limit: 10, windowMs: 60_000 },
+      '/api/backtest': { limit: 10, windowMs: 60_000 },
+      '/api/backtest/signal': { limit: 10, windowMs: 60_000 },
+      '/api/similar': { limit: 20, windowMs: 60_000 },
+    };
+    const routeLimit = routeLimits[url.pathname];
+    if (method === 'GET' && routeLimit && !(await checkRouteRateLimit(
+      url.pathname,
+      clientIP,
+      routeLimit.limit,
+      routeLimit.windowMs,
+      env,
+    ))) {
+      return Response.json(
+        { error: 'Too many requests' },
+        { status: 429, headers: { ...corsHeaders, 'Retry-After': '60' } },
+      );
+    }
+
+    if (method === 'POST' && url.pathname === '/api/alerts/subscribe/start') {
+      const sourceAllowed = await consumeRequestBudget(env.DB, 'subscribe-source', clientIP, 5, 60 * 60);
+      if (!sourceAllowed) {
+        return Response.json(
+          { error: 'Too many requests' },
+          { status: 429, headers: { ...corsHeaders, 'Retry-After': '3600' } },
+        );
+      }
+      const globalAllowed = await consumeRequestBudget(env.DB, 'subscribe-global', 'all', 200, 60 * 60);
+      if (!globalAllowed) {
+        return Response.json(
+          { error: 'Too many requests' },
+          { status: 429, headers: { ...corsHeaders, 'Retry-After': '3600' } },
+        );
+      }
+    }
+
+    if (method === 'POST' && url.pathname === '/api/metrics/utility-event') {
+      const sourceAllowed = await consumeRequestBudget(env.DB, 'utility-source', clientIP, 300, 60 * 60);
+      if (!sourceAllowed) {
+        return Response.json(
+          { error: 'Too many requests' },
+          { status: 429, headers: { ...corsHeaders, 'Retry-After': '3600' } },
+        );
+      }
+      const globalAllowed = await consumeRequestBudget(env.DB, 'utility-global', 'all', 5000, 60 * 60);
+      if (!globalAllowed) {
+        return Response.json(
+          { error: 'Too many requests' },
+          { status: 429, headers: { ...corsHeaders, 'Retry-After': '3600' } },
+        );
+      }
     }
 
     if (!['GET', 'POST', 'OPTIONS', 'HEAD'].includes(request.method)) {

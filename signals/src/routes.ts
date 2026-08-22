@@ -103,19 +103,24 @@ function isValidRunId(id: string): boolean {
  * Checks rate limit for a given key using KV storage.
  * Returns true if the request is allowed, false if rate limited.
  */
-async function checkRateLimit(env: Env, key: string): Promise<boolean> {
+async function checkRateLimit(
+  env: Env,
+  key: string,
+  limit = RATE_LIMIT_MAX,
+  windowSeconds = RATE_LIMIT_WINDOW,
+): Promise<boolean> {
   if (!env.SIGNALS_KV) return true // Skip if KV not configured
 
   const rateLimitKey = `ratelimit:${key}`
   const countStr = await env.SIGNALS_KV.get(rateLimitKey)
   const count = countStr ? parseInt(countStr, 10) : 0
 
-  if (count >= RATE_LIMIT_MAX) {
+  if (count >= limit) {
     return false
   }
 
   await env.SIGNALS_KV.put(rateLimitKey, String(count + 1), {
-    expirationTtl: RATE_LIMIT_WINDOW,
+    expirationTtl: windowSeconds,
   })
   return true
 }
@@ -306,6 +311,18 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
   const path = url.pathname.slice(base.length) || "/"
   const method = request.method === "HEAD" ? "GET" : request.method
+
+  if (method === "GET" && path.startsWith("/api/")) {
+    const clientKey = getClientKey(request)
+    const allowed = await checkRateLimit(env, `public:${path}:${clientKey}`, 60, 60)
+    if (!allowed) {
+      return jsonResponse(
+        { error: "Rate limit exceeded" },
+        429,
+        { ...OPERATIONAL_NO_STORE_HEADERS, "Retry-After": "60" },
+      )
+    }
+  }
 
   if (method === "GET" && (path === "/" || path === "")) {
     return new Response(null, {

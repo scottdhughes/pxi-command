@@ -50,6 +50,10 @@ function createFakeDb(handler: (sql: string, args: unknown[]) => QueryResult): D
       }
       return (result ?? null) as T | null;
     },
+    run: async () => {
+      handler(sql, args);
+      return { success: true };
+    },
   });
 
   return {
@@ -58,6 +62,65 @@ function createFakeDb(handler: (sql: string, args: unknown[]) => QueryResult): D
     },
   } as D1Database;
 }
+
+test('subscription start preserves active subscribers without sending another verification email', async () => {
+  let sendCalls = 0;
+  const route = createRouteContext('https://pxi.test/api/alerts/subscribe/start', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'active@example.com' }),
+    headers: { 'Content-Type': 'application/json' },
+  }, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('FROM email_verification_tokens')) return null;
+      if (sql.includes('FROM email_subscribers')) return { status: 'active' };
+      throw new Error(`Unexpected mutation for active subscriber: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandleMarketProductsRoute(route, {
+    isFeatureEnabled: () => true,
+    canSendEmail: () => true,
+    ensureMarketProductSchema: async () => undefined,
+    parseJsonBody: async () => ({ email: 'active@example.com' }),
+    validateEmail: () => true,
+    getAlertsSigningSecret: () => 'test-secret',
+    sendCloudflareEmail: async () => {
+      sendCalls += 1;
+      return { ok: true };
+    },
+  });
+
+  assert.equal(response?.status, 200);
+  assert.equal(sendCalls, 0);
+});
+
+test('subscription verification normalizes ISO expiration before comparison', async () => {
+  let expiryQuery = '';
+  const route = createRouteContext('https://pxi.test/api/alerts/subscribe/verify', {
+    method: 'POST',
+    body: JSON.stringify({ token: 'expired-token' }),
+    headers: { 'Content-Type': 'application/json' },
+  }, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('FROM email_verification_tokens')) {
+        expiryQuery = sql;
+        return null;
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandleMarketProductsRoute(route, {
+    isFeatureEnabled: () => true,
+    ensureMarketProductSchema: async () => undefined,
+    parseJsonBody: async () => ({ token: 'expired-token' }),
+    getAlertsSigningSecret: () => 'test-secret',
+    hashToken: async () => 'expired-hash',
+  });
+
+  assert.equal(response?.status, 400);
+  assert.match(expiryQuery, /datetime\(expires_at\) > datetime\('now'\)/);
+});
 
 function createRouteContext(
   url: string,
