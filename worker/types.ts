@@ -5,6 +5,7 @@ import type {
   BriefData as SharedBriefData,
   CalibrationDiagnosticsResponse as SharedCalibrationDiagnosticsResponse,
   CategoryDetailData as SharedCategoryDetailData,
+  DecisionContractSnapshot as SharedDecisionContractSnapshot,
   DecisionImpactCoverage as SharedDecisionImpactCoverage,
   DecisionImpactMarketStats as SharedDecisionImpactMarketStats,
   DecisionImpactObserveMode as SharedDecisionImpactObserveMode,
@@ -138,6 +139,7 @@ export type PlanActionabilityReasonCode =
   | 'critical_data_quality_block'
   | 'consistency_fail_block'
   | 'edge_evidence_gate_block'
+  | 'plan_authority_required'
   | 'opportunity_reference_unavailable'
   | 'no_eligible_opportunities'
   | 'high_edge_override_no_eligible'
@@ -924,6 +926,7 @@ export interface RiskSizingSnapshot {
 }
 
 export type PlanPayload = SharedPlanData;
+export type DecisionContractSnapshot = SharedDecisionContractSnapshot;
 export type PXIResponsePayload = SharedPXIData;
 export type SignalResponsePayload = SharedSignalData;
 export type OpportunityFeedResponsePayload = SharedOpportunitiesResponse;

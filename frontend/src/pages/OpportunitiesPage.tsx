@@ -63,9 +63,7 @@ export function OpportunitiesPage({
   const actionabilityState = data?.actionability_state || (data?.items?.length ? 'WATCH' : 'NO_ACTION')
   const actionabilityReasonCodes = data?.actionability_reason_codes || []
   const ctaDisabledReasons = data?.cta_disabled_reasons || []
-  const ctaEnabled = typeof data?.cta_enabled === 'boolean'
-    ? Boolean(data.cta_enabled)
-    : (Boolean(data?.items?.length) && ctaDisabledReasons.length === 0)
+  const ctaEnabled = data?.cta_enabled === true && actionabilityState === 'ACTIONABLE'
   const itemCount = data?.items?.length ?? 0
   const ttlState = data?.ttl_state || 'unknown'
   const dataAgeText = formatDataAgeSeconds(data?.data_age_seconds)
@@ -321,7 +319,7 @@ export function OpportunitiesPage({
           </div>
         )}
 
-        {ctaEnabled && actionabilityState !== 'NO_ACTION' && data && (
+        {ctaEnabled && actionabilityState === 'ACTIONABLE' && data && (
           <div className="mb-4 flex flex-wrap items-center gap-3 rounded border border-[#1f3e56] bg-[#081521]/70 px-3 py-2">
             <button
               onClick={() => {

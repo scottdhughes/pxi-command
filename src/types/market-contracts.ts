@@ -11,6 +11,30 @@ export type RegimeType = 'RISK_ON' | 'RISK_OFF' | 'TRANSITION'
 export type SignalType = 'FULL_RISK' | 'REDUCED_RISK' | 'RISK_OFF' | 'DEFENSIVE'
 export type DecisionImpactOutcomeBasis = 'spy_forward_proxy' | 'theme_proxy_blend'
 
+export interface DecisionContractSnapshot {
+  contract_version: '2026-08-23-v1'
+  headline: 'Actionable plan' | 'Watch only' | 'No actionable signal'
+  actionability_state: PlanActionabilityState
+  action_authorized: boolean
+  actionability_reason_codes: string[]
+  descriptive_context: {
+    pxi_label: string
+    regime: RegimeType | null
+    research_posture: SignalType
+  }
+  evidence: {
+    status: 'PASSED' | 'BLOCKED'
+    pass: boolean
+    reason_codes: string[]
+  }
+  structural_quality: {
+    score: number
+    label: 'HIGH' | 'MEDIUM' | 'LOW'
+    interpretation: 'INPUT_AND_MODEL_DIAGNOSTIC_NOT_VALIDATED_EDGE'
+  }
+  consistency_scope: 'INTERNAL_COHERENCE'
+}
+
 export interface AlertData {
   id: number
   date: string
@@ -403,6 +427,7 @@ export interface AlertsFeedResponse {
 export interface PlanData {
   as_of: string
   setup_summary: string
+  decision_contract: DecisionContractSnapshot
   actionability_state?: PlanActionabilityState
   actionability_reason_codes?: string[]
   policy_state?: PolicyStateContract
@@ -425,6 +450,9 @@ export interface PlanData {
   edge_quality: {
     score: number
     label: 'HIGH' | 'MEDIUM' | 'LOW'
+    diagnostic_scope: 'INPUT_AND_MODEL_STRUCTURE'
+    validated_edge: boolean
+    calibration_authority: 'NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG'
     breakdown: {
       data_quality: number
       model_agreement: number
@@ -456,7 +484,8 @@ export interface PlanData {
   }
   consistency: ConsistencySnapshotContract
   trader_playbook: {
-    recommended_size_pct: { min: number; target: number; max: number }
+    authorization: 'AUTHORIZED' | 'WITHHELD'
+    recommended_size_pct: { min: number | null; target: number | null; max: number | null }
     scenarios: Array<{ condition: string; action: string; invalidation: string }>
     benchmark_follow_through_7d: {
       hit_rate: number | null
@@ -475,6 +504,9 @@ export interface PlanData {
     eligible_count: number
     suppressed_count: number
     degraded_reason: string | null
+    cta_enabled: boolean
+    cta_disabled_reasons: string[]
+    ttl_state: OpportunityTtlState
   }
   alerts_ref?: {
     as_of: string
@@ -510,9 +542,33 @@ export interface CategoryDetailData {
   percentile_rank: number
   indicators: Array<{
     id: string
+    canonical_id: string
+    legacy_id: string | null
+    identity_status: 'canonical' | 'legacy_storage_id'
+    definition_version: string
     name: string
     raw_value: number
     normalized_value: number
+    source: string
+    observed_source: string
+    configured_source: string
+    series: string
+    source_series: string
+    frequency: 'realtime' | 'daily' | 'weekly' | 'monthly'
+    observation_date: string
+    fetched_at: string | null
+    description: string
+    units: string | null
+    source_url: string | null
+    publisher: string | null
+    release_name: string | null
+    freshness: {
+      status: 'fresh' | 'stale' | 'missing'
+      basis: 'observation_date_sla'
+      age_days: number | null
+      max_age_days: number
+      sla_class: 'daily' | 'weekly' | 'monthly' | 'source_lagged'
+    }
   }>
   history: Array<{
     date: string
@@ -589,6 +645,7 @@ export interface PXIData {
 
 export interface SignalData {
   date: string
+  decision_contract: DecisionContractSnapshot
   state: {
     score: number
     label: string

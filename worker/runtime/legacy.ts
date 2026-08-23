@@ -28,7 +28,12 @@ import {
 } from '../lib/opportunity-snapshot-history';
 import { currentNewYorkDate } from '../lib/history-provenance';
 import { ensureMarketProductSchema as ensureMarketProductSchemaGuard } from '../db/schema';
-import { tryHandleMarketCoreRoute } from '../domain/market-core';
+import {
+  CANONICAL_PXI_CATEGORIES,
+  buildDecisionContractSnapshot,
+  projectTraderPlaybookForDecision,
+  tryHandleMarketCoreRoute,
+} from '../domain/market-core';
 import {
   computeNextExpectedRefresh as computeNextExpectedRefreshModule,
   isBriefSnapshotCompatible as isBriefSnapshotCompatibleModule,
@@ -1458,6 +1463,7 @@ type PlanActionabilityReasonCode =
   | 'critical_data_quality_block'
   | 'consistency_fail_block'
   | 'edge_evidence_gate_block'
+  | 'opportunity_cta_disabled'
   | 'opportunity_reference_unavailable'
   | 'no_eligible_opportunities'
   | 'high_edge_override_no_eligible'
@@ -1467,6 +1473,7 @@ type PlanActionabilityReasonCode =
   | 'cross_horizon_conflict_watch'
   | 'cross_horizon_insufficient_watch'
   | 'fallback_degraded_mode'
+  | `opportunity_cta_${string}`
   | `opportunity_${string}`;
 type OpportunityExpectancyBasis = 'theme_direction' | 'theme_direction_shrunk_prior' | 'direction_prior_proxy' | 'none';
 type OpportunityConfidenceBand = 'high' | 'medium' | 'low';
@@ -3249,6 +3256,17 @@ async function buildTraderPlaybookSnapshot(
   };
 }
 
+function selectCanonicalPxiCategories(categories: CategoryRow[]): CategoryRow[] | null {
+  const canonical = new Set<string>(CANONICAL_PXI_CATEGORIES);
+  const selected = categories.filter((row) => canonical.has(row.category));
+  const present = new Set(selected.map((row) => row.category));
+  return selected.length === CANONICAL_PXI_CATEGORIES.length &&
+    present.size === CANONICAL_PXI_CATEGORIES.length &&
+    CANONICAL_PXI_CATEGORIES.every((category) => present.has(category))
+    ? selected
+    : null;
+}
+
 async function selectLatestPxiWithCategories(db: D1Database): Promise<{
   pxi: PXIRow | null;
   categories: CategoryRow[];
@@ -3264,20 +3282,11 @@ async function selectLatestPxiWithCategories(db: D1Database): Promise<{
     const cats = await db.prepare(
       'SELECT category, score, weight FROM category_scores WHERE date = ?'
     ).bind(candidate.date).all<CategoryRow>();
-    if ((cats.results?.length || 0) >= 3) {
+    const canonicalCategories = selectCanonicalPxiCategories(cats.results || []);
+    if (canonicalCategories) {
       selected = candidate;
-      selectedCategories = cats.results || [];
+      selectedCategories = canonicalCategories;
       break;
-    }
-  }
-
-  if (!selected) {
-    selected = recentScores.results?.[0] || null;
-    if (selected) {
-      const cats = await db.prepare(
-        'SELECT category, score, weight FROM category_scores WHERE date = ?'
-      ).bind(selected.date).all<CategoryRow>();
-      selectedCategories = cats.results || [];
     }
   }
 
@@ -3321,6 +3330,12 @@ async function buildCanonicalMarketDecision(
   if (!pxi) {
     throw new Error('no_pxi_data');
   }
+
+  const canonicalCategories = selectCanonicalPxiCategories(categories);
+  if (!canonicalCategories) {
+    throw new Error('incomplete_pxi_categories');
+  }
+  categories = canonicalCategories;
 
   const categoryScores = categories.map((row) => ({ score: row.score }));
   const [regime, freshness, mlSampleSize, riskBand, edgeCalibrationSnapshot] = await Promise.all([
@@ -3983,22 +3998,76 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
     rationale_codes: ['fallback'],
   };
   const consistency = buildConsistencySnapshot(policyState);
+  const edgeEvidenceGate = {
+    pass: false,
+    reasons: [`fallback_${reason}`],
+  };
+  const actionabilityReasonCodes = [
+    'edge_evidence_gate_block',
+    'fallback_degraded_mode',
+    `opportunity_${reason}`,
+  ];
+  const edgeQuality: EdgeQualitySnapshot = {
+    score: 50,
+    label: 'MEDIUM',
+    breakdown: {
+      data_quality: 50,
+      model_agreement: 50,
+      regime_stability: 50,
+    },
+    stale_count: 0,
+    ml_sample_size: 0,
+    conflict_state: 'MIXED',
+    calibration: buildEdgeCalibrationFallback('50-59'),
+  };
+  const decisionContract = buildDecisionContractSnapshot({
+    actionability_state: 'NO_ACTION',
+    action_authorized: false,
+    actionability_reason_codes: actionabilityReasonCodes,
+    pxi_label: 'UNAVAILABLE',
+    regime: 'TRANSITION',
+    research_posture: 'REDUCED_RISK',
+    evidence_gate: edgeEvidenceGate,
+    consistency_state: consistency.state,
+    opportunity_cta_enabled: false,
+    allocation_target: null,
+    structural_quality: edgeQuality,
+  });
+  const fallbackPlaybook: TraderPlaybookSnapshot = {
+    recommended_size_pct: { min: 25, target: 50, max: 65 },
+    scenarios: [
+      {
+        condition: 'Fallback mode active.',
+        action: 'Do not use this degraded payload to change allocation.',
+        invalidation: 'Re-evaluate only after service health and prospective evidence recover.',
+      },
+    ],
+    benchmark_follow_through_7d: {
+      hit_rate: null,
+      sample_size: 0,
+      unavailable_reason: 'insufficient_sample',
+    },
+  };
+  const setupSummary = 'NO ACTION — Plan service is in degraded mode. Allocation is withheld until full context and prospective evidence are restored.';
+  const decisionStack = buildDecisionStack({
+    actionability_state: decisionContract.actionability_state,
+    action_authorized: decisionContract.action_authorized,
+    actionability_reason_codes: decisionContract.actionability_reason_codes,
+    edge_evidence_gate: edgeEvidenceGate,
+    setup_summary: setupSummary,
+    edge_quality: edgeQuality,
+    consistency,
+  });
   return {
     as_of: asIsoDateTime(new Date()),
-    setup_summary: 'Plan service is in degraded mode. Allocation is withheld until full context and prospective evidence are restored.',
+    setup_summary: setupSummary,
+    decision_contract: decisionContract,
     policy_state: policyState,
-    edge_evidence_gate: {
-      pass: false,
-      reasons: [`fallback_${reason}`],
-    },
-    actionability_state: 'NO_ACTION',
-    actionability_reason_codes: [
-      'edge_evidence_gate_block',
-      'fallback_degraded_mode',
-      `opportunity_${reason}`,
-    ],
+    edge_evidence_gate: edgeEvidenceGate,
+    actionability_state: decisionContract.actionability_state,
+    actionability_reason_codes: decisionContract.actionability_reason_codes,
     action_now: {
-      action_authorized: false,
+      action_authorized: decisionContract.action_authorized,
       risk_allocation_target: null,
       raw_signal_allocation_target: 0.5,
       risk_allocation_basis: 'withheld_edge_evidence',
@@ -4006,17 +4075,10 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
       primary_signal: 'REDUCED_RISK',
     },
     edge_quality: {
-      score: 50,
-      label: 'MEDIUM',
-      breakdown: {
-        data_quality: 50,
-        model_agreement: 50,
-        regime_stability: 50,
-      },
-      stale_count: 0,
-      ml_sample_size: 0,
-      conflict_state: 'MIXED',
-      calibration: buildEdgeCalibrationFallback('50-59'),
+      ...edgeQuality,
+      diagnostic_scope: 'INPUT_AND_MODEL_STRUCTURE',
+      validated_edge: false,
+      calibration_authority: 'NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG',
     },
     risk_band: {
       d7: { bear: null, base: null, bull: null, sample_size: 0 },
@@ -4031,24 +4093,11 @@ function buildPlanFallbackPayload(reason: string): PlanPayload {
       },
     },
     consistency,
-    trader_playbook: {
-      recommended_size_pct: { min: 25, target: 50, max: 65 },
-      scenarios: [
-        {
-          condition: 'Fallback mode active.',
-          action: 'Hold neutral risk and avoid directional concentration.',
-          invalidation: 'Replace with live plan once service health recovers.',
-        },
-      ],
-      benchmark_follow_through_7d: {
-        hit_rate: null,
-        sample_size: 0,
-        unavailable_reason: 'insufficient_sample',
-      },
-    },
+    trader_playbook: projectTraderPlaybookForDecision(fallbackPlaybook, false),
     invalidation_rules: [
-      'Hold neutral risk until plan data is fully available.',
+      'Do not use the degraded plan to change allocation; re-evaluate after full plan data is available.',
     ],
+    decision_stack: decisionStack,
     degraded_reason: reason,
   };
 }
@@ -4336,6 +4385,7 @@ async function fetchLatestSignalsThemes(
   options?: {
     sanitize_tickers?: boolean;
     signals_service?: Pick<Fetcher, 'fetch'>;
+    as_of_date?: string;
   }
 ): Promise<SignalsThemeRecord[]> {
   const sanitizeTickers = options?.sanitize_tickers !== false;
@@ -4373,7 +4423,12 @@ async function fetchLatestSignalsThemes(
     const runsRes = await fetchSignals('https://pxicommand.com/signals/api/runs?status=ok');
     const runsJson = await readJsonRecord(runsRes);
     const runs = Array.isArray(runsJson?.runs) ? runsJson.runs : [];
-    const latestRun = runs[0];
+    const latestRun = runs.find((candidate) => {
+      if (typeof candidate !== 'object' || candidate === null) return false;
+      if (!options?.as_of_date) return true;
+      const createdAt = (candidate as Record<string, unknown>).created_at_utc;
+      return typeof createdAt === 'string' && createdAt.slice(0, 10) <= options.as_of_date;
+    });
     const latestRunId = typeof latestRun === 'object' && latestRun !== null
       && typeof (latestRun as Record<string, unknown>).id === 'string'
       ? (latestRun as Record<string, unknown>).id as string
@@ -4419,16 +4474,23 @@ async function fetchLatestSignalsThemes(
 }
 
 async function buildBriefSnapshot(db: D1Database): Promise<BriefSnapshot | null> {
-  const latestAndPrevious = await db.prepare(`
+  const selected = await selectLatestPxiWithCategories(db);
+  const latest = selected.pxi;
+  if (!latest) return null;
+  const previous = await db.prepare(`
     SELECT date, score, label, status, delta_7d, delta_30d
     FROM pxi_scores
+    WHERE date < ?
     ORDER BY date DESC
-    LIMIT 2
-  `).all<{ date: string; score: number; label: string; status: string; delta_7d: number | null; delta_30d: number | null }>();
-
-  const latest = latestAndPrevious.results?.[0];
-  if (!latest) return null;
-  const previous = latestAndPrevious.results?.[1] || null;
+    LIMIT 1
+  `).bind(latest.date).first<{
+    date: string;
+    score: number;
+    label: string;
+    status: string;
+    delta_7d: number | null;
+    delta_30d: number | null;
+  }>();
 
   const [currentRegime, previousRegime] = await Promise.all([
     detectRegime(db, latest.date),
@@ -5058,27 +5120,36 @@ function buildExpectancyFromOutcomes(
 
 async function computeOpportunityOutcomeHistory(
   db: D1Database,
-  horizon: '7d' | '30d'
+  horizon: '7d' | '30d',
+  asOfDate?: string,
 ): Promise<{
   byThemeDirection: Map<string, number[]>;
   byDirection: Record<OpportunityDirection, number[]>;
 }> {
   const horizonDays = horizon === '7d' ? 7 : 30;
+  const snapshotDateFilter = asOfDate ? 'AND substr(as_of, 1, 10) <= ?' : '';
+  const spyDateFilter = asOfDate ? 'AND date <= ?' : '';
   const [snapshots, spyRows] = await Promise.all([
     db.prepare(`
       SELECT as_of, payload_json
       FROM opportunity_snapshots
       WHERE horizon = ?
         AND instr(payload_json, ?) = 0
+        ${snapshotDateFilter}
       ORDER BY as_of DESC
       LIMIT 730
-    `).bind(horizon, HISTORICAL_BACKFILL_SEED_MARKER).all<{ as_of: string; payload_json: string }>(),
+    `).bind(
+      horizon,
+      HISTORICAL_BACKFILL_SEED_MARKER,
+      ...(asOfDate ? [asOfDate] : []),
+    ).all<{ as_of: string; payload_json: string }>(),
     db.prepare(`
       SELECT date, value
       FROM indicator_values
       WHERE indicator_id = 'spy_close'
+        ${spyDateFilter}
       ORDER BY date ASC
-    `).all<{ date: string; value: number }>(),
+    `).bind(...(asOfDate ? [asOfDate] : [])).all<{ date: string; value: number }>(),
   ]);
 
   const spyMap = new Map<string, number>();
@@ -5397,8 +5468,13 @@ function projectOpportunityFeed(
   };
 }
 
+type PlanOpportunityReference = NonNullable<PlanPayload['opportunity_ref']> & {
+  cta_enabled?: boolean;
+  cta_disabled_reasons?: string[];
+};
+
 function resolvePlanActionability(args: {
-  opportunity_ref?: PlanPayload['opportunity_ref'];
+  opportunity_ref?: PlanOpportunityReference;
   edge_quality: EdgeQualitySnapshot;
   freshness: FreshnessStatus;
   consistency: ConsistencySnapshot;
@@ -5426,6 +5502,17 @@ function resolvePlanActionability(args: {
   if (!opportunityRef) {
     reasonCodes.push('opportunity_reference_unavailable');
     return { state: 'NO_ACTION', reason_codes: reasonCodes };
+  }
+
+  if (opportunityRef.cta_enabled !== true) {
+    reasonCodes.push('opportunity_cta_disabled');
+    for (const reason of opportunityRef.cta_disabled_reasons || []) {
+      if (reason) reasonCodes.push(`opportunity_cta_${reason}`);
+    }
+    return {
+      state: 'NO_ACTION',
+      reason_codes: Array.from(new Set(reasonCodes)),
+    };
   }
 
   if (opportunityRef.eligible_count <= 0) {
@@ -5546,6 +5633,9 @@ function applyCrossHorizonActionabilityOverride(
 
 function buildDecisionStack(args: {
   actionability_state: PlanActionabilityState;
+  action_authorized: boolean;
+  actionability_reason_codes: string[];
+  edge_evidence_gate: { pass: boolean; reasons: string[] };
   setup_summary: string;
   edge_quality: EdgeQualitySnapshot;
   consistency: ConsistencySnapshot;
@@ -5559,24 +5649,47 @@ function buildDecisionStack(args: {
   const warning24h = args.alerts_ref?.warning_count_24h ?? 0;
   const critical24h = args.alerts_ref?.critical_count_24h ?? 0;
   const crossHorizonState = args.cross_horizon?.state || 'INSUFFICIENT';
+  const actionAuthorized = args.action_authorized === true &&
+    args.actionability_state === 'ACTIONABLE' &&
+    args.edge_evidence_gate.pass === true &&
+    args.consistency.state !== 'FAIL' &&
+    args.opportunity_ref?.cta_enabled === true;
+  const ctaState: PlanActionabilityState = actionAuthorized
+    ? 'ACTIONABLE'
+    : args.actionability_state === 'ACTIONABLE'
+      ? 'NO_ACTION'
+      : args.actionability_state;
 
   const whatChanged = `${regimeDelta} regime delta · ${eligibleCount} eligible opportunities · ${warning24h} warning / ${critical24h} critical alerts (24h).`;
-  let whatToDo = 'Monitor and wait for cleaner setup.';
-  if (args.actionability_state === 'ACTIONABLE') {
+  let whatToDo = 'No action. Monitor and wait for the evidence and actionability gates to authorize a plan.';
+  if (actionAuthorized) {
     whatToDo = 'Execute the playbook target with standard risk controls and invalidation checks.';
-  } else if (args.actionability_state === 'WATCH') {
+  } else if (ctaState === 'WATCH') {
     whatToDo = 'Maintain watch posture and require confirmation before adding risk.';
   }
 
-  const whyNow = `Edge ${args.edge_quality.label.toLowerCase()} · consistency ${args.consistency.state.toLowerCase()} · cross-horizon ${crossHorizonState.toLowerCase()}.`;
-  const confidence = `edge=${args.edge_quality.label} | consistency=${args.consistency.state} | cross_horizon=${crossHorizonState}`;
+  const evidenceStatus = args.edge_evidence_gate.pass ? 'PASSED' : 'BLOCKED';
+  const authorizationStatus = actionAuthorized ? 'AUTHORIZED' : 'WITHHELD';
+  const decisionLead = args.edge_evidence_gate.pass
+    ? actionAuthorized
+      ? 'Action authorized · prospective evidence passed'
+      : 'Action authorization withheld · prospective evidence passed'
+    : 'Prospective evidence blocked · action authorization withheld';
+  const whyNow = `${decisionLead} · structural quality ${args.edge_quality.label.toLowerCase()} · internal consistency ${args.consistency.state.toLowerCase()} · cross-horizon ${crossHorizonState.toLowerCase()}.`;
+  const reasonCodes = Array.from(new Set([
+    ...args.actionability_reason_codes,
+    ...args.edge_evidence_gate.reasons,
+  ]));
+  const confidence = `evidence=${evidenceStatus} | action=${authorizationStatus} | structural_quality=${args.edge_quality.label} | consistency=${args.consistency.state} | cross_horizon=${crossHorizonState}${
+    reasonCodes.length > 0 ? ` | reasons=${reasonCodes.join(',')}` : ''
+  }`;
 
   return {
     what_changed: whatChanged,
     what_to_do: whatToDo,
     why_now: whyNow,
     confidence,
-    cta_state: args.actionability_state,
+    cta_state: ctaState,
   };
 }
 
@@ -5679,12 +5792,8 @@ async function buildOpportunitySnapshot(
     signals_service?: Pick<Fetcher, 'fetch'>;
   }
 ): Promise<OpportunitySnapshot | null> {
-  const latestPxi = await db.prepare(`
-    SELECT date, score, delta_7d, delta_30d
-    FROM pxi_scores
-    ORDER BY date DESC
-    LIMIT 1
-  `).first<{ date: string; score: number; delta_7d: number | null; delta_30d: number | null }>();
+  const selected = await selectLatestPxiWithCategories(db);
+  const latestPxi = selected.pxi;
 
   if (!latestPxi) {
     return null;
@@ -5694,30 +5803,33 @@ async function buildOpportunitySnapshot(
     db.prepare(`
       SELECT date, risk_allocation, signal_type, regime
       FROM pxi_signal
+      WHERE date <= ?
       ORDER BY date DESC
       LIMIT 1
-    `).first<{ date: string; risk_allocation: number; signal_type: string; regime: string }>(),
+    `).bind(latestPxi.date).first<{ date: string; risk_allocation: number; signal_type: string; regime: string }>(),
     db.prepare(`
       SELECT prediction_date, ensemble_7d, ensemble_30d, confidence_7d, confidence_30d
       FROM ensemble_predictions
+      WHERE prediction_date <= ?
       ORDER BY prediction_date DESC
       LIMIT 1
-    `).first<{
+    `).bind(latestPxi.date).first<{
       prediction_date: string;
       ensemble_7d: number | null;
       ensemble_30d: number | null;
       confidence_7d: string | null;
       confidence_30d: string | null;
     }>(),
-    computeHistoricalHitStats(db, horizon),
+    computeHistoricalHitStats(db, horizon, latestPxi.date),
     fetchLatestSignalsThemes({
       sanitize_tickers: options?.sanitize_signals_tickers !== false,
       signals_service: options?.signals_service,
+      as_of_date: latestPxi.date,
     }),
-    calibrationSnapshot ? Promise.resolve(calibrationSnapshot) : fetchLatestCalibrationSnapshot(db, 'conviction', horizon),
-    computeOpportunityOutcomeHistory(db, horizon),
+    calibrationSnapshot ? Promise.resolve(calibrationSnapshot) : fetchCalibrationSnapshotAtOrBefore(db, 'conviction', horizon, latestPxi.date),
+    computeOpportunityOutcomeHistory(db, horizon, latestPxi.date),
     computeFreshnessStatus(db),
-    fetchLatestCalibrationSnapshot(db, 'edge_quality', null),
+    fetchCalibrationSnapshotAtOrBefore(db, 'edge_quality', null, latestPxi.date),
   ]);
 
   const freshnessPenalty = freshnessPenaltyCount(freshness);
@@ -10358,14 +10470,14 @@ export default {
 
         const { pxi, signal, regime, freshness, risk_band, edge_quality, policy_state, degraded_reasons, risk_sizing } = canonical;
         const stalePenaltyUnits = freshnessPenaltyCount(freshness);
-        const setupSummary = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policy_state.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} tactical posture at ${risk_sizing.target_pct}% risk budget (raw ${Math.round(signal.risk_allocation * 100)}%).${
+        const setupContext = `PXI ${pxi.score.toFixed(1)} (${pxi.label}); ${policy_state.stance.replace('_', ' ')} stance with ${signal.signal_type.replace('_', ' ')} research posture.${
           stalePenaltyUnits > 0
             ? ` stale-input pressure ${stalePenaltyUnits} (critical stale: ${freshness.critical_stale_count}).`
             : ''
         }`;
 
         let briefRef: PlanPayload['brief_ref'] | undefined;
-        let opportunityRef: PlanPayload['opportunity_ref'] | undefined;
+        let opportunityRef: PlanOpportunityReference | undefined;
         let alertsRef: PlanPayload['alerts_ref'] | undefined;
         let crossHorizonRef: PlanPayload['cross_horizon'] | undefined;
         try {
@@ -10472,6 +10584,9 @@ export default {
               eligible_count: projectedByHorizon['7d'].items.length,
               suppressed_count: projectedByHorizon['7d'].suppressed_count,
               degraded_reason: projectedByHorizon['7d'].degraded_reason,
+              cta_enabled: false,
+              cta_disabled_reasons: ['legacy_plan_path_not_authoritative'],
+              ttl_state: 'unknown',
             };
           } else if (projectedByHorizon['30d']) {
             opportunityRef = {
@@ -10480,6 +10595,9 @@ export default {
               eligible_count: projectedByHorizon['30d'].items.length,
               suppressed_count: projectedByHorizon['30d'].suppressed_count,
               degraded_reason: projectedByHorizon['30d'].degraded_reason,
+              cta_enabled: false,
+              cta_disabled_reasons: ['legacy_plan_path_not_authoritative'],
+              ttl_state: 'unknown',
             };
           }
 
@@ -10499,15 +10617,38 @@ export default {
           console.warn('Failed to attach plan reference blocks:', err);
         }
 
+        const edgeEvidenceGate = {
+          pass: false,
+          reasons: ['legacy_plan_path_not_authoritative'],
+        };
         const actionability = resolvePlanActionability({
           opportunity_ref: opportunityRef,
           edge_quality,
           freshness,
           consistency: canonical.consistency,
+          edge_evidence_gate: edgeEvidenceGate,
         });
         const actionabilityWithCrossHorizon = applyCrossHorizonActionabilityOverride(actionability, crossHorizonRef || null);
-        const decisionStack = buildDecisionStack({
+        const actionAuthorized = false;
+        const decisionContract = buildDecisionContractSnapshot({
           actionability_state: actionabilityWithCrossHorizon.state,
+          action_authorized: actionAuthorized,
+          actionability_reason_codes: actionabilityWithCrossHorizon.reason_codes,
+          pxi_label: pxi.label,
+          regime: regime?.regime || null,
+          research_posture: signal.signal_type,
+          evidence_gate: edgeEvidenceGate,
+          consistency_state: canonical.consistency.state,
+          opportunity_cta_enabled: false,
+          allocation_target: null,
+          structural_quality: edge_quality,
+        });
+        const setupSummary = `NO ACTION — ${setupContext} Allocation withheld because this legacy plan path is not an authoritative prospective-evidence source.`;
+        const decisionStack = buildDecisionStack({
+          actionability_state: decisionContract.actionability_state,
+          action_authorized: decisionContract.action_authorized,
+          actionability_reason_codes: decisionContract.actionability_reason_codes,
+          edge_evidence_gate: edgeEvidenceGate,
           setup_summary: setupSummary,
           edge_quality,
           consistency: canonical.consistency,
@@ -10530,21 +10671,29 @@ export default {
         const payload: PlanPayload = {
           as_of: canonical.as_of,
           setup_summary: setupSummary,
+          decision_contract: decisionContract,
           policy_state,
-          actionability_state: actionabilityWithCrossHorizon.state,
-          actionability_reason_codes: actionabilityWithCrossHorizon.reason_codes,
+          edge_evidence_gate: edgeEvidenceGate,
+          actionability_state: decisionContract.actionability_state,
+          actionability_reason_codes: decisionContract.actionability_reason_codes,
           action_now: {
-            risk_allocation_target: risk_sizing.target_pct / 100,
+            action_authorized: decisionContract.action_authorized,
+            risk_allocation_target: null,
             raw_signal_allocation_target: risk_sizing.raw_signal_allocation_target,
-            risk_allocation_basis: 'penalized_playbook_target',
+            risk_allocation_basis: 'withheld_edge_evidence',
             horizon_bias: resolveHorizonBias(signal, regime, edge_quality.score),
             primary_signal: signal.signal_type,
           },
-          edge_quality,
+          edge_quality: {
+            ...edge_quality,
+            diagnostic_scope: 'INPUT_AND_MODEL_STRUCTURE',
+            validated_edge: false,
+            calibration_authority: 'NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG',
+          },
           risk_band,
           uncertainty: canonical.uncertainty,
           consistency: canonical.consistency,
-          trader_playbook: canonical.trader_playbook,
+          trader_playbook: projectTraderPlaybookForDecision(canonical.trader_playbook, false),
           invalidation_rules: finalInvalidationRules,
           ...(briefRef ? { brief_ref: briefRef } : {}),
           ...(opportunityRef ? { opportunity_ref: opportunityRef } : {}),
@@ -14124,6 +14273,7 @@ export {
   roundMetric,
   sanitizeUtilityPayload,
   sendCloudflareEmail,
+  selectLatestPxiWithCategories,
   stableHash,
   summarizeCrossHorizonCoherence,
   toNumber,

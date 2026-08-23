@@ -39,35 +39,42 @@ export function OnboardingModal({
       content: (
         <div className="space-y-3">
           <p className="text-[12px] text-[#949ba5] mb-4">
-            Higher scores indicate stronger risk-on conditions. Lower scores suggest caution.
+            Higher scores describe stronger readings across the weighted inputs. These labels are not return forecasts.
           </p>
           <div className="space-y-2">
             <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#ff6b6b]">
-              <div className="w-16 text-[11px] font-mono text-[#ff6b6b]">0–30</div>
+              <div className="w-16 text-[11px] font-mono text-[#ff6b6b]">0–&lt;35</div>
               <div className="flex-1">
-                <div className="text-[11px] text-[#f3f3f3]">Weak / Dumping</div>
-                <div className="text-[9px] text-[#949ba5]/60">Historically favorable for forward returns (mean reversion)</div>
+                <div className="text-[11px] text-[#f3f3f3]">DUMPING</div>
+                <div className="text-[9px] text-[#949ba5]/60">Weak composite input conditions</div>
               </div>
             </div>
             <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#949ba5]">
-              <div className="w-16 text-[11px] font-mono text-[#949ba5]">30–60</div>
+              <div className="w-16 text-[11px] font-mono text-[#949ba5]">35–&lt;50</div>
               <div className="flex-1">
-                <div className="text-[11px] text-[#f3f3f3]">Neutral / Soft</div>
-                <div className="text-[9px] text-[#949ba5]/60">Typical market conditions, no strong directional bias</div>
+                <div className="text-[11px] text-[#f3f3f3]">SOFT</div>
+                <div className="text-[9px] text-[#949ba5]/60">Below-neutral composite input conditions</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#949ba5]">
+              <div className="w-16 text-[11px] font-mono text-[#949ba5]">50–&lt;65</div>
+              <div className="flex-1">
+                <div className="text-[11px] text-[#f3f3f3]">NEUTRAL</div>
+                <div className="text-[9px] text-[#949ba5]/60">Middle-band composite input conditions</div>
               </div>
             </div>
             <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#00a3ff]">
-              <div className="w-16 text-[11px] font-mono text-[#00a3ff]">60–80</div>
+              <div className="w-16 text-[11px] font-mono text-[#00a3ff]">65–&lt;80</div>
               <div className="flex-1">
-                <div className="text-[11px] text-[#f3f3f3]">Strong / Pamping</div>
-                <div className="text-[9px] text-[#949ba5]/60">Risk-on conditions, favorable environment</div>
+                <div className="text-[11px] text-[#f3f3f3]">PAMPING</div>
+                <div className="text-[9px] text-[#949ba5]/60">Strong composite input conditions</div>
               </div>
             </div>
             <div className="flex items-center gap-3 bg-[#0a0a0a] rounded px-3 py-2 border-l-2 border-[#f59e0b]">
               <div className="w-16 text-[11px] font-mono text-[#f59e0b]">80–100</div>
               <div className="flex-1">
-                <div className="text-[11px] text-[#f3f3f3]">Extended / Max Pamp</div>
-                <div className="text-[9px] text-[#949ba5]/60">Historically poor forward returns, elevated reversal risk</div>
+                <div className="text-[11px] text-[#f3f3f3]">MAX PAMP</div>
+                <div className="text-[9px] text-[#949ba5]/60">Highest composite input band</div>
               </div>
             </div>
           </div>
@@ -86,7 +93,7 @@ export function OnboardingModal({
               <span className="text-[#00a3ff] text-lg">↗</span>
               <div>
                 <div className="text-[11px] text-[#00a3ff] uppercase tracking-wide">Risk On</div>
-                <div className="text-[9px] text-[#949ba5]/60">Favorable for equities, credit tight, volatility low</div>
+                <div className="text-[9px] text-[#949ba5]/60">Indicators vote toward a lower-stress, risk-on regime</div>
               </div>
             </div>
             <div className="flex items-center gap-3 bg-[#f59e0b]/10 border border-[#f59e0b]/30 rounded px-3 py-2">
@@ -100,7 +107,7 @@ export function OnboardingModal({
               <span className="text-[#ff6b6b] text-lg">↘</span>
               <div>
                 <div className="text-[11px] text-[#ff6b6b] uppercase tracking-wide">Risk Off</div>
-                <div className="text-[9px] text-[#949ba5]/60">Defensive positioning recommended, stress signals</div>
+                <div className="text-[9px] text-[#949ba5]/60">Indicators vote toward a higher-stress, risk-off regime</div>
               </div>
             </div>
           </div>
@@ -120,7 +127,7 @@ export function OnboardingModal({
               { name: 'Volatility', weight: '20%', desc: 'VIX, term structure' },
               { name: 'Breadth', weight: '15%', desc: 'RSP/SPY, sectors' },
               { name: 'Positioning', weight: '15%', desc: 'Fed, TGA, RRP' },
-              { name: 'Macro', weight: '10%', desc: 'ISM, claims' },
+              { name: 'Macro', weight: '10%', desc: 'Manufacturing payrolls, claims' },
               { name: 'Global', weight: '10%', desc: 'DXY, EM spreads' },
               { name: 'Crypto', weight: '10%', desc: 'BTC, stables' },
             ].map((cat) => (
@@ -134,7 +141,7 @@ export function OnboardingModal({
             ))}
           </div>
           <p className="text-[9px] text-[#949ba5]/50 text-center">
-            See /spec for full methodology and backtest results
+            See /spec for methodology, decision authority, and validation status
           </p>
         </div>
       ),

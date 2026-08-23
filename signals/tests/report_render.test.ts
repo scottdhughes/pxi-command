@@ -52,9 +52,12 @@ describe("report rendering", () => {
     expect(html).toContain("Not investment advice.")
     expect(html).toContain("Research Timing Flags — Not Actionable")
     expect(html).toContain("Research-only observation layer")
+    expect(html).toContain("Signals never authorizes action")
+    expect(html).toContain("<code>/api/plan</code> is the sole authoritative PXI action surface")
     expect(html).not.toContain("Ready to act")
     expect(html).not.toContain("Top 10 Opportunities")
-    expect(html).toContain("Top Signal")
+    expect(html).toContain("Top Observed Theme")
+    expect(html).not.toContain("Top Signal")
     for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
       expect(html).toContain(`href="${href}"`)
     }
@@ -67,7 +70,7 @@ describe("report rendering", () => {
   })
 
   it("upgrades stored report snapshots", () => {
-    const legacy = `<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","mainEntity":{"@type":"Dataset","name":"Legacy signals","description":"Legacy sector rotation research derived from discussion patterns."}}</script></head><body><div class="nav-dropdown-menu"><a href="/">/</a><a href="/spec">/SPEC</a><a href="/signals">/SIGNALS</a></div><header></header><!-- Summary Dashboard --><div class="takeaway-title">Actionable Signals</div><span class="section-title">Top 8 Opportunities</span><div class="stat-label">"Now" Signals</div><div class="stat-sub">Ready to act</div></body></html>`
+    const legacy = `<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","mainEntity":{"@type":"Dataset","name":"Legacy signals","description":"Legacy sector rotation research derived from discussion patterns."}}</script></head><body><div class="nav-dropdown-menu"><a href="/">/</a><a href="/spec">/SPEC</a><a href="/signals">/SIGNALS</a></div><header><span class="hero-meta-label">Next Update Next Update</span></header><!-- Summary Dashboard --><div class="takeaway-title">Actionable Signals</div><span class="section-title">Top 8 Opportunities</span><div class="stat-label">Top Signal</div><div class="stat-label">"Now" Signals</div><div class="stat-sub">Ready to act</div></body></html>`
     const upgraded = upgradeStoredReportNavigation(legacy)
     for (const href of ["/", "/brief", "/opportunities", "/signals", "/alerts", "/inbox", "/guide", "/spec"]) {
       expect(upgraded).toContain(`href="${href}"`)
@@ -78,7 +81,13 @@ describe("report rendering", () => {
     expect(upgraded).toContain('"Now" Activity Flags')
     expect(upgraded).toContain("Research only")
     expect(upgraded).toContain("Research-only observation layer")
+    expect(upgraded).toContain("Signals never authorizes action")
+    expect(upgraded).toContain("<code>/api/plan</code> is the sole authoritative PXI action surface")
+    expect(upgraded).toContain("Top Observed Theme")
+    expect(upgraded).not.toContain("Top Signal")
+    expect(upgraded.match(/Next Update/g)).toHaveLength(1)
     expect(upgraded).not.toContain("Ready to act")
+    expect(upgradeStoredReportNavigation(upgraded)).toBe(upgraded)
 
     const jsonLd = upgraded.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)?.[1]
     expect(jsonLd).toBeDefined()

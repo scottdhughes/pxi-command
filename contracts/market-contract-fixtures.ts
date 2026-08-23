@@ -92,6 +92,29 @@ export const pxiFixture = {
 
 export const signalFixture = {
   date: '2026-03-05',
+  decision_contract: {
+    contract_version: '2026-08-23-v1',
+    headline: 'No actionable signal',
+    actionability_state: 'NO_ACTION',
+    action_authorized: false,
+    actionability_reason_codes: ['edge_evidence_gate_block'],
+    descriptive_context: {
+      pxi_label: 'Constructive',
+      regime: 'RISK_ON',
+      research_posture: 'FULL_RISK',
+    },
+    evidence: {
+      status: 'BLOCKED',
+      pass: false,
+      reason_codes: ['policy_alignment:validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy'],
+    },
+    structural_quality: {
+      score: 74,
+      label: 'HIGH',
+      interpretation: 'INPUT_AND_MODEL_DIAGNOSTIC_NOT_VALIDATED_EDGE',
+    },
+    consistency_scope: 'INTERNAL_COHERENCE',
+  },
   state: {
     score: 67.4,
     label: 'Constructive',
@@ -122,6 +145,9 @@ export const signalFixture = {
   edge_quality: {
     score: 74,
     label: 'HIGH',
+    diagnostic_scope: 'INPUT_AND_MODEL_STRUCTURE',
+    validated_edge: false,
+    calibration_authority: 'NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG',
     breakdown: {
       data_quality: 22,
       model_agreement: 28,
@@ -149,6 +175,32 @@ export const signalFixture = {
 export const planFixture = {
   as_of: '2026-03-05',
   setup_summary: 'Risk remains supported, but stale macro inputs still limit conviction.',
+  decision_contract: {
+    contract_version: '2026-08-23-v1',
+    headline: 'Actionable plan',
+    actionability_state: 'ACTIONABLE',
+    action_authorized: true,
+    actionability_reason_codes: [
+      'high_edge_with_eligible_opportunities',
+      'opportunity_theme-semiconductors',
+    ],
+    descriptive_context: {
+      pxi_label: 'Constructive',
+      regime: 'RISK_ON',
+      research_posture: 'FULL_RISK',
+    },
+    evidence: {
+      status: 'PASSED',
+      pass: true,
+      reason_codes: [],
+    },
+    structural_quality: {
+      score: 74,
+      label: 'HIGH',
+      interpretation: 'INPUT_AND_MODEL_DIAGNOSTIC_NOT_VALIDATED_EDGE',
+    },
+    consistency_scope: 'INTERNAL_COHERENCE',
+  },
   actionability_state: 'ACTIONABLE',
   actionability_reason_codes: [
     'high_edge_with_eligible_opportunities',
@@ -172,7 +224,10 @@ export const planFixture = {
     horizon_bias: '7d stronger than 30d',
     primary_signal: 'FULL_RISK',
   },
-  edge_quality: signalFixture.edge_quality!,
+  edge_quality: {
+    ...signalFixture.edge_quality!,
+    validated_edge: true,
+  },
   risk_band: {
     d7: { bear: -2.4, base: 1.8, bull: 4.2, sample_size: 83 },
     d30: { bear: -5.1, base: 4.7, bull: 9.8, sample_size: 67 },
@@ -196,6 +251,7 @@ export const planFixture = {
     },
   },
   trader_playbook: {
+    authorization: 'AUTHORIZED',
     recommended_size_pct: { min: 35, target: 55, max: 75 },
     scenarios: [
       {
@@ -221,6 +277,9 @@ export const planFixture = {
     eligible_count: 2,
     suppressed_count: 1,
     degraded_reason: null,
+    cta_enabled: true,
+    cta_disabled_reasons: [],
+    ttl_state: 'fresh',
   },
   alerts_ref: {
     as_of: '2026-03-05',
@@ -507,28 +566,76 @@ export const alertsApiFixture = {
 
 export const categoryDetailFixture = {
   category: 'macro',
-  date: '2026-03-05',
+  date: '2026-08-23',
   score: 71.2,
-  weight: 0.35,
-  percentile_rank: 0.82,
+  weight: 0.1,
+  percentile_rank: 82,
   indicators: [
     {
-      id: 'fed-balance-sheet',
-      name: 'Fed Balance Sheet',
-      raw_value: 7.2,
-      normalized_value: 0.61,
+      id: 'ism_manufacturing',
+      canonical_id: 'manufacturing_payrolls',
+      legacy_id: 'ism_manufacturing',
+      identity_status: 'legacy_storage_id',
+      definition_version: 'indicator-contract/v1',
+      name: 'Manufacturing Payrolls',
+      raw_value: 12611,
+      normalized_value: 11.875,
+      source: 'fred',
+      observed_source: 'fred',
+      configured_source: 'fred',
+      series: 'MANEMP',
+      source_series: 'MANEMP',
+      frequency: 'monthly',
+      observation_date: '2026-07-01',
+      fetched_at: '2026-08-23T14:00:31.000Z',
+      description: 'Manufacturing employees, thousands (FRED MANEMP); legacy internal ID retained for history compatibility',
+      units: 'Thousands of persons, seasonally adjusted',
+      source_url: 'https://fred.stlouisfed.org/series/MANEMP',
+      publisher: 'U.S. Bureau of Labor Statistics via FRED',
+      release_name: 'Current Employment Statistics',
+      freshness: {
+        status: 'fresh',
+        basis: 'observation_date_sla',
+        age_days: 53,
+        max_age_days: 65,
+        sla_class: 'monthly',
+      },
     },
     {
-      id: 'yield-curve-3m10y',
-      name: 'Yield Curve 3m10y',
-      raw_value: 0.42,
-      normalized_value: 0.54,
+      id: 'jobless_claims',
+      canonical_id: 'jobless_claims',
+      legacy_id: null,
+      identity_status: 'canonical',
+      definition_version: 'indicator-contract/v1',
+      name: 'Initial Jobless Claims (4wk)',
+      raw_value: 235000,
+      normalized_value: 58.2,
+      source: 'fred',
+      observed_source: 'fred',
+      configured_source: 'fred',
+      series: 'IC4WSA',
+      source_series: 'IC4WSA',
+      frequency: 'weekly',
+      observation_date: '2026-08-15',
+      fetched_at: '2026-08-23T14:00:31.000Z',
+      description: '4-week moving average of initial claims',
+      units: null,
+      source_url: null,
+      publisher: null,
+      release_name: null,
+      freshness: {
+        status: 'fresh',
+        basis: 'observation_date_sla',
+        age_days: 5,
+        max_age_days: 10,
+        sla_class: 'weekly',
+      },
     },
   ],
   history: [
-    { date: '2026-03-03', score: 68.1 },
-    { date: '2026-03-04', score: 69.7 },
-    { date: '2026-03-05', score: 71.2 },
+    { date: '2026-08-21', score: 68.1 },
+    { date: '2026-08-22', score: 69.7 },
+    { date: '2026-08-23', score: 71.2 },
   ],
 } satisfies CategoryDetailData;
 

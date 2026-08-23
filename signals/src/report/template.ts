@@ -125,7 +125,7 @@ function renderStars(count: number): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function renderSummaryDashboard(themes: ThemeReportItem[], totalDocs: number): string {
-  const topSignal = themes[0]?.theme_name || "N/A"
+  const topObservedTheme = themes[0]?.theme_name || "N/A"
 
   // Calculate average confidence score (map confidence strings to numbers)
   const confMap: Record<string, number> = {
@@ -146,9 +146,9 @@ function renderSummaryDashboard(themes: ThemeReportItem[], totalDocs: number): s
   return `
     <div class="summary-grid">
       <div class="stat-card highlight">
-        <div class="stat-label">Top Signal</div>
+        <div class="stat-label">Top Observed Theme</div>
         <div class="stat-value accent">#1</div>
-        <div class="stat-sub">${escapeHtml(topSignal)}</div>
+        <div class="stat-sub">${escapeHtml(topObservedTheme)}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Avg Confidence</div>
@@ -676,7 +676,7 @@ export function renderHtml(
     </header>
 
     <div class="research-posture">
-      Research-only observation layer. Timing labels, rankings, confidence, and historical accuracy do not authorize a trade or allocation. PXI action authority remains withheld until the prospective evidence and exact-policy gates pass.
+      Research-only observation layer. Signals never authorizes action. Timing labels, rankings, confidence, and historical accuracy do not authorize a trade or allocation. <code>/api/plan</code> is the sole authoritative PXI action surface.
     </div>
 
     <!-- Summary Dashboard -->

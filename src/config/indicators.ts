@@ -188,6 +188,8 @@ export const INDICATORS: IndicatorDefinition[] = [
   // ============== MACRO ECONOMIC (10%) ==============
   {
     id: 'ism_manufacturing',
+    canonicalId: 'manufacturing_payrolls',
+    definitionVersion: 'indicator-contract/v1',
     name: 'Manufacturing Payrolls',
     category: 'macro',
     source: 'fred',
@@ -196,6 +198,10 @@ export const INDICATORS: IndicatorDefinition[] = [
     normalization: 'percentile',
     inverted: false,
     description: 'Manufacturing employees, thousands (FRED MANEMP); legacy internal ID retained for history compatibility',
+    units: 'Thousands of persons, seasonally adjusted',
+    sourceUrl: 'https://fred.stlouisfed.org/series/MANEMP',
+    publisher: 'U.S. Bureau of Labor Statistics via FRED',
+    releaseName: 'Current Employment Statistics',
   },
   {
     id: 'jobless_claims',

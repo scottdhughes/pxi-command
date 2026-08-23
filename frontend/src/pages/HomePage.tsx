@@ -120,8 +120,10 @@ function RegimeBadge({ regime }: { regime: PXIData['regime'] }) {
   )
 }
 
-function SignalIndicator({ signal }: { signal: SignalData['signal'] | null }) {
-  if (!signal) return null
+function SignalIndicator({ data }: { data: SignalData | null }) {
+  if (!data) return null
+
+  const { signal, decision_contract: decisionContract } = data
 
   const signalColors: Record<string, string> = {
     FULL_RISK: '#00c896',
@@ -137,30 +139,34 @@ function SignalIndicator({ signal }: { signal: SignalData['signal'] | null }) {
     DEFENSIVE: 'Defensive',
   }
 
-  const color = signalColors[signal.type] || '#949ba5'
-  const actionAuthorized = signal.action_authorized === true && typeof signal.risk_allocation === 'number'
+  const researchPosture = decisionContract?.descriptive_context.research_posture || signal.type
+  const color = signalColors[researchPosture] || '#949ba5'
+  const evidenceStatus = decisionContract?.evidence.status || 'BLOCKED'
 
   return (
     <div className="flex items-center gap-2 sm:gap-4 mb-6">
       <div className="w-20 sm:w-28 shrink-0 text-right">
         <span className="text-[9px] text-[#949ba5]/50 uppercase tracking-widest">
-          {actionAuthorized ? 'Signal' : 'Research posture'}
+          Research posture
         </span>
       </div>
-      <div className="flex-1 flex items-center gap-3">
+      <div className="min-w-0 flex-1 flex flex-wrap items-start gap-2 sm:gap-3">
         <div
           className="bg-[#0a0a0a]/80 backdrop-blur-sm rounded px-3 py-2"
           style={{ borderLeft: `2px solid ${color}` }}
         >
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
             <span
               className="text-[11px] font-medium uppercase tracking-wide"
               style={{ color }}
             >
-              {signalLabels[signal.type]}
+              {signalLabels[researchPosture]}
             </span>
-            <span className={`text-[10px] font-mono ${actionAuthorized ? 'text-[#f3f3f3]/80' : 'text-[#f59e0b]'}`}>
-              {actionAuthorized ? `${Math.round((signal.risk_allocation as number) * 100)}%` : 'allocation withheld'}
+            <span className="text-[10px] font-mono text-[#f59e0b]">
+              allocation withheld
+            </span>
+            <span className={`text-[8px] uppercase tracking-widest ${evidenceStatus === 'PASSED' ? 'text-[#00c896]' : 'text-[#f59e0b]'}`}>
+              evidence {evidenceStatus.toLowerCase()}
             </span>
             {signal.conflict_state && (
               <span className={`text-[8px] uppercase tracking-widest ${
@@ -179,6 +185,9 @@ function SignalIndicator({ signal }: { signal: SignalData['signal'] | null }) {
               {signal.adjustments.join(' · ')}
             </p>
           )}
+          <p className="text-[9px] text-[#949ba5]/60 mt-1">
+            {decisionContract?.headline || 'No actionable signal'} · research context only; the Plan is the sole allocation authority.
+          </p>
         </div>
         {signal.volatility_percentile !== null && (
           <span className="text-[9px] text-[#949ba5]/40">
@@ -508,7 +517,7 @@ export function HomePage({
                 <RegimeBadge regime={data.regime} />
               </div>
             ) : null}
-            {signal && <SignalIndicator signal={signal.signal} />}
+            {signal && <SignalIndicator data={signal} />}
             <BriefCompactCard brief={briefData} onOpen={() => navigateTo('/brief')} className="w-full p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg" />
           </div>
         </details>

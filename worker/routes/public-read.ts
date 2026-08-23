@@ -4,6 +4,7 @@ import type {
   WorkerRouteContext,
 } from '../types';
 import { INDICATORS } from '../../src/config/indicators.js';
+import { evaluateSla, resolveIndicatorSla } from '../../src/config/indicator-sla.js';
 
 type PublicReadDeps = Record<string, any>;
 
@@ -323,24 +324,31 @@ export async function tryHandlePublicReadRoute(
       return Response.json({ error: 'Invalid category' }, { status: 400, headers: corsHeaders });
     }
 
-    const latestPxi = await env.DB.prepare(
-      'SELECT date FROM pxi_scores ORDER BY date DESC LIMIT 1'
-    ).first<{ date: string }>();
+    const selected = await deps.selectLatestPxiWithCategories(env.DB);
+    const latestPxi = selected.pxi;
 
     if (!latestPxi) {
       return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
     }
 
-    const categoryScore = await env.DB.prepare(
-      'SELECT score, weight FROM category_scores WHERE category = ? AND date = ?'
-    ).bind(category, latestPxi.date).first<{ score: number; weight: number }>();
+    const categoryScore = selected.categories.find(
+      (row: { category: string }) => row.category === category,
+    );
+    if (!categoryScore) {
+      return Response.json({ error: 'No category data' }, { status: 404, headers: corsHeaders });
+    }
 
     const categoryIndicators = INDICATORS.filter((indicator) => indicator.category === category);
     const categoryIndicatorIds = categoryIndicators.map((indicator) => indicator.id);
 
     const indicatorScoresResult = await env.DB.prepare(`
       WITH latest AS (
-        SELECT iv.indicator_id, iv.value AS raw_value
+        SELECT
+          iv.indicator_id,
+          iv.date AS observation_date,
+          iv.value AS raw_value,
+          iv.source,
+          iv.fetched_at
         FROM indicator_values iv
         INNER JOIN (
           SELECT indicator_id, MAX(date) AS max_date
@@ -354,7 +362,10 @@ export async function tryHandlePublicReadRoute(
       )
       SELECT
         latest.indicator_id,
+        latest.observation_date,
         latest.raw_value,
+        latest.source,
+        latest.fetched_at,
         100.0 * (
           SUM(CASE WHEN history.value < latest.raw_value THEN 1 ELSE 0 END) +
           (0.5 * SUM(CASE WHEN history.value = latest.raw_value THEN 1 ELSE 0 END))
@@ -364,7 +375,12 @@ export async function tryHandlePublicReadRoute(
         ON history.indicator_id = latest.indicator_id
        AND history.date >= date(?, '-5 years')
        AND history.date <= ?
-      GROUP BY latest.indicator_id, latest.raw_value
+      GROUP BY
+        latest.indicator_id,
+        latest.observation_date,
+        latest.raw_value,
+        latest.source,
+        latest.fetched_at
       HAVING COUNT(history.value) >= 10
     `).bind(
       ...categoryIndicatorIds,
@@ -373,39 +389,78 @@ export async function tryHandlePublicReadRoute(
       latestPxi.date,
     ).all<{
       indicator_id: string;
+      observation_date: string;
       raw_value: number;
+      source: string;
+      fetched_at: string | null;
       normalized_value: number;
     }>();
 
     const historyResult = await env.DB.prepare(`
       SELECT date, score FROM category_scores
-      WHERE category = ?
+      WHERE category = ? AND date <= ?
       ORDER BY date DESC
       LIMIT 90
-    `).bind(category).all<{ date: string; score: number }>();
+    `).bind(category, latestPxi.date).all<{ date: string; score: number }>();
 
     const scores = (historyResult.results || []).map((row) => row.score);
-    const currentScore = categoryScore?.score || 0;
+    const currentScore = categoryScore.score;
     const percentileRank = scores.length > 0
       ? (scores.filter((score) => score < currentScore).length / scores.length) * 100
       : 50;
 
-    const indicatorNames = new Map(categoryIndicators.map((indicator) => [indicator.id, indicator.name]));
+    const indicatorDefinitions = new Map(categoryIndicators.map((indicator) => [indicator.id, indicator]));
 
     const payload: CategoryDetailResponsePayload = {
       category,
       date: latestPxi.date,
       score: currentScore,
-      weight: categoryScore?.weight || 0,
+      weight: categoryScore.weight,
       percentile_rank: Math.round(percentileRank),
-      indicators: (indicatorScoresResult.results || []).map((indicator) => ({
-        id: indicator.indicator_id,
-        name: indicatorNames.get(indicator.indicator_id) || indicator.indicator_id,
-        raw_value: indicator.raw_value,
-        normalized_value: categoryIndicators.find((definition) => definition.id === indicator.indicator_id)?.inverted
-          ? 100 - indicator.normalized_value
-          : indicator.normalized_value,
-      })),
+      indicators: (indicatorScoresResult.results || []).map((indicator) => {
+        const definition = indicatorDefinitions.get(indicator.indicator_id);
+        if (!definition) {
+          throw new Error(`Indicator definition missing for ${indicator.indicator_id}`);
+        }
+        const sla = evaluateSla(
+          indicator.observation_date,
+          new Date(`${latestPxi.date}T00:00:00.000Z`),
+          resolveIndicatorSla(definition.id, definition.frequency),
+        );
+
+        return {
+          id: indicator.indicator_id,
+          canonical_id: definition.canonicalId || definition.id,
+          legacy_id: definition.canonicalId ? definition.id : null,
+          identity_status: definition.canonicalId ? 'legacy_storage_id' as const : 'canonical' as const,
+          definition_version: definition.definitionVersion || 'indicator-contract/v1',
+          name: definition.name,
+          raw_value: indicator.raw_value,
+          normalized_value: definition.inverted
+            ? 100 - indicator.normalized_value
+            : indicator.normalized_value,
+          source: indicator.source,
+          observed_source: indicator.source,
+          configured_source: definition.source,
+          series: definition.ticker,
+          source_series: definition.ticker,
+          frequency: definition.frequency,
+          observation_date: indicator.observation_date,
+          fetched_at: indicator.fetched_at,
+          description: definition.description,
+          units: definition.units || null,
+          source_url: definition.sourceUrl || null,
+          publisher: definition.publisher || null,
+          release_name: definition.releaseName || null,
+          freshness: {
+            status: sla.missing ? 'missing' : sla.stale ? 'stale' : 'fresh',
+            basis: 'observation_date_sla' as const,
+            age_days: sla.days_old === null ? null : Math.round(sla.days_old),
+            max_age_days: sla.max_age_days,
+            sla_class: sla.sla_class,
+          },
+        };
+      }),
       history: (historyResult.results || []).reverse(),
     };
 

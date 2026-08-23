@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { fetchApi, getOrCreateUtilitySessionId, utilityDecisionEventForState } from '../lib/api'
+import { isPlanActionAuthorized } from '../lib/plan-contract'
 import { applyRouteMetadata, getRouteFetchPlan, normalizeRoute, type AppRoute } from '../lib/routes'
 import type {
   AlertsApiResponse,
@@ -417,21 +418,126 @@ export function usePxiAppShell() {
         if (signalRes?.ok) {
           const signalJson = await signalRes.json() as SignalData & { error?: string }
           if (!signalJson.error) {
-            setSignal(signalJson)
+            const evidencePass = signalJson.signal.evidence_gate?.pass === true
+            const decisionContract: SignalData['decision_contract'] = signalJson.decision_contract || {
+              contract_version: '2026-08-23-v1',
+              headline: 'No actionable signal',
+              actionability_state: 'NO_ACTION',
+              action_authorized: false,
+              actionability_reason_codes: ['decision_contract_missing', 'signal_endpoint_research_only'],
+              descriptive_context: {
+                pxi_label: signalJson.state.label,
+                regime: signalJson.regime?.type || null,
+                research_posture: signalJson.signal.type,
+              },
+              evidence: {
+                status: evidencePass ? 'PASSED' : 'BLOCKED',
+                pass: evidencePass,
+                reason_codes: signalJson.signal.evidence_gate?.reasons || ['prospective_evidence_unavailable'],
+              },
+              structural_quality: {
+                score: signalJson.edge_quality?.score || 0,
+                label: signalJson.edge_quality?.label || 'LOW',
+                interpretation: 'INPUT_AND_MODEL_DIAGNOSTIC_NOT_VALIDATED_EDGE',
+              },
+              consistency_scope: 'INTERNAL_COHERENCE',
+            }
+            setSignal({
+              ...signalJson,
+              decision_contract: decisionContract,
+              signal: {
+                ...signalJson.signal,
+                action_authorized: false,
+                risk_allocation: null,
+              },
+              edge_quality: signalJson.edge_quality
+                ? {
+                    ...signalJson.edge_quality,
+                    diagnostic_scope: signalJson.edge_quality.diagnostic_scope || 'INPUT_AND_MODEL_STRUCTURE',
+                    validated_edge: signalJson.edge_quality.validated_edge === true && evidencePass,
+                    calibration_authority: signalJson.edge_quality.calibration_authority || 'NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG',
+                  }
+                : undefined,
+            })
           }
         }
 
         if (planRes?.ok) {
           const planJson = await planRes.json() as PlanData
           if (planJson.setup_summary && planJson.action_now) {
+            const receivedDecisionContract = planJson.decision_contract
+            const fallbackDecisionContract: PlanData['decision_contract'] = {
+              contract_version: '2026-08-23-v1',
+              headline: 'No actionable signal',
+              actionability_state: 'NO_ACTION',
+              action_authorized: false,
+              actionability_reason_codes: ['decision_contract_missing'],
+              descriptive_context: {
+                pxi_label: 'UNKNOWN',
+                regime: null,
+                research_posture: planJson.action_now.primary_signal === 'FULL_RISK' ||
+                  planJson.action_now.primary_signal === 'REDUCED_RISK' ||
+                  planJson.action_now.primary_signal === 'RISK_OFF' ||
+                  planJson.action_now.primary_signal === 'DEFENSIVE'
+                    ? planJson.action_now.primary_signal
+                    : 'REDUCED_RISK',
+              },
+              evidence: {
+                status: 'BLOCKED',
+                pass: false,
+                reason_codes: ['decision_contract_missing'],
+              },
+              structural_quality: {
+                score: planJson.edge_quality.score,
+                label: planJson.edge_quality.label,
+                interpretation: 'INPUT_AND_MODEL_DIAGNOSTIC_NOT_VALIDATED_EDGE',
+              },
+              consistency_scope: 'INTERNAL_COHERENCE',
+            }
+            const sourceDecisionContract = receivedDecisionContract || fallbackDecisionContract
+            const incomingPlaybook = planJson.trader_playbook
+            const incomingSizing = incomingPlaybook?.recommended_size_pct
+            const actionAuthorized = isPlanActionAuthorized(planJson)
+            const actionabilityState = actionAuthorized
+              ? 'ACTIONABLE'
+              : sourceDecisionContract.actionability_state === 'WATCH'
+                ? 'WATCH'
+                : 'NO_ACTION'
+            const actionabilityReasonCodes = !actionAuthorized && sourceDecisionContract.action_authorized
+              ? Array.from(new Set([...sourceDecisionContract.actionability_reason_codes, 'decision_contract_inconsistent']))
+              : sourceDecisionContract.actionability_reason_codes
+            const decisionContract: PlanData['decision_contract'] = {
+              ...sourceDecisionContract,
+              headline: actionAuthorized
+                ? 'Actionable plan'
+                : actionabilityState === 'WATCH'
+                  ? 'Watch only'
+                  : 'No actionable signal',
+              actionability_state: actionabilityState,
+              action_authorized: actionAuthorized,
+              actionability_reason_codes: actionabilityReasonCodes,
+            }
             setPlanData({
               ...planJson,
-              actionability_state: planJson.actionability_state || (planJson.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH'),
-              actionability_reason_codes: Array.isArray(planJson.actionability_reason_codes) ? planJson.actionability_reason_codes : [],
+              decision_contract: decisionContract,
+              actionability_state: decisionContract.actionability_state,
+              actionability_reason_codes: decisionContract.actionability_reason_codes,
               action_now: {
                 ...planJson.action_now,
+                action_authorized: actionAuthorized,
+                risk_allocation_target: actionAuthorized ? planJson.action_now.risk_allocation_target : null,
                 raw_signal_allocation_target: planJson.action_now.raw_signal_allocation_target ?? planJson.action_now.risk_allocation_target ?? 0.5,
-                risk_allocation_basis: planJson.action_now.risk_allocation_basis || 'penalized_playbook_target',
+                risk_allocation_basis: actionAuthorized
+                  ? 'penalized_playbook_target'
+                  : decisionContract.evidence.pass
+                    ? 'withheld_actionability'
+                    : 'withheld_edge_evidence',
+              },
+              edge_quality: {
+                ...planJson.edge_quality,
+                diagnostic_scope: planJson.edge_quality.diagnostic_scope || 'INPUT_AND_MODEL_STRUCTURE',
+                validated_edge: planJson.edge_quality.validated_edge === true && decisionContract.evidence.pass,
+                calibration_authority: planJson.edge_quality.calibration_authority || 'NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG',
               },
               policy_state: planJson.policy_state ? {
                 ...planJson.policy_state,
@@ -455,19 +561,26 @@ export function usePxiAppShell() {
                     },
                   }
                 : {
-                    score: 100,
-                    state: 'PASS',
-                    violations: [],
+                    score: 0,
+                    state: 'FAIL',
+                    violations: ['consistency_contract_missing'],
                     components: {
-                      base_score: 100,
-                      structural_penalty: 0,
-                      reliability_penalty: 0,
+                      base_score: 0,
+                      structural_penalty: 100,
+                      reliability_penalty: 100,
                     },
                   },
-              trader_playbook: planJson.trader_playbook || {
-                recommended_size_pct: { min: 25, target: 50, max: 65 },
-                scenarios: [],
-                benchmark_follow_through_7d: {
+              trader_playbook: {
+                authorization: actionAuthorized ? 'AUTHORIZED' : 'WITHHELD',
+                recommended_size_pct: actionAuthorized
+                  ? {
+                      min: typeof incomingSizing?.min === 'number' ? incomingSizing.min : null,
+                      target: typeof incomingSizing?.target === 'number' ? incomingSizing.target : null,
+                      max: typeof incomingSizing?.max === 'number' ? incomingSizing.max : null,
+                    }
+                  : { min: null, target: null, max: null },
+                scenarios: actionAuthorized ? (incomingPlaybook?.scenarios || []) : [],
+                benchmark_follow_through_7d: incomingPlaybook?.benchmark_follow_through_7d || {
                   hit_rate: null,
                   sample_size: 0,
                   unavailable_reason: 'insufficient_sample',
@@ -482,11 +595,15 @@ export function usePxiAppShell() {
               decision_stack: planJson.decision_stack
                 ? {
                     ...planJson.decision_stack,
-                    cta_state: planJson.decision_stack.cta_state || (planJson.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH'),
+                    cta_state: decisionContract.actionability_state,
                   }
                 : undefined,
             })
+          } else {
+            setPlanData(null)
           }
+        } else if (fetchPlan.plan) {
+          setPlanData(null)
         }
 
         if (predRes?.ok) {
@@ -557,9 +674,9 @@ export function usePxiAppShell() {
               source_plan_as_of: briefJson.source_plan_as_of || briefJson.as_of,
               contract_version: briefJson.contract_version || 'legacy',
               consistency: briefJson.consistency || {
-                score: 100,
-                state: 'PASS',
-                violations: [],
+                score: 0,
+                state: 'FAIL',
+                violations: ['consistency_contract_missing'],
               },
               degraded_reason: briefJson.degraded_reason || null,
             })
@@ -599,14 +716,21 @@ export function usePxiAppShell() {
               coherence_fail_rate: Number.isFinite(oppJson.coherence_fail_rate as number) ? Number(oppJson.coherence_fail_rate) : 0,
               actionability_state: oppJson.actionability_state || (oppJson.items.length > 0 ? 'WATCH' : 'NO_ACTION'),
               actionability_reason_codes: Array.isArray(oppJson.actionability_reason_codes) ? oppJson.actionability_reason_codes : [],
-              cta_enabled: typeof oppJson.cta_enabled === 'boolean' ? oppJson.cta_enabled : oppJson.items.length > 0,
-              cta_disabled_reasons: Array.isArray(oppJson.cta_disabled_reasons) ? oppJson.cta_disabled_reasons : [],
+              cta_enabled: oppJson.cta_enabled === true && oppJson.actionability_state === 'ACTIONABLE',
+              cta_disabled_reasons: Array.from(new Set([
+                ...(Array.isArray(oppJson.cta_disabled_reasons) ? oppJson.cta_disabled_reasons : ['authority_contract_missing']),
+                ...(oppJson.cta_enabled === true && oppJson.actionability_state !== 'ACTIONABLE'
+                  ? ['actionability_state_not_actionable']
+                  : []),
+              ])),
               data_age_seconds: dataAgeSeconds,
               ttl_state: oppJson.ttl_state || 'unknown',
               next_expected_refresh_at: typeof oppJson.next_expected_refresh_at === 'string' ? oppJson.next_expected_refresh_at : null,
               overdue_seconds: overdueSeconds,
             })
           }
+        } else if (fetchPlan.opportunities) {
+          setOpportunitiesData(null)
         }
 
         if (oppImpactRes?.ok) {
@@ -702,6 +826,12 @@ export function usePxiAppShell() {
 
         setError(null)
       } catch (err: unknown) {
+        if (fetchPlan.plan) {
+          setPlanData(null)
+        }
+        if (fetchPlan.opportunities) {
+          setOpportunitiesData(null)
+        }
         if (isHomeRoute) {
           const message = err instanceof Error ? err.message : 'Unknown error'
           setError(message)

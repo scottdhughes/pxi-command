@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  CANONICAL_PXI_CATEGORIES,
   buildCanonicalMarketDecision,
   resolveEdgeEvidenceGate,
   suppressProjectionForEdgeEvidence,
@@ -12,6 +13,14 @@ import { computeDecisionGradeScorecard } from './market-ops.js';
 import type { WorkerRouteContext } from '../types.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+function canonicalCategoryRows(score = 70) {
+  return CANONICAL_PXI_CATEGORIES.map((category) => ({
+    category,
+    score,
+    weight: 1 / CANONICAL_PXI_CATEGORIES.length,
+  }));
+}
 
 type QueryResult =
   | null
@@ -415,11 +424,7 @@ test('buildCanonicalMarketDecision assembles the extracted decision payload', as
       delta_7d: 4.2,
       delta_30d: 7.3,
     } as any,
-    categories: [
-      { category: 'credit', score: 68, weight: 0.25 },
-      { category: 'macro', score: 72, weight: 0.25 },
-      { category: 'liquidity', score: 74, weight: 0.25 },
-    ] as any,
+    categories: canonicalCategoryRows() as any,
   });
 
   assert.equal(decision.as_of, '2026-03-05T00:00:00.000Z');
@@ -555,11 +560,7 @@ test('tryHandleMarketCoreRoute reports a generic plan build failure for unexpect
         }];
       }
       if (sql.includes('FROM category_scores WHERE date = ?')) {
-        return [
-          { category: 'credit', score: 68, weight: 0.25 },
-          { category: 'macro', score: 72, weight: 0.25 },
-          { category: 'liquidity', score: 74, weight: 0.25 },
-        ];
+        return canonicalCategoryRows();
       }
       throw new Error(`Unhandled query: ${sql}`);
     }),
@@ -585,14 +586,16 @@ test('tryHandleMarketCoreRoute reports a generic plan build failure for unexpect
   assert.equal(payload.degraded_reason, 'decision_build_failed');
 });
 
-test('tryHandleMarketCoreRoute passes the selected horizon evidence gate into plan actionability', async () => {
-  const resolvedGates: Array<{ pass: boolean; reasons?: string[] }> = [];
-  const asOf = '2026-03-05T00:00:00.000Z';
+test('tryHandleMarketCoreRoute blocks plan authority for an opportunity snapshot from a different PXI date', async () => {
+  const canonicalDate = '2026-03-05';
+  const staleSnapshotAsOf = '2026-03-04T18:00:00.000Z';
+  const staleSnapshotCreatedAt = '2026-03-04T18:05:00.000Z';
+  const ttlInputs: Array<string | null> = [];
   const route = createRouteContext('https://pxi.test/api/plan', undefined, {
     DB: createFakeDb((sql) => {
       if (sql.includes('FROM pxi_scores ORDER BY date DESC LIMIT 10')) {
         return [{
-          date: '2026-03-05',
+          date: canonicalDate,
           score: 71,
           label: 'risk-on',
           status: 'bullish',
@@ -601,13 +604,7 @@ test('tryHandleMarketCoreRoute passes the selected horizon evidence gate into pl
           delta_30d: 7.3,
         }];
       }
-      if (sql.includes('FROM category_scores WHERE date = ?')) {
-        return [
-          { category: 'credit', score: 68, weight: 0.25 },
-          { category: 'macro', score: 72, weight: 0.25 },
-          { category: 'liquidity', score: 74, weight: 0.25 },
-        ];
-      }
+      if (sql.includes('FROM category_scores WHERE date = ?')) return canonicalCategoryRows();
       if (sql.includes('FROM market_brief_snapshots')) return null;
       if (sql.includes('FROM market_alert_events')) {
         return { latest_as_of: null, warning_count: 0, critical_count: 0 };
@@ -615,11 +612,12 @@ test('tryHandleMarketCoreRoute passes the selected horizon evidence gate into pl
       if (sql.includes('FROM opportunity_snapshots')) {
         return [{
           horizon: '7d',
-          as_of: asOf,
+          as_of: staleSnapshotAsOf,
+          created_at: staleSnapshotCreatedAt,
           payload_json: JSON.stringify({
-            as_of: asOf,
+            as_of: staleSnapshotAsOf,
             horizon: '7d',
-            items: [{ id: 'candidate-1', direction: 'LONG', conviction_score: 80 }],
+            items: [{ id: 'stale-candidate', direction: 'LONG', conviction_score: 80 }],
           }),
         }];
       }
@@ -661,10 +659,26 @@ test('tryHandleMarketCoreRoute passes the selected horizon evidence gate into pl
     }),
     buildUncertaintySnapshot: () => ({ level: 'LOW', reasons: [] }),
     computeRiskSizingSnapshot: () => ({ target_pct: 80, raw_signal_allocation_target: 0.8 }),
-    buildTraderPlaybookSnapshot: async () => ({ recommended_size_pct: { target: 80 } }),
+    buildTraderPlaybookSnapshot: async () => ({
+      recommended_size_pct: { min: 68, target: 80, max: 92 },
+      scenarios: [],
+      benchmark_follow_through_7d: { hit_rate: 0.6, sample_size: 100, unavailable_reason: null },
+    }),
     buildConsistencySnapshot: () => ({ score: 100, state: 'PASS', violations: [], components: {} }),
     ensureMarketProductSchema: async () => {},
-    buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': false, '30d': true }),
+    buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': true }),
+    computeOpportunityTtlMetadata: (asOf: string | null) => {
+      ttlInputs.push(asOf);
+      return {
+        data_age_seconds: 60,
+        ttl_state: 'fresh',
+        next_expected_refresh_at: '2026-03-06T10:00:00.000Z',
+        overdue_seconds: 0,
+      };
+    },
+    resolveLatestObservedRefreshTimestamp: async () => {
+      throw new Error('global refresh timestamp must not authorize an opportunity snapshot');
+    },
     normalizeOpportunityItemsForPublishing: (items: unknown[]) => items,
     projectOpportunityFeed: (items: unknown[]) => ({
       items,
@@ -672,13 +686,14 @@ test('tryHandleMarketCoreRoute passes the selected horizon evidence gate into pl
       degraded_reason: null,
       suppression_by_reason: {},
     }),
+    computeCalibrationDiagnostics: () => ({ quality_band: 'ROBUST', ece: 0.01 }),
+    evaluateOpportunityCtaState: () => ({
+      actionability_state: 'ACTIONABLE',
+      cta_enabled: true,
+      cta_disabled_reasons: [],
+    }),
     summarizeCrossHorizonCoherence: () => null,
-    resolvePlanActionability: (args: { edge_evidence_gate: { pass: boolean; reasons?: string[] } }) => {
-      resolvedGates.push(args.edge_evidence_gate);
-      return args.edge_evidence_gate.pass
-        ? { state: 'ACTIONABLE', reason_codes: ['high_edge_with_eligible_opportunities'] }
-        : { state: 'NO_ACTION', reason_codes: ['edge_evidence_gate_block'] };
-    },
+    resolvePlanActionability: () => ({ state: 'ACTIONABLE', reason_codes: ['candidate_actionable'] }),
     applyCrossHorizonActionabilityOverride: (actionability: unknown) => actionability,
     buildDecisionStack: () => [],
     buildInvalidationRules: () => [],
@@ -686,18 +701,14 @@ test('tryHandleMarketCoreRoute passes the selected horizon evidence gate into pl
   });
 
   assert.ok(response);
-  assert.equal(resolvedGates[0]?.pass, false);
-  assert.ok(resolvedGates[0]?.reasons?.some((reason) => reason.includes('stale_evaluation')));
+  assert.deepEqual(ttlInputs, [staleSnapshotCreatedAt]);
   const payload = await response!.json() as Record<string, any>;
-  assert.equal(payload.actionability_state, 'NO_ACTION');
   assert.equal(payload.edge_evidence_gate.pass, false);
+  assert.ok(payload.edge_evidence_gate.reasons.includes('opportunity_snapshot_date_mismatch'));
   assert.equal(payload.action_now.action_authorized, false);
   assert.equal(payload.action_now.risk_allocation_target, null);
-  assert.equal(payload.action_now.raw_signal_allocation_target, 0.8);
-  assert.equal(payload.action_now.risk_allocation_basis, 'withheld_edge_evidence');
-  assert.ok(payload.actionability_reason_codes.includes('edge_evidence_gate_block'));
-  assert.equal(payload.opportunity_ref.eligible_count, 0);
-  assert.equal(payload.opportunity_ref.degraded_reason, 'edge_evidence_gate_failed');
+  assert.equal(payload.opportunity_ref.cta_enabled, false);
+  assert.ok(payload.opportunity_ref.cta_disabled_reasons.includes('edge_evidence_gate_failed'));
 });
 
 test('generateMarketEvents emits regime, threshold, opportunity, and freshness events', async () => {
@@ -793,6 +804,10 @@ test('tryHandleMarketProductsRoute preserves opportunity coherence and CTA field
       ],
     }),
     storeOpportunitySnapshot: async () => {},
+    selectLatestPxiWithCategories: async () => ({
+      pxi: { date: '2026-03-05' },
+      categories: canonicalCategoryRows(),
+    }),
     buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': true }),
     fetchLatestCalibrationSnapshot: async () => ({ quality_band: 'LIMITED' }),
     computeFreshnessStatus: async () => ({ stale_count: 0 }),
@@ -818,16 +833,16 @@ test('tryHandleMarketProductsRoute preserves opportunity coherence and CTA field
   });
 
   assert.ok(response);
-  assert.equal(response?.headers.get('Cache-Control'), 'no-store');
+  assert.equal(response?.headers.get('Cache-Control'), 'public, max-age=60');
 
   const payload = await response!.json() as Record<string, unknown>;
   assert.equal(payload.coherence_suppressed_count, 1);
   assert.equal(payload.coherence_fail_rate, 0.33);
-  assert.equal(payload.degraded_reason, 'refresh_ttl_unknown');
+  assert.equal(payload.degraded_reason, null);
   assert.equal(payload.cta_enabled, false);
   assert.deepEqual(
     (payload.actionability_reason_codes as string[]).sort(),
-    ['cta_freshness_guard', 'opportunity_refresh_ttl_unknown', 'watch_state'].sort(),
+    ['cta_freshness_guard', 'watch_state'].sort(),
   );
 });
 
@@ -840,6 +855,7 @@ test('tryHandleMarketProductsRoute independently suppresses a failed horizon evi
       DB: createFakeDb((sql) => {
         if (sql.includes('FROM opportunity_snapshots')) {
           return {
+            created_at: nowIso,
             payload_json: JSON.stringify({
               as_of: nowIso,
               horizon: '7d',
@@ -862,6 +878,10 @@ test('tryHandleMarketProductsRoute independently suppresses a failed horizon evi
     isFeatureEnabled: () => true,
     ensureMarketProductSchema: async () => {},
     buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': false }),
+    selectLatestPxiWithCategories: async () => ({
+      pxi: { date: nowIso.slice(0, 10) },
+      categories: canonicalCategoryRows(),
+    }),
     buildOpportunityFallbackSnapshot: () => {
       throw new Error('fallback should not be used');
     },
@@ -901,7 +921,7 @@ test('tryHandleMarketProductsRoute independently suppresses a failed horizon evi
   assert.ok(payload.actionability_reason_codes.includes('opportunity_edge_evidence_gate_failed'));
 });
 
-test('tryHandleMarketProductsRoute rebuilds stale opportunity snapshots and uses observed refresh timestamps', async () => {
+test('tryHandleMarketProductsRoute rebuilds and persists a canonical replacement snapshot', async () => {
   const nowIso = new Date().toISOString();
   let rebuilt = 0;
   let storedAfterRebuild = 0;
@@ -913,6 +933,7 @@ test('tryHandleMarketProductsRoute rebuilds stale opportunity snapshots and uses
       DB: createFakeDb((sql) => {
         if (sql.includes('FROM opportunity_snapshots')) {
           return {
+            created_at: '2026-03-08 14:00:00',
             payload_json: JSON.stringify({
               as_of: '2026-03-08T00:00:00.000Z',
               horizon: '7d',
@@ -948,6 +969,10 @@ test('tryHandleMarketProductsRoute rebuilds stale opportunity snapshots and uses
     storeOpportunitySnapshot: async () => {
       storedAfterRebuild += 1;
     },
+    selectLatestPxiWithCategories: async () => ({
+      pxi: { date: '2026-03-11' },
+      categories: canonicalCategoryRows(),
+    }),
     buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': true }),
     fetchLatestCalibrationSnapshot: async () => ({ quality_band: 'ROBUST' }),
     computeFreshnessStatus: async () => ({ stale_count: 0, critical_stale_count: 0 }),
@@ -976,10 +1001,89 @@ test('tryHandleMarketProductsRoute rebuilds stale opportunity snapshots and uses
   assert.ok(response);
   const payload = await response!.json() as Record<string, unknown>;
   assert.equal(rebuilt, 1);
-  assert.equal(storedAfterRebuild, 0);
+  assert.equal(storedAfterRebuild, 1);
   assert.equal(payload.as_of, '2026-03-11T00:00:00.000Z');
   assert.equal(payload.ttl_state, 'fresh');
   assert.equal((payload.items as Array<Record<string, unknown>>)[0]?.id, 'new-op');
+});
+
+test('tryHandleMarketProductsRoute retains the complete-date snapshot while a newer PXI refresh is partial', async () => {
+  const nowIso = new Date().toISOString();
+  let rebuilt = 0;
+  let stored = 0;
+  const canonicalDate = '2026-03-10';
+
+  const request = new Request('https://pxi.test/api/opportunities?horizon=7d&limit=5');
+  const route = {
+    request,
+    env: {
+      DB: createFakeDb((sql) => {
+        if (sql.includes('FROM opportunity_snapshots')) {
+          return {
+            created_at: nowIso,
+            payload_json: JSON.stringify({
+              as_of: `${canonicalDate}T00:00:00.000Z`,
+              horizon: '7d',
+              items: [{ id: 'canonical-op', theme_id: 'credit', theme_name: 'credit', conviction_score: 63 }],
+            }),
+          };
+        }
+        throw new Error(`Unhandled query: ${sql}`);
+      }),
+    },
+    url: new URL(request.url),
+    method: 'GET',
+    corsHeaders: {},
+  };
+
+  const response = await tryHandleMarketProductsRoute(route as any, {
+    isFeatureEnabled: () => true,
+    ensureMarketProductSchema: async () => {},
+    buildOpportunityFallbackSnapshot: () => {
+      throw new Error('fallback should not be used');
+    },
+    // The exact selector intentionally returns yesterday's complete state even
+    // though a newer raw pxi_scores row may already exist mid-refresh.
+    selectLatestPxiWithCategories: async () => ({
+      pxi: { date: canonicalDate },
+      categories: canonicalCategoryRows(),
+    }),
+    buildOpportunitySnapshot: async () => {
+      rebuilt += 1;
+      return null;
+    },
+    storeOpportunitySnapshot: async () => {
+      stored += 1;
+    },
+    buildEdgeDiagnosticsReport: async () => buildEdgeEvidenceReport({ '7d': true }),
+    fetchLatestCalibrationSnapshot: async () => ({ total_samples: 100 }),
+    computeFreshnessStatus: async () => ({ stale_count: 0, critical_stale_count: 0 }),
+    fetchLatestConsistencyCheck: async () => ({ state: 'PASS' }),
+    normalizeOpportunityItemsForPublishing: (items: unknown[]) => items,
+    projectOpportunityFeed: (items: unknown[]) => ({
+      items,
+      suppressed_count: 0,
+      quality_filtered_count: 0,
+      coherence_suppressed_count: 0,
+      suppression_by_reason: { coherence_failed: 0, quality_filtered: 0, data_quality_suppressed: 0 },
+      quality_filter_rate: 0,
+      coherence_fail_rate: 0,
+      degraded_reason: null,
+    }),
+    computeCalibrationDiagnostics: () => ({ quality_band: 'ROBUST', ece: 0.04 }),
+    evaluateOpportunityCtaState: () => ({
+      actionability_state: 'ACTIONABLE',
+      cta_enabled: true,
+      cta_disabled_reasons: [],
+    }),
+  });
+
+  assert.ok(response);
+  const payload = await response!.json() as Record<string, any>;
+  assert.equal(rebuilt, 0);
+  assert.equal(stored, 0);
+  assert.equal(payload.as_of, `${canonicalDate}T00:00:00.000Z`);
+  assert.equal(payload.items[0]?.id, 'canonical-op');
 });
 
 test('computeDecisionGradeScorecard composes go-live blockers from extracted diagnostics', async () => {

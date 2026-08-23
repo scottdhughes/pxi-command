@@ -1,7 +1,9 @@
 import {
+  computeOpportunityTtlMetadata as computeOpportunityTtlMetadataModule,
   computeNextExpectedRefresh as computeNextExpectedRefreshModule,
   isBriefSnapshotCompatible as isBriefSnapshotCompatibleModule,
 } from '../domain/market-products';
+import { selectLatestPxiWithCategories as selectLatestPxiWithCategoriesModule } from '../domain/market-core';
 import { ensureMarketProductSchema as ensureMarketProductSchemaGuard } from '../db/schema';
 import {
   insertMarketEvents as insertMarketEventsData,
@@ -84,6 +86,7 @@ export function createRouteDeps() {
     computeEdgeQualitySnapshot: legacy.computeEdgeQualitySnapshot,
     computeFreshnessDiagnostics: legacy.computeFreshnessDiagnostics,
     computeFreshnessStatus: legacy.computeFreshnessStatus,
+    computeOpportunityTtlMetadata: computeOpportunityTtlMetadataModule,
     computeRiskSizingSnapshot: legacy.computeRiskSizingSnapshot,
     claimMarketRefreshRun: claimMarketRefreshRunData,
     computeFreshnessSloWindow: computeFreshnessSloWindowData,
@@ -151,6 +154,7 @@ export function createRouteDeps() {
     resolveThemeProxyRules: legacy.resolveThemeProxyRules,
     roundMetric: legacy.roundMetric,
     sanitizeUtilityPayload: legacy.sanitizeUtilityPayload,
+    selectLatestPxiWithCategories: selectLatestPxiWithCategoriesModule,
     sendCloudflareEmail: legacy.sendCloudflareEmail,
     reserveDigestDeliveryForSubscriber: reserveDigestDeliveryForSubscriberService,
     finalizeDigestDeliverySent: finalizeDigestDeliverySentService,

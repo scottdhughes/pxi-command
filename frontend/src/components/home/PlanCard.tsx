@@ -33,22 +33,41 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
   if (!plan) return null
 
   const policyStance = derivePolicyStance(plan)
-  const actionabilityState = plan.actionability_state || (plan.opportunity_ref?.eligible_count === 0 ? 'NO_ACTION' : 'WATCH')
-  const actionabilityReasons = (plan.actionability_reason_codes || []).filter(Boolean)
+  const decisionContract = plan.decision_contract
+  const actionabilityState = decisionContract?.actionability_state || 'NO_ACTION'
+  const actionabilityReasons = (decisionContract?.actionability_reason_codes || ['decision_contract_missing']).filter(Boolean)
   const noActionUnlockConditions = actionabilityState === 'NO_ACTION'
     ? deriveNoActionUnlockConditions({ actionabilityReasonCodes: actionabilityReasons })
     : []
-  const actionAuthorized = plan.action_now.action_authorized === true
-  const targetPct = actionAuthorized && typeof plan.action_now.risk_allocation_target === 'number'
-    ? Math.round(plan.action_now.risk_allocation_target * 100)
+  const authorizedTarget = typeof plan.action_now.risk_allocation_target === 'number'
+    ? plan.action_now.risk_allocation_target
     : null
-  const rawTargetPct = actionAuthorized
+  const actionAuthorized = Boolean(
+    decisionContract?.action_authorized === true &&
+    decisionContract.evidence.pass === true &&
+    actionabilityState === 'ACTIONABLE' &&
+    plan.action_now.action_authorized === true &&
+    authorizedTarget !== null,
+  )
+  const targetPct = actionAuthorized && authorizedTarget !== null
+    ? Math.round(authorizedTarget * 100)
+    : null
+  const rawTargetPct = actionAuthorized && typeof plan.action_now.raw_signal_allocation_target === 'number'
     ? Math.round((plan.action_now.raw_signal_allocation_target ?? plan.action_now.risk_allocation_target ?? 0.5) * 100)
     : null
+  const canonicalHeadline = decisionContract?.headline || 'No actionable signal'
+  const evidenceStatus = decisionContract?.evidence.status || 'BLOCKED'
+  const evidenceClass = evidenceStatus === 'PASSED'
+    ? 'border-[#00c896]/40 text-[#00c896]'
+    : 'border-[#f59e0b]/40 text-[#f59e0b]'
+  const structuralQuality = decisionContract?.structural_quality || {
+    score: plan.edge_quality.score,
+    label: plan.edge_quality.label,
+  }
   const qualityColor =
-    plan.edge_quality.label === 'HIGH' ? 'text-[#00c896]' :
-    plan.edge_quality.label === 'MEDIUM' ? 'text-[#f59e0b]' :
-    'text-[#ff6b6b]'
+    structuralQuality.label === 'HIGH' ? 'text-[#00a3ff]' :
+    structuralQuality.label === 'MEDIUM' ? 'text-[#949ba5]' :
+    'text-[#f59e0b]'
 
   const conflictColor =
     plan.edge_quality.conflict_state === 'ALIGNED' ? 'text-[#00c896]' :
@@ -84,20 +103,52 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
     crossHorizonState === 'MIXED' ? 'border-[#f59e0b]/40 text-[#f59e0b]' :
     crossHorizonState === 'CONFLICT' ? 'border-[#ff6b6b]/40 text-[#ff6b6b]' :
     'border-[#26272b] text-[#949ba5]'
-  const decisionStack = plan.decision_stack || {
-    what_changed: plan.setup_summary,
-    what_to_do: actionabilityState === 'ACTIONABLE'
-      ? 'Execute with playbook risk controls.'
+  const decisionStack = {
+    what_changed: plan.decision_stack?.what_changed || plan.setup_summary,
+    what_to_do: actionAuthorized
+      ? (plan.decision_stack?.what_to_do || 'Execute with playbook risk controls.')
       : actionabilityState === 'WATCH'
-        ? 'Hold watch posture until confirmation.'
-        : 'No action; wait for unlock conditions.',
-    why_now: `${plan.edge_quality.label} edge with ${plan.consistency.state} consistency.`,
-    confidence: `edge=${plan.edge_quality.label} | consistency=${plan.consistency.state}`,
+        ? 'Watch only; do not allocate until the Plan evidence and actionability gates authorize it.'
+        : 'No action; allocation remains withheld until the Plan evidence and actionability gates authorize it.',
+    why_now: `Prospective evidence ${evidenceStatus.toLowerCase()} · structural quality ${structuralQuality.label.toLowerCase()} · internal consistency ${plan.consistency.state.toLowerCase()}.`,
+    confidence: 'Structural quality and internal consistency are diagnostics, not proof of validated edge.',
     cta_state: actionabilityState,
   }
+  const sizing = plan.trader_playbook.recommended_size_pct
+  const sizingReady = Boolean(
+    actionAuthorized &&
+    plan.trader_playbook.authorization === 'AUTHORIZED' &&
+    typeof sizing.min === 'number' &&
+    typeof sizing.target === 'number' &&
+    typeof sizing.max === 'number',
+  )
 
   return (
     <section className="w-full mb-6 rounded border border-[#26272b] bg-[#0a0a0a]/80 p-4">
+      <div className={`mb-3 rounded border px-3 py-3 ${actionAuthorized ? 'border-[#00c896]/40 bg-[#00c896]/5' : 'border-[#f59e0b]/40 bg-[#f59e0b]/5'}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="text-[9px] uppercase tracking-wider text-[#949ba5]">Canonical Plan decision</p>
+            <p className={`mt-1 text-[14px] font-medium ${actionAuthorized ? 'text-[#00c896]' : 'text-[#f3e3c2]'}`}>
+              {canonicalHeadline}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2 text-[8px] uppercase tracking-wider">
+            <span className={`rounded border px-2 py-1 ${actionabilityClass(actionabilityState)}`}>
+              {formatActionabilityState(actionabilityState)}
+            </span>
+            <span className={`rounded border px-2 py-1 ${evidenceClass}`}>
+              evidence {evidenceStatus.toLowerCase()}
+            </span>
+          </div>
+        </div>
+        <p className="mt-2 text-[10px] text-[#d7dbe1]">
+          {targetPct === null
+            ? 'Allocation withheld. The research context below is descriptive only.'
+            : `Authorized allocation target: ${targetPct}%.`}
+        </p>
+      </div>
+
       {shouldShowUncertaintyBanner && (
         <div className="mb-3 rounded border border-[#f59e0b]/40 bg-[#f59e0b]/10 px-3 py-2">
           <p className="text-[9px] uppercase tracking-wider text-[#f59e0b]">Uncertainty</p>
@@ -122,16 +173,16 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
 
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-[9px] uppercase tracking-[0.25em] text-[#949ba5]">Decision</p>
+          <p className="text-[9px] uppercase tracking-[0.25em] text-[#949ba5]">Research context</p>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wide">
             <span className={`rounded border px-2 py-1 ${policyStanceClass(policyStance)}`}>
-              stance {policyStance.replace('_', ' ')}
+              descriptive stance {policyStance.replace('_', ' ')}
             </span>
             <span className={`rounded border px-2 py-1 ${actionabilityClass(actionabilityState)}`}>
               {formatActionabilityState(actionabilityState)}
             </span>
             <span className="rounded border border-[#26272b] px-2 py-1 text-[#949ba5]">
-              {actionAuthorized ? 'tactical' : 'research posture'} {plan.action_now.primary_signal.replace('_', ' ')}
+              research posture {plan.action_now.primary_signal.replace('_', ' ')}
             </span>
             <span className={`rounded border px-2 py-1 ${actionAuthorized ? 'border-[#26272b] text-[#d7dbe1]' : 'border-[#f59e0b]/40 text-[#f59e0b]'}`}>
               {targetPct === null ? 'allocation withheld' : `target ${targetPct}%`}
@@ -178,17 +229,17 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
         </div>
         <div className="shrink-0 text-right">
           <p className={`text-[11px] font-medium uppercase tracking-wide ${qualityColor}`}>
-            {plan.edge_quality.label}
+            structural quality {structuralQuality.label}
           </p>
-          <p className="text-[10px] text-[#949ba5]">edge {plan.edge_quality.score}</p>
+          <p className="text-[10px] text-[#949ba5]">diagnostic {structuralQuality.score}</p>
         </div>
       </div>
 
       <div className="mt-4 rounded border border-[#26272b] px-2 py-2">
         <div className="flex items-center justify-between gap-2">
-          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Confidence</p>
+          <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Diagnostics</p>
           <span className={`rounded border px-2 py-0.5 text-[8px] uppercase tracking-wider ${consistencyClass}`}>
-            consistency {plan.consistency.state} {plan.consistency.score}
+            internal consistency {plan.consistency.state} {plan.consistency.score}
           </span>
         </div>
         <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
@@ -199,7 +250,7 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
             {plan.edge_quality.conflict_state.toLowerCase()}
           </span>
           <span className={`rounded border px-2 py-1 ${calibrationQualityClass(calibration.quality)}`}>
-            calibration {calibration.quality.toLowerCase()}
+            legacy calibration {calibration.quality.toLowerCase()}
           </span>
         </div>
         {plan.consistency.components && (
@@ -224,13 +275,16 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
           ))}
         </div>
         <p className="mt-2 text-[10px] text-[#d7dbe1]">
-          p(correct) {formatProbability(calibration.probability_correct_7d)} ·
+          legacy p(correct) {formatProbability(calibration.probability_correct_7d)} ·
           {' '}95% CI {formatProbability(calibration.ci95_low_7d)}-{formatProbability(calibration.ci95_high_7d)} ·
           {' '}bin {calibration.bin || 'n/a'} · n={calibration.sample_size_7d}
         </p>
+        <p className="mt-1 text-[9px] text-[#949ba5]/70">
+          Non-authoritative legacy diagnostic; the prospective evidence gate controls action.
+        </p>
         {calibration.quality !== 'ROBUST' && (
           <p className="mt-1 text-[9px] text-[#f59e0b]">
-            Limited calibration sample; size down and prefer faster invalidation checks.
+            Limited calibration sample; do not use it to infer an allocation.
           </p>
         )}
       </div>
@@ -252,7 +306,7 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
       </div>
 
       <div className="mt-3 rounded border border-[#26272b] px-2 py-2">
-        <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Risk Limits</p>
+        <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Historical scenario context · non-authoritative</p>
         <div className="mt-2 grid grid-cols-2 gap-2 text-[10px]">
           <div className="rounded border border-[#26272b] px-2 py-2">
             <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">7d band</p>
@@ -271,10 +325,10 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
         </div>
         <div className="mt-2 rounded border border-[#26272b] px-2 py-2">
           <p className="text-[9px] uppercase tracking-wide text-[#949ba5]">Sizing Playbook</p>
-          {actionAuthorized ? (
+          {sizingReady ? (
             <p className="mt-1 text-[10px] text-[#d7dbe1]">
-              size range {plan.trader_playbook.recommended_size_pct.min}%-{plan.trader_playbook.recommended_size_pct.max}%
-              {' '}· target {plan.trader_playbook.recommended_size_pct.target}%
+              size range {sizing.min}%-{sizing.max}%
+              {' '}· target {sizing.target}%
             </p>
           ) : (
             <p className="mt-1 text-[10px] text-[#f59e0b]">
@@ -288,7 +342,7 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
               ? ` · ${formatUnavailableReason(plan.trader_playbook.benchmark_follow_through_7d.unavailable_reason)}`
               : ''}
           </p>
-          {actionAuthorized && <div className="mt-2 space-y-1">
+          {sizingReady && <div className="mt-2 space-y-1">
             {plan.trader_playbook.scenarios.slice(0, 3).map((scenario) => (
               <div key={`${scenario.condition}-${scenario.action}`} className="text-[9px] text-[#cfd5de]">
                 <span className="text-[#949ba5]">if</span> {scenario.condition} <span className="text-[#949ba5]">then</span> {scenario.action}

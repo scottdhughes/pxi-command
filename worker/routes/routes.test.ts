@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { tryHandleAdminIngestionRoute } from './admin-ingestion.js';
+import { selectLatestPxiWithCategories } from '../domain/market-core.js';
 import { tryHandlePublicReadRoute } from './public-read.js';
 import { tryHandleSimilarityRoute } from './similarity.js';
 import { tryHandleSystemRoute } from './system.js';
@@ -239,6 +240,130 @@ test('tryHandlePublicReadRoute rejects invalid category paths', async () => {
   const route = createRouteContext('https://pxi.test/api/category/invalid');
   const response = await tryHandlePublicReadRoute(route as any, {});
   assert.equal(response?.status, 400);
+});
+
+test('tryHandlePublicReadRoute preserves legacy indicator IDs and exposes category provenance', async () => {
+  const route = createRouteContext('https://pxi.test/api/category/macro', undefined, {
+    DB: createFakeDb((sql) => {
+      if (sql.includes('WITH latest AS')) {
+        return [{
+          indicator_id: 'ism_manufacturing',
+          observation_date: '2026-07-01',
+          raw_value: 12611,
+          source: 'fred',
+          fetched_at: '2026-08-23 14:00:31',
+          normalized_value: 11.875,
+        }];
+      }
+      if (sql.includes('SELECT date, score FROM category_scores')) {
+        return [
+          { date: '2026-08-22', score: 63.4 },
+          { date: '2026-08-23', score: 63.47 },
+        ];
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandlePublicReadRoute(route as any, {
+    selectLatestPxiWithCategories: async () => ({
+      pxi: { date: '2026-08-23' },
+      categories: [{ category: 'macro', score: 63.47, weight: 0.1 }],
+    }),
+  });
+  assert.ok(response);
+  assert.equal(response!.status, 200);
+
+  const payload = await response!.json() as any;
+  assert.deepEqual(payload.indicators, [{
+    id: 'ism_manufacturing',
+    canonical_id: 'manufacturing_payrolls',
+    legacy_id: 'ism_manufacturing',
+    identity_status: 'legacy_storage_id',
+    definition_version: 'indicator-contract/v1',
+    name: 'Manufacturing Payrolls',
+    raw_value: 12611,
+    normalized_value: 11.875,
+    source: 'fred',
+    observed_source: 'fred',
+    configured_source: 'fred',
+    series: 'MANEMP',
+    source_series: 'MANEMP',
+    frequency: 'monthly',
+    observation_date: '2026-07-01',
+    fetched_at: '2026-08-23 14:00:31',
+    description: 'Manufacturing employees, thousands (FRED MANEMP); legacy internal ID retained for history compatibility',
+    units: 'Thousands of persons, seasonally adjusted',
+    source_url: 'https://fred.stlouisfed.org/series/MANEMP',
+    publisher: 'U.S. Bureau of Labor Statistics via FRED',
+    release_name: 'Current Employment Statistics',
+    freshness: {
+      status: 'fresh',
+      basis: 'observation_date_sla',
+      age_days: 53,
+      max_age_days: 65,
+      sla_class: 'monthly',
+    },
+  }]);
+});
+
+test('tryHandlePublicReadRoute anchors category detail to the latest exact PXI state', async () => {
+  let historyArgs: unknown[] = [];
+  const route = createRouteContext('https://pxi.test/api/category/macro', undefined, {
+    DB: createFakeDb((sql, args) => {
+      if (sql.includes('FROM pxi_scores ORDER BY date DESC LIMIT 10')) {
+        return [
+          {
+            date: '2026-08-23',
+            score: 71,
+            label: 'Constructive',
+            status: 'GREEN',
+            delta_1d: 1,
+            delta_7d: 2,
+            delta_30d: 3,
+          },
+          {
+            date: '2026-08-22',
+            score: 69,
+            label: 'Constructive',
+            status: 'GREEN',
+            delta_1d: 0,
+            delta_7d: 1,
+            delta_30d: 2,
+          },
+        ];
+      }
+      if (sql.includes('SELECT category, score, weight FROM category_scores')) {
+        const date = String(args[0]);
+        const categories = date === '2026-08-23'
+          ? CANONICAL_PXI_CATEGORIES.filter((candidate) => candidate !== 'macro')
+          : CANONICAL_PXI_CATEGORIES;
+        return categories.map((candidate) => ({
+          category: candidate,
+          score: candidate === 'macro' ? 63.47 : 55,
+          weight: 0.1,
+        }));
+      }
+      if (sql.includes('WITH latest AS')) return [];
+      if (sql.includes('SELECT date, score FROM category_scores')) {
+        historyArgs = args;
+        return [{ date: '2026-08-22', score: 63.47 }];
+      }
+      throw new Error(`Unhandled query: ${sql}`);
+    }),
+  });
+
+  const response = await tryHandlePublicReadRoute(route as any, {
+    selectLatestPxiWithCategories,
+  });
+  assert.ok(response);
+  assert.equal(response!.status, 200);
+
+  const payload = await response!.json() as any;
+  assert.equal(payload.date, '2026-08-22');
+  assert.equal(payload.score, 63.47);
+  assert.equal(payload.weight, 0.1);
+  assert.deepEqual(historyArgs, ['macro', '2026-08-22']);
 });
 
 test('tryHandlePublicReadRoute serves /api/analyze', async () => {

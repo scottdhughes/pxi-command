@@ -331,7 +331,7 @@ export function BriefCompactCard({
   return (
     <div className={className || 'w-full mt-6 p-4 bg-[#0a0a0a]/60 border border-[#26272b] rounded-lg'}>
       <div className="flex items-center justify-between mb-2">
-        <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider">Today&apos;s Brief</div>
+        <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider">Today&apos;s Brief · Research Context</div>
         <button
           onClick={onOpen}
           className="text-[9px] uppercase tracking-[0.2em] text-[#00a3ff] hover:text-[#7ccfff]"
@@ -342,7 +342,9 @@ export function BriefCompactCard({
       <p className="text-[12px] text-[#d7dbe1] leading-relaxed">{brief.summary}</p>
       <div className="mt-3 flex items-center gap-2 text-[9px] uppercase tracking-wider">
         <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.regime_delta}</span>
-        <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.risk_posture.replace('_', '-')}</span>
+        <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+          research posture {brief.risk_posture.replace('_', '-')}
+        </span>
         <span className={`px-2 py-1 border rounded ${
           brief.consistency.state === 'PASS'
             ? 'border-[#00c896]/40 text-[#00c896]'
@@ -350,7 +352,7 @@ export function BriefCompactCard({
               ? 'border-[#f59e0b]/40 text-[#f59e0b]'
               : 'border-[#ff6b6b]/40 text-[#ff6b6b]'
         }`}>
-          {brief.consistency.state} {brief.consistency.score}
+          internal consistency {brief.consistency.state} {brief.consistency.score}
         </span>
         {brief.freshness_status.has_stale_data && (
           <span className="px-2 py-1 border border-[#ff6b6b]/40 rounded text-[#ff6b6b]">
@@ -359,7 +361,10 @@ export function BriefCompactCard({
         )}
       </div>
       <div className="mt-2 text-[9px] uppercase tracking-wider text-[#949ba5]/70">
-        policy {brief.policy_state.stance.replace('_', ' ')} · {brief.policy_state.base_signal.replace(/_/g, ' ')}
+        descriptive stance {brief.policy_state.stance.replace('_', ' ')} · research signal {brief.policy_state.base_signal.replace(/_/g, ' ')}
+      </div>
+      <div className="mt-1 text-[9px] text-[#949ba5]/60">
+        Context only; the Plan is the sole allocation authority.
       </div>
       {brief.degraded_reason && (
         <div className="mt-1 text-[9px] text-[#f59e0b]">
@@ -385,9 +390,7 @@ export function OpportunityPreview({ data, onOpen }: { data: OpportunitiesRespon
   const coherenceFailRate = Number.isFinite(data.coherence_fail_rate as number) ? Number(data.coherence_fail_rate) : 0
   const actionabilityState = data.actionability_state || (top.length === 0 ? 'NO_ACTION' : 'WATCH')
   const ctaDisabledReasons = data.cta_disabled_reasons || []
-  const ctaEnabled = typeof data.cta_enabled === 'boolean'
-    ? data.cta_enabled
-    : (top.length > 0 && ctaDisabledReasons.length === 0)
+  const ctaEnabled = data.cta_enabled === true && actionabilityState === 'ACTIONABLE'
   const ttlState = data.ttl_state || 'unknown'
   const dataAgeText = formatDataAgeSeconds(data.data_age_seconds)
   const nextExpectedRefresh = data.next_expected_refresh_at ? new Date(data.next_expected_refresh_at).toLocaleString() : 'unknown'

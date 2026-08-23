@@ -35,14 +35,19 @@ export function BriefPage({
           <div className="space-y-6">
             <div className="p-5 bg-[#0a0a0a]/70 border border-[#26272b] rounded-lg">
               <div className="text-[9px] text-[#949ba5]/50 uppercase tracking-wider mb-2">
-                Market Summary
+                Market Summary · Research Context
               </div>
               <p className="text-[14px] leading-relaxed text-[#e4e8ee]">{brief.summary}</p>
+              <p className="mt-2 text-[10px] leading-relaxed text-[#949ba5]/80">
+                Descriptive context only. This brief cannot authorize an allocation; /api/plan is the sole action authority.
+              </p>
               <div className="mt-3 flex flex-wrap items-center gap-2 text-[9px] uppercase tracking-wider">
                 <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.regime_delta}</span>
-                <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">{brief.risk_posture.replace('_', '-')}</span>
                 <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
-                  stance {brief.policy_state.stance.replace('_', ' ')}
+                  research posture {brief.risk_posture.replace('_', '-')}
+                </span>
+                <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
+                  descriptive stance {brief.policy_state.stance.replace('_', ' ')}
                 </span>
                 <span className={`px-2 py-1 border rounded ${
                   brief.consistency.state === 'PASS'
@@ -51,7 +56,7 @@ export function BriefPage({
                       ? 'border-[#f59e0b]/40 text-[#f59e0b]'
                       : 'border-[#ff6b6b]/40 text-[#ff6b6b]'
                 }`}>
-                  consistency {brief.consistency.state} {brief.consistency.score}
+                  internal consistency {brief.consistency.state} {brief.consistency.score}
                 </span>
                 <span className="px-2 py-1 border border-[#26272b] rounded text-[#949ba5]">
                   as of {new Date(brief.as_of).toLocaleString()}
@@ -76,7 +81,7 @@ export function BriefPage({
               <div className="impact-card p-4 border rounded-lg">
                 <div className="flex items-center justify-between gap-2">
                   <div className="text-[9px] uppercase tracking-wider text-[#949ba5]/60">
-                    Market impact ({formatDecisionImpactBasis(decisionImpact.outcome_basis)})
+                    Observational market impact ({formatDecisionImpactBasis(decisionImpact.outcome_basis)})
                   </div>
                   <span className={`impact-quality-chip rounded border px-2 py-1 text-[8px] uppercase tracking-wider ${calibrationQualityClass(decisionImpact.market.quality_band)}`}>
                     {decisionImpact.market.quality_band.toLowerCase()}

@@ -1,7 +1,7 @@
 import {
   buildCanonicalMarketDecision,
+  evaluateOpportunityAuthorityProjection,
   resolveEdgeEvidenceGate,
-  suppressProjectionForEdgeEvidence,
 } from './market-core';
 import {
   HISTORICAL_BACKFILL_SEED_MARKER,
@@ -47,7 +47,10 @@ export function computeNextExpectedRefresh(now = new Date()): { at: string; in_m
 
 function parseIsoTimestamp(value: string | null | undefined): Date | null {
   if (!value) return null;
-  const parsed = new Date(value);
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
+    ? `${value.replace(' ', 'T')}Z`
+    : value;
+  const parsed = new Date(normalized);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed;
 }
@@ -468,16 +471,19 @@ export async function tryHandleMarketProductsRoute(
     const edgeEvidenceGate = resolveEdgeEvidenceGate(edgeDiagnosticsReport, horizon);
 
     let snapshot: OpportunitySnapshot | null = null;
-    let stored: { payload_json: string } | null = null;
+    let stored: { payload_json: string; created_at: string | null } | null = null;
     try {
       stored = await env.DB.prepare(`
-        SELECT payload_json
+        SELECT payload_json, created_at
         FROM opportunity_snapshots
         WHERE horizon = ?
           AND instr(payload_json, ?) = 0
         ORDER BY as_of DESC
         LIMIT 1
-      `).bind(horizon, HISTORICAL_BACKFILL_SEED_MARKER).first<{ payload_json: string }>();
+      `).bind(horizon, HISTORICAL_BACKFILL_SEED_MARKER).first<{
+        payload_json: string;
+        created_at: string | null;
+      }>();
     } catch (err) {
       console.error('Opportunity snapshot lookup failed:', err);
       stored = null;
@@ -489,35 +495,47 @@ export async function tryHandleMarketProductsRoute(
 
     let latestPxiDate: string | null = null;
     try {
-      const latestPxiRow = await env.DB.prepare(`
-        SELECT date
-        FROM pxi_scores
-        ORDER BY date DESC
-        LIMIT 1
-      `).first<{ date: string | null }>();
-      latestPxiDate = latestPxiRow?.date || null;
+      if (typeof deps.selectLatestPxiWithCategories !== 'function') {
+        throw new Error('canonical_pxi_selector_unavailable');
+      }
+      const selected = await deps.selectLatestPxiWithCategories(env.DB);
+      latestPxiDate = selected?.pxi?.date || null;
     } catch (err) {
-      console.error('Latest PXI date lookup failed for opportunities:', err);
+      console.error('Canonical PXI date lookup failed for opportunities:', err);
     }
 
-    const hadStoredSnapshot = Boolean(snapshot);
-    const shouldRebuildSnapshot = !snapshot || (
-      Boolean(latestPxiDate) &&
-      Boolean(snapshotAsOfDate(snapshot)) &&
-      String(snapshotAsOfDate(snapshot)) < String(latestPxiDate)
-    );
+    if (!latestPxiDate) {
+      const fallback = deps.buildOpportunityFallbackSnapshot(horizon, 'canonical_state_unavailable');
+      return Response.json(buildOpportunityRouteFallbackResponse(fallback, unknownTtlMetadata), {
+        headers: {
+          ...corsHeaders,
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+
+    let effectiveSnapshotCreatedAt = stored?.created_at || null;
+    const storedSnapshotDate = snapshotAsOfDate(snapshot);
+    const shouldRebuildSnapshot = !snapshot || storedSnapshotDate !== latestPxiDate;
 
 	    if (shouldRebuildSnapshot) {
+	      let rebuiltSnapshot: OpportunitySnapshot | null = null;
 	      try {
-	        snapshot = await deps.buildOpportunitySnapshot(env.DB, horizon, undefined, {
+	        rebuiltSnapshot = await deps.buildOpportunitySnapshot(env.DB, horizon, undefined, {
           sanitize_signals_tickers: signalsSanitizerEnabled,
           signals_service: env.SIGNALS_SERVICE,
         });
       } catch (err) {
         console.error('Failed to build opportunity snapshot:', err);
-        snapshot = null;
       }
-      if (!snapshot) {
+      if (!rebuiltSnapshot || snapshotAsOfDate(rebuiltSnapshot) !== latestPxiDate) {
+        if (rebuiltSnapshot) {
+          console.error('Rejected opportunity snapshot with non-canonical as_of date', {
+            horizon,
+            expected: latestPxiDate,
+            received: snapshotAsOfDate(rebuiltSnapshot),
+          });
+        }
         const fallback = deps.buildOpportunityFallbackSnapshot(horizon, 'snapshot_unavailable');
         return Response.json(buildOpportunityRouteFallbackResponse(fallback, unknownTtlMetadata), {
           headers: {
@@ -526,12 +544,12 @@ export async function tryHandleMarketProductsRoute(
           },
         });
       }
-	      if (!hadStoredSnapshot) {
-	        try {
-	          await deps.storeOpportunitySnapshot(env.DB, snapshot);
-	        } catch (err) {
-	          console.error('Opportunity snapshot store failed:', err);
-	        }
+	      snapshot = rebuiltSnapshot;
+	      effectiveSnapshotCreatedAt = new Date().toISOString();
+	      try {
+	        await deps.storeOpportunitySnapshot(env.DB, snapshot);
+	      } catch (err) {
+	        console.error('Opportunity snapshot store failed:', err);
 	      }
 	    }
 	    if (!snapshot) {
@@ -545,39 +563,32 @@ export async function tryHandleMarketProductsRoute(
 	    }
 	    const effectiveSnapshot = snapshot;
 
-	    const resolveRefreshTimestamp = deps.resolveLatestObservedRefreshTimestamp || deps.resolveLatestRefreshTimestamp;
-    const [convictionCalibration, freshness, latestConsistencyCheck, latestRefresh] = await Promise.all([
+    const [convictionCalibration, freshness, latestConsistencyCheck] = await Promise.all([
       deps.fetchLatestCalibrationSnapshot(env.DB, 'conviction', horizon),
       deps.computeFreshnessStatus(env.DB),
       deps.fetchLatestConsistencyCheck(env.DB),
-      resolveRefreshTimestamp(env.DB),
     ]);
 
-    let consistencyState = latestConsistencyCheck?.state ?? 'FAIL';
-    if (!latestConsistencyCheck) {
-      try {
-        consistencyState = (await buildCanonicalMarketDecision(env.DB, deps)).consistency.state;
-      } catch {
-        consistencyState = 'FAIL';
-      }
+    let consistencyState: 'PASS' | 'WARN' | 'FAIL' = 'FAIL';
+    try {
+      consistencyState = (await buildCanonicalMarketDecision(env.DB, deps)).consistency.state;
+    } catch {
+      consistencyState = latestConsistencyCheck?.state ?? 'FAIL';
     }
 
-	    const normalizedItems = deps.normalizeOpportunityItemsForPublishing(effectiveSnapshot.items, convictionCalibration);
-    const candidateProjection = deps.projectOpportunityFeed(normalizedItems, {
+    const ttlMetadata = computeOpportunityTtlMetadata(effectiveSnapshotCreatedAt, new Date());
+    const authorityProjection = evaluateOpportunityAuthorityProjection({
+      items: effectiveSnapshot.items,
+      calibration: convictionCalibration,
       coherence_gate_enabled: coherenceGateEnabled,
       freshness,
       consistency_state: consistencyState,
-    });
-    const projectedFeed = suppressProjectionForEdgeEvidence(candidateProjection, edgeEvidenceGate);
-    const ttlMetadata = computeOpportunityTtlMetadata(latestRefresh.last_refresh_at_utc, new Date());
-    let effectiveDegradedReason = projectedFeed.degraded_reason;
-    if (!effectiveDegradedReason && ttlMetadata.ttl_state === 'overdue') {
-      effectiveDegradedReason = 'refresh_ttl_overdue';
-    } else if (!effectiveDegradedReason && ttlMetadata.ttl_state === 'unknown') {
-      effectiveDegradedReason = 'refresh_ttl_unknown';
-    }
-    const diagnostics = deps.computeCalibrationDiagnostics(convictionCalibration);
-    const ctaState = deps.evaluateOpportunityCtaState(projectedFeed, diagnostics, ttlMetadata, effectiveDegradedReason);
+      edge_evidence_gate: edgeEvidenceGate,
+      ttl: ttlMetadata,
+    }, deps);
+    const projectedFeed = authorityProjection.projected_feed;
+    const effectiveDegradedReason = projectedFeed.degraded_reason;
+    const ctaState = authorityProjection.cta_state;
     const actionabilityReasonCodes = Array.from(new Set([
       ...(!edgeEvidenceGate.pass ? ['edge_evidence_gate_block'] : []),
       ...(projectedFeed.items.length === 0 ? ['no_eligible_opportunities'] : []),

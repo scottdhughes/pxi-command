@@ -33,6 +33,8 @@ export type UpdateFrequency =
 
 export interface IndicatorDefinition {
   id: string;
+  canonicalId?: string;
+  definitionVersion?: string;
   name: string;
   category: Category;
   source: DataSource;
@@ -41,6 +43,10 @@ export interface IndicatorDefinition {
   normalization: NormalizationMethod;
   inverted: boolean;
   description: string;
+  units?: string;
+  sourceUrl?: string;
+  publisher?: string;
+  releaseName?: string;
 }
 
 export interface IndicatorValue {

@@ -595,6 +595,14 @@ export function CategoryModal({
   const formatDisplayName = (name: string) =>
     name.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())
 
+  const formatObservationDate = (value: string | null | undefined) => {
+    if (!value) return 'unavailable'
+    const parsed = new Date(`${value}T00:00:00Z`)
+    return Number.isNaN(parsed.getTime())
+      ? value
+      : parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+  }
+
   const renderSparkline = () => {
     if (!data || data.history.length < 2) return null
 
@@ -716,27 +724,67 @@ export function CategoryModal({
                   Component Indicators
                 </div>
                 <div className="space-y-2">
-                  {data.indicators.map((ind) => (
-                    <div key={ind.id} className="flex items-center justify-between py-2 border-b border-[#1a1a1a]">
-                      <div>
-                        <div className="text-[11px] text-[#f3f3f3]">{ind.name}</div>
-                        <div className="text-[9px] text-[#949ba5]/50 font-mono mt-0.5">
-                          Raw: {typeof ind.raw_value === 'number' ? ind.raw_value.toFixed(2) : '—'}
+                  {data.indicators.map((ind) => {
+                    const sourceHref = ind.source_url && /^https?:\/\//i.test(ind.source_url) ? ind.source_url : null
+                    const sourceLabel = ind.publisher || ind.observed_source || ind.configured_source || ind.source || 'Source unavailable'
+                    const sourceSeries = ind.source_series || ind.series || 'series unavailable'
+                    const frequency = typeof ind.frequency === 'string' ? ind.frequency : null
+                    const freshness = ind.freshness || null
+                    const referenceLabel = frequency === 'monthly' || freshness?.sla_class === 'source_lagged'
+                      ? 'Reference period'
+                      : 'Observation'
+                    const freshnessClass = freshness?.status === 'fresh'
+                      ? 'text-[#00c896]'
+                      : freshness?.status === 'stale'
+                        ? 'text-[#f59e0b]'
+                        : 'text-[#ff6b6b]'
+                    const ageLabel = freshness?.age_days === null || freshness?.age_days === undefined
+                      ? 'age unknown'
+                      : `${freshness.age_days}d old`
+
+                    return (
+                      <div key={ind.id} className="flex items-start justify-between gap-3 py-2 border-b border-[#1a1a1a]">
+                        <div className="min-w-0">
+                          <div className="text-[11px] text-[#f3f3f3]">{ind.name}</div>
+                          <div className="text-[9px] text-[#949ba5]/50 font-mono mt-0.5">
+                            Raw: {typeof ind.raw_value === 'number' ? ind.raw_value.toFixed(2) : '—'}{ind.units ? ` ${ind.units}` : ''}
+                          </div>
+                          <div className="mt-1 text-[9px] text-[#949ba5]/65">
+                            {frequency === 'monthly' ? 'Monthly · ' : ''}{referenceLabel}: {formatObservationDate(ind.observation_date)}
+                          </div>
+                          {freshness ? (
+                            <div className={`mt-0.5 text-[9px] ${freshnessClass}`}>
+                              {freshness.status} by {freshness.sla_class.replace('_', '-')} SLA · {ageLabel} / {freshness.max_age_days}d max · as of PXI snapshot {data.date}
+                            </div>
+                          ) : (
+                            <div className="mt-0.5 text-[9px] text-[#f59e0b]">
+                              SLA metadata unavailable
+                            </div>
+                          )}
+                          <div className="mt-0.5 truncate text-[9px] text-[#949ba5]/55">
+                            {sourceHref ? (
+                              <a href={sourceHref} target="_blank" rel="noreferrer" className="hover:text-[#00a3ff] hover:underline">
+                                {sourceLabel} · {sourceSeries}
+                              </a>
+                            ) : (
+                              <span>{sourceLabel} · {sourceSeries}</span>
+                            )}
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <div className={`text-lg font-mono ${getScoreColor(ind.normalized_value)}`}>
+                            {Math.round(ind.normalized_value)}
+                          </div>
+                          <div className="w-12 h-1 bg-[#26272b] rounded-full overflow-hidden mt-1">
+                            <div
+                              className="h-full bg-[#00a3ff]/60 rounded-full"
+                              style={{ width: `${ind.normalized_value}%` }}
+                            />
+                          </div>
                         </div>
                       </div>
-                      <div className="text-right">
-                        <div className={`text-lg font-mono ${getScoreColor(ind.normalized_value)}`}>
-                          {Math.round(ind.normalized_value)}
-                        </div>
-                        <div className="w-12 h-1 bg-[#26272b] rounded-full overflow-hidden mt-1">
-                          <div
-                            className="h-full bg-[#00a3ff]/60 rounded-full"
-                            style={{ width: `${ind.normalized_value}%` }}
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               </div>
 

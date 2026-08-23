@@ -34,7 +34,7 @@ const STORED_REPORT_NAV_STYLE = `<style>
 </style>`
 
 const RESEARCH_POSTURE_BANNER = `<div class="research-posture">
-      Research-only observation layer. Timing labels, rankings, confidence, and historical accuracy do not authorize a trade or allocation. PXI action authority remains withheld until the prospective evidence and exact-policy gates pass.
+      Research-only observation layer. Signals never authorizes action. Timing labels, rankings, confidence, and historical accuracy do not authorize a trade or allocation. <code>/api/plan</code> is the sole authoritative PXI action surface.
     </div>`
 
 // Historical report snapshots used Dataset without publishing a dataset license.
@@ -69,8 +69,13 @@ export function upgradeStoredReportNavigation(html: string): string {
     .replace(/<div class="nav-dropdown-menu">[\s\S]*?<\/div>/, COMPLETE_SITE_NAV)
     .replace(/>Actionable Signals</g, ">Research Timing Flags — Not Actionable<")
     .replace(/>Top (\d+) Opportunities</g, ">Top $1 Observed Themes<")
+    .replace(/>Top Signal</g, ">Top Observed Theme<")
     .replace(/>"Now" Signals</g, '>"Now" Activity Flags<')
     .replace(/>Ready to act</g, ">Research only<")
+    .replace(
+      /(<span\b[^>]*\bclass=["'][^"']*\bhero-meta-label\b[^"']*["'][^>]*>)\s*(?:Next Update\s*){2,}(<\/span>)/gi,
+      "$1Next Update$2",
+    )
   if (!upgraded.includes('class="research-posture"')) {
     upgraded = upgraded.replace("<!-- Summary Dashboard -->", `${RESEARCH_POSTURE_BANNER}\n\n    <!-- Summary Dashboard -->`)
   }
@@ -681,7 +686,7 @@ function generateOgImageSvg(topTheme: string, totalDocs: number, analysisDate: s
     Research Signals
   </text>
 
-  <!-- Top Signal Box -->
+  <!-- Top Observed Theme Box -->
   <rect x="80" y="340" width="1040" height="120" rx="8" fill="#0a0a0a" stroke="#26272b" stroke-width="1"/>
   <text x="110" y="385" font-family="ui-monospace, SF Mono, monospace" font-size="14" fill="#949ba5" letter-spacing="0.1em">
     TOP OBSERVED THEME

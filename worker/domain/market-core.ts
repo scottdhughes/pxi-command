@@ -1,7 +1,9 @@
 import type {
   CanonicalMarketDecision,
   CategoryRow,
+  DecisionContractSnapshot,
   OpportunitySnapshot,
+  OpportunityTtlMetadata,
   PlanPayload,
   PXIResponsePayload,
   PXIRow,
@@ -19,6 +21,120 @@ type MarketCoreDeps = Record<string, any>;
 export interface EdgeEvidenceGateResolution {
   pass: boolean;
   reasons: string[];
+}
+
+export const CANONICAL_PXI_CATEGORIES = Object.freeze([
+  'positioning',
+  'credit',
+  'volatility',
+  'breadth',
+  'macro',
+  'global',
+  'crypto',
+] as const);
+
+function selectCanonicalCategories(categories: CategoryRow[]): CategoryRow[] | null {
+  const canonical = new Set<string>(CANONICAL_PXI_CATEGORIES);
+  const selected = categories.filter((row) => canonical.has(row.category));
+  const present = new Set(selected.map((row) => row.category));
+  return selected.length === CANONICAL_PXI_CATEGORIES.length &&
+    present.size === CANONICAL_PXI_CATEGORIES.length &&
+    CANONICAL_PXI_CATEGORIES.every((category) => present.has(category))
+    ? selected
+    : null;
+}
+
+export function buildDecisionContractSnapshot(args: {
+  actionability_state: DecisionContractSnapshot['actionability_state'];
+  action_authorized: boolean;
+  actionability_reason_codes: string[];
+  pxi_label: string;
+  regime: DecisionContractSnapshot['descriptive_context']['regime'];
+  research_posture: DecisionContractSnapshot['descriptive_context']['research_posture'];
+  evidence_gate: EdgeEvidenceGateResolution;
+  consistency_state: 'PASS' | 'WARN' | 'FAIL';
+  opportunity_cta_enabled: boolean;
+  allocation_target: number | null;
+  structural_quality: {
+    score: number;
+    label: DecisionContractSnapshot['structural_quality']['label'];
+  };
+}): DecisionContractSnapshot {
+  const hasNumericAllocationTarget = typeof args.allocation_target === 'number' &&
+    Number.isFinite(args.allocation_target);
+  const actionAuthorized = args.action_authorized === true &&
+    args.actionability_state === 'ACTIONABLE' &&
+    args.evidence_gate.pass === true &&
+    args.consistency_state !== 'FAIL' &&
+    args.opportunity_cta_enabled === true &&
+    hasNumericAllocationTarget;
+  const actionabilityState = actionAuthorized
+    ? 'ACTIONABLE'
+    : args.actionability_state === 'ACTIONABLE'
+      ? 'NO_ACTION'
+      : args.actionability_state;
+  const evidenceReasons = Array.from(new Set(args.evidence_gate.reasons));
+  const reasonCodes = Array.from(new Set([
+    ...args.actionability_reason_codes,
+    ...(args.evidence_gate.pass ? [] : ['edge_evidence_gate_block']),
+    ...(args.action_authorized && args.consistency_state === 'FAIL' ? ['consistency_fail_block'] : []),
+    ...(args.action_authorized && args.opportunity_cta_enabled !== true ? ['opportunity_cta_disabled'] : []),
+    ...(args.action_authorized && !hasNumericAllocationTarget ? ['allocation_target_missing'] : []),
+    ...(args.action_authorized && !actionAuthorized ? ['authorization_invariant_block'] : []),
+  ]));
+
+  return {
+    contract_version: '2026-08-23-v1',
+    headline: actionAuthorized
+      ? 'Actionable plan'
+      : actionabilityState === 'WATCH'
+        ? 'Watch only'
+        : 'No actionable signal',
+    actionability_state: actionabilityState,
+    action_authorized: actionAuthorized,
+    actionability_reason_codes: reasonCodes,
+    descriptive_context: {
+      pxi_label: args.pxi_label,
+      regime: args.regime,
+      research_posture: args.research_posture,
+    },
+    evidence: {
+      status: args.evidence_gate.pass ? 'PASSED' : 'BLOCKED',
+      pass: args.evidence_gate.pass,
+      reason_codes: evidenceReasons,
+    },
+    structural_quality: {
+      score: args.structural_quality.score,
+      label: args.structural_quality.label,
+      interpretation: 'INPUT_AND_MODEL_DIAGNOSTIC_NOT_VALIDATED_EDGE',
+    },
+    consistency_scope: 'INTERNAL_COHERENCE',
+  };
+}
+
+export function projectTraderPlaybookForDecision(
+  playbook: CanonicalMarketDecision['trader_playbook'],
+  actionAuthorized: boolean,
+): PlanPayload['trader_playbook'] {
+  if (actionAuthorized) {
+    return {
+      authorization: 'AUTHORIZED',
+      recommended_size_pct: playbook.recommended_size_pct,
+      scenarios: playbook.scenarios,
+      benchmark_follow_through_7d: playbook.benchmark_follow_through_7d,
+    };
+  }
+
+  return {
+    authorization: 'WITHHELD',
+    recommended_size_pct: { min: null, target: null, max: null },
+    scenarios: [{
+      condition: 'The prospective evidence or plan actionability gate is blocked.',
+      action: 'Do not use the research posture to change allocation.',
+      invalidation: 'Re-evaluate only after the evidence gate passes and the plan becomes actionable.',
+    }],
+    benchmark_follow_through_7d: playbook.benchmark_follow_through_7d,
+  };
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -118,9 +234,100 @@ export function suppressProjectionForEdgeEvidence<T extends Record<string, any>>
   };
 }
 
+export function evaluateOpportunityAuthorityProjection(args: {
+  items: OpportunitySnapshot['items'];
+  calibration: unknown;
+  coherence_gate_enabled: boolean;
+  freshness: unknown;
+  consistency_state: 'PASS' | 'WARN' | 'FAIL';
+  edge_evidence_gate: EdgeEvidenceGateResolution;
+  ttl: OpportunityTtlMetadata;
+}, deps: MarketCoreDeps): {
+  projected_feed: Record<string, any>;
+  cta_state: {
+    cta_enabled: boolean;
+    cta_disabled_reasons: string[];
+    actionability_state: 'ACTIONABLE' | 'WATCH' | 'NO_ACTION';
+  };
+} {
+  const normalizedItems = deps.normalizeOpportunityItemsForPublishing(
+    args.items,
+    args.calibration,
+  );
+  const candidateProjection = deps.projectOpportunityFeed(normalizedItems, {
+    coherence_gate_enabled: args.coherence_gate_enabled,
+    freshness: args.freshness,
+    consistency_state: args.consistency_state,
+  });
+  const projected = suppressProjectionForEdgeEvidence(
+    candidateProjection,
+    args.edge_evidence_gate,
+  );
+
+  let effectiveDegradedReason = projected.degraded_reason;
+  if (!effectiveDegradedReason && args.ttl.ttl_state === 'overdue') {
+    effectiveDegradedReason = 'refresh_ttl_overdue';
+  } else if (!effectiveDegradedReason && args.ttl.ttl_state === 'unknown') {
+    effectiveDegradedReason = 'refresh_ttl_unknown';
+  }
+
+  const projectedFeed = {
+    ...projected,
+    degraded_reason: effectiveDegradedReason,
+  };
+  if (typeof deps.computeCalibrationDiagnostics !== 'function' ||
+    typeof deps.evaluateOpportunityCtaState !== 'function') {
+    return {
+      projected_feed: projectedFeed,
+      cta_state: {
+        cta_enabled: false,
+        cta_disabled_reasons: ['authority_contract_unavailable'],
+        actionability_state: 'NO_ACTION',
+      },
+    };
+  }
+
+  const ctaState = deps.evaluateOpportunityCtaState(
+    projectedFeed,
+    deps.computeCalibrationDiagnostics(args.calibration),
+    args.ttl,
+    effectiveDegradedReason,
+  );
+  const evaluatedActionabilityState = ctaState.actionability_state === 'ACTIONABLE' ||
+    ctaState.actionability_state === 'WATCH'
+    ? ctaState.actionability_state
+    : 'NO_ACTION';
+  const actionabilityState = args.edge_evidence_gate.pass
+    ? evaluatedActionabilityState
+    : 'NO_ACTION';
+  const ctaEnabled = args.edge_evidence_gate.pass === true &&
+    ctaState.cta_enabled === true &&
+    actionabilityState === 'ACTIONABLE';
+  const disabledReasons = Array.isArray(ctaState.cta_disabled_reasons)
+    ? ctaState.cta_disabled_reasons
+    : ['authority_contract_unavailable'];
+  return {
+    projected_feed: projectedFeed,
+    cta_state: {
+      cta_enabled: ctaEnabled,
+      cta_disabled_reasons: Array.from(new Set([
+        ...disabledReasons,
+        ...(!args.edge_evidence_gate.pass ? ['edge_evidence_gate_failed'] : []),
+        ...(!ctaEnabled && ctaState.cta_enabled === true
+          ? ['actionability_state_not_actionable']
+          : []),
+      ])),
+      actionability_state: actionabilityState,
+    },
+  };
+}
+
 function resolvePlanFallbackReason(error: unknown): string {
   if (error instanceof Error && error.message === 'no_pxi_data') {
     return 'no_pxi_data';
+  }
+  if (error instanceof Error && error.message === 'incomplete_pxi_categories') {
+    return 'incomplete_pxi_state';
   }
   return 'decision_build_failed';
 }
@@ -140,20 +347,11 @@ export async function selectLatestPxiWithCategories(db: D1Database): Promise<{
     const cats = await db.prepare(
       'SELECT category, score, weight FROM category_scores WHERE date = ?'
     ).bind(candidate.date).all<CategoryRow>();
-    if ((cats.results?.length || 0) >= 3) {
+    const canonicalCategories = selectCanonicalCategories(cats.results || []);
+    if (canonicalCategories) {
       selected = candidate;
-      selectedCategories = cats.results || [];
+      selectedCategories = canonicalCategories;
       break;
-    }
-  }
-
-  if (!selected) {
-    selected = recentScores.results?.[0] || null;
-    if (selected) {
-      const cats = await db.prepare(
-        'SELECT category, score, weight FROM category_scores WHERE date = ?'
-      ).bind(selected.date).all<CategoryRow>();
-      selectedCategories = cats.results || [];
     }
   }
 
@@ -183,6 +381,12 @@ export async function buildCanonicalMarketDecision(
   if (!pxi) {
     throw new Error('no_pxi_data');
   }
+
+  const canonicalCategories = selectCanonicalCategories(categories);
+  if (!canonicalCategories) {
+    throw new Error('incomplete_pxi_categories');
+  }
+  categories = canonicalCategories;
 
   const categoryScores = categories.map((row) => ({ score: row.score }));
   const [regime, freshness, mlSampleSize, riskBand, edgeCalibrationSnapshot] = await Promise.all([
@@ -293,8 +497,8 @@ export async function tryHandleMarketCoreRoute(
     }
 
     const sparkResult = await env.DB.prepare(
-      'SELECT date, score FROM pxi_scores ORDER BY date DESC LIMIT 30'
-    ).all<SparklineRow>();
+      'SELECT date, score FROM pxi_scores WHERE date <= ? ORDER BY date DESC LIMIT 30'
+    ).bind(pxi.date).all<SparklineRow>();
 
     const regime = await deps.detectRegime(env.DB, pxi.date);
     const divergence = await deps.detectDivergence(env.DB, pxi.score, regime);
@@ -391,24 +595,21 @@ export async function tryHandleMarketCoreRoute(
   }
 
   if (url.pathname === '/api/signal') {
-    const pxi = await env.DB.prepare(
-      'SELECT date, score, label, status, delta_1d, delta_7d, delta_30d FROM pxi_scores ORDER BY date DESC LIMIT 1'
-    ).first<PXIRow>();
+    const selected = await selectLatestPxiWithCategories(env.DB);
+    const pxi = selected.pxi;
 
     if (!pxi) {
       return Response.json({ error: 'No data' }, { status: 404, headers: corsHeaders });
     }
 
-    const cats = await env.DB.prepare(
-      'SELECT category, score, weight FROM category_scores WHERE date = ?'
-    ).bind(pxi.date).all<CategoryRow>();
+    const categories = selected.categories;
 
     const regime = await deps.detectRegime(env.DB, pxi.date);
     const signal = await deps.calculatePXISignal(
       env.DB,
       { score: pxi.score, delta_7d: pxi.delta_7d, delta_30d: pxi.delta_30d },
       regime,
-      cats.results || []
+      categories
     );
 
     const [divergence, freshness, mlSampleSize, edgeCalibrationSnapshot] = await Promise.all([
@@ -448,9 +649,25 @@ export async function tryHandleMarketCoreRoute(
     // remains descriptive even after its evidence window matures, avoiding a
     // second, weaker authorization policy.
     const signalActionAuthorized = false;
+    const signalDecisionContract = buildDecisionContractSnapshot({
+      actionability_state: 'NO_ACTION',
+      action_authorized: signalActionAuthorized,
+      actionability_reason_codes: signalEdgeGate.pass
+        ? ['plan_authority_required']
+        : ['edge_evidence_gate_block'],
+      pxi_label: pxi.label,
+      regime: regime?.regime || null,
+      research_posture: signal.signal_type,
+      evidence_gate: signalEdgeGate,
+      consistency_state: 'FAIL',
+      opportunity_cta_enabled: false,
+      allocation_target: null,
+      structural_quality: edgeQualityWithCalibration,
+    });
 
     const payload: SignalResponsePayload = {
       date: pxi.date,
+      decision_contract: signalDecisionContract,
       state: {
         score: pxi.score,
         label: pxi.label,
@@ -460,7 +677,7 @@ export async function tryHandleMarketCoreRoute(
           d7: pxi.delta_7d,
           d30: pxi.delta_30d,
         },
-        categories: (cats.results || []).map((category) => ({
+        categories: categories.map((category) => ({
           name: category.category,
           score: category.score,
           weight: category.weight,
@@ -489,7 +706,12 @@ export async function tryHandleMarketCoreRoute(
           metrics: undefined,
         })),
       } : null,
-      edge_quality: edgeQualityWithCalibration,
+      edge_quality: {
+        ...edgeQualityWithCalibration,
+        diagnostic_scope: 'INPUT_AND_MODEL_STRUCTURE',
+        validated_edge: signalEdgeGate.pass,
+        calibration_authority: 'NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG',
+      },
       freshness_status: freshness,
     };
 
@@ -580,7 +802,7 @@ export async function tryHandleMarketCoreRoute(
       }
 
       const opportunityRows = await env.DB.prepare(`
-        SELECT horizon, as_of, payload_json
+        SELECT horizon, as_of, payload_json, created_at
         FROM opportunity_snapshots
         WHERE horizon IN ('7d', '30d')
           AND instr(payload_json, ?) = 0
@@ -593,7 +815,12 @@ export async function tryHandleMarketCoreRoute(
       `).bind(
         HISTORICAL_BACKFILL_SEED_MARKER,
         HISTORICAL_BACKFILL_SEED_MARKER,
-      ).all<{ horizon: '7d' | '30d'; as_of: string; payload_json: string }>();
+      ).all<{
+        horizon: '7d' | '30d';
+        as_of: string;
+        payload_json: string;
+        created_at: string | null;
+      }>();
 
       const coherenceGateEnabled = deps.isFeatureEnabled(
         env,
@@ -618,6 +845,11 @@ export async function tryHandleMarketCoreRoute(
       edgeEvidenceByHorizon['30d'] = resolveEdgeEvidenceGate(edgeDiagnosticsReport, '30d');
       const projectedByHorizon: Record<string, any> = {};
       const asOfByHorizon: Record<string, string> = {};
+      const ctaByHorizon: Record<string, {
+        cta_enabled: boolean;
+        cta_disabled_reasons: string[];
+        ttl_state: 'fresh' | 'stale' | 'overdue' | 'unknown';
+      }> = {};
 
       for (const row of opportunityRows.results || []) {
         try {
@@ -630,29 +862,59 @@ export async function tryHandleMarketCoreRoute(
             continue;
           }
 
+          const snapshotAsOf = typeof opportunitySnapshot.as_of === 'string'
+            ? opportunitySnapshot.as_of
+            : '';
+          const snapshotDate = /^\d{4}-\d{2}-\d{2}(?:T|$)/.test(snapshotAsOf)
+            ? snapshotAsOf.slice(0, 10)
+            : null;
+          const snapshotMatchesCanonicalPxi = snapshotDate === pxi.date;
+          const ttlMetadata = typeof deps.computeOpportunityTtlMetadata === 'function'
+            ? deps.computeOpportunityTtlMetadata(row.created_at || null, new Date())
+            : {
+                data_age_seconds: null,
+                ttl_state: 'unknown' as const,
+                next_expected_refresh_at: null,
+                overdue_seconds: null,
+              };
+
           const calibration = await deps.fetchLatestCalibrationSnapshot(
             env.DB,
             'conviction',
             opportunitySnapshot.horizon
           );
-          const normalized = deps.normalizeOpportunityItemsForPublishing(
-            opportunitySnapshot.items,
-            calibration
-          );
-          const candidateProjection = deps.projectOpportunityFeed(normalized, {
-            coherence_gate_enabled: coherenceGateEnabled,
-            freshness,
-            consistency_state: canonical.consistency.state,
-          });
-          const edgeGate = opportunitySnapshot.horizon === '7d'
+          const horizonEdgeGate = opportunitySnapshot.horizon === '7d'
             ? edgeEvidenceByHorizon['7d']
             : opportunitySnapshot.horizon === '30d'
               ? edgeEvidenceByHorizon['30d']
               : { pass: false, reasons: ['opportunity_horizon_invalid'] };
-          const projected = suppressProjectionForEdgeEvidence(candidateProjection, edgeGate);
+          const edgeGate = snapshotMatchesCanonicalPxi
+            ? horizonEdgeGate
+            : {
+                pass: false,
+                reasons: Array.from(new Set([
+                  ...horizonEdgeGate.reasons,
+                  'opportunity_snapshot_date_mismatch',
+                ])),
+              };
+          edgeEvidenceByHorizon[opportunitySnapshot.horizon] = edgeGate;
+          const authorityProjection = evaluateOpportunityAuthorityProjection({
+            items: opportunitySnapshot.items,
+            calibration,
+            coherence_gate_enabled: coherenceGateEnabled,
+            freshness,
+            consistency_state: canonical.consistency.state,
+            edge_evidence_gate: edgeGate,
+            ttl: ttlMetadata,
+          }, deps);
 
-          projectedByHorizon[opportunitySnapshot.horizon] = projected;
-          asOfByHorizon[opportunitySnapshot.horizon] = opportunitySnapshot.as_of;
+          projectedByHorizon[opportunitySnapshot.horizon] = authorityProjection.projected_feed;
+          asOfByHorizon[opportunitySnapshot.horizon] = snapshotAsOf || canonical.as_of;
+          ctaByHorizon[opportunitySnapshot.horizon] = {
+            cta_enabled: authorityProjection.cta_state.cta_enabled,
+            cta_disabled_reasons: authorityProjection.cta_state.cta_disabled_reasons,
+            ttl_state: ttlMetadata.ttl_state,
+          };
         } catch {
           // Skip malformed snapshot payloads.
         }
@@ -665,6 +927,9 @@ export async function tryHandleMarketCoreRoute(
           eligible_count: projectedByHorizon['7d'].items.length,
           suppressed_count: projectedByHorizon['7d'].suppressed_count,
           degraded_reason: projectedByHorizon['7d'].degraded_reason,
+          cta_enabled: ctaByHorizon['7d']?.cta_enabled === true,
+          cta_disabled_reasons: ctaByHorizon['7d']?.cta_disabled_reasons || ['authority_contract_unavailable'],
+          ttl_state: ctaByHorizon['7d']?.ttl_state || 'unknown',
         };
       } else if (projectedByHorizon['30d']) {
         opportunityRef = {
@@ -673,6 +938,9 @@ export async function tryHandleMarketCoreRoute(
           eligible_count: projectedByHorizon['30d'].items.length,
           suppressed_count: projectedByHorizon['30d'].suppressed_count,
           degraded_reason: projectedByHorizon['30d'].degraded_reason,
+          cta_enabled: ctaByHorizon['30d']?.cta_enabled === true,
+          cta_disabled_reasons: ctaByHorizon['30d']?.cta_disabled_reasons || ['authority_contract_unavailable'],
+          ttl_state: ctaByHorizon['30d']?.ttl_state || 'unknown',
         };
       }
 
@@ -703,12 +971,34 @@ export async function tryHandleMarketCoreRoute(
       edge_evidence_gate: selectedEdgeEvidenceGate,
     });
     const actionabilityWithCrossHorizon = deps.applyCrossHorizonActionabilityOverride(actionability, crossHorizonRef || null);
-    const actionAuthorized = selectedEdgeEvidenceGate.pass && actionabilityWithCrossHorizon.state === 'ACTIONABLE';
+    const actionAuthorized = selectedEdgeEvidenceGate.pass &&
+      opportunityRef?.cta_enabled === true &&
+      canonical.consistency.state !== 'FAIL' &&
+      actionabilityWithCrossHorizon.state === 'ACTIONABLE' &&
+      Number.isFinite(risk_sizing.target_pct);
+    const decisionContract = buildDecisionContractSnapshot({
+      actionability_state: actionabilityWithCrossHorizon.state,
+      action_authorized: actionAuthorized,
+      actionability_reason_codes: actionabilityWithCrossHorizon.reason_codes,
+      pxi_label: pxi.label,
+      regime: regime?.regime || null,
+      research_posture: signal.signal_type,
+      evidence_gate: selectedEdgeEvidenceGate,
+      consistency_state: canonical.consistency.state,
+      opportunity_cta_enabled: opportunityRef?.cta_enabled === true,
+      allocation_target: Number.isFinite(risk_sizing.target_pct)
+        ? risk_sizing.target_pct / 100
+        : null,
+      structural_quality: edge_quality,
+    });
     const setupSummary = actionAuthorized
       ? `${setupContext} Authorized target ${risk_sizing.target_pct}% under the prospective evidence and actionability gates.`
-      : `${setupContext} Allocation withheld until the prospective evidence and actionability gates pass.`;
+      : `NO ACTION — ${setupContext} Allocation withheld until the prospective evidence and actionability gates pass.`;
     const decisionStack = deps.buildDecisionStack({
       actionability_state: actionabilityWithCrossHorizon.state,
+      action_authorized: actionAuthorized,
+      actionability_reason_codes: actionabilityWithCrossHorizon.reason_codes,
+      edge_evidence_gate: selectedEdgeEvidenceGate,
       setup_summary: setupSummary,
       edge_quality,
       consistency: canonical.consistency,
@@ -731,15 +1021,16 @@ export async function tryHandleMarketCoreRoute(
     const payload: PlanPayload = {
       as_of: canonical.as_of,
       setup_summary: setupSummary,
+      decision_contract: decisionContract,
       policy_state,
       edge_evidence_gate: selectedEdgeEvidenceGate,
-      actionability_state: actionabilityWithCrossHorizon.state,
-      actionability_reason_codes: actionabilityWithCrossHorizon.reason_codes,
+      actionability_state: decisionContract.actionability_state,
+      actionability_reason_codes: decisionContract.actionability_reason_codes,
       action_now: {
-        action_authorized: actionAuthorized,
-        risk_allocation_target: actionAuthorized ? risk_sizing.target_pct / 100 : null,
+        action_authorized: decisionContract.action_authorized,
+        risk_allocation_target: decisionContract.action_authorized ? risk_sizing.target_pct / 100 : null,
         raw_signal_allocation_target: risk_sizing.raw_signal_allocation_target,
-        risk_allocation_basis: actionAuthorized
+        risk_allocation_basis: decisionContract.action_authorized
           ? 'penalized_playbook_target'
           : selectedEdgeEvidenceGate.pass
             ? 'withheld_actionability'
@@ -747,11 +1038,16 @@ export async function tryHandleMarketCoreRoute(
         horizon_bias: deps.resolveHorizonBias(signal, regime, edge_quality.score),
         primary_signal: signal.signal_type,
       },
-      edge_quality,
+      edge_quality: {
+        ...edge_quality,
+        diagnostic_scope: 'INPUT_AND_MODEL_STRUCTURE',
+        validated_edge: selectedEdgeEvidenceGate.pass,
+        calibration_authority: 'NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG',
+      },
       risk_band,
       uncertainty: canonical.uncertainty,
       consistency: canonical.consistency,
-      trader_playbook: canonical.trader_playbook,
+      trader_playbook: projectTraderPlaybookForDecision(canonical.trader_playbook, decisionContract.action_authorized),
       invalidation_rules: finalInvalidationRules,
       ...(briefRef ? { brief_ref: briefRef } : {}),
       ...(opportunityRef ? { opportunity_ref: opportunityRef } : {}),
@@ -777,18 +1073,6 @@ export async function tryHandleMarketCoreRoute(
       return Response.json({ error: 'Schema initialization failed' }, { status: 503, headers: corsHeaders });
     }
 
-    const latest = await deps.fetchLatestConsistencyCheck(env.DB);
-    if (latest) {
-      return Response.json({
-        as_of: latest.as_of,
-        score: latest.score,
-        state: latest.state,
-        violations: latest.violations,
-        components: latest.components,
-        created_at: latest.created_at,
-      }, { headers: corsHeaders });
-    }
-
     try {
       const canonical = await buildCanonicalMarketDecision(env.DB, deps);
       return Response.json({
@@ -797,12 +1081,31 @@ export async function tryHandleMarketCoreRoute(
         state: canonical.consistency.state,
         violations: canonical.consistency.violations,
         components: canonical.consistency.components,
+        scope: 'INTERNAL_COHERENCE',
+        note: 'A PASS means the descriptive fields agree internally; it does not authorize action or validate prospective edge.',
+        source: 'CURRENT_CANONICAL_STATE',
         created_at: deps.asIsoDateTime(new Date()),
       }, { headers: corsHeaders });
     } catch (err) {
-      console.error('Consistency fallback computation failed:', err);
-      return Response.json({ error: 'Consistency unavailable' }, { status: 503, headers: corsHeaders });
+      console.warn('Current consistency computation unavailable; attempting stored fallback:', err);
     }
+
+    const latest = await deps.fetchLatestConsistencyCheck(env.DB);
+    if (latest) {
+      return Response.json({
+        as_of: latest.as_of,
+        score: latest.score,
+        state: latest.state,
+        violations: latest.violations,
+        components: latest.components,
+        scope: 'INTERNAL_COHERENCE',
+        note: 'Stored fallback only. A PASS means the descriptive fields agreed internally at the stated time; it does not authorize action or validate prospective edge.',
+        source: 'STORED_FALLBACK',
+        created_at: latest.created_at,
+      }, { headers: corsHeaders });
+    }
+
+    return Response.json({ error: 'Consistency unavailable' }, { status: 503, headers: corsHeaders });
   }
 
   if (url.pathname === '/api/ops/freshness-slo' && method === 'GET') {

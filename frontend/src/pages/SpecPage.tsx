@@ -30,11 +30,19 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
         </p>
 
         <section className="mb-12">
-          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Two-Layer Architecture</h2>
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Decision Architecture</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
-            Two-layer system separating descriptive state from actionable signals.
+            Descriptive state and research posture remain separate from the canonical action decision.
           </p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="mb-4 rounded border border-[#f59e0b]/30 bg-[#f59e0b]/5 px-4 py-3">
+            <p className="text-[11px] font-medium text-[#f3e3c2]">/api/plan is the sole action-authority surface.</p>
+            <p className="mt-1 text-[10px] leading-relaxed text-[#949ba5]">
+              An allocation is authorized only when decision_contract.action_authorized is true and
+              action_now.risk_allocation_target is numeric. PXI state, /api/signal research posture,
+              structural quality, internal consistency, and legacy calibration never authorize an allocation by themselves.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#00a3ff]">
               <div className="text-[11px] font-medium uppercase tracking-wide mb-2">PXI-State</div>
               <p className="text-[10px] text-[#949ba5]/70 mb-2">Descriptive layer for monitoring macro conditions</p>
@@ -47,12 +55,22 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
             </div>
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#00c896]">
               <div className="text-[11px] font-medium uppercase tracking-wide mb-2">PXI-Signal (Research)</div>
-              <p className="text-[10px] text-[#949ba5]/70 mb-2">Experimental policy layer; not a validated allocation recommendation</p>
+              <p className="text-[10px] text-[#949ba5]/70 mb-2">Experimental research context; never an allocation authorization</p>
               <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
-                <li>• Risk allocation (0-100%)</li>
-                <li>• Signal type classification</li>
+                <li>• Raw research allocation heuristic</li>
+                <li>• Research posture classification</li>
                 <li>• Volatility percentile</li>
                 <li>• Adjustment explanations</li>
+              </ul>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3 border-l-2 border-[#f59e0b]">
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-2">PXI-Plan (Authority)</div>
+              <p className="text-[10px] text-[#949ba5]/70 mb-2">Fail-closed decision contract for action versus watch/no-action</p>
+              <ul className="text-[9px] text-[#949ba5]/60 space-y-1">
+                <li>• Canonical decision headline</li>
+                <li>• Prospective evidence gate</li>
+                <li>• Actionability reason codes</li>
+                <li>• Nullable authorized allocation</li>
               </ul>
             </div>
           </div>
@@ -101,7 +119,8 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Research Allocation Heuristic</h2>
           <p className="text-[13px] text-[#949ba5] leading-relaxed mb-4">
             The experimental signal layer applies a deterministic heuristic to convert PXI state into a research allocation.
-            Base allocation scales linearly from 30% (PXI=0) to 100% (PXI=100).
+            Base allocation scales linearly from 30% (PXI=0) to 100% (PXI=100). This raw output is
+            descriptive research context and remains withheld unless /api/plan explicitly authorizes it.
           </p>
           <div className="bg-[#0a0a0a] rounded px-4 py-3 font-mono text-[11px] text-[#f3f3f3]/70 space-y-1 mb-4">
             <div>Base = 0.3 + (PXI / 100) × 0.7</div>
@@ -128,6 +147,19 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
               <div className="text-[#949ba5]/60">&lt;30% alloc</div>
             </div>
           </div>
+          <p className="mt-2 text-[9px] text-[#949ba5]/60">
+            These are raw research-allocation ranges, not PXI score-label bands and not authorized sizing.
+          </p>
+        </section>
+
+        <section className="mb-12 rounded border border-[#26272b] bg-[#0a0a0a]/60 px-4 py-4">
+          <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-2">Structural Quality</h2>
+          <p className="text-[12px] text-[#949ba5] leading-relaxed">
+            HIGH, MEDIUM, and LOW structural quality summarize input availability, model agreement,
+            and regime stability. They are model-and-input diagnostics, not validated edge. The
+            prospective evidence gate is separate and controls whether /api/plan may authorize action.
+            A PASS consistency state means internal coherence only.
+          </p>
         </section>
 
         <section className="mb-12 rounded border border-[#f59e0b]/30 bg-[#f59e0b]/5 px-4 py-4">
@@ -393,22 +425,29 @@ export function SpecPage({ onClose, inPage = false }: { onClose: () => void; inP
 
         <section className="mb-12">
           <h2 className="text-[10px] text-[#00a3ff] uppercase tracking-widest mb-4">Interpretation Guide</h2>
-          <div className="grid grid-cols-2 gap-4 text-[11px]">
+          <p className="mb-4 text-[11px] leading-relaxed text-[#949ba5]">
+            Production score labels use these five exact bands. They describe the composite inputs and do not forecast returns.
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-[11px]">
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
-              <div className="text-[#00a3ff] font-medium mb-1">0–40: Weak</div>
+              <div className="text-[#ff6b6b] font-medium mb-1">0–&lt;35: DUMPING</div>
               <p className="text-[10px] text-[#949ba5]/70">Weak conditions across the weighted inputs; not a return forecast.</p>
             </div>
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
-              <div className="text-[#949ba5] font-medium mb-1">40–60: Neutral</div>
-              <p className="text-[10px] text-[#949ba5]/70">Typical conditions. No strong directional bias.</p>
+              <div className="text-[#949ba5] font-medium mb-1">35–&lt;50: SOFT</div>
+              <p className="text-[10px] text-[#949ba5]/70">Below-neutral conditions across the weighted inputs.</p>
             </div>
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
-              <div className="text-[#f59e0b] font-medium mb-1">60–80: Strong</div>
-              <p className="text-[10px] text-[#949ba5]/70">Risk-on conditions. Watch for overextension.</p>
+              <div className="text-[#949ba5] font-medium mb-1">50–&lt;65: NEUTRAL</div>
+              <p className="text-[10px] text-[#949ba5]/70">Middle-band conditions across the weighted inputs.</p>
             </div>
             <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
-              <div className="text-[#ff6b6b] font-medium mb-1">80–100: Extended</div>
-              <p className="text-[10px] text-[#949ba5]/70">Broadly strong or extended inputs; not a reversal forecast.</p>
+              <div className="text-[#00a3ff] font-medium mb-1">65–&lt;80: PAMPING</div>
+              <p className="text-[10px] text-[#949ba5]/70">Strong conditions across the weighted inputs.</p>
+            </div>
+            <div className="bg-[#0a0a0a]/60 rounded px-4 py-3">
+              <div className="text-[#f59e0b] font-medium mb-1">80–100: MAX PAMP</div>
+              <p className="text-[10px] text-[#949ba5]/70">Highest production score band; not a reversal forecast.</p>
             </div>
           </div>
         </section>

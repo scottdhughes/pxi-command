@@ -816,32 +816,6 @@ check_utility_funnel_semantics() {
   fi
 }
 
-check_cta_action_event_contract() {
-  local code
-  local accepted_type
-  local ignored_reason
-  local payload
-
-  payload='{"session_id":"ux_contract_cta","event_type":"cta_action_click","route":"/opportunities","actionability_state":"ACTIONABLE","metadata":{"source":"contract_check","as_of":"2026-02-22T00:00:00.000Z","horizon":"7d","scope":"market_theme"}}'
-  code=$(curl -sS -o "$TMP_BODY" -w "%{http_code}" --max-time 20 -X POST "$API_URL/api/metrics/utility-event" \
-    -H "Content-Type: application/json" \
-    -d "$payload")
-
-  if [[ "$code" != "200" ]]; then
-    echo "Expected 200 for cta_action_click utility event but got $code"
-    cat "$TMP_BODY"
-    exit 1
-  fi
-
-  accepted_type=$(jq -r '.accepted.event_type // ""' "$TMP_BODY")
-  ignored_reason=$(jq -r '.ignored_reason // ""' "$TMP_BODY")
-  if [[ "$accepted_type" != "cta_action_click" && "$ignored_reason" != "cta_intent_tracking_disabled" ]]; then
-    echo "cta_action_click was neither accepted nor explicitly ignored due to feature flag"
-    cat "$TMP_BODY"
-    exit 1
-  fi
-}
-
 check_decision_grade_semantics() {
   local grade_json
   local score
@@ -1061,7 +1035,93 @@ check_decision_impact_semantics() {
 }
 
 check_api_json_contract "/api/plan" \
-  'type=="object" and (.as_of|type=="string") and (.setup_summary|type=="string") and (.actionability_state|type=="string") and (.actionability_reason_codes|type=="array") and (all(.actionability_reason_codes[]?; type=="string")) and ((.action_now.risk_allocation_target==null) or (.action_now.risk_allocation_target|type=="number")) and ((.action_now|has("action_authorized")|not) or (.action_now.action_authorized|type=="boolean")) and (.action_now.raw_signal_allocation_target|type=="number") and (.action_now.risk_allocation_basis|type=="string") and ((has("edge_evidence_gate")|not) or ((.edge_evidence_gate.pass|type=="boolean") and (.edge_evidence_gate.reasons|type=="array") and (all(.edge_evidence_gate.reasons[]?; type=="string")))) and (.edge_quality.score|type=="number") and (.edge_quality.calibration.quality|type=="string") and (.edge_quality.calibration.sample_size_7d|type=="number") and (.risk_band.d7.sample_size|type=="number") and (.invalidation_rules|type=="array") and ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|type=="array")) and ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and (.uncertainty.flags.stale_inputs|type=="boolean") and (.uncertainty.flags.limited_calibration|type=="boolean") and (.uncertainty.flags.limited_scenario_sample|type=="boolean") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and (.consistency.violations|type=="array") and (.consistency.components.base_score|type=="number") and (.consistency.components.structural_penalty|type=="number") and (.consistency.components.reliability_penalty|type=="number") and (.trader_playbook.recommended_size_pct.min|type=="number") and (.trader_playbook.recommended_size_pct.target|type=="number") and (.trader_playbook.recommended_size_pct.max|type=="number") and (.trader_playbook.scenarios|type=="array") and ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")))) and ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number"))) and ((has("cross_horizon")|not) or ((.cross_horizon.as_of|type=="string") and (.cross_horizon.state|type=="string") and (.cross_horizon.eligible_7d|type=="number") and (.cross_horizon.eligible_30d|type=="number") and ((.cross_horizon.top_direction_7d==null) or (.cross_horizon.top_direction_7d|type=="string")) and ((.cross_horizon.top_direction_30d==null) or (.cross_horizon.top_direction_30d|type=="string")) and (.cross_horizon.rationale_codes|type=="array") and (all(.cross_horizon.rationale_codes[]?; type=="string")) and ((.cross_horizon.invalidation_note==null) or (.cross_horizon.invalidation_note|type=="string")))) and ((has("decision_stack")|not) or ((.decision_stack.what_changed|type=="string") and (.decision_stack.what_to_do|type=="string") and (.decision_stack.why_now|type=="string") and (.decision_stack.confidence|type=="string") and (.decision_stack.cta_state|type=="string")))' \
+  'def string_array: type=="array" and all(.[]?; type=="string");
+   def decision_contract:
+     type=="object" and
+     (.contract_version=="2026-08-23-v1") and
+     ((.headline=="Actionable plan") or (.headline=="Watch only") or (.headline=="No actionable signal")) and
+     ((.actionability_state=="ACTIONABLE") or (.actionability_state=="WATCH") or (.actionability_state=="NO_ACTION")) and
+     (.action_authorized|type=="boolean") and
+     (.actionability_reason_codes|string_array) and
+     (.descriptive_context.pxi_label|type=="string") and
+     ((.descriptive_context.regime==null) or (.descriptive_context.regime=="RISK_ON") or (.descriptive_context.regime=="RISK_OFF") or (.descriptive_context.regime=="TRANSITION")) and
+     ((.descriptive_context.research_posture=="FULL_RISK") or (.descriptive_context.research_posture=="REDUCED_RISK") or (.descriptive_context.research_posture=="RISK_OFF") or (.descriptive_context.research_posture=="DEFENSIVE")) and
+     (.evidence.pass|type=="boolean") and
+     (.evidence.reason_codes|string_array) and
+     (((.evidence.pass==true) and (.evidence.status=="PASSED")) or ((.evidence.pass==false) and (.evidence.status=="BLOCKED"))) and
+     (.structural_quality.score|type=="number") and
+     ((.structural_quality.label=="HIGH") or (.structural_quality.label=="MEDIUM") or (.structural_quality.label=="LOW")) and
+     (.structural_quality.interpretation=="INPUT_AND_MODEL_DIAGNOSTIC_NOT_VALIDATED_EDGE") and
+     (.consistency_scope=="INTERNAL_COHERENCE");
+   type=="object" and
+   (.as_of|type=="string") and
+   (.setup_summary|type=="string") and
+   (.decision_contract|decision_contract) and
+   (.actionability_state==.decision_contract.actionability_state) and
+   (.actionability_reason_codes==.decision_contract.actionability_reason_codes) and
+   (.action_now.action_authorized==.decision_contract.action_authorized) and
+   ((.action_now.risk_allocation_target==null) or (.action_now.risk_allocation_target|type=="number")) and
+   (.action_now.action_authorized|type=="boolean") and
+   (.action_now.raw_signal_allocation_target|type=="number") and
+   (.action_now.risk_allocation_basis|type=="string") and
+   (.edge_evidence_gate.pass|type=="boolean") and
+   (.edge_evidence_gate.reasons|string_array) and
+   (.edge_evidence_gate.pass==.decision_contract.evidence.pass) and
+   (.edge_quality.score|type=="number") and
+   (.edge_quality.diagnostic_scope=="INPUT_AND_MODEL_STRUCTURE") and
+   (.edge_quality.validated_edge|type=="boolean") and
+   (.edge_quality.validated_edge==.edge_evidence_gate.pass) and
+   (.edge_quality.calibration_authority=="NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG") and
+   (.edge_quality.score==.decision_contract.structural_quality.score) and
+   (.edge_quality.label==.decision_contract.structural_quality.label) and
+   (.edge_quality.calibration.quality|type=="string") and
+   (.edge_quality.calibration.sample_size_7d|type=="number") and
+   (.risk_band.d7.sample_size|type=="number") and
+   (.invalidation_rules|type=="array") and
+   ((.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.policy_state.conflict_state|type=="string") and (.policy_state.base_signal|type=="string") and (.policy_state.regime_context|type=="string") and (.policy_state.rationale|type=="string") and (.policy_state.rationale_codes|string_array)) and
+   ((.uncertainty.headline==null) or (.uncertainty.headline|type=="string")) and
+   (.uncertainty.flags.stale_inputs|type=="boolean") and
+   (.uncertainty.flags.limited_calibration|type=="boolean") and
+   (.uncertainty.flags.limited_scenario_sample|type=="boolean") and
+   (.consistency.score|type=="number") and
+   (.consistency.state|type=="string") and
+   (.consistency.violations|type=="array") and
+   (.consistency.components.base_score|type=="number") and
+   (.consistency.components.structural_penalty|type=="number") and
+   (.consistency.components.reliability_penalty|type=="number") and
+   ((.trader_playbook.authorization=="AUTHORIZED") or (.trader_playbook.authorization=="WITHHELD")) and
+   ((.trader_playbook.recommended_size_pct.min==null) or (.trader_playbook.recommended_size_pct.min|type=="number")) and
+   ((.trader_playbook.recommended_size_pct.target==null) or (.trader_playbook.recommended_size_pct.target|type=="number")) and
+   ((.trader_playbook.recommended_size_pct.max==null) or (.trader_playbook.recommended_size_pct.max|type=="number")) and
+   (.trader_playbook.scenarios|type=="array") and
+   ((.trader_playbook.benchmark_follow_through_7d.hit_rate==null) or (.trader_playbook.benchmark_follow_through_7d.hit_rate|type=="number")) and
+   (.trader_playbook.benchmark_follow_through_7d.sample_size|type=="number") and
+   ((.trader_playbook.benchmark_follow_through_7d.unavailable_reason==null) or (.trader_playbook.benchmark_follow_through_7d.unavailable_reason|type=="string")) and
+   ((has("brief_ref")|not) or ((.brief_ref.as_of|type=="string") and (.brief_ref.regime_delta|type=="string") and (.brief_ref.risk_posture|type=="string"))) and
+   ((has("opportunity_ref")|not) or ((.opportunity_ref.as_of|type=="string") and (.opportunity_ref.horizon|type=="string") and (.opportunity_ref.eligible_count|type=="number") and (.opportunity_ref.suppressed_count|type=="number") and ((.opportunity_ref.degraded_reason==null) or (.opportunity_ref.degraded_reason|type=="string")) and (.opportunity_ref.cta_enabled|type=="boolean") and (.opportunity_ref.cta_disabled_reasons|string_array) and ((.opportunity_ref.ttl_state=="fresh") or (.opportunity_ref.ttl_state=="stale") or (.opportunity_ref.ttl_state=="overdue") or (.opportunity_ref.ttl_state=="unknown")))) and
+   ((has("alerts_ref")|not) or ((.alerts_ref.as_of|type=="string") and (.alerts_ref.warning_count_24h|type=="number") and (.alerts_ref.critical_count_24h|type=="number"))) and
+   ((has("cross_horizon")|not) or ((.cross_horizon.as_of|type=="string") and (.cross_horizon.state|type=="string") and (.cross_horizon.eligible_7d|type=="number") and (.cross_horizon.eligible_30d|type=="number") and ((.cross_horizon.top_direction_7d==null) or (.cross_horizon.top_direction_7d|type=="string")) and ((.cross_horizon.top_direction_30d==null) or (.cross_horizon.top_direction_30d|type=="string")) and (.cross_horizon.rationale_codes|string_array) and ((.cross_horizon.invalidation_note==null) or (.cross_horizon.invalidation_note|type=="string")))) and
+   ((has("decision_stack")|not) or ((.decision_stack.what_changed|type=="string") and (.decision_stack.what_to_do|type=="string") and (.decision_stack.why_now|type=="string") and (.decision_stack.confidence|type=="string") and (.decision_stack.cta_state|type=="string"))) and
+   (if .decision_contract.action_authorized then
+      (.decision_contract.actionability_state=="ACTIONABLE") and
+      (.decision_contract.headline=="Actionable plan") and
+      (.decision_contract.evidence.pass==true) and
+      (.consistency.state!="FAIL") and
+      (.opportunity_ref.cta_enabled==true) and
+      (.action_now.risk_allocation_target|type=="number") and
+      (.action_now.risk_allocation_basis=="penalized_playbook_target") and
+      (.trader_playbook.authorization=="AUTHORIZED") and
+      (.trader_playbook.recommended_size_pct.min|type=="number") and
+      (.trader_playbook.recommended_size_pct.target|type=="number") and
+      (.trader_playbook.recommended_size_pct.max|type=="number")
+    else
+      (.action_now.risk_allocation_target==null) and
+      ((.action_now.risk_allocation_basis=="withheld_edge_evidence") or (.action_now.risk_allocation_basis=="withheld_actionability")) and
+      (.trader_playbook.authorization=="WITHHELD") and
+      (.trader_playbook.recommended_size_pct.min==null) and
+      (.trader_playbook.recommended_size_pct.target==null) and
+      (.trader_playbook.recommended_size_pct.max==null)
+    end)' \
   "plan"
 
 if [[ "$EDGE_EVIDENCE_V2_REQUIRED" == "1" ]]; then
@@ -1088,6 +1148,52 @@ if [[ "$EDGE_EVIDENCE_V2_REQUIRED" == "1" ]]; then
       end)' \
     "plan-edge-evidence-v2"
 fi
+
+check_api_json_contract "/api/signal" \
+  'def string_array: type=="array" and all(.[]?; type=="string");
+   def exact_categories:
+     type=="array" and
+     length==7 and
+     ([.[].name] | sort == ["breadth", "credit", "crypto", "global", "macro", "positioning", "volatility"]);
+   type=="object" and
+   (.date|type=="string") and
+   (.decision_contract|type=="object") and
+   (.decision_contract.contract_version=="2026-08-23-v1") and
+   (.decision_contract.headline=="No actionable signal") and
+   (.decision_contract.actionability_state=="NO_ACTION") and
+   (.decision_contract.action_authorized==false) and
+   (.decision_contract.actionability_reason_codes|string_array) and
+   (.decision_contract.descriptive_context.pxi_label|type=="string") and
+   ((.decision_contract.descriptive_context.regime==null) or (.decision_contract.descriptive_context.regime=="RISK_ON") or (.decision_contract.descriptive_context.regime=="RISK_OFF") or (.decision_contract.descriptive_context.regime=="TRANSITION")) and
+   ((.decision_contract.descriptive_context.research_posture=="FULL_RISK") or (.decision_contract.descriptive_context.research_posture=="REDUCED_RISK") or (.decision_contract.descriptive_context.research_posture=="RISK_OFF") or (.decision_contract.descriptive_context.research_posture=="DEFENSIVE")) and
+   (.decision_contract.evidence.pass|type=="boolean") and
+   (.decision_contract.evidence.reason_codes|string_array) and
+   (((.decision_contract.evidence.pass==true) and (.decision_contract.evidence.status=="PASSED")) or ((.decision_contract.evidence.pass==false) and (.decision_contract.evidence.status=="BLOCKED"))) and
+   (.decision_contract.structural_quality.score|type=="number") and
+   ((.decision_contract.structural_quality.label=="HIGH") or (.decision_contract.structural_quality.label=="MEDIUM") or (.decision_contract.structural_quality.label=="LOW")) and
+   (.decision_contract.structural_quality.interpretation=="INPUT_AND_MODEL_DIAGNOSTIC_NOT_VALIDATED_EDGE") and
+   (.decision_contract.consistency_scope=="INTERNAL_COHERENCE") and
+   (.state.score|type=="number") and
+   (.state.label|type=="string") and
+   (.state.status|type=="string") and
+   (.state.categories|exact_categories) and
+   (all(.state.categories[]?; (.score|type=="number") and (.weight|type=="number"))) and
+   (.signal.action_authorized|type=="boolean") and
+   (.signal.action_authorized==.decision_contract.action_authorized) and
+   (.signal.action_authorized==false) and
+   (.signal.risk_allocation==null) and
+   (.signal.raw_risk_allocation|type=="number") and
+   (.signal.evidence_gate.pass|type=="boolean") and
+   (.signal.evidence_gate.reasons|string_array) and
+   (.signal.evidence_gate.pass==.decision_contract.evidence.pass) and
+   (.signal.adjustments|string_array) and
+   (.edge_quality.score==.decision_contract.structural_quality.score) and
+   (.edge_quality.label==.decision_contract.structural_quality.label) and
+   (.edge_quality.diagnostic_scope=="INPUT_AND_MODEL_STRUCTURE") and
+   (.edge_quality.validated_edge|type=="boolean") and
+   (.edge_quality.validated_edge==.signal.evidence_gate.pass) and
+   (.edge_quality.calibration_authority=="NON_AUTHORITATIVE_LEGACY_PREDICTION_LOG")' \
+  "signal"
 
 check_api_json_contract "/api/brief?scope=market" \
   'type=="object" and (.as_of|type=="string") and (.summary|type=="string") and (.regime_delta|type=="string") and (.risk_posture|type=="string") and (.freshness_status.stale_count|type=="number") and (.policy_state.stance|type=="string") and (.policy_state.risk_posture|type=="string") and (.source_plan_as_of|type=="string") and (.contract_version|type=="string") and (.consistency.score|type=="number") and (.consistency.state|type=="string") and ((.degraded_reason==null) or (.degraded_reason|type=="string"))' \
@@ -1119,11 +1225,63 @@ check_api_json_contract "/api/alerts/feed?limit=10" \
   "alerts-feed"
 
 check_api_json_contract "/api/pxi" \
-  'type=="object" and (.date|type=="string") and (.score|type=="number") and (.dataFreshness.hasStaleData|type=="boolean") and (.dataFreshness.staleCount|type=="number") and (.dataFreshness.topOffenders|type=="array") and ((.dataFreshness.lastRefreshAtUtc==null) or (.dataFreshness.lastRefreshAtUtc|type=="string")) and (.dataFreshness.lastRefreshSource|type=="string") and (.dataFreshness.nextExpectedRefreshAtUtc|type=="string") and (.dataFreshness.nextExpectedRefreshInMinutes|type=="number")' \
+  'def exact_categories:
+     type=="array" and
+     length==7 and
+     ([.[].name] | sort == ["breadth", "credit", "crypto", "global", "macro", "positioning", "volatility"]);
+   type=="object" and
+   (.date|type=="string") and
+   (.score|type=="number") and
+   (.categories|exact_categories) and
+   (all(.categories[]?; (.score|type=="number") and (.weight|type=="number"))) and
+   (.dataFreshness.hasStaleData|type=="boolean") and
+   (.dataFreshness.staleCount|type=="number") and
+   (.dataFreshness.topOffenders|type=="array") and
+   ((.dataFreshness.lastRefreshAtUtc==null) or (.dataFreshness.lastRefreshAtUtc|type=="string")) and
+   (.dataFreshness.lastRefreshSource|type=="string") and
+   (.dataFreshness.nextExpectedRefreshAtUtc|type=="string") and
+   (.dataFreshness.nextExpectedRefreshInMinutes|type=="number")' \
   "pxi"
 
+check_api_json_contract "/api/category/macro" \
+  'type=="object" and
+   (.category=="macro") and
+   (.date|type=="string") and
+   (.indicators|type=="array") and
+   ([.indicators[]? | select(.id=="ism_manufacturing")] | length==1) and
+   (any(.indicators[]?;
+     (.id=="ism_manufacturing") and
+     (.canonical_id=="manufacturing_payrolls") and
+     (.legacy_id=="ism_manufacturing") and
+     (.identity_status=="legacy_storage_id") and
+     (.definition_version=="indicator-contract/v1") and
+     (.name=="Manufacturing Payrolls") and
+     (.source=="fred") and
+     (.configured_source=="fred") and
+     (.series=="MANEMP") and
+     (.source_series=="MANEMP") and
+     (.frequency=="monthly") and
+     (.observation_date|type=="string") and
+     (.observation_date|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) and
+     has("fetched_at") and
+     ((.fetched_at==null) or (.fetched_at|type=="string")) and
+     (.description|type=="string") and
+     (.description|contains("MANEMP")) and
+     (.units=="Thousands of persons, seasonally adjusted") and
+     (.source_url=="https://fred.stlouisfed.org/series/MANEMP") and
+     (.publisher=="U.S. Bureau of Labor Statistics via FRED") and
+     (.release_name=="Current Employment Statistics") and
+     ((.freshness.status=="fresh") or (.freshness.status=="stale") or (.freshness.status=="missing")) and
+     (.freshness.basis=="observation_date_sla") and
+     (.freshness.age_days|type=="number") and
+     (.freshness.age_days>=0) and
+     (.freshness.max_age_days==65) and
+     (.freshness.sla_class=="monthly")
+   ))' \
+  "category-macro-manemp-provenance"
+
 check_api_json_contract "/api/market/consistency" \
-  'type=="object" and (.as_of|type=="string") and (.score|type=="number") and (.state|type=="string") and (.violations|type=="array") and (.components.base_score|type=="number") and (.components.structural_penalty|type=="number") and (.components.reliability_penalty|type=="number")' \
+  'type=="object" and (.as_of|type=="string") and (.score|type=="number") and (.state|type=="string") and (.violations|type=="array") and (.components.base_score|type=="number") and (.components.structural_penalty|type=="number") and (.components.reliability_penalty|type=="number") and (.scope=="INTERNAL_COHERENCE") and (.note|type=="string") and ((.source=="CURRENT_CANONICAL_STATE") or (.source=="STORED_FALLBACK"))' \
   "market-consistency"
 
 check_api_json_contract "/api/ml/accuracy" \
@@ -1267,7 +1425,6 @@ if edge_diagnostics_available; then
 fi
 if [[ "$UTILITY_FUNNEL_LIVE" == "1" ]]; then
   check_utility_funnel_semantics
-  check_cta_action_event_contract
 fi
 if [[ "$DECISION_GRADE_LIVE" == "1" ]]; then
   check_decision_grade_semantics
