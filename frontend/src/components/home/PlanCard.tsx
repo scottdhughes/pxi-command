@@ -8,6 +8,7 @@ import {
   formatOpportunityDegradedReason,
   formatProbability,
   formatUnavailableReason,
+  summarizeEvidenceBlock,
 } from '../../lib/display'
 import type { PlanData } from '../../lib/types'
 
@@ -36,8 +37,12 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
   const decisionContract = plan.decision_contract
   const actionabilityState = decisionContract?.actionability_state || 'NO_ACTION'
   const actionabilityReasons = (decisionContract?.actionability_reason_codes || ['decision_contract_missing']).filter(Boolean)
+  const evidenceReasons = (decisionContract?.evidence.reason_codes || ['decision_contract_missing']).filter(Boolean)
   const noActionUnlockConditions = actionabilityState === 'NO_ACTION'
-    ? deriveNoActionUnlockConditions({ actionabilityReasonCodes: actionabilityReasons })
+    ? deriveNoActionUnlockConditions({
+        actionabilityReasonCodes: actionabilityReasons,
+        evidenceReasonCodes: evidenceReasons,
+      })
     : []
   const authorizedTarget = typeof plan.action_now.risk_allocation_target === 'number'
     ? plan.action_now.risk_allocation_target
@@ -133,12 +138,13 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
               {canonicalHeadline}
             </p>
           </div>
-          <div className="flex flex-wrap gap-2 text-[8px] uppercase tracking-wider">
+          <div className="flex flex-wrap items-center gap-2 text-[8px] uppercase tracking-wider">
             <span className={`rounded border px-2 py-1 ${actionabilityClass(actionabilityState)}`}>
-              {formatActionabilityState(actionabilityState)}
+              decision: {formatActionabilityState(actionabilityState)}
             </span>
+            <span aria-hidden="true" className="text-[#949ba5]">·</span>
             <span className={`rounded border px-2 py-1 ${evidenceClass}`}>
-              evidence {evidenceStatus.toLowerCase()}
+              {evidenceStatus === 'PASSED' ? 'prospective evidence: passed' : 'prospective evidence: not passed'}
             </span>
           </div>
         </div>
@@ -147,6 +153,11 @@ export function TodayPlanCard({ plan }: { plan: PlanData | null }) {
             ? 'Allocation withheld. The research context below is descriptive only.'
             : `Authorized allocation target: ${targetPct}%.`}
         </p>
+        {targetPct === null && evidenceStatus === 'BLOCKED' && (
+          <p className="mt-1 text-[10px] leading-relaxed text-[#f3e3c2]">
+            {summarizeEvidenceBlock(evidenceReasons)}
+          </p>
+        )}
       </div>
 
       {shouldShowUncertaintyBanner && (

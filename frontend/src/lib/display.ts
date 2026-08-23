@@ -90,11 +90,28 @@ export function formatCtaDisabledReason(reason: string): string {
 export function deriveNoActionUnlockConditions(args: {
   actionabilityReasonCodes?: string[]
   ctaDisabledReasons?: string[]
+  evidenceReasonCodes?: string[]
   diagnostics?: CalibrationDiagnosticsResponse | null
 }): string[] {
   const reasonCodes = new Set((args.actionabilityReasonCodes || []).filter(Boolean))
   const ctaReasons = new Set((args.ctaDisabledReasons || []).filter(Boolean))
+  const evidenceReasons = new Set((args.evidenceReasonCodes || []).filter(Boolean))
   const hasAny = (...codes: string[]): boolean => codes.some((code) => reasonCodes.has(code) || ctaReasons.has(code) || reasonCodes.has(`cta_${code}`))
+  const evidenceHasFragment = (...fragments: string[]): boolean => (
+    [...evidenceReasons].some((reason) => fragments.some((fragment) => reason.includes(fragment)))
+  )
+  const hasSampleMaturityBlock = evidenceHasFragment(
+    'current_model_rows_unavailable',
+    'insufficient_paired_sample',
+    'insufficient_discordant_pairs',
+    'insufficient_calendar_span',
+    'insufficient_weekday_coverage',
+  )
+  const hasFreshnessBlock = evidenceHasFragment(
+    'prediction_freshness_unavailable',
+    'actual_freshness_unavailable',
+    'actual_observation_freshness_unavailable',
+  )
 
   const unlock: string[] = []
 
@@ -117,10 +134,72 @@ export function deriveNoActionUnlockConditions(args: {
   if (hasAny('refresh_ttl_overdue', 'refresh_ttl_unknown', 'opportunity_refresh_ttl_overdue', 'opportunity_refresh_ttl_unknown')) {
     unlock.push('Latest successful refresh must be within the scheduled TTL window before action CTA unlocks.')
   }
+  if (hasSampleMaturityBlock) {
+    unlock.push('Current-model predictions must mature into enough evaluated outcomes, with adequate calendar span and weekday coverage; another refresh alone will not clear this gate.')
+  }
+  if (!hasSampleMaturityBlock && hasFreshnessBlock) {
+    unlock.push('Current prediction and outcome observations must satisfy the evidence freshness checks.')
+  }
+  if (evidenceHasFragment(
+    'direction_evidence_unavailable',
+    'signed_return_evidence_unavailable',
+    'direction_hac_lower_bound_not_positive',
+    'signed_return_hac_lower_bound_not_positive',
+  )) {
+    unlock.push('Prospective direction accuracy and after-cost return uplift must clear their confidence thresholds.')
+  }
+  if (evidenceHasFragment('validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy')) {
+    unlock.push('A versioned forecast-to-sizing and theme policy must be implemented, tested, and validated.')
+  }
 
   return unlock.length > 0
     ? unlock
-    : ['Wait for the next refresh cycle and recheck actionability state.']
+    : ['Required prospective evidence and policy gates must pass before allocation can be authorized.']
+}
+
+export function summarizeEvidenceBlock(reasonCodes: string[] | null | undefined): string {
+  const reasons = (reasonCodes || []).filter(Boolean)
+  const hasFragment = (...fragments: string[]): boolean => (
+    reasons.some((reason) => fragments.some((fragment) => reason.includes(fragment)))
+  )
+  const causes: string[] = []
+  const currentModelRowsUnavailable = hasFragment('current_model_rows_unavailable')
+  const sampleMaturityBlocked = hasFragment(
+    'insufficient_paired_sample',
+    'insufficient_discordant_pairs',
+    'insufficient_calendar_span',
+    'insufficient_weekday_coverage',
+  )
+  const freshnessUnavailable = hasFragment(
+    'prediction_freshness_unavailable',
+    'actual_freshness_unavailable',
+    'actual_observation_freshness_unavailable',
+  )
+
+  if (currentModelRowsUnavailable) {
+    causes.push('current-model outcomes are not yet available for evaluation')
+  } else if (sampleMaturityBlocked) {
+    causes.push('current-model outcomes are still accumulating')
+  } else if (freshnessUnavailable) {
+    causes.push('prediction and outcome freshness cannot yet be established')
+  }
+  if (hasFragment('direction_evidence_unavailable', 'signed_return_evidence_unavailable')) {
+    causes.push('prospective performance evidence is not yet available')
+  } else if (hasFragment('direction_hac_lower_bound_not_positive', 'signed_return_hac_lower_bound_not_positive')) {
+    causes.push('prospective performance has not cleared its confidence thresholds')
+  }
+  if (hasFragment('validated_spy_forecast_not_bound_to_plan_sizing_or_theme_policy')) {
+    causes.push('the validated SPY forecast is not yet bound to a tested Plan sizing and theme policy')
+  }
+
+  if (causes.length === 0) {
+    return 'Why: required prospective evidence has not yet passed the allocation gate.'
+  }
+
+  const explanation = causes.length === 1
+    ? causes[0]
+    : `${causes.slice(0, -1).join(', ')}, and ${causes.at(-1)}`
+  return `Why: ${explanation}.`
 }
 
 export function calibrationQualityClass(quality: 'ROBUST' | 'LIMITED' | 'INSUFFICIENT'): string {
